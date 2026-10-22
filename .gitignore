@@ -8,3 +8,20 @@ shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
+# flame: Google/Apple images and firmware, boot tools, run logs, build trees (only work/userland/bin is shared)
+images/
+stock/
+downloads/
+logs/
+reference-repos/
+work/*
+!work/userland/
+work/userland/*
+!work/userland/bin/
+phone/*/out/
+phone/metal/pipelines/
+tools/camsnap/camsnap
+tools/flamebridge/FlameBridge.app/Contents/MacOS/
+tools/flamebridge/FlameBridge.app/Contents/_CodeSignature/
+*.ipa
+.DS_Store
