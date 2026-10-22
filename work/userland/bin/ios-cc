@@ -1,0 +1,3 @@
+#!/bin/sh
+# clang for iOS 16 arm64 userland tools (dropbear, dash, toybox)
+exec "$(xcrun -f clang)" -arch arm64 -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" -miphoneos-version-min=16.0 "$@"

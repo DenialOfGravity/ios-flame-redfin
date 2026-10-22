@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "$(xcrun -f clang)" -isysroot "$(xcrun --sdk macosx --show-sdk-path)" "$@"
