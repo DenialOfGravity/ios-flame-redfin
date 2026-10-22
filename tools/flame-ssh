@@ -1,0 +1,8 @@
+#!/bin/sh
+# SSH into iOS on the Pixel (dropbear over USB Ethernet, via FlameBridge 127.0.0.1:2222).
+#   tools/flame-ssh                 interactive shell
+#   tools/flame-ssh 'command ...'   run a command
+cd "$(dirname "$0")/.."
+exec ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+	-o ConnectTimeout=20 -i work/userland/ssh/id_ed25519 -p 2222 root@127.0.0.1 \
+	${1:+"export PATH=/var/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; $*"}

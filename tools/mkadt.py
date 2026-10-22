@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
+"""Build the minimal Apple Device Tree that the SWEET xnu needs to boot on flame.
 
-Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+Only what the early boot path actually reads (see ios-sweet's NOTES.md); every
+MMIO address comes from the flame (Pixel 4, SM8150) live FDT. The kernel's
+built-in drivers still match the Redmi names (xiaomi,sweet, qcom,kryo470,
+sweet,display), so those stay next to the flame ones.
+Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
 """
 import hashlib, os, struct, sys
 
@@ -12,15 +15,11 @@ import adt  # noqa: E402
 # Kernel-managed RAM: above every Qualcomm XPU carve-out (see NOTES.md)
 PHYS_BASE = 0xb0000000
 MEM_SIZE = 0x4d000000
-# Panic log buffer, carved from the TOP of the dram range and exposed to XNU as
-# /pram + /chosen/embedded-panic-log-size. Without it, pe_init.c's
-# check_for_panic_log() leaves gPanicBase == 0, debug_log_init() bails out twice
-# and the kernel hangs right after "kdp_core zlib memory" — reproduced on QEMU
-# and independently on ios-fajita.
-PANIC_LOG_SIZE = 0x100000
-# --highmem (phone only): the whole upper DDR bank. The live FDT memory node is
-# <0x80000000 2G>, <0x1_00000000 0xfcc00000>; every fixed reserved-memory
-# carve-out is in the low bank and the dynamic pools are limited below 4G.
+# --highmem (phone only): above 4G. The flame live FDT memory node is
+# <0x80000000 0x3cc00000>, <0xc0000000 0x140000000>; every fixed
+# reserved-memory carve-out ends below 0xac800000 and the dynamic pools are
+# limited below 4G. ABL puts the ramdisk (our payload) at 0x84700000 or, if
+# big, 0xc0000000, so XNU takes 0x1_00000000 up (same size as on the Redmi).
 HIGH_PHYS_BASE = 0x100000000
 HIGH_MEM_SIZE = 0xfcc00000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
@@ -28,9 +27,10 @@ SOC_BASE = 0x01000000
 
 GICD, GICD_SIZE = 0x17a00000, 0x10000
 GICR, GICR_SIZE = 0x17a60000, 0x100000
-FB, FB_SIZE = 0x9c000000, 0x1700000
+# cont_splash_region; ABL scans it out (autorefreshed command-mode panel)
+FB, FB_SIZE = 0x9c400000, 0x2400000
 SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
-FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
+FB_W, FB_H, FB_STRIDE = 1080, 2280, 1080 * 4
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 TIMEBASE = 19200000
@@ -67,6 +67,10 @@ u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
 
 
+PANIC_LOG_PA = 0x1fd000000
+PANIC_LOG_SIZE = 0x80000
+
+
 def node(name, props=(), children=()):
     n = adt.Node()
     n.props = [('name', 0, cstr(name))] + [(k, 0, v) for k, v in props]
@@ -77,9 +81,6 @@ def node(name, props=(), children=()):
 def build(seed=None, qemu=False, highmem=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
-    # Carve the panic log off the top so the kernel never allocates over it.
-    panic_base = phys_base + mem_size - PANIC_LOG_SIZE
-    mem_size -= PANIC_LOG_SIZE
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -91,9 +92,8 @@ def build(seed=None, qemu=False, highmem=False):
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),
         ('debug-enabled', u32(1)),
-        ('embedded-panic-log-size', u32(PANIC_LOG_SIZE)),
-        ('firmware-version', cstr('sweet-shim')),
-        ('system-firmware-version', cstr('sweet-shim')),
+        ('firmware-version', cstr('flame-shim')),
+        ('system-firmware-version', cstr('flame-shim')),
         # iBoot's SHA-384 of the boot manifest; /sbin/mount -P 1 exits unless
         # it exists (bind mounts /private/preboot/<hex>/usr/standalone/firmware,
         # tolerating a missing directory). Fixed stand-in value.
@@ -103,8 +103,8 @@ def build(seed=None, qemu=False, highmem=False):
         ('crypto-hash-method', cstr('sha2-384')),
         # MobileGestalt's screen class: display-scale (u32, default 0) comes
         # from /chosen, the pixel size from IOMobileFramebuffer. Scale 0 makes
-        # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. 1080x2400 @3x =
-        # 360x800 points (like iPhone X class devices).
+        # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. The display is
+        # presented as the iPhone X's 1125x2436 @3x.
         ('display-scale', u32(3)),
         # XNU derives IOPlatformUUID (gethostuuid) from these on arm; without
         # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
@@ -121,6 +121,18 @@ def build(seed=None, qemu=False, highmem=False):
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
+        # MobileGestalt's WiFi/Bluetooth/Ethernet addresses: without them each
+        # WifiAddress answer waits 5 s for an IONetworkController (sdio, wlan,
+        # marconi-wifi) that never comes, and the old-style UniqueDeviceID needs
+        # it: installd then takes 5 s per bundle, LaunchServices never finishes
+        # registering extensions, and PosterBoard (no poster providers) asserts:
+        # black wallpaper. Locally administered addresses, not the phone's.
+        ('mac-address-wifi0', bytes([0x02, 0x50, 0x49, 0x58, 0x45, 0x4c])),
+        ('mac-address-bluetooth0', bytes([0x02, 0x50, 0x49, 0x58, 0x45, 0x4d])),
+        ('mac-address-ethernet0', bytes([0x02, 0x50, 0x49, 0x58, 0x45, 0x4e])),
+        # Panic region size (with /pram below): XNU's SavePanicInfo spins forever
+        # without one, so panics printed no backtrace.
+        ('embedded-panic-log-size', u32(PANIC_LOG_SIZE)),
     ], [node('memory-map', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
@@ -129,27 +141,27 @@ def build(seed=None, qemu=False, highmem=False):
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # SWEET SMP: all eight cores in physical-core order (0-5 Cortex-A55,
-    # 6-7 Cortex-A76), one homogeneous cluster. The kernel defaults to one
-    # and uses cpus=N to select an initial prefix (N <= 8).
-    # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
+    # SMP: all eight cores in physical-core order (flame: 0-3 Cortex-A55,
+    # 4-6 Cortex-A76, 7 the A76 prime core), one homogeneous cluster. The
+    # kernel defaults to one and uses cpus=N to select an initial prefix.
+    # QEMU retains its original single-CPU tree: its MPIDRs differ.
     cpu_nodes = []
     for core in range(1 if qemu else 8):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
+            ('compatible', cstr('qcom,kryo470') + cstr('qcom,kryo485') + cstr('ARM,v8')),
             ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
             ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
             ('die-cluster-id', u32(0)),
             ('cluster-core-id', u32(core)),
-            ('l2-cache-id', u32(core)),  # distinct per-core L2 nodes in live FDT
+            ('l2-cache-id', u32(core)),  # per-core L2 nodes in the live FDT
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2304000000 if core >= 6 else 1804800000)),
+            ('clock-frequency', u32(2841600000 if core == 7 else 2419200000 if core >= 4 else 1785600000)),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
@@ -181,6 +193,14 @@ def build(seed=None, qemu=False, highmem=False):
         # with this device_type and reads the canvas size from the node
         # (the presented iPhone X size, see SweetFramebuffer.cpp);
         # the kernel's AppleCLCD matches the compatible string.
+        # launchd starts wifid only when the device tree has a "wlan" node
+        # (com.apple.wifid _LimitLoadToDeviceTree = wlan, marconi-wifi); the
+        # kernel's en0 + Apple80211 (bsd/dev/flame_wlan.c) answer it (as ios-topaz)
+        node('wlan', [
+            ph(),
+            ('device_type', cstr('wlan')),
+            ('compatible', cstr('flame,wcn3990')),
+        ]),
         node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),
@@ -196,6 +216,10 @@ def build(seed=None, qemu=False, highmem=False):
         ('height', u32(FB_H)),
         ('stride', u32(FB_STRIDE)),
     ])
+
+    # iBoot's panic region (pe_init.c check_for_panic_log): RAM above XNU's range
+    # (which ends at 0x1fcc00000) and below the console mirror at 0x1fe000000.
+    pram = node('pram', [ph(), ('reg', struct.pack('<2Q', PANIC_LOG_PA, PANIC_LOG_SIZE))])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
     ufs = node('sweet-ufs', [
@@ -222,23 +246,19 @@ def build(seed=None, qemu=False, highmem=False):
     product_props = d22ap_product()
     product = [node('product', [ph()] + product_props)] if product_props else []
 
-    # Panic log region. /pram reg = <phys size>; it sits just above the
-    # dram-size we expose, so XNU maps it but never allocates into it.
-    pram = node('pram', [ph(), ('reg', u64(panic_base) + u64(PANIC_LOG_SIZE))])
-
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('google,flame') + cstr('qcom,sm8150') + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs, pram]))
 
 
 if __name__ == '__main__':

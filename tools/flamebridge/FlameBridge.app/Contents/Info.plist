@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key><string>FlameBridge</string>
+	<key>CFBundleIdentifier</key><string>dev.iosonpixel.flamebridge</string>
+	<key>CFBundleName</key><string>FlameBridge</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>CFBundleShortVersionString</key><string>1.0</string>
+	<key>CFBundleVersion</key><string>1</string>
+	<key>LSUIElement</key><true/>
+	<key>NSLocalNetworkUsageDescription</key><string>FlameBridge relays SSH and debug traffic to the Pixel 4 running iOS over USB Ethernet (192.168.7.2).</string>
+</dict>
+</plist>

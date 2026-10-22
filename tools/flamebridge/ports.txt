@@ -1,0 +1,4 @@
+# LOCAL REMOTE (TCP 127.0.0.1:LOCAL -> 192.168.7.2:REMOTE); restart: pkill -x FlameBridge; open FlameBridge.app
+2222 22
+2223 2223
+62078 62078

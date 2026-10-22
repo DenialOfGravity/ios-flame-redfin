@@ -17,7 +17,8 @@ Payload layout (little endian, all offsets from payload start):
   0x030  u64   kernel_end_va  end of the highest segment (page aligned)
   0x038  u64   phys_base      kernel-managed RAM (same values as the ADT's dram-base/size)
   0x040  u64   mem_size
-  0x048  char  cmdline[608]
+  0x048  char  cmdline[608]   (the last 16 bytes, 0x298: u64 ring_va, total_va of
+                              the kernel's console ring, for the shim's RAM log rescue)
   0x2a8  seg[nsegs] { u64 vmaddr, vmsize, file_off(in payload), file_size }
 
 --ramdisk appends IMAGE as one more segment right after the kernel and moves
@@ -36,6 +37,19 @@ PAGE = 0x4000
 BOOT_LINE_LENGTH = 608
 CMDLINE = 0x48
 SEG_TABLE = CMDLINE + BOOT_LINE_LENGTH	# 0x2a8
+RAMLOG = CMDLINE + BOOT_LINE_LENGTH - 16	# 0x298: ring_va, total_va
+
+
+def kernel_symbols(path, *names):
+    """Addresses of the named symbols (0 if absent), from nm."""
+    import subprocess
+    found = dict.fromkeys(names, 0)
+    out = subprocess.run(['nm', path], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[2] in found:
+            found[parts[2]] = int(parts[0], 16)
+    return [found[n] for n in names]
 
 
 def parse_macho(buf):
@@ -132,6 +146,28 @@ def add_ramdisk_to_adt(adt_blob, phys, size):
     return adt.serialize(root)
 
 
+def add_poke_to_adt(adt_blob, script):
+    """Return the ADT with /chosen/sweet-poke = the register script (bsd/dev/sweet_poke.c)."""
+    root, _ = adt.parse(adt_blob)
+    chosen = next(c for c in root.children if c.name == 'chosen')
+    chosen.props = [p for p in chosen.props if p[0] != 'sweet-poke']
+    chosen.props.append(('sweet-poke', 0, script.encode() + b'\0'))
+    return adt.serialize(root)
+
+
+GPU_FW = ('a640_gmu.bin', 'a630_sqe.fw', 'a640_zap.mdt', 'a640_zap.b02')
+
+
+def add_gpufw_to_adt(adt_blob, fw_dir):
+    """Return the ADT with /chosen/gpufw,<file> = the Adreno firmware (bsd/dev/sweet_gpu.c)."""
+    root, _ = adt.parse(adt_blob)
+    chosen = next(c for c in root.children if c.name == 'chosen')
+    chosen.props = [p for p in chosen.props if not p[0].startswith('gpufw,')]
+    for name in GPU_FW:
+        chosen.props.append(('gpufw,' + name, 0, open(os.path.join(fw_dir, name), 'rb').read()))
+    return adt.serialize(root)
+
+
 def adt_dram(adt_blob):
     """Kernel-managed RAM <base, size> from the ADT's /chosen dram-base/dram-size."""
     root, _ = adt.parse(adt_blob)
@@ -140,7 +176,7 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, poke_path=None, gpufw_dir=None):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -154,6 +190,10 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     kernel_end = (kernel_end + PAGE - 1) & ~(PAGE - 1)
 
     adt_blob = open(adt_path, 'rb').read()
+    if poke_path:
+        adt_blob = add_poke_to_adt(adt_blob, open(poke_path).read())
+    if gpufw_dir:
+        adt_blob = add_gpufw_to_adt(adt_blob, gpufw_dir)
     # The ADT decides where the kernel's RAM is (mkadt.py --highmem).
     PHYS_BASE, MEM_SIZE = adt_dram(adt_blob)
     pieces = [(s['vmaddr'], s['vmsize'], buf[s['fileoff']:s['fileoff'] + s['filesize']]) for s in segs]
@@ -183,8 +223,11 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     struct.pack_into('<8sII', out, 0, b'SWEETXNU', 1, len(pieces))
     struct.pack_into('<7Q', out, 0x10, virt_base, m['entry'], adt_off, len(adt_blob), kernel_end,
                      PHYS_BASE, MEM_SIZE)
-    cl = cmdline.encode()[:BOOT_LINE_LENGTH - 1]
+    cl = cmdline.encode()
+    assert len(cl) < BOOT_LINE_LENGTH - 16, 'cmdline too long (the last 16 bytes hold the ramlog VAs)'
     out[CMDLINE:CMDLINE + len(cl)] = cl
+    ring_va, total_va = kernel_symbols(kernel_path, '_sweet_log_ring', '_sweet_log_total')
+    struct.pack_into('<2Q', out, RAMLOG, ring_va, total_va)
     for i, t in enumerate(seg_table):
         struct.pack_into('<4Q', out, SEG_TABLE + 32 * i, *t)
     info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, virt_base=hex(virt_base),
@@ -198,8 +241,10 @@ if __name__ == '__main__':
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--poke', help='register script for bsd/dev/sweet_poke.c (/chosen/sweet-poke)')
+    ap.add_argument('--gpufw', help='Adreno firmware directory for bsd/dev/sweet_gpu.c (/chosen/gpufw,*)')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.poke, a.gpufw)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':

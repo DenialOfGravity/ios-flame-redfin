@@ -1,0 +1,12 @@
+#!/bin/sh
+# Mesa's freedreno tools (built in the Lima VM iosroot: work/mesa/build.sh -> ~/mesa-build).
+#   tools/fd cffdump [OPTS] FILE.rd        decode a command stream capture (gpu submit writes .rd)
+#   tools/fd crashdec [OPTS] -f FILE.txt   decode a state dump (gpu dump / hang-N.txt)
+#   tools/fd pgmdump2 | rddecompiler ...
+# Files must be under the project (the VM mounts it at the same path). Useful options:
+# cffdump --verbose, --summary; crashdec -v. Output goes through no pager.
+set -e
+cd "$(dirname "$0")/.."
+tool=$1; shift
+exec limactl shell --workdir "$PWD" iosroot env LESS=FRX PAGER=cat \
+	"/home/$(whoami).guest/mesa-build/src/freedreno/decode/$tool" "$@"
