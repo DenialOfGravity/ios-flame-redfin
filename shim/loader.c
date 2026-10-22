@@ -8,9 +8,10 @@
  * and caches off, x0 = boot_args (physical).
  */
 #include <stdint.h>
-#include "console.h"
 #include "fdt.h"
 #include "loader.h"
+#include "ramlog.h"
+#include "log.h"
 
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
@@ -76,14 +77,21 @@ static int magic_ok(const char *m)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
-const char *loader_boot(uintptr_t dtb)
+int loader_has_payload(uintptr_t dtb)
+{
+	uint64_t rd_start;
+	return fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) &&
+	       magic_ok(((const struct payload *)rd_start)->magic);
+}
+
+const char *loader_boot(uintptr_t dtb, const struct loader_fb *fb)
 {
 	uint64_t rd_start, rd_end;
 
 	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
 	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
 		return "no initrd in /chosen";
-	con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
+	log_printf("loader: initrd %lx-%lx\n", rd_start, rd_end);
 
 	const struct payload *p = (const struct payload *)rd_start;
 	if (!magic_ok(p->magic))
@@ -92,9 +100,8 @@ const char *loader_boot(uintptr_t dtb)
 		return "bad payload header";
 
 	uint64_t pa_of_va_base = p->phys_base - p->virt_base;	/* pa = va + this */
-	con_hex2("PHYS", "base=", p->phys_base, "size=", p->mem_size);
-	con_hex("VIRT", p->virt_base);
-	con_hex("ENTRY", p->entry_va);
+	log_printf("loader: phys %lx size %lx virt %lx entry %lx\n", p->phys_base, p->mem_size,
+		   p->virt_base, p->entry_va);
 
 	/* The payload must not overlap where the kernel goes. */
 	if (rd_end > p->phys_base && rd_start < p->phys_base + p->mem_size)
@@ -107,7 +114,7 @@ const char *loader_boot(uintptr_t dtb)
 		if (s->vmsize > s->file_size)
 			zero64(dst + ((s->file_size + 7) & ~7UL), s->vmsize - ((s->file_size + 7) & ~7UL));
 	}
-	con_hex2("SEGS", "n=", p->nsegs, "end=", p->kernel_end + pa_of_va_base);
+	log_printf("loader: %u segments, end %lx\n", p->nsegs, p->kernel_end + pa_of_va_base);
 
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
@@ -123,22 +130,30 @@ const char *loader_boot(uintptr_t dtb)
 	ba->physBase = p->phys_base;
 	ba->memSize = p->mem_size;
 	ba->topOfKernelData = top;
-	ba->Video.v_baseAddr = FB_BASE;
-	ba->Video.v_display = 1;
-	ba->Video.v_rowBytes = FB_STRIDE;
-	ba->Video.v_width = FB_W;
-	ba->Video.v_height = FB_H;
+	ba->Video.v_baseAddr = fb->base;
+	ba->Video.v_display = fb->base != 0;
+	ba->Video.v_rowBytes = fb->stride;
+	ba->Video.v_width = fb->width;
+	ba->Video.v_height = fb->height;
 	ba->Video.v_depth = 32;
 	ba->deviceTreeP = adt_pa - pa_of_va_base;	/* xnu reads it with the MMU on: a VA */
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
 	ba->memSizeActual = p->mem_size;
-	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
+	log_printf("loader: boot_args %lx top %lx\n", (uint64_t)ba_pa, (uint64_t)top);
+
+	/* ring_va, total_va in the last 16 bytes of the cmdline field (mkpayload.py) */
+	uint64_t ring_va, total_va;
+	__builtin_memcpy(&ring_va, &p->cmdline[BOOT_LINE_LENGTH - 16], 8);
+	__builtin_memcpy(&total_va, &p->cmdline[BOOT_LINE_LENGTH - 8], 8);
+	if (ring_va && total_va)
+		ramlog_arm(ring_va + pa_of_va_base, total_va + pa_of_va_base);
 
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
-	con_hex("JUMP", entry_pa);
-	con_str("XNU", "jumping (fbcon clears screen)");
+	log_printf("loader: jump %lx\n", (uint64_t)entry_pa);
+	if (fb->before_jump)
+		fb->before_jump();
 
 	/* Everything was written with the MMU and caches off; drop any stale I-cache lines too. */
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");

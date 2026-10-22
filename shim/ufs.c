@@ -1,19 +1,20 @@
 /*
- * Milestone 5 probe: can we talk to the internal UFS that ABL booted from?
+ * Polled UFS access for the shim, on the host ABL leaves running.
  *
- * Runs with the MMU off (all memory Device, so DMA is coherent with no cache
- * maintenance). Dumps the UFSHCI registers ABL left behind and, if the host
- * is enabled and the link is up, points the transfer request list at our own
- * buffers and issues READ-ONLY SCSI commands on LUN 0. Nothing is ever
- * written to the device: there is no SCSI WRITE in this file.
+ * Runs with the MMU off (all memory Device, so DMA needs no cache
+ * maintenance). Takes over the transfer request list with our own buffers
+ * and issues one SCSI command at a time on LUN 0. Writes are restricted to
+ * the scratch area at the end of the userdata partition (ufs_scratch_*),
+ * nothing else on the device is ever written.
  *
  * Register layout and descriptor formats: JEDEC UFSHCI (JESD223).
  */
 #include <stdint.h>
-#include "console.h"
+#include "log.h"
 #include "ufs.h"
+#include "util.h"
 
-#define UFS_BASE	0x01d84000UL	/* ufshc@1d84000, sweet live FDT */
+#define UFS_BASE	0x01d84000UL	/* ufshc@1d84000, flame live FDT */
 
 #define REG_CAP		0x00
 #define REG_VER		0x08
@@ -28,72 +29,58 @@
 
 #define HCS_DP		(1u << 0)
 #define HCS_UTRLRDY	(1u << 1)
-#define HCS_UCRDY	(1u << 3)
 
 #define BLOCK		4096u
+#define XFER_BLOCKS	64u		/* one PRDT entry of 256 KiB */
 
 static inline uint32_t ufs_rd(uint32_t off) { return *(volatile uint32_t *)(UFS_BASE + off); }
 static inline void ufs_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(UFS_BASE + off) = v; }
 
-/* UTP transfer request descriptor (32 bytes). */
 struct utrd {
-	uint32_t dw0;		/* [31:28] CT, [26:25] DD, [24] I */
-	uint32_t dw1;
-	uint32_t dw2;		/* [7:0] OCS */
-	uint32_t dw3;
-	uint32_t ucdba;		/* command descriptor base, 128-byte aligned */
-	uint32_t ucdbau;
+	uint32_t dw0, dw1, dw2, dw3;
+	uint32_t ucdba, ucdbau;
 	uint32_t resp;		/* [31:16] response UPIU offset, [15:0] length (DWORDs) */
-	uint32_t prdt;		/* [31:16] PRDT offset, [15:0] entries (DWORDs/entries) */
+	uint32_t prdt;		/* [31:16] PRDT offset (DWORDs), [15:0] entries */
 };
 
-/* UTP command descriptor: command UPIU, response UPIU, PRDT. */
 struct ucd {
 	uint8_t cmd[512];
 	uint8_t resp[512];
 	struct {
-		uint32_t addr_lo, addr_hi, rsvd, dbc;	/* dbc = byte count - 1 */
+		uint32_t addr_lo, addr_hi, rsvd, dbc;
 	} prdt[1];
 };
 
 static struct utrd utrl[32] __attribute__((aligned(1024)));
 static struct ucd ucd __attribute__((aligned(128)));
-static uint8_t data[2 * BLOCK] __attribute__((aligned(4096)));
+static uint8_t data[XFER_BLOCKS * BLOCK] __attribute__((aligned(4096)));
+
+static int ready;
+static uint64_t part_first, part_blocks;	/* userdata, in 4K blocks */
+static uint64_t scratch_first;
 
 static uint64_t ticks(void)
 {
 	uint64_t t;
-	__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(t));
+	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t));
 	return t;
 }
 
-static void zero(void *p, unsigned n)
-{
-	volatile uint8_t *b = p;
-	for (unsigned i = 0; i < n; i++)
-		b[i] = 0;
-}
-
-static uint32_t be32(const uint8_t *p)
-{
-	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
-}
-
 /*
- * Issue one SCSI command (read direction or no data) in slot 0.
- * Returns 0 on success, otherwise a code describing the failure stage.
+ * One SCSI command in slot 0. dir: 0 none, 1 data out (to the device),
+ * 2 data in. Returns 0 on success, else the failing stage.
  */
-static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *buf, uint32_t len,
-    uint32_t *ocs_out, uint32_t *status_out)
+static uint32_t scsi(const uint8_t *cdb, unsigned cdb_len, void *buf, uint32_t len, int dir)
 {
 	static uint8_t tag;
-	zero(&utrl[0], sizeof(utrl[0]));
-	zero(&ucd, sizeof(ucd));
+	uint8_t *u = (uint8_t *)&utrl[0];
+	for (unsigned i = 0; i < sizeof(utrl[0]); i++)
+		u[i] = 0;
+	vzero(&ucd, sizeof(ucd));
 
-	/* Command UPIU: header (12 bytes), expected length, CDB. */
-	ucd.cmd[0] = 0x01;			/* transaction type: COMMAND */
-	ucd.cmd[1] = len ? 0x40 : 0x00;		/* flags: R (data in) */
-	ucd.cmd[2] = lun;
+	ucd.cmd[0] = 0x01;				/* COMMAND UPIU */
+	ucd.cmd[1] = dir == 1 ? 0x20 : dir == 2 ? 0x40 : 0;	/* W / R flag */
+	ucd.cmd[2] = 0;					/* LUN 0 */
 	ucd.cmd[3] = ++tag;
 	ucd.cmd[12] = len >> 24;
 	ucd.cmd[13] = len >> 16;
@@ -103,8 +90,9 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 		ucd.cmd[16 + i] = cdb[i];
 
 	uintptr_t ucd_pa = (uintptr_t)&ucd;
-	utrl[0].dw0 = (1u << 28) | ((len ? 2u : 0u) << 25) | (1u << 24);	/* UFS storage, dev->host */
-	utrl[0].dw2 = 0x0f;			/* OCS: invalid until the host updates it */
+	/* CT=UFS storage, DD 1 = memory to device, 2 = device to memory, I */
+	utrl[0].dw0 = (1u << 28) | ((uint32_t)dir << 25) | (1u << 24);
+	utrl[0].dw2 = 0x0f;
 	utrl[0].ucdba = (uint32_t)ucd_pa;
 	utrl[0].ucdbau = (uint32_t)(ucd_pa >> 32);
 	utrl[0].resp = (512u / 4) << 16 | (512u / 4);
@@ -120,26 +108,26 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 	ufs_wr(REG_UTRLDBR, 1);
 	uint64_t start = ticks();
 	while (ufs_rd(REG_UTRLDBR) & 1) {
-		if (ticks() - start > 19200000) {	/* 1 s */
-			ufs_wr(REG_UTRLCLR, ~1u);	/* clear slot 0 (write 0 to the bit) */
-			return 1;			/* timeout */
+		if (ticks() - start > 19200000ULL * 5) {	/* 5 s */
+			ufs_wr(REG_UTRLCLR, ~1u);
+			return 1;
 		}
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
-	*ocs_out = utrl[0].dw2 & 0xff;
-	*status_out = ucd.resp[7];		/* SCSI status in the response UPIU */
-	if (*ocs_out)
-		return 2;
-	if (ucd.resp[0] != 0x21)		/* RESPONSE UPIU */
+	ufs_wr(REG_IS, ufs_rd(REG_IS));
+	if (utrl[0].dw2 & 0xff)
+		return 0x100 | (utrl[0].dw2 & 0xff);	/* OCS */
+	if (ucd.resp[0] != 0x21)
 		return 3;
-	return *status_out ? 4 : 0;
+	if (ucd.resp[6] || ucd.resp[7])
+		return 0x200 | ucd.resp[6] << 8 | ucd.resp[7];
+	return 0;
 }
 
-static uint32_t read_blocks(uint32_t lba, uint32_t count, void *buf)
+static uint32_t read_blocks(uint64_t lba, uint32_t count, void *buf)
 {
 	uint8_t cdb[10] = { 0x28, 0, lba >> 24, lba >> 16, lba >> 8, lba, 0, count >> 8, count, 0 };
-	uint32_t ocs, st;
-	return scsi(0, cdb, sizeof(cdb), buf, count * BLOCK, &ocs, &st);
+	return scsi(cdb, sizeof(cdb), buf, count * BLOCK, 2);
 }
 
 static uint64_t le64(const uint8_t *p)
@@ -150,117 +138,136 @@ static uint64_t le64(const uint8_t *p)
 	return v;
 }
 
-/* Name the filesystem whose superblock starts at block lba (f2fs/ext4). */
-static const char *fs_type(uint32_t lba)
+static uint32_t le32(const uint8_t *p)
 {
-	if (read_blocks(lba, 1, data))
-		return "read error";
-	const uint8_t *sb = data + 1024;
-	if (sb[0] == 0x10 && sb[1] == 0x20 && sb[2] == 0xf5 && sb[3] == 0xf2)
-		return "f2fs";
-	if (sb[56] == 0x53 && sb[57] == 0xef)
-		return "ext4";
-	return "other";
+	return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
-/* One line per GPT entry of at least 64 MiB: name, first LBA, size in MiB (4K blocks). */
-static void list_partitions(uint32_t entry_lba, uint32_t nent)
+static int find_userdata(void)
 {
-	static uint8_t ents[128 * 128] __attribute__((aligned(4096)));
-	uint32_t blocks = (nent * 128 + BLOCK - 1) / BLOCK;
-	if (read_blocks(entry_lba, blocks, ents)) {
-		con_str("UFS PART", "read error");
-		return;
-	}
+	if (read_blocks(1, 1, data))
+		return -1;
+	static const char sig[] = "EFI PART";
+	for (int i = 0; i < 8; i++)
+		if (data[i] != (uint8_t)sig[i])
+			return -2;
+	uint64_t entry_lba = le64(data + 72);
+	uint32_t nent = le32(data + 80), esz = le32(data + 84);
+	if (esz != 128 || nent == 0 || nent * esz > sizeof(data))
+		return -3;
+	if (read_blocks(entry_lba, (nent * esz + BLOCK - 1) / BLOCK, data))
+		return -4;
+	static const char want[] = "userdata";
 	for (uint32_t i = 0; i < nent; i++) {
-		const uint8_t *e = ents + i * 128;
-		uint64_t first = le64(e + 32), last = le64(e + 40);
-		if (!first)
+		const uint8_t *e = data + i * esz;
+		int match = 1;
+		for (int c = 0; c < 9; c++)
+			if (e[56 + 2 * c] != (uint8_t)want[c] || e[57 + 2 * c])
+				match = 0;
+		if (!match)
 			continue;
-		char name[17];
-		for (int c = 0; c < 16; c++) {
-			uint8_t ch = e[56 + 2 * c];
-			name[c] = (ch >= 32 && ch < 127) ? ch : (ch ? '?' : 0);
-		}
-		name[16] = 0;
-		if (((last - first + 1) >> 8) < 64)	/* keep the screen to the big ones */
-			continue;
-		con_hex2(name, "lba=", (uint32_t)first, "MiB=", (uint32_t)((last - first + 1) >> 8));
-		if (!__builtin_strcmp(name, "userdata") || !__builtin_strcmp(name, "cust") ||
-		    !__builtin_strcmp(name, "cache"))
-			con_str(" fs", fs_type((uint32_t)first));
+		part_first = le64(e + 32);
+		part_blocks = le64(e + 40) - part_first + 1;
+		return 0;
 	}
+	return -5;
 }
 
-void test_ufs(void)
+int ufs_init(void)
 {
-	con_str("UFS", "milestone 5 probe (read-only)");
 	uint32_t cap = ufs_rd(REG_CAP), hcs = ufs_rd(REG_HCS), hce = ufs_rd(REG_HCE);
-	con_hex2("UFS", "ver=", ufs_rd(REG_VER), "cap=", cap);
-	con_hex2("UFS", "hce=", hce, "hcs=", hcs);
-	con_hex2("UFS", "is=", ufs_rd(REG_IS), "rsr=", ufs_rd(REG_UTRLRSR));
-	con_hex2("UFS", "utrlba=", ufs_rd(REG_UTRLBA), "hi=", ufs_rd(REG_UTRLBAU));
-	con_hex2("UFS", "dbr=", ufs_rd(REG_UTRLDBR), "nutrs=", (cap & 0x1f) + 1);
-
+	log_printf("ufs: ver=%x cap=%x hce=%x hcs=%x is=%x rsr=%x dbr=%x utrlba=%x:%x\n",
+		   ufs_rd(REG_VER), cap, hce, hcs, ufs_rd(REG_IS), ufs_rd(REG_UTRLRSR),
+		   ufs_rd(REG_UTRLDBR), ufs_rd(REG_UTRLBAU), ufs_rd(REG_UTRLBA));
 	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
-		con_str("UFS", "host not enabled/ready: stop");
-		return;
+		log_printf("ufs: host not enabled/ready\n");
+		return -1;
 	}
 	if (ufs_rd(REG_UTRLDBR)) {
-		con_str("UFS", "requests outstanding: stop");
-		return;
+		log_printf("ufs: requests outstanding\n");
+		return -1;
 	}
-
-	/* Take over the transfer request list: stop, point at ours, run. */
 	ufs_wr(REG_UTRLRSR, 0);
 	uintptr_t list = (uintptr_t)utrl;
 	ufs_wr(REG_UTRLBA, (uint32_t)list);
 	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
 	ufs_wr(REG_UTRLRSR, 1);
-	con_hex2("UFS", "ours=", (uint32_t)list, "rsr=", ufs_rd(REG_UTRLRSR));
-	/*
-	 * Never ring a doorbell unless the host really uses our list: otherwise
-	 * it would execute whatever ABL left in its own slot 0 (maybe a write).
-	 */
+	/* Never ring a doorbell unless the host really uses our list. */
 	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
 	    !(ufs_rd(REG_UTRLRSR) & 1)) {
-		con_str("UFS", "list base not taken: stop");
-		return;
+		log_printf("ufs: list base not taken\n");
+		return -1;
 	}
-
-	uint32_t ocs = 0, st = 0, rc;
-	static const uint8_t tur[6] = { 0x00 };
-	/* A first command may report a unit attention; retry a few times. */
+	static const uint8_t tur[6] = { 0 };
+	uint32_t rc = 0;
 	for (int i = 0; i < 3; i++) {
-		rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
-		con_hex2("UFS TUR", "rc=", rc, "ocs/st=", ocs << 8 | st);
+		rc = scsi(tur, sizeof(tur), 0, 0, 0);
 		if (!rc)
 			break;
 	}
+	log_printf("ufs: test unit ready rc=%x\n", rc);
+	int prc = find_userdata();
+	if (prc) {
+		log_printf("ufs: userdata not found (%d)\n", prc);
+		return -1;
+	}
+	if (part_blocks < UFS_SCRATCH_TAIL + UFS_RESCUE_BLOCKS + 16) {
+		log_printf("ufs: userdata too small\n");
+		return -1;
+	}
+	scratch_first = part_first + part_blocks - UFS_SCRATCH_TAIL;
+	ready = 1;
+	log_printf("ufs: userdata first=%lx blocks=%lx scratch=%lx+%x\n",
+		   part_first, part_blocks, scratch_first, UFS_SCRATCH_BLOCKS);
+	return 0;
+}
 
-	static const uint8_t cap10[10] = { 0x25 };	/* READ CAPACITY(10) */
-	rc = scsi(0, cap10, sizeof(cap10), data, 8, &ocs, &st);
-	con_hex2("UFS CAP", "rc=", rc, "ocs/st=", ocs << 8 | st);
-	if (!rc)
-		con_hex2("UFS LUN0", "lastlba=", be32(data), "blk=", be32(data + 4));
-
-	/* READ(10) LBA 0, 2 blocks: protective MBR and the GPT header. */
-	static const uint8_t rd10[10] = { 0x28, 0, 0, 0, 0, 0, 0, 0, 2, 0 };
-	rc = scsi(0, rd10, sizeof(rd10), data, 2 * BLOCK, &ocs, &st);
-	con_hex2("UFS READ", "rc=", rc, "ocs/st=", ocs << 8 | st);
+/*
+ * Read count blocks starting at block index idx of the scratch area. Reads
+ * may go on into the XNU log after it (idx up to UFS_SCRATCH_TAIL).
+ */
+int ufs_scratch_read(uint32_t idx, uint32_t count, void *buf)
+{
+	if (!ready || count > XFER_BLOCKS || idx >= UFS_SCRATCH_TAIL ||
+	    count > UFS_SCRATCH_TAIL - idx)
+		return -1;
+	uint32_t rc = read_blocks(scratch_first + idx, count, data);
 	if (rc)
-		return;
-	con_hex2("UFS MBR", "sig=", data[510] | data[511] << 8, "type=", data[450]);
-	const uint8_t *gpt = data + BLOCK;
-	char sig[9];
-	for (int i = 0; i < 8; i++)
-		sig[i] = (gpt[i] >= 32 && gpt[i] < 127) ? gpt[i] : '.';
-	sig[8] = 0;
-	con_str("UFS GPT", sig);
-	uint32_t nent = gpt[80] | gpt[81] << 8 | gpt[82] << 16, esz = gpt[84] | gpt[85] << 8;
-	uint32_t elba = gpt[72] | gpt[73] << 8;
-	con_hex2("UFS GPT", "entries=", nent, "lba=", elba);
-	if (esz != 128 || nent > 128)
-		return;
-	list_partitions(elba, nent);
+		return -(int)rc;
+	vcopy(buf, data, count * BLOCK);
+	return 0;
+}
+
+static int write_lba(uint64_t lba, uint32_t count, const void *buf);
+
+/* Write count blocks to the scratch area, then flush the device cache. */
+int ufs_scratch_write(uint32_t idx, uint32_t count, const void *buf)
+{
+	if (!ready || count == 0 || count > XFER_BLOCKS || idx >= UFS_SCRATCH_BLOCKS ||
+	    count > UFS_SCRATCH_BLOCKS - idx)
+		return -1;
+	return write_lba(scratch_first + idx, count, buf);
+}
+
+/* Write count blocks to the rescue area just below the scratch area. */
+int ufs_rescue_write(uint32_t idx, uint32_t count, const void *buf)
+{
+	if (!ready || count == 0 || count > XFER_BLOCKS || idx >= UFS_RESCUE_BLOCKS ||
+	    count > UFS_RESCUE_BLOCKS - idx)
+		return -1;
+	return write_lba(scratch_first - UFS_RESCUE_BLOCKS + idx, count, buf);
+}
+
+static int write_lba(uint64_t lba, uint32_t count, const void *buf)
+{
+	if (lba < part_first || lba + count > part_first + part_blocks)
+		return -1;
+	vcopy(data, buf, count * BLOCK);
+	uint8_t cdb[10] = { 0x2a, 0, lba >> 24, lba >> 16, lba >> 8, lba, 0, count >> 8, count, 0 };
+	uint32_t rc = scsi(cdb, sizeof(cdb), data, count * BLOCK, 1);
+	if (rc)
+		return -(int)rc;
+	static const uint8_t sync[10] = { 0x35 };
+	rc = scsi(sync, sizeof(sync), 0, 0, 0);
+	return rc ? -(int)rc : 0;
 }

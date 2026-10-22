@@ -1,36 +1,59 @@
 #!/bin/bash
-# Build the shim and wrap it in a boot.img v2 that mirrors the stock PixelOS header.
+# Build the flame shim and wrap it in a boot image v2 with the stock header
+# layout (base 0, kernel 0x8000, ramdisk 0x1000000, tags 0x100, dtb 0x1f00000).
+#
+#   shim/build.sh [PAYLOAD] [OUT]   PAYLOAD: tools/mkpayload.py output (ramdisk);
+#                                   none -> probe-only image
+#   SHIM_CFLAGS=-DSHIM_SHOWLOG shim/build.sh "" OUT
+#                                   show the logs on UFS on screen (showlog.c)
+# Needs Homebrew llvm + lld; the DTB is the stock boot.img's (stock/dtb).
 set -euo pipefail
 cd "$(dirname "$0")"
-CC=aarch64-linux-gnu-gcc
-OBJCOPY=aarch64-linux-gnu-objcopy
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
+ROOT=$(cd .. && pwd)
+LLVM=/opt/homebrew/opt/llvm/bin
+LLD=/opt/homebrew/opt/lld/bin
+CC="$LLVM/clang --target=aarch64-none-elf"
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-builtin -fno-pic -fno-pie -mgeneral-regs-only -mstrict-align
+	-fno-stack-protector -fno-asynchronous-unwind-tables -Wall -Wextra ${SHIM_CFLAGS:-}"
+SRCS="start.S shim.c console.c log.c util.c mmu.c fdt.c loader.c ufs.c spmi.c sde.c showlog.c diag.c disptest.c gpuprobe.c gpufw.S smmuprobe.c ramlog.c"
 mkdir -p out
-for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c; do
-	$CC $CFLAGS -c $f -o out/${f%.*}.o
+objs=
+for f in $SRCS; do
+	$CC $CFLAGS -c "$f" -o "out/${f%.*}.o"
+	objs="$objs out/${f%.*}.o"
 done
 # The image runs wherever ABL puts it with no relocation pass: only the
 # header's image_size (start.o, linked at 0) may be an absolute address.
-abs=$(aarch64-linux-gnu-readelf -r out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o | grep -c ABS64 || true)
-[ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
-$CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
-	out/start.o out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o -o out/shim.elf
-$OBJCOPY -O binary out/shim.elf out/Image
+abs=$($LLVM/llvm-readelf -r $(echo "$objs" | sed 's| out/start.o||') | grep -c R_AARCH64_ABS64 || true)
+[ "$abs" = 0 ] || {
+	$LLVM/llvm-readelf -r $(echo "$objs" | sed 's| out/start.o||') | grep -B5 R_AARCH64_ABS64 >&2
+	echo "error: $abs absolute relocations in C objects" >&2
+	exit 1
+}
+$LLD/ld.lld -static -nostdlib -T shim.ld --build-id=none -N $objs -o out/shim.elf
+$LLVM/llvm-objcopy -O binary out/shim.elf out/Image
 # ABL copies the file; pad to image_size so .bss/stacks exist as zeroed bytes.
-size=$(aarch64-linux-gnu-nm out/shim.elf | awk '$3=="_end"{print strtonum("0x"$1)}')
-truncate -s "$size" out/Image
-# Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty
-# newc cpio (ABL dislikes a zero-size ramdisk on some builds) -> diagnostics.
+size=$($LLVM/llvm-nm out/shim.elf | awk '$3=="_end"{print $1}')
+truncate -s $((16#$size)) out/Image
+# Google's ABL only takes compressed kernels (stock and TWRP are LZ4 frames);
+# an uncompressed Image is "Unsupported".
+lz4 -q -9 -B7 -f out/Image out/Image.lz4
 if [ -n "${1:-}" ]; then
 	cp "$1" out/ramdisk.bin
 else
+	# ABL dislikes a zero-size ramdisk on some builds: an empty newc cpio.
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
-mkbootimg --header_version 2 --kernel out/Image --ramdisk out/ramdisk.bin \
-	--dtb ../dtb/boot_unpacked/dtb --base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
-	--tags_offset 0x100 --dtb_offset 0x1f00000 --pagesize 4096 \
-	--os_version 17.0.0 --os_patch_level 2035-06 \
-	--cmdline "console=null" -o out/shim-boot.img
-# Host render of the console layout.
-gcc -O1 -Wall -o out/host_test console.c host_test.c && ./out/host_test
-ls -l out/Image out/shim-boot.img
+OUT=${2:-out/shim-boot.img}
+PYTHONPATH="$ROOT/downloads/mkbootimg" python3 "$ROOT/downloads/mkbootimg/mkbootimg.py" \
+	--header_version 2 --kernel out/Image.lz4 --ramdisk out/ramdisk.bin --dtb "$ROOT/stock/dtb" \
+	--base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 --tags_offset 0x100 \
+	--dtb_offset 0x1f00000 --pagesize 4096 --os_version 13.0.0 --os_patch_level 2022-10 \
+	--cmdline "console=null" -o "$OUT"
+# Google's ABL refuses "fastboot boot" of an image without an AVB footer
+# ("Error verifying the received boot.img: Unsupported"), even unlocked: add
+# an unsigned hash footer (algorithm NONE) like TWRP's, padding to the boot
+# partition size.
+python3 "$ROOT/downloads/avb/avbtool.py" add_hash_footer --image "$OUT" \
+	--partition_size 67108864 --partition_name boot
+ls -l out/Image "$OUT"

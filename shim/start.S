@@ -1,5 +1,5 @@
 /*
- * sweet boot shim entry: arm64 Linux Image header so Qualcomm ABL treats
+ * flame boot shim entry: arm64 Linux Image header so Qualcomm ABL treats
  * us like a kernel. ABL enters at EL1, MMU/D-cache off, x0 = DTB pointer.
  */
 	.section .text.head, "ax"
@@ -7,7 +7,7 @@
 _head:
 	b	_start			/* code0 */
 	.long	0			/* code1 */
-	.quad	0			/* text_offset */
+	.quad	0x80000			/* text_offset: Google's ABL wants Linux's 0x80000 */
 	.quad	_end			/* image_size (linked at 0) */
 	.quad	0xa			/* flags: LE, 4K pages, place anywhere */
 	.quad	0			/* res2 */
@@ -22,14 +22,18 @@ _start:
 	msr	daifset, #0xf
 	mov	x19, x0			/* DTB pointer from ABL */
 	msr	spsel, #1
-	adr	x1, _stack_top
+	adrp	x1, _stack_top
+	add	x1, x1, :lo12:_stack_top
 	mov	sp, x1
-	adr	x1, vectors
+	adrp	x1, vectors
+	add	x1, x1, :lo12:vectors
 	msr	vbar_el1, x1
 	isb
 	/* zero .bss */
-	adr	x1, _bss_start
-	adr	x2, _bss_end
+	adrp	x1, _bss_start
+	add	x1, x1, :lo12:_bss_start
+	adrp	x2, _bss_end
+	add	x2, x2, :lo12:_bss_end
 1:	cmp	x1, x2
 	b.hs	2f
 	str	xzr, [x1], #8
@@ -44,11 +48,13 @@ _start:
 secondary_entry:
 	msr	daifset, #0xf
 	msr	spsel, #1
-	adr	x1, _sec_stacks
+	adrp	x1, _sec_stacks
+	add	x1, x1, :lo12:_sec_stacks
 	add	x1, x1, x0, lsl #12
 	add	x1, x1, #0x1000
 	mov	sp, x1
-	adr	x1, vectors
+	adrp	x1, vectors
+	add	x1, x1, :lo12:vectors
 	msr	vbar_el1, x1
 	isb
 	bl	secondary_main
