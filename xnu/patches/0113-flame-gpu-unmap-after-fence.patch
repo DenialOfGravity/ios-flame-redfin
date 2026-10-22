@@ -1,0 +1,50 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 91ae9af1a..78c2d1804 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -621,7 +621,7 @@ sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, u
+ 	return 0;
+ }
+ 
+-/* Undo sweet_gpu_map_user (submissions are synchronous: nothing in flight uses it). */
++/* Undo sweet_gpu_map_user. The caller makes sure no queued GPU work uses it (SweetAccelerator: the client's last fence). */
+ void
+ sweet_gpu_unmap_user(uint64_t iova, uint64_t len)
+ {
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index 406cb129a..ab5627342 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -98,6 +98,7 @@ class SweetAcceleratorUserClient : public IOUserClient {
+ 	OSArray *fMaps;         /* same index: the kernel IOMemoryMap, for cache maintenance */
+ 	uint64_t *fVA;          /* same index: GPU VA and length (0 once freed) */
+ 	uint64_t *fLen;
++	uint32_t fLastFence;    /* of this client's last submit: waited for before its memory is unmapped */
+ 
+ 	int addMemory(IOMemoryDescriptor *md, uint64_t *handle, uint64_t *va);
+ 
+@@ -137,6 +138,14 @@ SweetAcceleratorUserClient::clientClose(void)
+ void
+ SweetAcceleratorUserClient::free(void)
+ {
++	/*
++	 * Submits are asynchronous: a client that exits (or crashes) may leave work queued. Unmapping its
++	 * memory under the GPU would fault, or hand the VAs and pages to someone else while the GPU still
++	 * writes them: wait for its last fence first.
++	 */
++	if (fLastFence != 0 && sweet_gpu_wait_fence(fLastFence, 2000)) {
++		IOLog("SWEET MTL: client freed with fence %u still pending\n", fLastFence);
++	}
+ 	if (fMem != NULL) {
+ 		for (unsigned i = 0; i < fMem->getCount(); i++) {
+ 			IOMemoryDescriptor *md = OSDynamicCast(IOMemoryDescriptor, fMem->getObject(i));
+@@ -339,6 +348,9 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
+ 			return kIOReturnBadArgument;
+ 		}
+ 		out[0] = sweet_gpu_submit_user_async(in[0], (uint32_t)in[1]);
++		if (out[0]) {
++			fLastFence = (uint32_t)out[0];
++		}
+ 		return out[0] ? kIOReturnSuccess : kIOReturnNotReady;
+ 	}
+ 	case 7:

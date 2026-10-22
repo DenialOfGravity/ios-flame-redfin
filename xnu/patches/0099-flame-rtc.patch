@@ -1,0 +1,161 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490ad..6a121c5ac 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -4,6 +4,7 @@
+  * No interrupt clear, peripheral enable, charger config, or PMIC writes.
+  * Init is serialized by the single built-in SweetBattery personality.
+  * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
++ * Also the PM8150 RTC (peripheral 0x60) for the time of day (SweetPlatformExpert.cpp).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -86,11 +87,11 @@ sweet_spmi_init(void)
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery blocks; keys retain their own lanes. */
++	/* Restrict access to the battery blocks and the RTC (0x60); keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+ 	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x60)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 56a44fa30..ff4d89ba4 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -882,7 +882,8 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ /*
+  * Command server on 192.168.7.2:5141 (UDP): each datagram is poke script
+  * text (bsd/dev/sweet_poke.c: r/w/m/p/s lines), run at once in this
+- * thread, results in the console (and so in the live log); "panic" panics
++ * thread, results in the console (and so in the live log); "rtc" prints the
++ * PM8150 RTC ("SWEET RTC: N", for tools/flame-rtc.py); "panic" panics
+  * (to test the panic path); "reboot" resets
+  * the phone with PSCI (the shim already set the PMIC reason to
+  * bootloader, so it lands in fastboot). tools/flame-cmd.py sends them.
+@@ -935,6 +936,18 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 				continue;
+ 			}
+ 		}
++		if (strncmp(cmd, "rtc", 3) == 0) {
++			extern int sweet_rtc_seconds(uint32_t *secs);   /* SweetPlatformExpert.cpp */
++			uint32_t rtc = 0;
++			struct timeval tv;
++			int rc = sweet_rtc_seconds(&rtc);
++			microtime(&tv);
++			printf("SWEET CMD: rtc %u%s, time of day %ld\n", rtc, rc ? " (read failed)" : "", (long)tv.tv_sec);
++			if (!rc) {
++				printf("SWEET RTC: %u\n", rtc);
++			}
++			continue;
++		}
+ 		if (strncmp(cmd, "panic", 5) == 0) {
+ 			/* Tests the panic path: backtraces must reach the persistent log. */
+ 			panic("SWEET CMD: panic requested over USB");
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 171778a0c..2514af3f3 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -18,6 +18,8 @@ public:
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
++	void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+@@ -76,6 +78,73 @@ flame_wdt_start(void)
+ 	IOLog("FLAME WDT: petting every %d s\n", FLAME_WDT_PET_S);
+ }
+ 
++/*
++ * Time of day: the PM8150 RTC (SPMI SID 0, peripheral 0x6000) counts seconds
++ * from whenever it was last set; Android cannot write it either
++ * (qcom,qpnp-rtc-write = 0) and keeps an offset. Here the offset is boot-arg
++ * sweetrtcoff (tools/flame-run.sh computes it from the Mac's clock). The
++ * RTC is published as the IORTC resource: IOKitInitializeTime waits up to
++ * 30 s for it (every boot did) before reading the calendar.
++ */
++#include "../../../bsd/dev/sweet_spmi.h"
++
++#define PM8150_RTC_CTRL         0x6046
++#define PM8150_RTC_RDATA0       0x6048
++
++static int
++sweet_rtc_read(uint32_t *secs)
++{
++	uint8_t b[4], again;
++	if (sweet_spmi_init() != 0) {
++		return -1;
++	}
++	for (int tries = 0; tries < 3; tries++) {
++		for (unsigned i = 0; i < 4; i++) {
++			if (sweet_spmi_read(0, PM8150_RTC_RDATA0 + i, &b[i]) != 0) {
++				return -1;
++			}
++		}
++		/* The low byte rolled over between the reads: read again (rtc-pm8xxx does the same). */
++		if (sweet_spmi_read(0, PM8150_RTC_RDATA0, &again) != 0) {
++			return -1;
++		}
++		if (again >= b[0]) {
++			*secs = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
++			return 0;
++		}
++	}
++	return -1;
++}
++
++/* For the USB command server's "rtc" (bsd/dev/sweet_usb.c): offset calibration from the Mac. */
++extern "C" int
++sweet_rtc_seconds(uint32_t *secs)
++{
++	return sweet_rtc_read(secs);
++}
++
++long
++SweetPlatformExpert::getGMTTimeOfDay(void)
++{
++	uint32_t rtc = 0;
++	uint64_t off = 0;
++	if (sweet_rtc_read(&rtc) != 0) {
++		return 0;
++	}
++	(void)PE_parse_boot_argn("sweetrtcoff", &off, sizeof(off));
++	return (long)((uint64_t)rtc + off);
++}
++
++void
++SweetPlatformExpert::setGMTTimeOfDay(long secs)
++{
++	uint32_t rtc = 0;
++	if (sweet_rtc_read(&rtc) == 0) {
++		IOLog("SWEET RTC: time set to %ld (RTC %u, offset %ld); the RTC is read-only, not kept\n",
++		    secs, rtc, secs - (long)rtc);
++	}
++}
++
+ extern "C" void sweet_log_mirror_start(void);
+ extern "C" void sweet_poke_start(void);
+ 
+@@ -89,6 +158,14 @@ SweetPlatformExpert::start(IOService *provider)
+ 	}
+ 	flame_wdt_start();
+ 	sweet_poke_start();             /* register scripts: bsd/dev/sweet_poke.c */
++	uint32_t rtc = 0;
++	uint8_t ctrl = 0;
++	if (sweet_rtc_read(&rtc) == 0 && sweet_spmi_read(0, PM8150_RTC_CTRL, &ctrl) == 0) {
++		IOLog("SWEET RTC: PM8150 RTC %u s (ctrl %02x), time of day %ld\n", rtc, ctrl, getGMTTimeOfDay());
++		publishResource("IORTC", this);
++	} else {
++		IOLog("SWEET RTC: PM8150 RTC not readable; no time of day\n");
++	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;

@@ -1,0 +1,83 @@
+diff --git a/bsd/dev/flame_wlan.c b/bsd/dev/flame_wlan.c
+index 7bac49749..4fca0972d 100644
+--- a/bsd/dev/flame_wlan.c
++++ b/bsd/dev/flame_wlan.c
+@@ -58,6 +58,8 @@ static uint64_t fw_tx_dropped;
+ static bool fw_opened, fw_ready, fw_link_up;
+ static uint8_t fw_addr[6];
+ static struct fw_link fw_link;          /* the network of the last FW_LINK up */
++static struct flame_wlan_bss fw_link_bss;       /* ... as a scan heard it (kept: a new list empties fw_bss a while) */
++static bool fw_link_bss_heard;
+ #define FW_BSS_MAX      64
+ static struct flame_wlan_bss fw_bss[FW_BSS_MAX];
+ static unsigned fw_nbss;
+@@ -205,11 +207,8 @@ flame_wlan_link_bss(struct flame_wlan_bss *bss)
+ 	bool have = fw_link_up && fw_link.ssid_len > 0;
+ 	if (have) {
+ 		bzero(bss, sizeof(*bss));
+-		unsigned i;
+-		for (i = 0; i < fw_nbss && memcmp(fw_bss[i].bssid, fw_link.bssid, 6) != 0; i++) {
+-		}
+-		if (i < fw_nbss) {
+-			memcpy(bss, &fw_bss[i], sizeof(*bss));
++		if (fw_link_bss_heard) {
++			memcpy(bss, &fw_link_bss, sizeof(*bss));
+ 		} else {
+ 			memcpy(bss->bssid, fw_link.bssid, 6);
+ 			memcpy(bss->ssid, fw_link.ssid, sizeof(bss->ssid));
+@@ -365,6 +364,10 @@ fw_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 			t->age_ms = b->age_ms;
+ 			t->elements_length = b->elements_len > sizeof(t->elements) ? sizeof(t->elements) : b->elements_len;
+ 			memcpy(t->elements, b->elements, t->elements_length);
++			if (fw_link_up && memcmp(t->bssid, fw_link.bssid, 6) == 0) {
++				fw_link_bss = *t;
++				fw_link_bss_heard = true;
++			}
+ 		}
+ 		lck_mtx_unlock(&fw_lock);
+ 		break;
+@@ -385,6 +388,14 @@ fw_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		fw_link_up = up;
+ 		if (up && h.len >= sizeof(fw_link)) {
+ 			memcpy(&fw_link, p, sizeof(fw_link));
++			fw_link_bss_heard = false;
++			for (unsigned i = 0; i < fw_nbss; i++) {
++				if (memcmp(fw_bss[i].bssid, fw_link.bssid, 6) == 0) {
++					fw_link_bss = fw_bss[i];
++					fw_link_bss_heard = true;
++					break;
++				}
++			}
+ 		}
+ 		lck_mtx_unlock(&fw_lock);
+ 		if (changed && flame_wlan_link_hook != NULL) {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 21d6ff6c7..423042fa1 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -294,7 +294,24 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	 * draw them, and the panel is 8-bit sRGB. Made as one-plane BGRA, which the client reads back.
+ 	 */
+ 	bool one_plane = false;
+-	if (s->pixelFormat == 0x77333072u || s->pixelFormat == 0x6C313072u || s->pixelFormat == 0x77333052u) {
++	/*
++	 * flame: only for WebKit's content process, which draws its tiles with CoreGraphics on the CPU and
++	 * reads the format back (its 'w30r' tiles stayed white otherwise). Clients that render the 10-bit
++	 * format they asked for (CA's software renderer in chronod, Metal in widget extensions such as
++	 * NewsToday2) write it into the BGRA surface: white widgets, garbled colours. Boot-arg
++	 * sweetsurf10=0 never remaps, =2 always does.
++	 */
++	static int remap10 = -1;
++	if (remap10 < 0) {
++		uint32_t v = 1;
++		PE_parse_boot_argn("sweetsurf10", &v, sizeof(v));
++		remap10 = (int)v;
++	}
++	char who[32] = "";
++	proc_selfname(who, sizeof(who));
++	bool remap = remap10 == 2 || (remap10 == 1 && strcmp(who, "com.apple.WebKit.WebContent") == 0);
++	if (!remap) {
++	} else if (s->pixelFormat == 0x77333072u || s->pixelFormat == 0x6C313072u || s->pixelFormat == 0x77333052u) {
+ 		s->pixelFormat = 0x42475241u;           /* BGRA */
+ 	} else if (s->pixelFormat == 0x62336138u) {
+ 		s->pixelFormat = 0x42475241u;

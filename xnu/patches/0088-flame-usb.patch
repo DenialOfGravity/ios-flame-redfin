@@ -1,0 +1,47 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index b6c1a41ba..f868ae49d 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -3,7 +3,7 @@
+  *
+  * The phone's USB is a Synopsys DWC3 (USB 2.0 only, maximum-speed
+  * high-speed) at 0x0a600000 behind Qualcomm's dwc-usb3-msm wrapper, with a
+- * QUSB2 PHY at 0x088e2000; its power domain is the USB30_PRIM GDSC and its
++ * QUSB2 PHY at 0x088e2000 (flame: Synopsys femto HS PHY, same address); its power domain is the USB30_PRIM GDSC and its
+  * clocks come from GCC (offsets from Linux gcc-sdmmagpie.c). ABL uses this
+  * controller for fastboot; this probe only reports what state it is left
+  * in after `fastboot boot`. It never writes a register, and it touches the
+@@ -51,13 +51,14 @@ static const struct {
+ 	const char *name;
+ 	uint32_t    off;
+ } usb_cbcr[] = {
++	/* flame (SM8150, gcc-sm8150.c); index 0 master and 3 cfg-noc-axi gate DWC3 reads */
+ 	{ "master", 0x0f010 },
+ 	{ "sleep", 0x0f014 },
+ 	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0502c },
+-	{ "aggre-axi", 0x8201c },
+-	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
++	{ "cfg-noc-axi", 0x0f078 },
++	{ "aggre-axi", 0x0f07c },
++	{ "phy-aux", 0x0f050 },
++	{ "clkref", 0x8c008 },
+ };
+ 
+ #define DWC3_PA                 0x0a600000
+@@ -119,8 +120,12 @@ sweet_usb_probe(void)
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+-	if (cbcr[5] & CBCR_CLK_OFF) {
+-		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
++	/*
++	 * flame's HS PHY at 0x088e2000 is a Synopsys femto PHY, not the Redmi's
++	 * QUSB2: its registers differ, so they are not read. ABL's PHY setup
++	 * is used as is (the driver never writes the PHY).
++	 */
++	if (1) {
+ 		return;
+ 	}
+ 	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);

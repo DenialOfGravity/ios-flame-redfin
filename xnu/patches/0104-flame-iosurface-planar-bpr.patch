@@ -1,0 +1,34 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c563a..0fba5027b 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -334,6 +334,29 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 			}
+ 		}
+ 		s->planeCount = planes->getCount();
++		/*
++		 * Planar surfaces whose creator gave no top-level geometry: report the sum over
++		 * the planes (b3a8 = BGRA + A8: 5 bytes per pixel), as Core Animation checks
++		 * IOSurfaceGetBytesPerRow against the format's full pixel size ("unexpected
++		 * bytes-per-row value of 4544, expected at least 5625": Safari pages stayed blank).
++		 * The allocation comes from the planes alone.
++		 */
++		if (props->getObject("IOSurfaceBytesPerRow") == NULL && s->planeCount > 1) {
++			uint32_t bpr = 0, bpe = 0;
++			end = s->offset;
++			for (uint32_t i = 0; i < s->planeCount; i++) {
++				const struct sweet_surface_plane *p = &s->planes[i];
++				bpr += (uint32_t)((uint64_t)p->bytesPerRow * s->width / (p->width ? p->width : 1));
++				bpe += p->bytesPerElement;
++				if ((uint64_t)p->offset + p->size > end) {
++					end = (uint64_t)p->offset + p->size;
++				}
++			}
++			s->bytesPerRow = bpr;
++			if (props->getObject("IOSurfaceBytesPerElement") == NULL && bpe <= 64) {
++				s->bytesPerElement = (uint16_t)bpe;
++			}
++		}
+ 	}
+ 
+ 	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);

@@ -1,0 +1,572 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index dbb4d9ab0..499310f33 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -1056,10 +1056,16 @@ uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *d
+ 	EV(EV_CACHE_INVALIDATE);
+ 	dw[n++] = a6_pkt7(A6_CP_WAIT_FOR_IDLE, 0);
+ 
+-	/* Source-over, with straight source alpha; used by the display corner matte. */
++	/* Blend: colour src * SRC_ALPHA + dst * ONE_MINUS_SRC_ALPHA, alpha src + dst * (1 - src alpha). */
+ 	REG(0x8c01, b->blend ? 0x3809c181 : 0);	/* RB_A2D_PIXEL_CNTL */
+-	REG(0x8c00, 0x00f03000);	/* RB_A2D_BLT_CNTL: 8888 UNORM, mask f */
+-	REG(0x8400, 0x00f03000);	/* GRAS_A2D_BLT_CNTL */
++	uint32_t cntl = 0x00f03000 | (b->clip ? 1u << 16 : 0);
++	REG(0x8c00, cntl);		/* RB_A2D_BLT_CNTL: 8888 UNORM, mask f, SCISSOR */
++	REG(0x8400, cntl);		/* GRAS_A2D_BLT_CNTL */
++	if (b->clip) {
++		dw[n++] = a6_pkt4(0x840a, 2);	/* GRAS_A2D_SCISSOR_TL, _BR (inclusive) */
++		dw[n++] = b->cx0 | (b->cy0 << 16);
++		dw[n++] = b->cx1 | (b->cy1 << 16);
++	}
+ 	REG(0xacc0, 0xf180);		/* SP_A2D_OUTPUT_INFO */
+ 	dw[n++] = a6_pkt4(0x8405, 2);	/* GRAS_A2D_DEST_TL, _BR (inclusive) */
+ 	dw[n++] = b->dx | (b->dy << 16);
+diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
+index 32d6dd32c..7511c23d6 100644
+--- a/bsd/dev/sweet_a6xx.h
++++ b/bsd/dev/sweet_a6xx.h
+@@ -124,6 +124,8 @@ struct a6_blit {
+ 	uint32_t dx, dy, dw, dh;		/* destination rectangle */
+ 	bool filter;				/* bilinear */
+ 	bool blend;				/* source-over alpha blend */
++	bool clip;				/* write only inside the scissor: */
++	uint32_t cx0, cy0, cx1, cy1;		/* destination, inclusive */
+ };
+ #define A6_BLIT_MAX_DW	256
+ uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *dw);
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 24c0fc005..91ae9af1a 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -361,22 +361,46 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
+ #define IB_OFF          A6_OFF_FREE     /* the present IB in the pool */
+ #define PANEL_W         1080
+ #define PANEL_H         2280
+-#define DISPLAY_MASK_OFF        0x500000ULL
++#define DISPLAY_MASK_OFF        0x500000ULL     /* 2x2 corner mattes, one per corner */
+ #define DISPLAY_MASK_SIDE       256u
+ #define DISPLAY_MASK_DIM        (DISPLAY_MASK_SIDE * 2)
+ #define DISPLAY_MASK_PITCH      (DISPLAY_MASK_DIM * 4)
+-#define DISPLAY_STAGE_OFF       0x600000ULL
++#define DISPLAY_STAGE_OFF       0x600000ULL     /* panel-sized; only the corner bands are used */
+ 
+-static bool display_stage_ready;
+ static uint32_t display_mask_radius;
+ 
+ static uint64_t stat_frames, stat_clean_abs, stat_gpu_abs;
+ 
++/* The four corner mattes: black, alpha = 1 - coverage of the image (SweetDisplayMask.h). */
++static void
++display_mask_build(uint32_t r, uint32_t ext)
++{
++	uint32_t *atlas = (uint32_t *)(pool_kva + DISPLAY_MASK_OFF);
++	uint8_t row[DISPLAY_MASK_SIDE];
++	uint32_t seg = 0;
++
++	for (uint32_t cy = 0; cy < ext; cy++) {
++		sweet_display_corner_row(r, ext, cy, &seg, row);
++		for (uint32_t corner = 0; corner < 4; corner++) {
++			/* Bit 0: right corner, bit 1: bottom; mirror the top-left one. */
++			uint32_t ty = (corner >> 1) * DISPLAY_MASK_SIDE + ((corner & 2) ? ext - 1 - cy : cy);
++			uint32_t *line = atlas + (size_t)ty * DISPLAY_MASK_DIM + (corner & 1) * DISPLAY_MASK_SIDE;
++			for (uint32_t cx = 0; cx < ext; cx++) {
++				line[(corner & 1) ? ext - 1 - cx : cx] = (uint32_t)(255 - row[cx]) << 24;
++			}
++		}
++	}
++	flush_dcache64((addr64_t)(uintptr_t)atlas, DISPLAY_MASK_PITCH * DISPLAY_MASK_DIM, FALSE);
++}
++
+ /*
+- * Blit a mapped surface, scaled to fit and centred. With corner_radius, the
+- * GPU composites a four-corner matte into a pool staging image and copies the
+- * completed frame to scanout. The CPU rendered the source through its cache:
+- * clean it through kva first (0: no clean). Waits for the GPU (a few ms).
++ * Blit a mapped surface, scaled to fit and centred, into the panel memory
++ * (rows of fb_pitch bytes). With corner_radius, the image gets continuous
++ * corners: the rows they cover go to a staging image in the pool first (same
++ * blit, scissored), get the mattes blended over, and only then reach the
++ * panel, which scans out continuously. The CPU rendered the source through
++ * its cache: clean it through kva first (0: no clean). Waits for the GPU (a
++ * few ms).
+  */
+ int
+ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch,
+@@ -388,9 +412,6 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 	    DISPLAY_STAGE_OFF + (uint64_t)fb_pitch * PANEL_H > A6_POOL_SIZE) {
+ 		return -1;
+ 	}
+-	if (corner_radius > DISPLAY_MASK_SIDE) {
+-		corner_radius = DISPLAY_MASK_SIDE;
+-	}
+ 	uint64_t t0 = mach_absolute_time();
+ 	if (kva) {
+ 		clean_dcache64((addr64_t)kva, (unsigned)((uint64_t)pitch * h + offset), FALSE);
+@@ -411,64 +432,61 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 	}
+ 	frame.dx = (PANEL_W - frame.dw) / 2;
+ 	frame.dy = (PANEL_H - frame.dh) / 2;
+-	static uint32_t ib[6 * A6_BLIT_MAX_DW];
++	uint32_t ext = corner_radius ? sweet_display_corner_extent(corner_radius) : 0;
++	if (ext > DISPLAY_MASK_SIDE || 2 * ext >= frame.dw || 2 * ext >= frame.dh) {
++		ext = 0;
++	}
++	static uint32_t ib[10 * A6_BLIT_MAX_DW];
+ 	lck_mtx_lock(&sweet_gpu_lock);
+ 	uint32_t n = 0;
+-	if (corner_radius != 0) {
+-		if (!display_stage_ready) {
+-			vm_size_t stage_size = (vm_size_t)fb_pitch * PANEL_H;
+-			bzero((void *)(pool_kva + DISPLAY_STAGE_OFF), stage_size);
+-			flush_dcache64((addr64_t)(pool_kva + DISPLAY_STAGE_OFF), (unsigned)stage_size, FALSE);
+-			display_stage_ready = true;
+-		}
++	if (ext) {
+ 		if (display_mask_radius != corner_radius) {
+-			uint32_t *atlas = (uint32_t *)(pool_kva + DISPLAY_MASK_OFF);
+-			bzero(atlas, DISPLAY_MASK_PITCH * DISPLAY_MASK_DIM);
+-			for (uint32_t y = 0; y < corner_radius; y++) {
+-				for (uint32_t x = 0; x < corner_radius; x++) {
+-					uint32_t xs[4] = { x, corner_radius - 1 - x, x, corner_radius - 1 - x };
+-					uint32_t ys[4] = { y, y, corner_radius - 1 - y, corner_radius - 1 - y };
+-					for (uint32_t corner = 0; corner < 4; corner++) {
+-						uint32_t tx = (corner & 1) * DISPLAY_MASK_SIDE + x;
+-						uint32_t ty = (corner >> 1) * DISPLAY_MASK_SIDE + y;
+-						/* Each tile is oriented so its destination's outer edge is local x/y = 0. */
+-						uint32_t cx = xs[corner], cy = ys[corner];
+-						uint32_t alpha = 255 - (sweet_display_corner_coverage(cx, cy, corner_radius) * 255 + 8) / 16;
+-						atlas[(size_t)ty * DISPLAY_MASK_DIM + tx] = alpha << 24;
+-					}
+-				}
+-			}
+-			flush_dcache64((addr64_t)(pool_kva + DISPLAY_MASK_OFF),
+-			    DISPLAY_MASK_PITCH * DISPLAY_MASK_DIM, FALSE);
++			display_mask_build(corner_radius, ext);
+ 			display_mask_radius = corner_radius;
+ 		}
+-
+-		frame.dst_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF;
+-		uint32_t used = a6_blit_ib(&gpu, &frame, ib + n);
+-		n += used;
++		uint32_t top = frame.dy, bottom = frame.dy + frame.dh - ext;
++		struct a6_blit b = frame;
++		b.clip = true;
++		b.cx0 = 0;
++		b.cx1 = PANEL_W - 1;
++		/* The rows between the corners straight to the panel ... */
++		b.cy0 = top + ext;
++		b.cy1 = bottom - 1;
++		n += a6_blit_ib(&gpu, &b, ib + n);
++		/* ... the corner rows to the stage ... */
++		b.dst_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF;
++		b.cy0 = top;
++		b.cy1 = top + ext - 1;
++		n += a6_blit_ib(&gpu, &b, ib + n);
++		b.cy0 = bottom;
++		b.cy1 = bottom + ext - 1;
++		n += a6_blit_ib(&gpu, &b, ib + n);
++		/* ... darkened by the mattes ... */
+ 		for (uint32_t corner = 0; corner < 4; corner++) {
+ 			struct a6_blit matte = {
+ 				.src_iova = A6_GVA_POOL + DISPLAY_MASK_OFF,
+ 				.src_w = DISPLAY_MASK_DIM, .src_h = DISPLAY_MASK_DIM, .src_pitch = DISPLAY_MASK_PITCH,
+ 				.sx = (corner & 1) * DISPLAY_MASK_SIDE, .sy = (corner >> 1) * DISPLAY_MASK_SIDE,
+-				.sw = corner_radius, .sh = corner_radius,
++				.sw = ext, .sh = ext,
+ 				.dst_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF, .dst_pitch = fb_pitch,
+-				.dx = (corner & 1) ? PANEL_W - corner_radius : 0,
+-				.dy = (corner & 2) ? PANEL_H - corner_radius : 0,
+-				.dw = corner_radius, .dh = corner_radius, .filter = false, .blend = true,
++				.dx = (corner & 1) ? frame.dx + frame.dw - ext : frame.dx,
++				.dy = (corner & 2) ? bottom : top,
++				.dw = ext, .dh = ext, .blend = true,
++			};
++			n += a6_blit_ib(&gpu, &matte, ib + n);
++		}
++		/* ... then copied to the panel. */
++		for (uint32_t band = 0; band < 2; band++) {
++			uint32_t y = band ? bottom : top;
++			struct a6_blit copy = {
++				.src_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF,
++				.src_w = PANEL_W, .src_h = PANEL_H, .src_pitch = fb_pitch,
++				.sx = frame.dx, .sy = y, .sw = frame.dw, .sh = ext,
++				.dst_iova = A6_GVA_FB, .dst_pitch = fb_pitch,
++				.dx = frame.dx, .dy = y, .dw = frame.dw, .dh = ext,
+ 			};
+-			used = a6_blit_ib(&gpu, &matte, ib + n);
+-			n += used;
++			n += a6_blit_ib(&gpu, &copy, ib + n);
+ 		}
+-		struct a6_blit output = {
+-			.src_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF,
+-			.src_w = PANEL_W, .src_h = PANEL_H, .src_pitch = fb_pitch,
+-			.sw = PANEL_W, .sh = PANEL_H,
+-			.dst_iova = A6_GVA_FB, .dst_pitch = fb_pitch,
+-			.dw = PANEL_W, .dh = PANEL_H, .filter = false,
+-		};
+-		used = a6_blit_ib(&gpu, &output, ib + n);
+-		n += used;
+ 	} else {
+ 		n = a6_blit_ib(&gpu, &frame, ib);
+ 	}
+diff --git a/iokit/Kernel/arm/SweetDisplayMask.h b/iokit/Kernel/arm/SweetDisplayMask.h
+index 6e671fe66..678471bbd 100644
+--- a/iokit/Kernel/arm/SweetDisplayMask.h
++++ b/iokit/Kernel/arm/SweetDisplayMask.h
+@@ -1,74 +1,129 @@
+ /*
+- * Small shared helpers for the display's continuous-corner mask and touch
+- * clipping. A fourth-power superellipse gives the corners a soft, squircle
+- * profile similar to Core Animation's continuous corner curve.
++ * The display's corner mask and touch clipping: Apple's continuous corner
++ * (UIBezierPath's rounded rect since iOS 7, CALayer cornerCurve continuous:
++ * per corner three cubics and a short line, reaching 1.52866483 r along each
++ * edge), in integer math. The corners belong to the presented iOS image (the
++ * GPU's fit, or the whole panel for the CPU copy), so the outline runs from
++ * the panel's top edge into the image's side edge without a step.
++ *
++ * Radius in panel pixels. The default is the iPhone X's display corner, 39 pt
++ * = 117 px, scaled to the fit (x 2280/2436): the corners iOS draws its UI
++ * for. Against Pixel 4's glass outline (Android's config_mainDisplayShape for
++ * flame) that curve lies inside the visible area below row 3.
+  */
+ #ifndef SWEET_DISPLAY_MASK_H
+ #define SWEET_DISPLAY_MASK_H
+ 
+ #include <stdint.h>
+ 
+-#define SWEET_DISPLAY_CORNER_DEFAULT 176u
+-#define SWEET_DISPLAY_CORNER_MAX     256u
+-#define SWEET_DISPLAY_MASK_SAMPLES   4u
++#define SWEET_DISPLAY_CORNER_DEFAULT 110u
++#define SWEET_DISPLAY_CORNER_MAX     160u       /* extent 245: fits the GPU's 256-px tiles */
++#define SWEET_CORNER_STEPS           32u        /* lines per cubic */
++#define SWEET_CORNER_SUB             16u        /* coverage sub-rows per pixel row */
+ 
+-static inline uint64_t
+-sweet_display_fourth(uint32_t v)
++/*
++ * Top-left corner, x from the side edge and y from the top edge, in units of
++ * r (16.16). From the top edge down: cubic, line (as a cubic), cubic, cubic.
++ */
++static const int32_t sweet_corner_k[13][2] = {
++	{ 100183, 0 }, { 71335, 0 }, { 56912, 0 }, { 43905, 4292 },
++	{ 43905, 4292 }, { 41386, 4909 }, { 41386, 4909 },
++	{ 24433, 11079 }, { 11079, 24433 }, { 4909, 41386 },
++	{ 0, 56912 }, { 0, 71335 }, { 0, 100183 },
++};
++
++/* Pixels the corner covers along each edge. */
++static inline uint32_t
++sweet_display_corner_extent(uint32_t r)
+ {
+-	uint64_t v2 = (uint64_t)v * v;
+-	return v2 * v2;
++	return (uint32_t)(((uint64_t)sweet_corner_k[0][0] * r + 0xffff) >> 16);
+ }
+ 
+-/* dx/dy and radius use the same fixed-point scale. */
+-static inline bool
+-sweet_display_corner_inside(uint32_t dx, uint32_t dy, uint32_t radius)
++/* Point i (0 .. 4 * STEPS) of the flattened corner, 1/65536 px; y grows with i. */
++static inline void
++sweet_display_corner_point(uint32_t r, uint32_t i, int64_t *x, int64_t *y)
+ {
+-	return sweet_display_fourth(dx) + sweet_display_fourth(dy) <= sweet_display_fourth(radius);
++	if (i == 0) {
++		*x = (int64_t)sweet_corner_k[0][0] * r;
++		*y = (int64_t)sweet_corner_k[0][1] * r;
++		return;
++	}
++	const int32_t (*p)[2] = &sweet_corner_k[3 * ((i - 1) / SWEET_CORNER_STEPS)];
++	int64_t k = (i - 1) % SWEET_CORNER_STEPS + 1, u = SWEET_CORNER_STEPS - k;
++	int64_t w0 = u * u * u, w1 = 3 * u * u * k, w2 = 3 * u * k * k, w3 = k * k * k;
++	int64_t n3 = (int64_t)SWEET_CORNER_STEPS * SWEET_CORNER_STEPS * SWEET_CORNER_STEPS;
++	*x = (w0 * p[0][0] + w1 * p[1][0] + w2 * p[2][0] + w3 * p[3][0]) * r / n3;
++	*y = (w0 * p[0][1] + w1 * p[1][1] + w2 * p[2][1] + w3 * p[3][1]) * r / n3;
+ }
+ 
+-/* Pixel coverage for a top-corner pixel; return 0..16 for 4x4 sampling. */
+-static inline uint32_t
+-sweet_display_corner_coverage(uint32_t x, uint32_t y, uint32_t radius)
++/*
++ * x where the visible area starts at height y (both 1/65536 px). *seg is a
++ * cursor: start at 0, then ask for growing y.
++ */
++static inline int64_t
++sweet_display_corner_edge(uint32_t r, int64_t y, uint32_t *seg)
+ {
+-	if (radius == 0 || x >= radius || y >= radius) {
+-		return 16;
+-	}
+-	if (sweet_display_corner_inside(radius - x, radius - y, radius)) {
+-		return 16;
++	const uint32_t last = 4 * SWEET_CORNER_STEPS;
++	int64_t x0, y0, x1, y1;
++
++	for (;;) {
++		sweet_display_corner_point(r, *seg, &x0, &y0);
++		if (*seg >= last) {
++			return y >= y0 ? 0 : x0;
++		}
++		sweet_display_corner_point(r, *seg + 1, &x1, &y1);
++		if (y <= y1) {
++			break;
++		}
++		(*seg)++;
+ 	}
+-	if (!sweet_display_corner_inside(radius - x - 1, radius - y - 1, radius)) {
+-		return 0;
++	if (y <= y0 || y1 == y0) {
++		return x0;
+ 	}
++	return x0 + (x1 - x0) * (y - y0) / (y1 - y0);
++}
++
++/*
++ * Coverage of the visible image (0..255) for row py of the top-left corner,
++ * ext = sweet_display_corner_extent(r) bytes: exact horizontally, SUB sub-rows
++ * vertically. *seg as above (rows in increasing order).
++ */
++static inline void
++sweet_display_corner_row(uint32_t r, uint32_t ext, uint32_t py, uint32_t *seg, uint8_t *out)
++{
++	const int64_t one = 65536;
++	int64_t edge[SWEET_CORNER_SUB];
+ 
+-	uint32_t hits = 0;
+-	uint32_t sample_scale = SWEET_DISPLAY_MASK_SAMPLES * 2;
+-	uint32_t scaled_radius = radius * sample_scale;
+-	for (uint32_t sy = 0; sy < SWEET_DISPLAY_MASK_SAMPLES; sy++) {
+-		uint32_t py = y * sample_scale + sy * 2 + 1;
+-		uint32_t dy = scaled_radius - py;
+-		for (uint32_t sx = 0; sx < SWEET_DISPLAY_MASK_SAMPLES; sx++) {
+-			uint32_t px = x * sample_scale + sx * 2 + 1;
+-			uint32_t dx = scaled_radius - px;
+-			if (sweet_display_fourth(dx) + sweet_display_fourth(dy) <=
+-			    sweet_display_fourth(scaled_radius)) {
+-				hits++;
+-			}
++	for (uint32_t s = 0; s < SWEET_CORNER_SUB; s++) {
++		int64_t y = (int64_t)py * one + (2 * s + 1) * one / (2 * SWEET_CORNER_SUB);
++		edge[s] = sweet_display_corner_edge(r, y, seg);
++	}
++	for (uint32_t px = 0; px < ext; px++) {
++		int64_t sum = 0;
++		for (uint32_t s = 0; s < SWEET_CORNER_SUB; s++) {
++			int64_t c = (px + 1) * one - edge[s];
++			sum += c <= 0 ? 0 : (c >= one ? one : c);
+ 		}
++		out[px] = (uint8_t)((sum * 255 + SWEET_CORNER_SUB * one / 2) / (SWEET_CORNER_SUB * one));
+ 	}
+-	return hits;
+ }
+ 
+-/* Touch coordinates are pixel indices; test their pixel centers. */
++/* Whether pixel (x, y) of the top-left corner (from its edges) is visible, at its centre. */
+ static inline bool
+-sweet_display_corner_point_visible(uint32_t x, uint32_t y, uint32_t radius)
++sweet_display_corner_point_visible(uint32_t x, uint32_t y, uint32_t r)
+ {
+-	if (radius == 0 || x >= radius || y >= radius) {
+-		return true;
+-	}
+-	uint32_t scaled_radius = radius * 2;
+-	uint32_t px = x * 2 + 1;
+-	uint32_t py = y * 2 + 1;
+-	return sweet_display_corner_inside(scaled_radius - px, scaled_radius - py, scaled_radius);
++	uint32_t seg = 0;
++	return ((int64_t)x << 16) + 0x8000 >= sweet_display_corner_edge(r, ((int64_t)y << 16) + 0x8000, &seg);
++}
++
++/* BGRA pixel times coverage c / 255 (alpha kept). */
++static inline uint32_t
++sweet_display_dim(uint32_t p, uint32_t c)
++{
++	uint32_t b = ((p & 0xff) * c + 127) / 255;
++	uint32_t g = (((p >> 8) & 0xff) * c + 127) / 255;
++	uint32_t r = (((p >> 16) & 0xff) * c + 127) / 255;
++	return (p & 0xff000000) | (r << 16) | (g << 8) | b;
+ }
+ 
+ #endif /* SWEET_DISPLAY_MASK_H */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 757dbaf31..307f212ac 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -121,7 +121,9 @@ public:
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+-	uint32_t      fCornerRadius;             /* output pixels; boot-arg sweetfb_corner_radius */
++	uint32_t      fCornerRadius;    /* panel pixels; boot-arg sweetfb_corner_radius */
++	uint32_t      fCornerExt;       /* rows/columns a corner covers */
++	uint8_t      *fCornerCov;       /* fCornerExt^2 coverage, top-left corner (CPU copy) */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -142,7 +144,7 @@ public:
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
+ 	bool presentGPU(const uint8_t *rec);
+-	void maskCorners(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
++	void copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -202,6 +204,19 @@ AppleCLCD::start(IOService *provider)
+ 	if (fCornerRadius > SWEET_DISPLAY_CORNER_MAX) {
+ 		fCornerRadius = SWEET_DISPLAY_CORNER_MAX;
+ 	}
++	fCornerExt = fCornerRadius ? sweet_display_corner_extent(fCornerRadius) : 0;
++	if (2 * fCornerExt >= fWidth || 2 * fCornerExt >= fHeight) {
++		fCornerExt = 0;
++	}
++	fCornerCov = fCornerExt ? (uint8_t *)IOMalloc((vm_size_t)fCornerExt * fCornerExt) : NULL;
++	if (fCornerCov != NULL) {
++		uint32_t seg = 0;
++		for (uint32_t cy = 0; cy < fCornerExt; cy++) {
++			sweet_display_corner_row(fCornerRadius, fCornerExt, cy, &seg, fCornerCov + cy * fCornerExt);
++		}
++	} else {
++		fCornerExt = 0;
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	/* With the GPU (sweetgpu=1) the panel later switches to 4352-byte rows: map that much. */
+@@ -380,52 +395,38 @@ gpu_fallback(uint32_t why, const char *what)
+ 	return false;
+ }
+ 
+-/* CPU fallback only. The normal GPU path applies this matte before scanout. */
++/*
++ * One row of the CPU copy, n pixels to panel (x, y): rows in the corner bands
++ * are darkened on the way (the GPU path has its own mattes), so the panel
++ * never shows the corners unmasked.
++ */
+ void
+-AppleCLCD::maskCorners(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
++AppleCLCD::copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n)
+ {
+-	if (fCornerRadius == 0 || x >= fWidth || y >= fHeight || w < 2 || h == 0) {
+-		return;
+-	}
+-	if (w > fWidth - x) {
+-		w = fWidth - x;
+-	}
+-	if (h > fHeight - y) {
+-		h = fHeight - y;
+-	}
+-	uint32_t radius = fCornerRadius;
+-	if (radius > w / 2) {
+-		radius = w / 2;
+-	}
+-	if (radius > h) {
+-		radius = h;
++	uint32_t *dst = (uint32_t *)(fPixels + (uint64_t)y * fRowBytes) + x;
++	uint32_t e = fCornerExt;
++	const uint8_t *cov = NULL;
++
++	if (y < e) {
++		cov = fCornerCov + (size_t)y * e;
++	} else if (y >= fHeight - e) {
++		cov = fCornerCov + (size_t)(fHeight - 1 - y) * e;
+ 	}
+-	if (radius == 0) {
++	if (cov == NULL) {
++		memcpy(dst, src, (size_t)n * 4);
+ 		return;
+ 	}
+-
+-	for (uint32_t cy = 0; cy < radius; cy++) {
+-		volatile uint32_t *top = (volatile uint32_t *)(fPixels + (uint64_t)(y + cy) * fRowBytes);
+-		volatile uint32_t *bottom = (volatile uint32_t *)(fPixels + (uint64_t)(y + h - 1 - cy) * fRowBytes);
+-		for (uint32_t cx = 0; cx < radius; cx++) {
+-			uint32_t coverage = sweet_display_corner_coverage(cx, cy, radius);
+-			if (coverage == 16) {
+-				continue;
+-			}
+-			volatile uint32_t *pixels[4] = { &top[x + cx], &top[x + w - 1 - cx],
+-			    &bottom[x + cx], &bottom[x + w - 1 - cx] };
+-			for (unsigned corner = 0; corner < 4; corner++) {
+-				uint32_t pixel = *pixels[corner];
+-				if (coverage == 0) {
+-					*pixels[corner] = 0;
+-				} else {
+-					uint32_t b = ((pixel & 0x000000ff) * coverage + 8) / 16;
+-					uint32_t g = ((pixel & 0x0000ff00) * coverage + 0x800) / 16 & 0x0000ff00;
+-					uint32_t r = ((pixel & 0x00ff0000) * coverage + 0x80000) / 16 & 0x00ff0000;
+-					*pixels[corner] = (pixel & 0xff000000) | r | g | b;
+-				}
+-			}
+-		}
++	/* [x, l): left corner, [l, r): plain, [r, end): right corner. */
++	uint32_t end = x + n, l = e < end ? e : end, r = fWidth - e;
++	l = l < x ? x : l;
++	r = r < l ? l : (r > end ? end : r);
++	for (uint32_t px = x; px < l; px++) {
++		dst[px - x] = cov[px] == 255 ? src[px - x] : sweet_display_dim(src[px - x], cov[px]);
++	}
++	memcpy(&dst[l - x], &src[l - x], (size_t)(r - l) * 4);
++	for (uint32_t px = r; px < end; px++) {
++		uint32_t c = cov[fWidth - 1 - px];
++		dst[px - x] = c == 255 ? src[px - x] : sweet_display_dim(src[px - x], c);
+ 	}
+ }
+ 
+@@ -604,14 +605,13 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++				copyRow((uint32_t)dx, (uint32_t)(dy + y),
++				    (const uint32_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++				    (uint32_t)w);
+ 			}
+ 		}
+ 		s->release();
+ 	}
+-	maskCorners(0, 0, fWidth, fHeight);
+ }
+ 
+ bool
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 12660b767..f876fb08b 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -482,23 +482,18 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		fitW = SWEET_PANEL_W;
+ 		fitH = SWEET_PANEL_H;
+ 	}
+-	if (!was && down && (x < fitX || x >= fitX + fitW || y < fitY || y >= fitY + fitH)) {
++	/*
++	 * No contact starts in a masked corner of the image (SweetDisplayMask.h);
++	 * cx/cy: from the nearest image edge, -1 outside a corner (or in the bars).
++	 */
++	int ext = fCornerRadius ? (int)sweet_display_corner_extent(fCornerRadius) : 0;
++	int cx = x - fitX < ext ? x - fitX : (fitX + fitW - 1 - x < ext ? fitX + fitW - 1 - x : -1);
++	int cy = y - fitY < ext ? y - fitY : (fitY + fitH - 1 - y < ext ? fitY + fitH - 1 - y : -1);
++	if (!was && down && cx >= 0 && cy >= 0 &&
++	    !sweet_display_corner_point_visible((uint32_t)cx, (uint32_t)cy, fCornerRadius)) {
+ 		IOLockUnlock(fLock);
+ 		return;
+ 	}
+-	uint32_t cornerRadius = fCornerRadius;
+-	bool left = x < (int)cornerRadius;
+-	bool right = x >= SWEET_PANEL_W - (int)cornerRadius;
+-	bool top = y < (int)cornerRadius;
+-	bool bottom = y >= SWEET_PANEL_H - (int)cornerRadius;
+-	if (!was && down && cornerRadius && (left || right) && (top || bottom)) {
+-		uint32_t localX = (uint32_t)(left ? x : SWEET_PANEL_W - 1 - x);
+-		uint32_t localY = (uint32_t)(top ? y : SWEET_PANEL_H - 1 - y);
+-		if (!sweet_display_corner_point_visible(localX, localY, cornerRadius)) {
+-			IOLockUnlock(fLock);
+-			return;
+-		}
+-	}
+ 	/*
+ 	 * Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp):
+ 	 * the centre crop of the CPU copy, or the GPU's fit (sweet_display_fit_*).

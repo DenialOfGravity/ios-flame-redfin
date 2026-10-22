@@ -1,0 +1,121 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index f4eeb9fe9..015530482 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -743,19 +743,30 @@ uint32_t a6_submit_ibs_async(struct a6_gpu *g, const uint64_t *iova, const uint3
+ 			     unsigned timeout_ms)
+ {
+ 	uint64_t fva = a6_pool_va(A6_OFF_SCRATCH);
+-	uint32_t dw[4 + 4 * A6_SUBMIT_MAX + 5], n = 0;
++	/* GPU time of this submit: CP_ALWAYS_ON_COUNTER before the IBs and once they are idle (a6_submit_time) */
++	uint64_t ts = a6_pool_va(A6_OFF_SCRATCH + A6_TS_OFF) + 16ull * ((g->fence + 1) % A6_TS_SLOTS);
++	uint32_t dw[4 + 4 + 4 * A6_SUBMIT_MAX + 5 + 5], n = 0;
+ 	if (nib == 0 || nib > A6_SUBMIT_MAX)
+ 		return 0;
+ 	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 1);
+ 	dw[n++] = 0x18;				/* PC_CCU_INVALIDATE_DEPTH */
+ 	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 1);
+ 	dw[n++] = 0x19;				/* PC_CCU_INVALIDATE_COLOR */
++	dw[n++] = a6_pkt7(0x3e, 3);		/* CP_REG_TO_MEM CP_ALWAYS_ON_COUNTER, 2 dwords -> ts */
++	dw[n++] = 0x980 | 2u << 18;
++	dw[n++] = (uint32_t)ts;
++	dw[n++] = (uint32_t)(ts >> 32);
+ 	for (unsigned i = 0; i < nib; i++) {
+ 		dw[n++] = a6_pkt7(A6_CP_INDIRECT_BUFFER, 3);
+ 		dw[n++] = (uint32_t)iova[i];
+ 		dw[n++] = (uint32_t)(iova[i] >> 32);
+ 		dw[n++] = dwords[i] & 0xfffff;
+ 	}
++	dw[n++] = a6_pkt7(A6_CP_WAIT_FOR_IDLE, 0);
++	dw[n++] = a6_pkt7(0x3e, 3);		/* ... -> ts + 8 */
++	dw[n++] = 0x980 | 2u << 18;
++	dw[n++] = (uint32_t)(ts + 8);
++	dw[n++] = (uint32_t)((ts + 8) >> 32);
+ 	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 4);
+ 	dw[n++] = 0x04;				/* CACHE_FLUSH_TS: the fence lands once the caches are clean */
+ 	dw[n++] = (uint32_t)fva;
+@@ -790,6 +801,13 @@ void a6_fence_force(struct a6_gpu *g)
+ 	a6_write(a6_pool_pa(g, A6_OFF_SCRATCH), &v, 4);
+ }
+ 
++uint64_t a6_submit_time(const struct a6_gpu *g, uint32_t fence)
++{
++	uint64_t t[2] = { 0, 0 };
++	a6_read(a6_pool_pa(g, A6_OFF_SCRATCH + A6_TS_OFF) + 16ull * (fence % A6_TS_SLOTS), t, 16);
++	return t[1] > t[0] ? t[1] - t[0] : 0;
++}
++
+ uint64_t a6_timestamp(const struct a6_gpu *g)
+ {
+ 	(void)g;
+diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
+index af727e0ba..d9d7860ae 100644
+--- a/bsd/dev/sweet_a6xx.h
++++ b/bsd/dev/sweet_a6xx.h
+@@ -111,6 +111,10 @@ uint32_t a6_fence_read(const struct a6_gpu *g);
+ void a6_fence_force(struct a6_gpu *g);
+ /* CP_ALWAYS_ON_COUNTER (19.2 MHz) */
+ uint64_t a6_timestamp(const struct a6_gpu *g);
++/* GPU ticks (19.2 MHz) a landed fence's submit took (a6_submit_ibs_async stamps its start and idle end) */
++#define A6_TS_OFF	0x1000ull	/* in the scratch page: 16-byte slots by fence */
++#define A6_TS_SLOTS	256u
++uint64_t a6_submit_time(const struct a6_gpu *g, uint32_t fence);
+ 
+ /* 4K pages (AP=01, NC) at iova -> pa; tables from the arena. Then a6_tlb_flush. */
+ int a6_map(struct a6_gpu *g, uint64_t iova, uint64_t pa, uint64_t size);
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 7cb1ffd1d..bc856466b 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -298,6 +298,43 @@ static uint64_t progress_abs;
+ static uint64_t recoveries;
+ static struct { uint32_t lo, hi; } lost[LOST_RING];
+ 
++/*
++ * Every 5 s: how long the GPU spent on the submits that landed (their CP_ALWAYS_ON stamps, 19.2 MHz), from the
++ * submit path. Fences older than the stamp ring (A6_TS_SLOTS) are skipped.
++ */
++static uint32_t gstat_next = 1;
++static uint64_t gstat_abs;
++
++static void
++gpu_stats_locked(void)
++{
++	uint64_t now = mach_absolute_time(), ns;
++	if (gstat_abs == 0) {
++		gstat_abs = now;
++	}
++	absolutetime_to_nanoseconds(now - gstat_abs, &ns);
++	if (ns < 5000000000ULL) {
++		return;
++	}
++	uint32_t done = a6_fence_read(&gpu), n = 0;
++	if ((int32_t)(done - gstat_next) >= (int32_t)A6_TS_SLOTS) {
++		gstat_next = done - A6_TS_SLOTS + 1;
++	}
++	uint64_t busy = 0, longest = 0;
++	for (; (int32_t)(done - gstat_next) >= 0; gstat_next++, n++) {
++		uint64_t t = a6_submit_time(&gpu, gstat_next);
++		busy += t;
++		if (t > longest) {
++			longest = t;
++		}
++	}
++	if (n) {
++		a6_log("5s: %u submits, GPU busy %llu ms (%llu%%), longest %llu us, mean %llu us\n", n, busy / 19200,
++		    busy * 100 / 19200 / (ns / 1000000), longest * 10 / 192, busy * 10 / 192 / n);
++	}
++	gstat_abs = now;
++}
++
+ static void
+ gpu_note_submit_locked(void)
+ {
+@@ -306,6 +343,7 @@ gpu_note_submit_locked(void)
+ 		progress_fence = done;
+ 		progress_abs = mach_absolute_time();
+ 	}
++	gpu_stats_locked();
+ }
+ 
+ static bool

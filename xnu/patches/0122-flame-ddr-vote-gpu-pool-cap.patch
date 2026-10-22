@@ -1,0 +1,137 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 605c5a0a4..c87ed5ddb 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -227,10 +227,35 @@ a6_firmware(const char *name, uint32_t *len)
+ 
+ /* ---- bring-up ---- */
+ 
++int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
++
++/*
++ * DDR (BCM MC0) and the memory NoC (SH0) at their top levels: nothing else votes them for the GPU (mainline
++ * sm8150 has no GPU interconnect path either), and ABL's level left 8-thread CPU bandwidth at 13.7 GB/s
++ * (19.6 GB/s voted up) and the present blit 35% slower. BCM command: commit | valid | x (avg) | y (peak).
++ * Boot-arg sweetddr=0 leaves them alone.
++ */
++static void
++gpu_bus_vote(void)
++{
++	uint32_t on = 1;
++	PE_parse_boot_argn("sweetddr", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	static const char *const bcm[] = { "MC0", "SH0" };
++	for (unsigned i = 0; i < sizeof(bcm) / sizeof(bcm[0]); i++) {
++		uint32_t off = 0, val = 1u << 30 | 1u << 29 | 0x3fffu << 14 | 0x3fffu;
++		int rc = sweet_rpmh_write(bcm[i], 1, &off, &val);
++		a6_log("bus vote %s top -> %d\n", bcm[i], rc);
++	}
++}
++
+ static void
+ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	uint64_t t0 = mach_absolute_time(), ns;
++	gpu_bus_vote();
+ 	lck_mtx_lock(&sweet_gpu_lock);
+ 	int rc = a6_power_up(&gpu);
+ 	if (!rc) {
+@@ -877,6 +902,18 @@ static const struct { uint64_t pa, size; } gpool_ranges[] = {
+ static struct { uint64_t pa, size; } gpool_free[GPOOL_FREE_MAX];       /* sorted by address, merged */
+ static uint32_t gpool_nfree;
+ static uint64_t gpool_used, gpool_peak;
++
++/* GPU pool bytes not in use (sweet_gpu_pool_alloc), for the per-client cap in SweetAccelerator */
++uint64_t sweet_gpu_pool_avail(void);
++uint64_t
++sweet_gpu_pool_avail(void)
++{
++	uint64_t total = 0;
++	for (unsigned i = 0; i < sizeof(gpool_ranges) / sizeof(gpool_ranges[0]); i++) {
++		total += gpool_ranges[i].size;
++	}
++	return total - gpool_used;
++}
+ static bool gpool_ready;
+ static LCK_MTX_DECLARE(sweet_gpool_lock, &sweet_gpu_grp);
+ 
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index e3e5f32e2..02548602c 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -63,6 +63,7 @@ bool sweet_gpu_lost(uint64_t *epoch, uint32_t last_fence);
+ uint64_t sweet_gpu_recoveries(void);
+ uint64_t sweet_gpu_timestamp(void);
+ int sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa);
++uint64_t sweet_gpu_pool_avail(void);
+ void sweet_gpu_pool_free(uint64_t pa, uint64_t bytes);
+ }
+ 
+@@ -149,6 +150,9 @@ class SweetAcceleratorUserClient : public IOUserClient {
+ 	uint64_t fEpoch, fFaults;       /* GPU resets seen; those that lost this client's work */
+ 	uint64_t fPoolBytes, fPoolPeak; /* GPU pool memory this client holds */
+ 	char fName[32];
++	bool fSystem;                   /* backboardd / SpringBoard: no pool cap, and the reserve is theirs */
++	bool fCapLogged;
++	bool v2PoolAllowed(uint64_t len);
+ 
+ 	int addMemory(IOMemoryDescriptor *md, uint64_t *handle, uint64_t *va);
+ 	IOReturn v2Method(uint32_t method, const void *in, uint32_t inSize, void *out, uint32_t *outSize);
+@@ -192,11 +196,45 @@ SweetAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID, UI
+ 		}
+ 		fEpoch = sweet_gpu_recoveries();
+ 		proc_selfname(fName, sizeof(fName));
++		fSystem = !strcmp(fName, "backboardd") || !strcmp(fName, "SpringBoard");
+ 		fV2 = true;
+ 	}
+ 	return true;
+ }
+ 
++/*
++ * The GPU pool is shared by every process (944 MB): one app must not take what the compositor needs. Others
++ * hold at most sweetgpucap MB each (default 256) and never take the last sweetgpureserve MB (default 160),
++ * which stay for backboardd and SpringBoard. A refused buffer is VK_ERROR_OUT_OF_DEVICE_MEMORY in Turnip.
++ */
++bool
++SweetAcceleratorUserClient::v2PoolAllowed(uint64_t len)
++{
++	static uint32_t cap_mb, reserve_mb;
++	if (cap_mb == 0) {
++		uint32_t v = 256;
++		PE_parse_boot_argn("sweetgpucap", &v, sizeof(v));
++		reserve_mb = 160;
++		PE_parse_boot_argn("sweetgpureserve", &reserve_mb, sizeof(reserve_mb));
++		cap_mb = v ? v : 0xffffffffu;
++	}
++	if (fSystem) {
++		return true;
++	}
++	const char *why = NULL;
++	if (fPoolBytes + len > ((uint64_t)cap_mb << 20)) {
++		why = "its cap";
++	} else if (sweet_gpu_pool_avail() < len + ((uint64_t)reserve_mb << 20)) {
++		why = "the compositor's reserve";
++	}
++	if (why != NULL && !fCapLogged) {
++		fCapLogged = true;
++		IOLog("SWEET MTL: v2 %s: %llu MB buffer refused (holds %llu MB, %llu MB of the pool free): %s\n", fName,
++		    len >> 20, fPoolBytes >> 20, sweet_gpu_pool_avail() >> 20, why);
++	}
++	return why == NULL;
++}
++
+ IOReturn
+ SweetAcceleratorUserClient::clientClose(void)
+ {
+@@ -648,6 +686,9 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 		/* memory XNU does not manage (sweet_gpu.c: no cacheable alias), zeroed through a WC kernel view */
+ 		sweet_zombie_sweep();
+ 		uint64_t len = round_page_64(rq->bytes), pa = 0;
++		if (!v2PoolAllowed(len)) {
++			return kIOReturnNoMemory;
++		}
+ 		if (sweet_gpu_pool_alloc(len, &pa)) {
+ 			return kIOReturnNoMemory;
+ 		}

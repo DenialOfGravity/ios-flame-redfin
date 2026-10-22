@@ -1,0 +1,69 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index cb67b4db1..ff2c725ff 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -305,8 +305,55 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 	}
+ }
+ 
++/*
++ * Policy "AMFI" syscalls. dyld asks amfi_check_dyld_policy_self (call 0x5a,
++ * arg = { u64 input flags, user pointer to u64 output flags }) what the
++ * process may do; on error it gets 0 = nothing, and with nothing every
++ * @rpath/@executable_path/@loader_path load fails ("security policy does not
++ * allow @ path expansion"): any app with embedded frameworks. Grant @ paths
++ * always, and DYLD_* variables, fallback paths, interposing, failed
++ * insertions and LC_DYLD_ENVIRONMENT unless the process is restricted
++ * (__RESTRICT segment) or FairPlay encrypted, like a development device.
++ * Other calls fail with ENOPOLICY as before the policy had this name.
++ */
++#define SWEET_AMFI_DYLD_POLICY_SELF     0x5a
++#define SWEET_AMFI_DYLD_IN_RESTRICTED   (1ULL << 1)
++#define SWEET_AMFI_DYLD_IN_ENCRYPTED    (1ULL << 2)
++#define SWEET_AMFI_DYLD_AT_PATH         (1ULL << 0)
++#define SWEET_AMFI_DYLD_DEVELOPMENT     0xfaULL         /* path vars, fallback, print, insert failures, interpose, embedded vars */
++
++static uint64_t sweet_amfi_seen[2];
++
++static int
++sweet_amfi_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	if (call >= 0 && call < 128 && !(sweet_amfi_seen[call / 64] & (1ULL << (call % 64)))) {
++		sweet_amfi_seen[call / 64] |= 1ULL << (call % 64);
++		char name[32];
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("SWEET AMFI: %s syscall %d\n", name, call);
++	}
++	if (call != SWEET_AMFI_DYLD_POLICY_SELF) {
++		return ENOPOLICY;
++	}
++	struct {
++		uint64_t input;
++		uint64_t output;        /* user pointer */
++	} args;
++	int error = copyin(arg, &args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	uint64_t out = SWEET_AMFI_DYLD_AT_PATH;
++	if (!(args.input & (SWEET_AMFI_DYLD_IN_RESTRICTED | SWEET_AMFI_DYLD_IN_ENCRYPTED))) {
++		out |= SWEET_AMFI_DYLD_DEVELOPMENT;
++	}
++	return copyout(&out, (user_addr_t)args.output, sizeof(out));
++}
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++	.mpo_policy_syscall = sweet_amfi_syscall,
+ };
+ 
+ /*
+@@ -360,7 +407,7 @@ static struct mac_policy_conf sweet_sandbox_mac_conf = {
+ static mac_policy_handle_t sweet_sandbox_mac_handle;
+ 
+ static struct mac_policy_conf sweet_amfi_mac_conf = {
+-	.mpc_name = "SWEET AMFI",
++	.mpc_name = "AMFI",     /* __mac_syscall("AMFI", ...) finds it by this name */
+ 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+ 	.mpc_ops = &sweet_amfi_mac_ops,
+ };

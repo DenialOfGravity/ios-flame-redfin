@@ -1,0 +1,154 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index fe43a3be4..43e3de400 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_fts.c			standard
++bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+new file mode 100644
+index 000000000..82097a3aa
+--- /dev/null
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -0,0 +1,92 @@
++/*
++ * flame (SM8150) CPU frequency: the OSM hardware DCVS keeps a frequency
++ * table per cluster and takes a desired table index per cluster; voltage
++ * (CPR) and thermal limits (LMh) stay in hardware. ABL leaves the clusters
++ * slow and nothing under XNU raises them. Linux: drivers/clk/qcom/
++ * clk-cpu-osm.c (msm-4.14), bases from the live DT qcom,cpucc node.
++ *
++ * Boot-arg flamecpufreq: 0 leave as is, 1 (default) highest all-core
++ * frequency, N > 1 the highest entry at or below N MHz.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_cpufreq_init(void);
++
++#define OSM_FREQ_REG    0x110u          /* + 32 * index */
++#define OSM_ROW         32u
++#define OSM_ROWS        40u
++#define OSM_DESIRED     0x920u          /* + 4 * core in cluster; core 0 drives the policy */
++#define OSM_XO_KHZ      19200u
++
++static const struct {
++	const char *name;
++	uint32_t pa;
++} osm_clusters[] = {
++	{"pwrcl (A55 x4)", 0x18323000u},
++	{"perfcl (A76 x3)", 0x18325800u},
++	{"perfpcl (A76 prime)", 0x18327800u},
++};
++
++static uint32_t
++osm_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++void
++sweet_cpufreq_init(void)
++{
++	unsigned want = 1;
++	(void)PE_parse_boot_argn("flamecpufreq", &want, sizeof(want));
++	for (unsigned c = 0; c < sizeof(osm_clusters) / sizeof(osm_clusters[0]); ++c) {
++		vm_offset_t base = ml_io_map(osm_clusters[c].pa, 0x1000);
++		if (!base) {
++			printf("SWEET CPUFREQ: %s: map failed\n", osm_clusters[c].name);
++			continue;
++		}
++		uint32_t cur = osm_rd(base, OSM_DESIRED);
++		unsigned best = cur, best_khz = 0, prev_khz = 0, n = 0;
++		char line[256];
++		unsigned len = 0;
++		for (unsigned i = 0; i < OSM_ROWS; ++i) {
++			uint32_t data = osm_rd(base, OSM_FREQ_REG + i * OSM_ROW);
++			unsigned src = data >> 30, lval = data & 0xffu, cores = (data >> 16) & 7u;
++			unsigned khz = src ? OSM_XO_KHZ * lval : 300000u;
++			if (i > 0 && khz == prev_khz) {
++				break; /* a repeated frequency ends the table */
++			}
++			prev_khz = khz;
++			n = i + 1;
++			if (len < sizeof(line) - 16) {
++				len += snprintf(line + len, sizeof(line) - len, " %u%s", khz / 1000,
++				    cores == 1 ? "*" : "");
++			}
++			/* core count 1 = single-core boost entry: skip, as Linux does */
++			if (cores == 1 || (want > 1 && khz / 1000 > want)) {
++				continue;
++			}
++			if (khz > best_khz) {
++				best_khz = khz;
++				best = i;
++			}
++		}
++		printf("SWEET CPUFREQ: %s table (MHz, *=1-core boost):%s\n", osm_clusters[c].name, line);
++		if (want == 0 || best_khz == 0 || best >= n) {
++			printf("SWEET CPUFREQ: %s index %u kept\n", osm_clusters[c].name, cur);
++			continue;
++		}
++		__asm__ volatile("dmb oshst" ::: "memory");
++		*(volatile uint32_t *)(base + OSM_DESIRED) = best;
++		__asm__ volatile("dsb osh" ::: "memory");
++		printf("SWEET CPUFREQ: %s index %u -> %u (%u MHz), reads back %u\n",
++		    osm_clusters[c].name, cur, best, best_khz / 1000, osm_rd(base, OSM_DESIRED));
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+index 1778d6d0f..7d77ffd33 100644
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -182,9 +182,18 @@ fts_clocks(void)
+ 			return false;
+ 		}
+ 	}
+-	/* Branch halt bits: wrap0 m_ahb, s_ahb, s4. */
++	/*
++	 * Branch halt bits: wrap0 m_ahb, s_ahb, s4. A branch under hardware
++	 * clock gating (bit 1) reads halted while idle; Linux skips the check
++	 * then (clk_branch_check_halt), so do the same.
++	 */
+ 	const uint32_t branches[] = {0x17004, 0x17008, 0x17604};
+ 	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		uint32_t cbcr = fts_rd(ft.gcc, branches[i]);
++		printf("SWEET FTS: GCC branch %#x = %#x\n", branches[i], cbcr);
++		if (cbcr & 2u) {
++			continue;
++		}
+ 		if (!fts_wait_clear(ft.gcc, branches[i], 1u << 31)) {
+ 			printf("SWEET FTS: GCC branch %#x halted (%#x)\n", branches[i],
+ 			    fts_rd(ft.gcc, branches[i]));
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index d8a46b72e..6cefbe88b 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_fts_init(void);
++extern void sweet_cpufreq_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -657,6 +658,7 @@ sweet_ufs_init(void)
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
++	sweet_cpufreq_init();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();

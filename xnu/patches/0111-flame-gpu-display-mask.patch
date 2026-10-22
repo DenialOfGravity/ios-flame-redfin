@@ -1,0 +1,375 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 61cd483cd..dbb4d9ab0 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -1056,7 +1056,8 @@ uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *d
+ 	EV(EV_CACHE_INVALIDATE);
+ 	dw[n++] = a6_pkt7(A6_CP_WAIT_FOR_IDLE, 0);
+ 
+-	REG(0x8c01, 0);			/* RB_A2D_PIXEL_CNTL */
++	/* Source-over, with straight source alpha; used by the display corner matte. */
++	REG(0x8c01, b->blend ? 0x3809c181 : 0);	/* RB_A2D_PIXEL_CNTL */
+ 	REG(0x8c00, 0x00f03000);	/* RB_A2D_BLT_CNTL: 8888 UNORM, mask f */
+ 	REG(0x8400, 0x00f03000);	/* GRAS_A2D_BLT_CNTL */
+ 	REG(0xacc0, 0xf180);		/* SP_A2D_OUTPUT_INFO */
+diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
+index dda32265c..32d6dd32c 100644
+--- a/bsd/dev/sweet_a6xx.h
++++ b/bsd/dev/sweet_a6xx.h
+@@ -123,6 +123,7 @@ struct a6_blit {
+ 	uint32_t dst_pitch;
+ 	uint32_t dx, dy, dw, dh;		/* destination rectangle */
+ 	bool filter;				/* bilinear */
++	bool blend;				/* source-over alpha blend */
+ };
+ #define A6_BLIT_MAX_DW	256
+ uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *dw);
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 78aeec4e8..24c0fc005 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -30,6 +30,7 @@
+ #include <libkern/libkern.h>
+ #include <mach/mach_time.h>
+ #include "sweet_a6xx.h"
++#include "../../iokit/Kernel/arm/SweetDisplayMask.h"
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern boolean_t pmap_valid_address(uint64_t pa);
+@@ -46,7 +47,8 @@ bool sweet_gpu_ready(void);
+ int sweet_gpu_surface_slot(uint64_t key);
+ int sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint32_t page_size);
+ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch,
+-	uint32_t fb_pitch, uint32_t *out_dx, uint32_t *out_dy, uint32_t *out_dw, uint32_t *out_dh);
++	uint32_t fb_pitch, uint32_t corner_radius, uint32_t *out_dx, uint32_t *out_dy,
++	uint32_t *out_dw, uint32_t *out_dh);
+ void sweet_gpu_panel_stride(uint32_t stride);
+ int sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size);
+ int sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out);
+@@ -359,46 +361,118 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
+ #define IB_OFF          A6_OFF_FREE     /* the present IB in the pool */
+ #define PANEL_W         1080
+ #define PANEL_H         2280
++#define DISPLAY_MASK_OFF        0x500000ULL
++#define DISPLAY_MASK_SIDE       256u
++#define DISPLAY_MASK_DIM        (DISPLAY_MASK_SIDE * 2)
++#define DISPLAY_MASK_PITCH      (DISPLAY_MASK_DIM * 4)
++#define DISPLAY_STAGE_OFF       0x600000ULL
++
++static bool display_stage_ready;
++static uint32_t display_mask_radius;
+ 
+ static uint64_t stat_frames, stat_clean_abs, stat_gpu_abs;
+ 
+ /*
+- * Blit a mapped surface, scaled to fit and centred, into the panel memory
+- * (rows of fb_pitch bytes). The CPU rendered it through the cache: clean
+- * it to memory first, through its kernel mapping kva (0: no clean). Waits
+- * for the GPU (a few ms).
++ * Blit a mapped surface, scaled to fit and centred. With corner_radius, the
++ * GPU composites a four-corner matte into a pool staging image and copies the
++ * completed frame to scanout. The CPU rendered the source through its cache:
++ * clean it through kva first (0: no clean). Waits for the GPU (a few ms).
+  */
+ int
+-sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch, uint32_t fb_pitch,
+-	uint32_t *out_dx, uint32_t *out_dy, uint32_t *out_dw, uint32_t *out_dh)
++sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch,
++	uint32_t fb_pitch, uint32_t corner_radius, uint32_t *out_dx, uint32_t *out_dy,
++	uint32_t *out_dw, uint32_t *out_dh)
+ {
+-	if (!gpu_ready || s < 0 || s >= SLOTS || !slot[s].npages || (pitch & 63) || (fb_pitch & 63)) {
++	if (!gpu_ready || s < 0 || s >= SLOTS || !slot[s].npages || w == 0 || h == 0 ||
++	    (pitch & 63) || (fb_pitch & 63) || fb_pitch < PANEL_W * 4 ||
++	    DISPLAY_STAGE_OFF + (uint64_t)fb_pitch * PANEL_H > A6_POOL_SIZE) {
+ 		return -1;
+ 	}
++	if (corner_radius > DISPLAY_MASK_SIDE) {
++		corner_radius = DISPLAY_MASK_SIDE;
++	}
+ 	uint64_t t0 = mach_absolute_time();
+ 	if (kva) {
+ 		clean_dcache64((addr64_t)kva, (unsigned)((uint64_t)pitch * h + offset), FALSE);
+ 	}
+ 	uint64_t t1 = mach_absolute_time();
+ 
+-	struct a6_blit b = {
++	struct a6_blit frame = {
+ 		.src_iova = SLOT_IOVA(s) + offset, .src_w = w, .src_h = h, .src_pitch = pitch,
+ 		.sw = w, .sh = h, .dst_iova = A6_GVA_FB, .dst_pitch = fb_pitch, .filter = true,
+ 	};
+ 	/* Fit: full height unless the frame is relatively wider than the panel. */
+ 	if ((uint64_t)w * PANEL_H <= (uint64_t)PANEL_W * h) {
+-		b.dh = PANEL_H;
+-		b.dw = (uint32_t)(((uint64_t)w * PANEL_H + h / 2) / h);
++		frame.dh = PANEL_H;
++		frame.dw = (uint32_t)(((uint64_t)w * PANEL_H + h / 2) / h);
+ 	} else {
+-		b.dw = PANEL_W;
+-		b.dh = (uint32_t)(((uint64_t)h * PANEL_W + w / 2) / w);
++		frame.dw = PANEL_W;
++		frame.dh = (uint32_t)(((uint64_t)h * PANEL_W + w / 2) / w);
+ 	}
+-	b.dx = (PANEL_W - b.dw) / 2;
+-	b.dy = (PANEL_H - b.dh) / 2;
+-	static uint32_t dw[A6_BLIT_MAX_DW];
++	frame.dx = (PANEL_W - frame.dw) / 2;
++	frame.dy = (PANEL_H - frame.dh) / 2;
++	static uint32_t ib[6 * A6_BLIT_MAX_DW];
+ 	lck_mtx_lock(&sweet_gpu_lock);
+-	uint32_t n = a6_blit_ib(&gpu, &b, dw);
+-	a6_write(a6_pool_pa(&gpu, IB_OFF), dw, 4ULL * n);
++	uint32_t n = 0;
++	if (corner_radius != 0) {
++		if (!display_stage_ready) {
++			vm_size_t stage_size = (vm_size_t)fb_pitch * PANEL_H;
++			bzero((void *)(pool_kva + DISPLAY_STAGE_OFF), stage_size);
++			flush_dcache64((addr64_t)(pool_kva + DISPLAY_STAGE_OFF), (unsigned)stage_size, FALSE);
++			display_stage_ready = true;
++		}
++		if (display_mask_radius != corner_radius) {
++			uint32_t *atlas = (uint32_t *)(pool_kva + DISPLAY_MASK_OFF);
++			bzero(atlas, DISPLAY_MASK_PITCH * DISPLAY_MASK_DIM);
++			for (uint32_t y = 0; y < corner_radius; y++) {
++				for (uint32_t x = 0; x < corner_radius; x++) {
++					uint32_t xs[4] = { x, corner_radius - 1 - x, x, corner_radius - 1 - x };
++					uint32_t ys[4] = { y, y, corner_radius - 1 - y, corner_radius - 1 - y };
++					for (uint32_t corner = 0; corner < 4; corner++) {
++						uint32_t tx = (corner & 1) * DISPLAY_MASK_SIDE + x;
++						uint32_t ty = (corner >> 1) * DISPLAY_MASK_SIDE + y;
++						/* Each tile is oriented so its destination's outer edge is local x/y = 0. */
++						uint32_t cx = xs[corner], cy = ys[corner];
++						uint32_t alpha = 255 - (sweet_display_corner_coverage(cx, cy, corner_radius) * 255 + 8) / 16;
++						atlas[(size_t)ty * DISPLAY_MASK_DIM + tx] = alpha << 24;
++					}
++				}
++			}
++			flush_dcache64((addr64_t)(pool_kva + DISPLAY_MASK_OFF),
++			    DISPLAY_MASK_PITCH * DISPLAY_MASK_DIM, FALSE);
++			display_mask_radius = corner_radius;
++		}
++
++		frame.dst_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF;
++		uint32_t used = a6_blit_ib(&gpu, &frame, ib + n);
++		n += used;
++		for (uint32_t corner = 0; corner < 4; corner++) {
++			struct a6_blit matte = {
++				.src_iova = A6_GVA_POOL + DISPLAY_MASK_OFF,
++				.src_w = DISPLAY_MASK_DIM, .src_h = DISPLAY_MASK_DIM, .src_pitch = DISPLAY_MASK_PITCH,
++				.sx = (corner & 1) * DISPLAY_MASK_SIDE, .sy = (corner >> 1) * DISPLAY_MASK_SIDE,
++				.sw = corner_radius, .sh = corner_radius,
++				.dst_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF, .dst_pitch = fb_pitch,
++				.dx = (corner & 1) ? PANEL_W - corner_radius : 0,
++				.dy = (corner & 2) ? PANEL_H - corner_radius : 0,
++				.dw = corner_radius, .dh = corner_radius, .filter = false, .blend = true,
++			};
++			used = a6_blit_ib(&gpu, &matte, ib + n);
++			n += used;
++		}
++		struct a6_blit output = {
++			.src_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF,
++			.src_w = PANEL_W, .src_h = PANEL_H, .src_pitch = fb_pitch,
++			.sw = PANEL_W, .sh = PANEL_H,
++			.dst_iova = A6_GVA_FB, .dst_pitch = fb_pitch,
++			.dw = PANEL_W, .dh = PANEL_H, .filter = false,
++		};
++		used = a6_blit_ib(&gpu, &output, ib + n);
++		n += used;
++	} else {
++		n = a6_blit_ib(&gpu, &frame, ib);
++	}
++	a6_write(a6_pool_pa(&gpu, IB_OFF), ib, 4ULL * n);
+ 	int rc = a6_submit_ib(&gpu, a6_pool_va(IB_OFF), n, 100);
+ 	if (rc) {
+ 		uint64_t far;
+@@ -422,10 +496,10 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 		    c / 1000 / 300, g / 1000 / 300);
+ 		stat_clean_abs = stat_gpu_abs = 0;
+ 	}
+-	*out_dx = b.dx;
+-	*out_dy = b.dy;
+-	*out_dw = b.dw;
+-	*out_dh = b.dh;
++	*out_dx = frame.dx;
++	*out_dy = frame.dy;
++	*out_dw = frame.dw;
++	*out_dh = frame.dh;
+ 	return rc;
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetDisplayMask.h b/iokit/Kernel/arm/SweetDisplayMask.h
+index 997badd6c..6e671fe66 100644
+--- a/iokit/Kernel/arm/SweetDisplayMask.h
++++ b/iokit/Kernel/arm/SweetDisplayMask.h
+@@ -8,7 +8,8 @@
+ 
+ #include <stdint.h>
+ 
+-#define SWEET_DISPLAY_CORNER_DEFAULT 64u
++#define SWEET_DISPLAY_CORNER_DEFAULT 176u
++#define SWEET_DISPLAY_CORNER_MAX     256u
+ #define SWEET_DISPLAY_MASK_SAMPLES   4u
+ 
+ static inline uint64_t
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e5fcf7f35..757dbaf31 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -45,7 +45,8 @@ bool sweet_gpu_ready(void);
+ int sweet_gpu_surface_slot(uint64_t key);
+ int sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint32_t page_size);
+ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch,
+-	uint32_t fb_pitch, uint32_t *out_dx, uint32_t *out_dy, uint32_t *out_dw, uint32_t *out_dh);
++	uint32_t fb_pitch, uint32_t corner_radius, uint32_t *out_dx, uint32_t *out_dy,
++	uint32_t *out_dw, uint32_t *out_dh);
+ void sweet_gpu_panel_stride(uint32_t stride);
+ extern int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
+ }
+@@ -141,7 +142,7 @@ public:
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
+ 	bool presentGPU(const uint8_t *rec);
+-	void maskTopCorners(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
++	void maskCorners(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -198,6 +199,9 @@ AppleCLCD::start(IOService *provider)
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fCornerRadius = SWEET_DISPLAY_CORNER_DEFAULT;
+ 	PE_parse_boot_argn("sweetfb_corner_radius", &fCornerRadius, sizeof(fCornerRadius));
++	if (fCornerRadius > SWEET_DISPLAY_CORNER_MAX) {
++		fCornerRadius = SWEET_DISPLAY_CORNER_MAX;
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	/* With the GPU (sweetgpu=1) the panel later switches to 4352-byte rows: map that much. */
+@@ -376,13 +380,9 @@ gpu_fallback(uint32_t why, const char *what)
+ 	return false;
+ }
+ 
+-/*
+- * Clip just the top corners of the rendered iOS image. The superellipse
+- * coverage approximates Core Animation's continuous corner curve; the
+- * output outside the content shape stays black.
+- */
++/* CPU fallback only. The normal GPU path applies this matte before scanout. */
+ void
+-AppleCLCD::maskTopCorners(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
++AppleCLCD::maskCorners(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+ {
+ 	if (fCornerRadius == 0 || x >= fWidth || y >= fHeight || w < 2 || h == 0) {
+ 		return;
+@@ -405,24 +405,24 @@ AppleCLCD::maskTopCorners(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+ 	}
+ 
+ 	for (uint32_t cy = 0; cy < radius; cy++) {
+-		volatile uint32_t *row = (volatile uint32_t *)(fPixels + (uint64_t)(y + cy) * fRowBytes);
++		volatile uint32_t *top = (volatile uint32_t *)(fPixels + (uint64_t)(y + cy) * fRowBytes);
++		volatile uint32_t *bottom = (volatile uint32_t *)(fPixels + (uint64_t)(y + h - 1 - cy) * fRowBytes);
+ 		for (uint32_t cx = 0; cx < radius; cx++) {
+ 			uint32_t coverage = sweet_display_corner_coverage(cx, cy, radius);
+ 			if (coverage == 16) {
+ 				continue;
+ 			}
+-			uint32_t left = x + cx;
+-			uint32_t right = x + w - 1 - cx;
+-			volatile uint32_t *pixels[2] = { &row[left], &row[right] };
+-			for (unsigned side = 0; side < (left == right ? 1u : 2u); side++) {
+-				uint32_t pixel = *pixels[side];
++			volatile uint32_t *pixels[4] = { &top[x + cx], &top[x + w - 1 - cx],
++			    &bottom[x + cx], &bottom[x + w - 1 - cx] };
++			for (unsigned corner = 0; corner < 4; corner++) {
++				uint32_t pixel = *pixels[corner];
+ 				if (coverage == 0) {
+-					*pixels[side] = 0;
++					*pixels[corner] = 0;
+ 				} else {
+ 					uint32_t b = ((pixel & 0x000000ff) * coverage + 8) / 16;
+ 					uint32_t g = ((pixel & 0x0000ff00) * coverage + 0x800) / 16 & 0x0000ff00;
+ 					uint32_t r = ((pixel & 0x00ff0000) * coverage + 0x80000) / 16 & 0x00ff0000;
+-					*pixels[side] = (pixel & 0xff000000) | r | g | b;
++					*pixels[corner] = (pixel & 0xff000000) | r | g | b;
+ 				}
+ 			}
+ 		}
+@@ -500,7 +500,7 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 	}
+ 	uint32_t dx = 0, dy = 0, dw = 0, dh = 0;
+ 	int rc = sweet_gpu_present(slot, s->kernelAddress(), s->offset, s->width, s->height, s->bytesPerRow,
+-	    fRowBytes, &dx, &dy, &dw, &dh);
++	    fRowBytes, fCornerRadius, &dx, &dy, &dw, &dh);
+ 	s->release();
+ 	if (rc) {
+ 		return gpu_fallback(7, "GPU blit failed");
+@@ -509,7 +509,6 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 	sweet_display_fit_y = (int)dy;
+ 	sweet_display_fit_w = (int)dw;
+ 	sweet_display_fit_h = (int)dh;
+-	maskTopCorners(dx, dy, dw, dh);
+ 	return true;
+ }
+ 
+@@ -612,7 +611,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
+-	maskTopCorners(0, 0, fWidth, fHeight);
++	maskCorners(0, 0, fWidth, fHeight);
+ }
+ 
+ bool
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index eb548aaef..12660b767 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -447,11 +447,8 @@ SweetHIDTouch::start(IOService *provider)
+ 	fOffY = (fLogicalH - SWEET_PANEL_H) / 2;
+ 	fCornerRadius = SWEET_DISPLAY_CORNER_DEFAULT;
+ 	PE_parse_boot_argn("sweetfb_corner_radius", &fCornerRadius, sizeof(fCornerRadius));
+-	if (fCornerRadius > SWEET_PANEL_W / 2) {
+-		fCornerRadius = SWEET_PANEL_W / 2;
+-	}
+-	if (fCornerRadius > SWEET_PANEL_H) {
+-		fCornerRadius = SWEET_PANEL_H;
++	if (fCornerRadius > SWEET_DISPLAY_CORNER_MAX) {
++		fCornerRadius = SWEET_DISPLAY_CORNER_MAX;
+ 	}
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+@@ -485,26 +482,19 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		fitW = SWEET_PANEL_W;
+ 		fitH = SWEET_PANEL_H;
+ 	}
+-	uint32_t cornerRadius = fCornerRadius;
+-	if (cornerRadius > (uint32_t)(fitW / 2)) {
+-		cornerRadius = (uint32_t)(fitW / 2);
+-	}
+-	if (cornerRadius > (uint32_t)fitH) {
+-		cornerRadius = (uint32_t)fitH;
+-	}
+ 	if (!was && down && (x < fitX || x >= fitX + fitW || y < fitY || y >= fitY + fitH)) {
+ 		IOLockUnlock(fLock);
+ 		return;
+ 	}
+-	if (!was && down && cornerRadius && y >= fitY && y < fitY + (int)cornerRadius) {
+-		int localX = -1;
+-		if (x >= fitX && x < fitX + (int)cornerRadius) {
+-			localX = x - fitX;
+-		} else if (x < fitX + fitW && x >= fitX + fitW - (int)cornerRadius) {
+-			localX = fitX + fitW - 1 - x;
+-		}
+-		if (localX >= 0 &&
+-		    !sweet_display_corner_point_visible((uint32_t)localX, (uint32_t)(y - fitY), cornerRadius)) {
++	uint32_t cornerRadius = fCornerRadius;
++	bool left = x < (int)cornerRadius;
++	bool right = x >= SWEET_PANEL_W - (int)cornerRadius;
++	bool top = y < (int)cornerRadius;
++	bool bottom = y >= SWEET_PANEL_H - (int)cornerRadius;
++	if (!was && down && cornerRadius && (left || right) && (top || bottom)) {
++		uint32_t localX = (uint32_t)(left ? x : SWEET_PANEL_W - 1 - x);
++		uint32_t localY = (uint32_t)(top ? y : SWEET_PANEL_H - 1 - y);
++		if (!sweet_display_corner_point_visible(localX, localY, cornerRadius)) {
+ 			IOLockUnlock(fLock);
+ 			return;
+ 		}

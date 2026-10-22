@@ -1,0 +1,143 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index ac471153f..c0fded89e 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -715,14 +715,15 @@ int a6_ring(struct a6_gpu *g, const uint32_t *dw, uint32_t n, const char *what,
+ 		a6_write(a6_pool_pa(g, A6_OFF_RING), dw + first, 4ull * (n - first));
+ 	g->wptr = (w + n) % A6_RING_DW;
+ 	wr32(GREG(CP_RB_WPTR), g->wptr);
++	/* poll: a few reads, then 20 us sleeps (1 ms ones made every submit take whole milliseconds) */
+ 	unsigned i;
+-	for (i = 0; i < timeout_ms * 10; i++) {
++	for (i = 0; i < timeout_ms * 50 + 8; i++) {
+ 		if (rd32(GREG(CP_RB_RPTR)) == g->wptr && !(rd32(GREG(RBBM_STATUS)) & (1u << 23)))
+ 			break;
+-		if ((i & 7) == 7)
+-			a6_delay_ms(1);
++		if (i >= 8)
++			a6_delay_us(20);
+ 	}
+-	bool ok = i < timeout_ms * 10;
++	bool ok = i < timeout_ms * 50 + 8;
+ 	if (what || !ok)
+ 		a6_log("ring %s: rptr %x wptr %x status %x int %x hwfault %x cp_status1 %x %s\n",
+ 		       what ? what : "", rd32(GREG(CP_RB_RPTR)), g->wptr, rd32(GREG(RBBM_STATUS)),
+@@ -878,6 +879,17 @@ void a6_unmap_high(struct a6_gpu *g)
+ 
+ /* ---- stage 4: GPU SMMU bank, hw_init, SQE, CP ---- */
+ 
++/* The zap shader is already in TrustZone after a GPU reset: tell TZ to resume it (Linux: SCM_GPU_ZAP_SHADER_RESUME) */
++static int zap_resume(void)
++{
++	uint64_t x[8] = { 0x42000000ull | (1u << 8) | 0x0a, 2, 0 /* resume */, PAS_GPU, 0, 0, 0, 0 };
++	a6_smc(x);
++	a6_log("zap: resume rc %lld\n", (long long)x[0]);
++	return x[0] ? -1 : 0;
++}
++
++static int gpu_cp_init(struct a6_gpu *g, bool resume);
++
+ static int gpu_cp(struct a6_gpu *g)
+ {
+ 	if (smmu_pick(&g->gpu_smr, &g->gpu_cb, g->gmu_cb + 1)) {
+@@ -886,7 +898,26 @@ static int gpu_cp(struct a6_gpu *g)
+ 	}
+ 	map_gpu_low(g);
+ 	smmu_bank(g->gpu_smr, g->gpu_cb, a6_pool_pa(g, A6_OFF_GT_L1), GPU_SID, GPU_SID_MASK);
++	return gpu_cp_init(g, false);
++}
+ 
++/* After a hang or fault: soft reset of the GPU core, then the CP up again (page tables and SMMU banks kept). */
++int a6_recover(struct a6_gpu *g)
++{
++	(void)a6_clear_fault(g);
++	wr32(GREG(0x43), 1);			/* RBBM_SW_RESET_CMD */
++	(void)rd32(GREG(0x43));
++	a6_delay_us(100);
++	wr32(GREG(0x43), 0);
++	a6_delay_ms(1);
++	(void)a6_clear_fault(g);
++	int rc = gpu_cp_init(g, true);
++	a6_log("recover: soft reset + CP init -> %d\n", rc);
++	return rc;
++}
++
++static int gpu_cp_init(struct a6_gpu *g, bool resume)
++{
+ 	/* a6xx hw_init for the A640 (a6xx_gpu.c), minus clock gating, CP protection and interrupts */
+ 	wr32(GREG(0x3c45), 0);			/* GBIF_HALT */
+ 	(void)rd32(GREG(0x3c45));
+@@ -933,7 +964,7 @@ static int gpu_cp(struct a6_gpu *g)
+ 	uint32_t me_init[] = { a6_pkt7(A6_CP_ME_INIT, 8), 0x2f, 3, 0x20000000, 0, 0, 0, 0, 0 };
+ 	if (a6_ring(g, me_init, 9, "me_init", 1000))
+ 		return -1;
+-	if (zap_load(g))
++	if (resume ? zap_resume() : zap_load(g))
+ 		return -1;
+ 	uint32_t secure[] = { a6_pkt7(A6_CP_SET_SECURE_MODE, 1), 0 };
+ 	return a6_ring(g, secure, 2, "secure mode off", 1000);
+diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
+index 416a605a6..6341cb762 100644
+--- a/bsd/dev/sweet_a6xx.h
++++ b/bsd/dev/sweet_a6xx.h
+@@ -70,6 +70,7 @@ void a6_wr(uint64_t pa, uint32_t v);
+ int a6_write(uint64_t pa, const void *buf, size_t len);	/* DRAM: any size; MMIO: words */
+ int a6_read(uint64_t pa, void *buf, size_t len);
+ void a6_delay_ms(unsigned ms);
++void a6_delay_us(unsigned us);
+ void a6_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+ void a6_smc(uint64_t x[8]);				/* x0..x7 in, x0..x3 out */
+ const uint8_t *a6_firmware(const char *name, uint32_t *len);	/* NULL if missing */
+@@ -81,6 +82,7 @@ static inline uint64_t a6_pool_va(uint64_t off) { return A6_GVA_POOL + off; }
+ 
+ void a6_init_state(struct a6_gpu *g, uint64_t pool_pa);
+ int a6_power_up(struct a6_gpu *g);	/* everything up to a working CP with the zap shader; 0 = ok */
++int a6_recover(struct a6_gpu *g);	/* after a hang/fault: soft reset, CP re-init (mappings kept); 0 = ok */
+ bool a6_cx_up(void);
+ bool a6_gx_up(void);
+ bool a6_cp_running(const struct a6_gpu *g);	/* GX on and the CP runs our SQE */
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 1373e4885..f1434a174 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -183,6 +183,12 @@ a6_delay_ms(unsigned ms)
+ 	delay((int)ms * 1000);
+ }
+ 
++void
++a6_delay_us(unsigned us)
++{
++	delay((int)us);
++}
++
+ void
+ a6_log(const char *fmt, ...)
+ {
+@@ -397,10 +403,12 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 	if (rc) {
+ 		uint64_t far;
+ 		uint32_t syn, fsr = a6_fault_status(&gpu, &far, &syn);
+-		a6_log("present: GPU timeout (fence %u, memory %u, smmu fsr %x far %llx); back to the CPU copy\n",
++		a6_log("present: GPU timeout (fence %u, memory %u, smmu fsr %x far %llx)\n",
+ 		    gpu.fence, a6_fence_read(&gpu), fsr, far);
+-		(void)a6_clear_fault(&gpu);
+-		gpu_ready = false;
++		if (a6_recover(&gpu)) {
++			a6_log("present: GPU not recovered; back to the CPU copy\n");
++			gpu_ready = false;
++		}
+ 	}
+ 	lck_mtx_unlock(&sweet_gpu_lock);
+ 	uint64_t t2 = mach_absolute_time();
+@@ -550,7 +558,10 @@ sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, ui
+ 		uint32_t syn, fsr = a6_fault_status(&gpu, &far, &syn);
+ 		a6_log("user submit: ib %llx %u dwords: timeout or fault (smmu fsr %x far %llx fsynr0 %x)\n",
+ 		    ib_iova, dwords, fsr, far, syn);
+-		(void)a6_clear_fault(&gpu);
++		if (a6_recover(&gpu)) {
++			a6_log("user submit: GPU not recovered\n");
++			gpu_ready = false;
++		}
+ 	}
+ 	*fence_out = gpu.fence;
+ 	lck_mtx_unlock(&sweet_gpu_lock);

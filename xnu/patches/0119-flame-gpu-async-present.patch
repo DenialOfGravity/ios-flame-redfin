@@ -1,0 +1,84 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index bc856466b..f5cbdad80 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -404,6 +404,8 @@ sweet_gpu_panel_stride(uint32_t stride)
+ 
+ /* ---- surfaces ---- */
+ 
++static int present_wait_locked(uint32_t k, const char *why);
++
+ #define SLOTS           4
+ #define SLOT_IOVA(n)    (0x100000000ULL + 0x1000000ULL * (n))
+ #define SLOT_MAX        0x1000000ULL
+@@ -442,6 +444,8 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
+ 		}
+ 	}
+ 	lck_mtx_lock(&sweet_gpu_lock);
++	(void)present_wait_locked(0, "surface remap");
++	(void)present_wait_locked(1, "surface remap");
+ 	int rc = a6_map_pages(&gpu, SLOT_IOVA(s), pages, npages, page_size);
+ 	a6_tlb_flush(&gpu);
+ 	lck_mtx_unlock(&sweet_gpu_lock);
+@@ -458,7 +462,27 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
+ 	return s;
+ }
+ 
+-#define IB_OFF          A6_OFF_FREE     /* the present IB in the pool */
++#define IB_OFF          A6_OFF_FREE     /* the present IBs in the pool (two, PRESENT_IB) */
++#define PRESENT_IB(k)   (IB_OFF + 0x4000ULL * (k))
++
++static uint32_t present_fence[2];      /* of the present last queued from each IB slot */
++static uint32_t present_next;
++
++/* With sweet_gpu_lock: the present from IB slot k has landed (or the GPU was reset). 0, or -1 if reset. */
++static int
++present_wait_locked(uint32_t k, const char *why)
++{
++	while (present_fence[k] && !a6_fence_done(&gpu, present_fence[k])) {
++		if (gpu_hung_locked(500)) {
++			gpu_recover_locked(why);
++			return -1;
++		}
++		lck_mtx_unlock(&sweet_gpu_lock);
++		delay(20);
++		lck_mtx_lock(&sweet_gpu_lock);
++	}
++	return 0;
++}
+ #define PANEL_W         1080
+ #define PANEL_H         2280
+ #define DISPLAY_MASK_OFF        0x500000ULL     /* 2x2 corner mattes, one per corner */
+@@ -590,21 +614,19 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 	} else {
+ 		n = a6_blit_ib(&gpu, &frame, ib);
+ 	}
+-	a6_write(a6_pool_pa(&gpu, IB_OFF), ib, 4ULL * n);
+ 	/*
+-	 * Queued behind whatever the Metal clients submitted: wait for our own fence, and reset the GPU only
+-	 * when it stops making progress (long but healthy client work must not count as a hang).
++	 * Not waited for: the vsync timer must not block behind the Metal clients' work queued ahead of it
++	 * (a waited present took 15-30 ms with metal2vulkan's frames in the ring, and the vsync notifications
++	 * CA paces on came late). Two IB slots: only the one two presents back must have landed.
+ 	 */
+-	gpu_note_submit_locked();
+-	uint32_t fence = a6_submit_ib_async(&gpu, a6_pool_va(IB_OFF), n, 100);
+-	int rc = fence ? 0 : -1;
+-	while (fence && !a6_fence_done(&gpu, fence)) {
+-		if (gpu_hung_locked(500)) {
+-			gpu_recover_locked("present");
+-			rc = -1;
+-			break;
+-		}
+-		delay(20);
++	uint32_t k = present_next & 1;
++	int rc = present_wait_locked(k, "present");
++	if (rc == 0) {
++		a6_write(a6_pool_pa(&gpu, PRESENT_IB(k)), ib, 4ULL * n);
++		gpu_note_submit_locked();
++		present_fence[k] = a6_submit_ib_async(&gpu, a6_pool_va(PRESENT_IB(k)), n, 100);
++		rc = present_fence[k] ? 0 : -1;
++		present_next++;
+ 	}
+ 	lck_mtx_unlock(&sweet_gpu_lock);
+ 	uint64_t t2 = mach_absolute_time();

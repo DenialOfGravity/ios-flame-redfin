@@ -1,0 +1,449 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index a0f873698..86c3b7129 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -45,9 +45,11 @@ void sweet_gpu_init(void);
+ bool sweet_gpu_ready(void);
+ int sweet_gpu_surface_slot(uint64_t key);
+ int sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint32_t page_size);
+-int sweet_gpu_present(int slot, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch, uint32_t fb_pitch,
+-    uint32_t *out_dx, uint32_t *out_dw);
++int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch,
++    uint32_t fb_pitch, uint32_t *out_dx, uint32_t *out_dw);
+ void sweet_gpu_panel_stride(uint32_t stride);
++int sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size);
++int sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out);
+ 
+ /* Panel mapping for touch (SweetHID.cpp): 0 = the crop of iOS's frame, else x offset + width of the fit. */
+ int sweet_display_fit_x, sweet_display_fit_w;
+@@ -117,13 +119,17 @@ a6_wr(uint64_t pa, uint32_t v)
+ 	__asm__ volatile ("dsb osh" ::: "memory");
+ }
+ 
+-/* Pool (and other kernel RAM): through the physmap, cleaned to the point of coherency. MMIO: words. */
++/*
++ * Pool: through its kernel mapping, cleaned to the point of coherency (by VA:
++ * physical cache operations panic for RAM outside the physmap). Other managed
++ * RAM: through the physmap. MMIO: words.
++ */
+ int
+ a6_write(uint64_t pa, const void *buf, size_t len)
+ {
+ 	if (in_pool(pa, len)) {
+ 		memcpy((void *)(pool_kva + (pa - gpu.pool_pa)), buf, len);
+-		flush_dcache64((addr64_t)pa, (unsigned)len, TRUE);
++		flush_dcache64((addr64_t)(pool_kva + (pa - gpu.pool_pa)), (unsigned)len, FALSE);
+ 		return 0;
+ 	}
+ 	if (pmap_valid_address(pa)) {
+@@ -142,7 +148,7 @@ int
+ a6_read(uint64_t pa, void *buf, size_t len)
+ {
+ 	if (in_pool(pa, len)) {
+-		flush_dcache64((addr64_t)pa, (unsigned)len, TRUE);
++		flush_dcache64((addr64_t)(pool_kva + (pa - gpu.pool_pa)), (unsigned)len, FALSE);
+ 		memcpy(buf, (const void *)(pool_kva + (pa - gpu.pool_pa)), len);
+ 		return 0;
+ 	}
+@@ -229,7 +235,7 @@ sweet_gpu_init(void)
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
+ 	a6_init_state(&gpu, ptoa_64(pn));
+ 	pool_kva = va;
+-	flush_dcache64((addr64_t)gpu.pool_pa, (unsigned)A6_POOL_SIZE, TRUE);
++	flush_dcache64((addr64_t)va, (unsigned)A6_POOL_SIZE, FALSE);
+ 	thread_t thread;
+ 	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+@@ -324,18 +330,19 @@ static uint64_t stat_frames, stat_clean_abs, stat_gpu_abs;
+ /*
+  * Blit a mapped surface, scaled to fit and centred, into the panel memory
+  * (rows of fb_pitch bytes). The CPU rendered it through the cache: clean
+- * its pages to memory first. Waits for the GPU (a few ms).
++ * it to memory first, through its kernel mapping kva (0: no clean). Waits
++ * for the GPU (a few ms).
+  */
+ int
+-sweet_gpu_present(int s, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch, uint32_t fb_pitch,
++sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch, uint32_t fb_pitch,
+     uint32_t *out_dx, uint32_t *out_dw)
+ {
+ 	if (!gpu_ready || s < 0 || s >= SLOTS || !slot[s].npages || (pitch & 63) || (fb_pitch & 63)) {
+ 		return -1;
+ 	}
+ 	uint64_t t0 = mach_absolute_time();
+-	for (uint32_t i = 0; i < slot[s].npages; i++) {
+-		clean_dcache64((addr64_t)slot[s].pages[i], slot[s].page_size, TRUE);
++	if (kva) {
++		clean_dcache64((addr64_t)kva, (unsigned)((uint64_t)pitch * h + offset), FALSE);
+ 	}
+ 	uint64_t t1 = mach_absolute_time();
+ 
+@@ -382,4 +389,63 @@ sweet_gpu_present(int s, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch
+ 	*out_dw = b.dw;
+ 	return rc;
+ }
++
++/* ---- buffers and submissions for Metal (iokit/Kernel/arm/SweetAccelerator.cpp) ---- */
++
++#define USER_VA_BASE    0x200000000ULL  /* above the surface slots */
++#define USER_VA_END     0x7f00000000ULL
++#define USER_VA_ALIGN   0x10000ULL
++
++static uint64_t user_va_next = USER_VA_BASE;
++
++/*
++ * Map pages at a fresh GPU VA (never reused yet: freed buffers leak their VA,
++ * and the page-table arena is finite). The caller cleans the CPU caches
++ * through a virtual mapping: physical cache operations panic for RAM outside
++ * the physmap (kernel memory below 4 GB, "phystokv_range: illegal PA").
++ */
++int
++sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size)
++{
++	if (!gpu_ready || npages == 0) {
++		return -1;
++	}
++	uint64_t size = (uint64_t)npages * page_size;
++	lck_mtx_lock(&sweet_gpu_lock);
++	uint64_t iova = user_va_next;
++	if (iova + size > USER_VA_END) {
++		lck_mtx_unlock(&sweet_gpu_lock);
++		return -1;
++	}
++	user_va_next = (iova + size + USER_VA_ALIGN - 1) & ~(USER_VA_ALIGN - 1);
++	int rc = a6_map_pages(&gpu, iova, pages, npages, page_size);
++	a6_tlb_flush(&gpu);
++	lck_mtx_unlock(&sweet_gpu_lock);
++	if (rc) {
++		return -1;
++	}
++	*iova_out = iova;
++	return 0;
++}
++
++/* Run an IB (user GPU memory) and wait for it. 0, or -1 on a hang/fault (cleared, logged). */
++int
++sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out)
++{
++	if (!gpu_ready) {
++		return -1;
++	}
++	lck_mtx_lock(&sweet_gpu_lock);
++	int rc = a6_submit_ib(&gpu, ib_iova, dwords, timeout_ms ? timeout_ms : 1000);
++	if (rc) {
++		uint64_t far;
++		uint32_t syn, fsr = a6_fault_status(&gpu, &far, &syn);
++		a6_log("user submit: ib %llx %u dwords: timeout or fault (smmu fsr %x far %llx fsynr0 %x)\n",
++		    ib_iova, dwords, fsr, far, syn);
++		(void)a6_clear_fault(&gpu);
++	}
++	*fence_out = gpu.fence;
++	lck_mtx_unlock(&sweet_gpu_lock);
++	return rc;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index 5464cdfb6..385a3b728 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -10,11 +10,35 @@
+  *
+  * Boot-arg sweetmtl=1 publishes it; without it Metal finds no device and
+  * Core Animation keeps its software renderer.
++ *
++ * User client (IOServiceOpen type 0), scalar in/out:
++ *   0 info            -> [gpu_id, chip_id, ready]
++ *   1 buffer alloc    [size] -> [handle, gpu_va, size]  zeroed, wired, cleaned; map it into the task
++ *                     with IOConnectMapMemory64(type = handle): cacheable, so userland does the cache
++ *                     maintenance (the GPU does not snoop)
++ *   2 buffer free     [handle]                          (the GPU VA is not reused yet)
++ *   3 surface import  [IOSurface id] -> [handle, gpu_va, size]  the surface's pages, wired
++ *   4 submit          [ib_gpu_va, dwords, timeout_ms] -> [fence]  runs the IB and waits for it
++ *   5 cache flush     [handle, offset, length]  clean+invalidate through the kernel mapping: before
++ *                     a submit for what the CPU wrote, after it for what the CPU will read
++ *                     (sys_dcache_flush does nothing on iOS: Apple GPUs are coherent)
++ * Buffers belong to the client and go with it.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <pexpert/pexpert.h>
++#include "SweetSurface.h"
++
++extern "C" {
++bool sweet_gpu_ready(void);
++int sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size);
++int sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out);
++void flush_dcache64(addr64_t addr, unsigned count, int phys);
++}
+ 
+ class IOAcceleratorES : public IOService {
+ 	OSDeclareDefaultStructors(IOAcceleratorES);
+@@ -50,8 +74,239 @@ SweetAccelerator::start(IOService *provider)
+ 	setProperty("MetalPluginClassName", "SweetMTLDevice");
+ 	setProperty("IOGLBundleName", "SweetMetal");
+ 	setProperty("model", "Adreno 640");
++	setProperty(kIOUserClientClassKey, "SweetAcceleratorUserClient");
+ 	registerService();
+ 	IOLog("SWEET MTL: IOAcceleratorES published (MetalPluginName SweetMetal)\n");
+ 	return true;
+ }
++
++/* ---- user client ---- */
++
++#define SWEET_MTL_MAX_BUFFERS   4096
++
++class SweetAcceleratorUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetAcceleratorUserClient);
++
++	task_t   fTask;
++	IOLock  *fLock;
++	OSArray *fMem;          /* index + 1 = handle; IOMemoryDescriptor, or kOSBooleanFalse once freed */
++	OSArray *fMaps;         /* same index: the kernel IOMemoryMap, for cache maintenance */
++
++	int addMemory(IOMemoryDescriptor *md, uint64_t *handle, uint64_t *va);
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetAcceleratorUserClient, IOUserClient);
++
++bool
++SweetAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fTask = owningTask;
++	fLock = IOLockAlloc();
++	fMem = OSArray::withCapacity(64);
++	fMaps = OSArray::withCapacity(64);
++	return fLock != NULL && fMem != NULL && fMaps != NULL;
++}
++
++IOReturn
++SweetAcceleratorUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++SweetAcceleratorUserClient::free(void)
++{
++	if (fMem != NULL) {
++		for (unsigned i = 0; i < fMem->getCount(); i++) {
++			IOMemoryDescriptor *md = OSDynamicCast(IOMemoryDescriptor, fMem->getObject(i));
++			if (md != NULL) {
++				md->complete();
++			}
++		}
++	}
++	OSSafeReleaseNULL(fMem);
++	OSSafeReleaseNULL(fMaps);
++	if (fLock != NULL) {
++		IOLockFree(fLock);
++		fLock = NULL;
++	}
++	IOUserClient::free();
++}
++
++/* Wire md, clean it, map its pages into the GPU, keep it. */
++int
++SweetAcceleratorUserClient::addMemory(IOMemoryDescriptor *md, uint64_t *handle, uint64_t *va)
++{
++	static uint64_t pages[8192];
++	uint64_t len = md->getLength();
++	if (len == 0 || len > sizeof(pages) / sizeof(pages[0]) * PAGE_SIZE || md->prepare() != kIOReturnSuccess) {
++		return -1;
++	}
++	IOLockLock(fLock);
++	uint32_t n = 0;
++	bool ok = fMem->getCount() < SWEET_MTL_MAX_BUFFERS;
++	for (uint64_t off = 0; ok && off < len; off += PAGE_SIZE) {
++		IOByteCount seg = 0;
++		addr64_t pa = md->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
++		ok = pa != 0 && (pa & PAGE_MASK) == 0;
++		pages[n++] = pa;
++	}
++	/* Clean the CPU's view to memory through a kernel mapping (the GPU does not snoop). */
++	IOMemoryMap *km = ok ? md->map() : NULL;
++	if (km != NULL) {
++		flush_dcache64((addr64_t)km->getVirtualAddress(), (unsigned)len, FALSE);
++	}
++	if (!ok || km == NULL || sweet_gpu_map_user(va, pages, n, PAGE_SIZE)) {
++		IOLockUnlock(fLock);
++		OSSafeReleaseNULL(km);
++		md->complete();
++		return -1;
++	}
++	fMaps->setObject(km);
++	km->release();
++	fMem->setObject(md);
++	*handle = fMem->getCount();
++	IOLockUnlock(fLock);
++	return 0;
++}
++
++IOReturn
++SweetAcceleratorUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
++{
++	IOLockLock(fLock);
++	IOMemoryDescriptor *md = type >= 1 && type <= fMem->getCount() ?
++	    OSDynamicCast(IOMemoryDescriptor, fMem->getObject(type - 1)) : NULL;
++	if (md != NULL) {
++		md->retain();
++	}
++	IOLockUnlock(fLock);
++	if (md == NULL) {
++		return kIOReturnBadArgument;
++	}
++	/*
++	 * Default (cacheable) mapping. A write-combined one panicked
++	 * "phystokv_range: illegal PA 0xf87e8000" for page 0x1f87e8000: the cache
++	 * mode change cleans pages by a 32-bit-truncated physical address. The
++	 * GPU does not snoop, so userland cleans what it wrote (sys_dcache_flush)
++	 * before a submit and invalidates what it reads after.
++	 */
++	*options = (*options & ~kIOMapCacheMask) | kIOMapDefaultCache;
++	*memory = md;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	const uint64_t *in = args->scalarInput;
++	uint64_t *out = args->scalarOutput;
++	uint32_t nin = args->scalarInputCount;
++
++	switch (selector) {
++	case 0:
++		if (args->scalarOutputCount < 3) {
++			return kIOReturnBadArgument;
++		}
++		out[0] = 640;
++		out[1] = 0x06040001;
++		out[2] = sweet_gpu_ready();
++		return kIOReturnSuccess;
++	case 1: {
++		if (nin < 1 || args->scalarOutputCount < 3 || in[0] == 0 || in[0] > (1ULL << 30)) {
++			return kIOReturnBadArgument;
++		}
++		uint64_t size = round_page_64(in[0]);
++		IOBufferMemoryDescriptor *bmd = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared, size, PAGE_SIZE);
++		if (bmd == NULL) {
++			return kIOReturnNoMemory;
++		}
++		bzero(bmd->getBytesNoCopy(), size);
++		uint64_t handle = 0, va = 0;
++		int rc = addMemory(bmd, &handle, &va);
++		bmd->release();
++		if (rc) {
++			return kIOReturnNoResources;
++		}
++		out[0] = handle;
++		out[1] = va;
++		out[2] = size;
++		return kIOReturnSuccess;
++	}
++	case 2: {
++		if (nin < 1) {
++			return kIOReturnBadArgument;
++		}
++		IOLockLock(fLock);
++		IOMemoryDescriptor *md = in[0] >= 1 && in[0] <= fMem->getCount() ?
++		    OSDynamicCast(IOMemoryDescriptor, fMem->getObject((unsigned)in[0] - 1)) : NULL;
++		if (md != NULL) {
++			md->complete();
++			fMem->replaceObject((unsigned)in[0] - 1, kOSBooleanFalse);
++			fMaps->replaceObject((unsigned)in[0] - 1, kOSBooleanFalse);
++		}
++		IOLockUnlock(fLock);
++		return md != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
++	}
++	case 3: {
++		if (nin < 1 || args->scalarOutputCount < 3) {
++			return kIOReturnBadArgument;
++		}
++		SweetSurface *s = sweet_surface_copy((uint32_t)in[0]);
++		if (s == NULL || s->memory == NULL) {
++			OSSafeReleaseNULL(s);
++			return kIOReturnNotFound;
++		}
++		uint64_t handle = 0, va = 0;
++		int rc = addMemory(s->memory, &handle, &va);
++		out[2] = s->memory->getLength();
++		s->release();
++		if (rc) {
++			return kIOReturnNoResources;
++		}
++		out[0] = handle;
++		out[1] = va;
++		return kIOReturnSuccess;
++	}
++	case 4: {
++		if (nin < 3 || args->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		uint32_t fence = 0;
++		int rc = sweet_gpu_submit_user(in[0], (uint32_t)in[1], (uint32_t)in[2], &fence);
++		out[0] = fence;
++		return rc ? kIOReturnTimeout : kIOReturnSuccess;
++	}
++	case 5: {
++		if (nin < 3) {
++			return kIOReturnBadArgument;
++		}
++		IOLockLock(fLock);
++		IOMemoryMap *km = in[0] >= 1 && in[0] <= fMaps->getCount() ?
++		    OSDynamicCast(IOMemoryMap, fMaps->getObject((unsigned)in[0] - 1)) : NULL;
++		IOReturn ret = kIOReturnBadArgument;
++		if (km != NULL && in[1] < km->getLength() && in[2] <= km->getLength() - in[1]) {
++			flush_dcache64((addr64_t)(km->getVirtualAddress() + in[1]), (unsigned)in[2], FALSE);
++			ret = kIOReturnSuccess;
++		}
++		IOLockUnlock(fLock);
++		return ret;
++	}
++	default:
++		return kIOReturnUnsupported;
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e05b618b2..fde881c80 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -43,8 +43,8 @@ extern "C" {
+ bool sweet_gpu_ready(void);
+ int sweet_gpu_surface_slot(uint64_t key);
+ int sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint32_t page_size);
+-int sweet_gpu_present(int slot, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch, uint32_t fb_pitch,
+-    uint32_t *out_dx, uint32_t *out_dw);
++int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch,
++    uint32_t fb_pitch, uint32_t *out_dx, uint32_t *out_dw);
+ void sweet_gpu_panel_stride(uint32_t stride);
+ extern int sweet_display_fit_x, sweet_display_fit_w;
+ }
+@@ -441,7 +441,8 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 		IOLog("SWEET FB: frames now scaled to fit by the GPU (panel stride %u)\n", fRowBytes);
+ 	}
+ 	uint32_t dx = 0, dw = 0;
+-	int rc = sweet_gpu_present(slot, s->offset, s->width, s->height, s->bytesPerRow, fRowBytes, &dx, &dw);
++	int rc = sweet_gpu_present(slot, s->kernelAddress(), s->offset, s->width, s->height, s->bytesPerRow,
++	    fRowBytes, &dx, &dw);
+ 	s->release();
+ 	if (rc) {
+ 		return gpu_fallback(7, "GPU blit failed");

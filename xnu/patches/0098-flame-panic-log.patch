@@ -1,0 +1,67 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 032adc884..56a44fa30 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -882,7 +882,8 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ /*
+  * Command server on 192.168.7.2:5141 (UDP): each datagram is poke script
+  * text (bsd/dev/sweet_poke.c: r/w/m/p/s lines), run at once in this
+- * thread, results in the console (and so in the live log); "reboot" resets
++ * thread, results in the console (and so in the live log); "panic" panics
++ * (to test the panic path); "reboot" resets
+  * the phone with PSCI (the shim already set the PMIC reason to
+  * bootloader, so it lands in fastboot). tools/flame-cmd.py sends them.
+  */
+@@ -934,6 +935,10 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 				continue;
+ 			}
+ 		}
++		if (strncmp(cmd, "panic", 5) == 0) {
++			/* Tests the panic path: backtraces must reach the persistent log. */
++			panic("SWEET CMD: panic requested over USB");
++		}
+ 		if (strncmp(cmd, "reboot", 6) == 0) {
+ 			ud_sleep_ms(1000);      /* let HFS finish the journal writes */
+ 			printf("SWEET CMD: rebooting (PSCI SYSTEM_RESET)\n");
+diff --git a/osfmk/kern/printf.c b/osfmk/kern/printf.c
+index e44008f87..dd6f204c9 100644
+--- a/osfmk/kern/printf.c
++++ b/osfmk/kern/printf.c
+@@ -908,12 +908,26 @@ vprintf(const char *fmt, va_list ap)
+ 	return vprintf_internal(fmt, ap, __builtin_return_address(0));
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * The paniclog (backtraces, register dumps) bypasses the console's log ring
++ * (unbuffered output, or console output disabled): put it in the persistent
++ * log ring too (bsd/dev/sweet_ufs.c, lock-free), so the RAM rescue keeps it.
++ */
++extern void sweet_log_append(const char *c, int size);
++#endif
++
+ void
+ consdebug_putc(char c)
+ {
+ 	if (!disableConsoleOutput) {
+ 		console_write_char(c);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	else {
++		sweet_log_append(&c, 1);
++	}
++#endif
+ 
+ 	debug_putc(c);
+ 
+@@ -928,6 +942,10 @@ consdebug_putc_unbuffered(char c)
+ 	if (!disableConsoleOutput) {
+ 		console_write_unbuffered(c);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* console_write_unbuffered goes straight to _cnputc, past the log ring in _cnputs. */
++	sweet_log_append(&c, 1);
++#endif
+ 
+ 	debug_putc(c);
+ 

@@ -1,0 +1,700 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 663013104..fe43a3be4 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/sweet_fts.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+new file mode 100644
+index 000000000..1778d6d0f
+--- /dev/null
++++ b/bsd/dev/sweet_fts.c
+@@ -0,0 +1,585 @@
++/*
++ * flame (Pixel 4) touch: ST FTM5 (FTS) on GENI SPI SE4 (QUPv3 wrapper 0).
++ * Call once after the scheduler is running; all work runs on one thread.
++ *
++ * Sources: the live DT (spi@890000/touchscreen@0) and Google's driver
++ * (kernel/google-modules/touch/fts_touch, ftm5/). The IC keeps its firmware
++ * in flash; nothing is written to it except system reset and scan mode.
++ * Needs ABL/XBL-loaded GENI SPI firmware on SE4 and FIFO (not GSI) mode.
++ * The SPI bus is shared with the SLPI (touch bus negotiator); the SLPI never
++ * runs under XNU, so the AP simply takes it (switch GPIO 126 low).
++ * Boot-args: flametouch=0 off, flametouchdelay=N start after N s,
++ * flametouchlog=1 log every event.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_fts_init(void);
++
++#define FTS_SE_PA       0x00890000u     /* spi@890000, QUPv3 0 SE4 */
++#define FTS_GCC_PA      0x00100000u
++#define FTS_SOUTH_PA    0x03d00000u     /* TLMM 0x3000000 + SOUTH tile */
++#define FTS_GCC_VOTE    0x5200cu        /* APCS_CLOCK_BRANCH_ENA_VOTE_1 */
++/* wrap0 m_ahb (6), s_ahb (7), core/core2x (8, 9), s4 (14): gcc-sm8150.c */
++#define FTS_GCC_BITS    ((0xfu << 6) | (1u << 14))
++#define FTS_RCG         0x17608u        /* gcc_qupv3_wrap0_s4_clk_src */
++#define FTS_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
++#define FTS_GPIO_IO(n)  (FTS_GPIO_CFG(n) + 4u)
++#define FTS_PIN_MISO    51              /* 51-54 = qup4 (function 1) */
++#define FTS_PIN_IRQ     122
++#define FTS_PIN_SWITCH  126             /* 0 = AP owns the bus, 1 = SLPI */
++#define FTS_PIN_RESET   127
++#define FTS_PIN_RATE    128             /* display refresh: 1 = 90 Hz */
++#define FTS_MAX         10u
++
++#define SE_STATUS       0x040u
++#define SE_MCLK         0x048u
++#define SE_FIFO_OFF     0x064u
++#define SE_FW           0x068u
++#define SE_CLK_SEL      0x07cu
++#define SE_SPI_CPHA     0x224u
++#define SE_SPI_LOOP     0x22cu
++#define SE_SPI_CPOL     0x230u
++#define SE_SPI_INV      0x24cu
++#define SE_SPI_DEMUX    0x250u
++#define SE_DMA          0x258u
++#define SE_SPI_TRANS    0x25cu
++#define SE_SPI_WORD     0x268u
++#define SE_TX_LEN       0x26cu
++#define SE_RX_LEN       0x270u
++#define SE_SPI_DELAY    0x278u
++#define SE_CMD          0x600u
++#define SE_CTRL         0x604u
++#define SE_IRQ          0x610u
++#define SE_IRQ_EN       0x614u
++#define SE_IRQ_CLR      0x618u
++#define SE_TX           0x700u
++#define SE_RX           0x780u
++#define SE_TX_COUNT     0x800u
++#define SE_RX_COUNT     0x804u
++#define SE_TX_WM        0x80cu
++#define SE_HW_TX        0xe24u
++#define SE_HW_RX        0xe28u
++#define SE_DONE         (1u << 0)
++#define SE_RX_WM_IRQ    (1u << 26)
++#define SE_RX_LAST      (1u << 27)
++#define SE_TX_WM_IRQ    (1u << 30)
++#define SE_ERRORS       (0x3eu | (3u << 28))
++#define SE_EVENTS       (SE_DONE | SE_ERRORS | SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ)
++#define SPI_FULL_DUPLEX 3u
++/* se_config_packing(8, 4, msb_first): as the Redmi I2C (sweet_touch.c). */
++#define SE_PACK0        0x0007f8feu
++#define SE_PACK1        0x000ffefeu
++
++/* FTM5 SPI protocol (ftsHardware.h / ftsSoftware.h, SPI variant). */
++#define FTS_CMD_HW_R    0xfbu
++#define FTS_CMD_HW_W    0xfau
++#define FTS_CMD_FIFO    0x87u
++#define FTS_CMD_SCAN    0xa0u
++#define FTS_ADDR_CHIPID 0x20000000u
++#define FTS_ADDR_RESET  0x20000024u
++#define FTS_EVT_NONE    0x00u
++#define FTS_EVT_READY   0x03u
++#define FTS_EVT_ENTER   0x13u
++#define FTS_EVT_MOTION  0x23u
++#define FTS_EVT_LEAVE   0x33u
++#define FTS_EVT_ERROR   0xf3u
++
++static struct {
++	vm_offset_t se, gcc, gpio;
++	bool started, dead;
++	int log;
++	unsigned fifo_words;
++	uint32_t active;
++	int x[FTS_MAX], y[FTS_MAX];
++} ft;
++static int fts_sleep_chan;
++
++static uint32_t
++fts_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++fts_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++fts_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&fts_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++fts_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(fts_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* TLMM: [1:0] pull, [5:2] function, [8:6] drive (mA/2 - 1), [9] output. */
++static void
++fts_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++{
++	uint32_t off = FTS_GPIO_CFG(pin);
++	if (out) {
++		fts_wr(ft.gpio, FTS_GPIO_IO(pin),
++		    (fts_rd(ft.gpio, FTS_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++	}
++	uint32_t cfg = fts_rd(ft.gpio, off) & ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	fts_wr(ft.gpio, off, cfg);
++}
++
++static bool
++fts_clocks(void)
++{
++	fts_wr(ft.gcc, FTS_GCC_VOTE, fts_rd(ft.gcc, FTS_GCC_VOTE) | FTS_GCC_BITS);
++	uint32_t cmd = fts_rd(ft.gcc, FTS_RCG), cfg = fts_rd(ft.gcc, FTS_RCG + 4u);
++	uint32_t dfs = fts_rd(ft.gcc, FTS_RCG + 0x14u);
++	printf("SWEET FTS: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
++	    fts_rd(ft.gcc, FTS_GCC_VOTE), cmd, cfg, dfs);
++	if (dfs & 1u) {
++		/* CLK_SEL 0 picks DFS level 0; it must be XO (19.2 MHz) undivided. */
++		cfg = fts_rd(ft.gcc, FTS_RCG + 0x1cu);
++		printf("SWEET FTS: DFS level0 cfg=%#x\n", cfg);
++		if ((cfg & 0x371fu) != 1u) {
++			printf("SWEET FTS: DFS level 0 is not XO/1; stopping\n");
++			return false;
++		}
++	} else {
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
++		fts_wr(ft.gcc, FTS_RCG + 4u, cfg);
++		fts_wr(ft.gcc, FTS_RCG, fts_rd(ft.gcc, FTS_RCG) | 1u);
++		if (!fts_wait_clear(ft.gcc, FTS_RCG, 1u)) {
++			printf("SWEET FTS: RCG update timeout\n");
++			return false;
++		}
++	}
++	/* Branch halt bits: wrap0 m_ahb, s_ahb, s4. */
++	const uint32_t branches[] = {0x17004, 0x17008, 0x17604};
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		if (!fts_wait_clear(ft.gcc, branches[i], 1u << 31)) {
++			printf("SWEET FTS: GCC branch %#x halted (%#x)\n", branches[i],
++			    fts_rd(ft.gcc, branches[i]));
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool
++fts_se_init(void)
++{
++	uint32_t fw = fts_rd(ft.se, SE_FW);
++	uint32_t tx = fts_rd(ft.se, SE_HW_TX), rx = fts_rd(ft.se, SE_HW_RX);
++	printf("SWEET FTS: se4 fw=%#x proto=%u status=%#x fifo-off=%#x tx=%#x rx=%#x\n",
++	    fw, (fw >> 8) & 0xffu, fts_rd(ft.se, SE_STATUS), fts_rd(ft.se, SE_FIFO_OFF), tx, rx);
++	/* Protocol 1 = SPI; 32-bit FIFO words. */
++	if (((fw >> 8) & 0xffu) != 1u || (fts_rd(ft.se, SE_FIFO_OFF) & 1u) ||
++	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
++	    ((tx >> 16) & 0x3fu) < 4u || ((rx >> 16) & 0x3fu) < 4u) {
++		printf("SWEET FTS: need ABL-loaded SPI firmware and 32-bit FIFOs; stopping\n");
++		return false;
++	}
++	if (fts_rd(ft.se, SE_STATUS) & 0x1001u) {
++		printf("SWEET FTS: SE4 already busy; stopping\n");
++		return false;
++	}
++	ft.fifo_words = (tx >> 16) & 0x3fu;
++	if (((rx >> 16) & 0x3fu) < ft.fifo_words) {
++		ft.fifo_words = (rx >> 16) & 0x3fu;
++	}
++	/* geni_se_init + FIFO mode, polled (no GSI, no IRQ routing). */
++	fts_wr(ft.se, 0xe18, 0);
++	fts_wr(ft.se, 0xe1c, 0);
++	fts_wr(ft.se, 0x644, 0);
++	fts_wr(ft.se, SE_IRQ_CLR, 0xffffffffu);
++	fts_wr(ft.se, 0x648, 0xffffffffu);
++	fts_wr(ft.se, SE_DMA, 0);
++	fts_wr(ft.se, 0x28, fts_rd(ft.se, 0x28) | 0x7fu);
++	fts_wr(ft.se, 0xe30, fts_rd(ft.se, 0xe30) | 0x0fu);
++	fts_wr(ft.se, 0x24, 0x7f);
++	fts_wr(ft.se, 0x20, 1);
++	/* SPI mode 0, CS0, no loopback; 19.2 MHz / 4 = 4.8 MHz (IC max 10). */
++	fts_wr(ft.se, SE_SPI_LOOP, fts_rd(ft.se, SE_SPI_LOOP) & ~3u);
++	fts_wr(ft.se, SE_SPI_DEMUX, 0);
++	fts_wr(ft.se, SE_SPI_CPHA, fts_rd(ft.se, SE_SPI_CPHA) & ~1u);
++	fts_wr(ft.se, SE_SPI_CPOL, fts_rd(ft.se, SE_SPI_CPOL) & ~4u);
++	fts_wr(ft.se, SE_SPI_INV, 0);
++	fts_wr(ft.se, SE_CLK_SEL, 0);
++	fts_wr(ft.se, SE_MCLK, (4u << 4) | 1u);
++	fts_wr(ft.se, SE_SPI_DELAY, 0);
++	fts_wr(ft.se, SE_SPI_WORD, (fts_rd(ft.se, SE_SPI_WORD) & ~0x3ffu) | (8u - 4u));
++	fts_wr(ft.se, SE_SPI_TRANS, fts_rd(ft.se, SE_SPI_TRANS) & ~1u); /* no CS toggle */
++	fts_wr(ft.se, 0x254, 0);
++	fts_wr(ft.se, 0x260, SE_PACK0);
++	fts_wr(ft.se, 0x264, SE_PACK1);
++	fts_wr(ft.se, 0x284, SE_PACK0);
++	fts_wr(ft.se, 0x288, SE_PACK1);
++	fts_wr(ft.se, SE_TX_WM, 0);
++	fts_wr(ft.se, 0x810, 0);
++	fts_wr(ft.se, 0x814, ((rx >> 16) & 0x3fu) - 2u);
++	fts_wr(ft.se, SE_IRQ_EN, SE_EVENTS);
++	if ((fts_rd(ft.se, SE_TX_COUNT) & 0xfffffffu) ||
++	    (fts_rd(ft.se, SE_RX_COUNT) & 0x1ffffffu)) {
++		printf("SWEET FTS: inherited FIFO data; stopping\n");
++		return false;
++	}
++	return true;
++}
++
++static void
++fts_abort(void)
++{
++	fts_wr(ft.se, SE_CTRL, 2);
++	bool done = false;
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (fts_rd(ft.se, SE_IRQ) & (1u << 5)) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	for (unsigned i = 0; i < 64 && (fts_rd(ft.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)fts_rd(ft.se, SE_RX);
++	}
++	fts_wr(ft.se, SE_IRQ_CLR, 0xffffffffu);
++	if (!done || !fts_wait_clear(ft.se, SE_STATUS, 1u)) {
++		ft.dead = true;
++		printf("SWEET FTS: abort failed status=%#x irq=%#x; stopping\n",
++		    fts_rd(ft.se, SE_STATUS), fts_rd(ft.se, SE_IRQ));
++	}
++}
++
++/*
++ * One full-duplex transfer with CS held: the FTS write-then-read messages
++ * are tx bytes followed by clocked-in rx bytes, so rx[i] lines up with
++ * buf[i]. Bounded by one FIFO fill in each direction.
++ */
++static int
++fts_xfer(uint8_t *buf, unsigned len)
++{
++	unsigned words = (len + 3u) / 4u, sent = 0, got = 0;
++	if (ft.dead || len == 0 || words > ft.fifo_words) {
++		return EIO;
++	}
++	if (!fts_wait_clear(ft.se, SE_STATUS, 1u)) {
++		ft.dead = true;
++		return EBUSY;
++	}
++	fts_wr(ft.se, SE_IRQ_CLR, 0xffffffffu);
++	fts_wr(ft.se, SE_TX_LEN, len);
++	fts_wr(ft.se, SE_RX_LEN, len);
++	fts_wr(ft.se, SE_TX_WM, 1);
++	fts_wr(ft.se, SE_CMD, SPI_FULL_DUPLEX << 27);
++	for (unsigned i = 0; i < 20000; ++i) {
++		uint32_t irq = fts_rd(ft.se, SE_IRQ);
++		if (irq & SE_ERRORS) {
++			printf("SWEET FTS: xfer error irq=%#x\n", irq);
++			break;
++		}
++		if (!sent && (irq & SE_TX_WM_IRQ)) {
++			for (unsigned w = 0; w < words; ++w) {
++				uint32_t word = 0;
++				for (unsigned j = 0; j < 4 && w * 4u + j < len; ++j) {
++					word |= (uint32_t)buf[w * 4u + j] << (8u * j);
++				}
++				fts_wr(ft.se, SE_TX, word);
++			}
++			sent = len;
++			fts_wr(ft.se, SE_TX_WM, 0);
++		}
++		uint32_t count = fts_rd(ft.se, SE_RX_COUNT) & 0x1ffffffu;
++		while (count-- && got < len) {
++			uint32_t word = fts_rd(ft.se, SE_RX);
++			for (unsigned j = 0; j < 4 && got < len; ++j) {
++				buf[got++] = (uint8_t)(word >> (8u * j));
++			}
++		}
++		if (irq & SE_DONE) {
++			fts_wr(ft.se, SE_IRQ_CLR, irq);
++			if (got == len && sent == len) {
++				return 0;
++			}
++			if (sent == len) {
++				continue; /* final RX words may land after DONE */
++			}
++			break;
++		}
++		fts_wr(ft.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
++		delay(1);
++	}
++	printf("SWEET FTS: xfer len=%u sent=%u got=%u irq=%#x status=%#x\n", len, sent, got,
++	    fts_rd(ft.se, SE_IRQ), fts_rd(ft.se, SE_STATUS));
++	fts_abort();
++	return EIO;
++}
++
++/* HW register read: FB addr[4] then one dummy byte, then data. */
++static int
++fts_reg_read(uint32_t addr, uint8_t *out, unsigned n)
++{
++	uint8_t buf[32] = {FTS_CMD_HW_R, (uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
++		               (uint8_t)(addr >> 8), (uint8_t)addr};
++	if (n > sizeof(buf) - 6u) {
++		return EINVAL;
++	}
++	int err = fts_xfer(buf, 6u + n);
++	if (!err) {
++		memcpy(out, buf + 6, n);
++	}
++	return err;
++}
++
++static int
++fts_reg_write(uint32_t addr, const uint8_t *data, unsigned n)
++{
++	uint8_t buf[16] = {FTS_CMD_HW_W, (uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
++		               (uint8_t)(addr >> 8), (uint8_t)addr};
++	if (n > sizeof(buf) - 5u) {
++		return EINVAL;
++	}
++	memcpy(buf + 5, data, n);
++	return fts_xfer(buf, 5u + n);
++}
++
++/* One FIFO event: 0x87, a dummy byte, then 8 event bytes. */
++static int
++fts_event(uint8_t ev[8])
++{
++	uint8_t buf[10] = {FTS_CMD_FIFO};
++	int err = fts_xfer(buf, sizeof(buf));
++	if (!err) {
++		memcpy(ev, buf + 2, 8);
++	}
++	return err;
++}
++
++static void
++fts_log_event(const char *what, const uint8_t ev[8])
++{
++	printf("SWEET FTS: %s %02x %02x %02x %02x %02x %02x %02x %02x\n", what,
++	    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
++}
++
++/* Poll the FIFO for an event id, logging what else comes by. */
++static int
++fts_wait_event(uint8_t id, unsigned ms)
++{
++	uint8_t ev[8];
++	for (unsigned t = 0; t < ms; t += 5) {
++		int err = fts_event(ev);
++		if (err) {
++			return err;
++		}
++		if (ev[0] != FTS_EVT_NONE && ev[0] != 0xffu) {
++			fts_log_event("event", ev);
++			if (ev[0] == id) {
++				return 0;
++			}
++		} else {
++			fts_wait(5);
++		}
++	}
++	return ETIMEDOUT;
++}
++
++static void
++fts_handle(const uint8_t ev[8])
++{
++	unsigned id = ev[1] >> 4;
++	if (ft.log) {
++		fts_log_event("touch", ev);
++	}
++	if (id >= FTS_MAX) {
++		return;
++	}
++	int x = ((ev[3] & 0x0f) << 8) | ev[2];
++	int y = (ev[4] << 4) | (ev[3] >> 4);
++	switch (ev[0]) {
++	case FTS_EVT_ENTER:
++	case FTS_EVT_MOTION:
++		ft.active |= 1u << id;
++		ft.x[id] = x;
++		ft.y[id] = y;
++		sweet_hid_touch((int)id, 1, x, y);
++		break;
++	case FTS_EVT_LEAVE:
++		if (ft.active & (1u << id)) {
++			ft.active &= ~(1u << id);
++			sweet_hid_touch((int)id, 0, ft.x[id], ft.y[id]);
++		}
++		break;
++	case FTS_EVT_ERROR:
++		fts_log_event("error", ev);
++		break;
++	default:
++		break;
++	}
++}
++
++static void
++fts_release_all(void)
++{
++	for (unsigned id = 0; id < FTS_MAX; ++id) {
++		if (ft.active & (1u << id)) {
++			sweet_hid_touch((int)id, 0, ft.x[id], ft.y[id]);
++		}
++	}
++	ft.active = 0;
++}
++
++static void
++fts_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 20;
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("flametouchdelay", &delay_s, sizeof(delay_s));
++	printf("SWEET FTS: starting in %u s\n", delay_s);
++	fts_wait(delay_s * 1000u);
++	ft.gcc = ml_io_map(FTS_GCC_PA, 0x60000);
++	ft.gpio = ml_io_map(FTS_SOUTH_PA, 0x81000);
++	ft.se = ml_io_map(FTS_SE_PA, 0x4000);
++	if (!ft.gcc || !ft.gpio || !ft.se) {
++		printf("SWEET FTS: MMIO mapping failed\n");
++		goto out;
++	}
++	printf("SWEET FTS: TLMM cfg/io miso=%#x/%#x irq=%#x/%#x switch=%#x/%#x reset=%#x/%#x\n",
++	    fts_rd(ft.gpio, FTS_GPIO_CFG(FTS_PIN_MISO)), fts_rd(ft.gpio, FTS_GPIO_IO(FTS_PIN_MISO)),
++	    fts_rd(ft.gpio, FTS_GPIO_CFG(FTS_PIN_IRQ)), fts_rd(ft.gpio, FTS_GPIO_IO(FTS_PIN_IRQ)),
++	    fts_rd(ft.gpio, FTS_GPIO_CFG(FTS_PIN_SWITCH)), fts_rd(ft.gpio, FTS_GPIO_IO(FTS_PIN_SWITCH)),
++	    fts_rd(ft.gpio, FTS_GPIO_CFG(FTS_PIN_RESET)), fts_rd(ft.gpio, FTS_GPIO_IO(FTS_PIN_RESET)));
++	/* Hold the IC in reset while the rails come up (FTI: DVDD, then AVDD). */
++	fts_gpio(FTS_PIN_RESET, 0, 0, 0, true, false);
++	fts_gpio(FTS_PIN_IRQ, 0, 0, 0, false, false);
++	fts_gpio(FTS_PIN_SWITCH, 0, 0, 0, true, false);
++	fts_gpio(FTS_PIN_RATE, 0, 0, 0, true, false);
++	int err = sweet_rpmh_vreg_enable("ldoa14", 1800);
++	if (!err) {
++		fts_wait(1);
++		err = sweet_rpmh_vreg_enable("ldoa17", 2856);
++	}
++	if (err) {
++		printf("SWEET FTS: rail enable failed %d; stopping\n", err);
++		goto out;
++	}
++	fts_wait(5);
++	if (!fts_clocks()) {
++		goto out;
++	}
++	for (unsigned pin = FTS_PIN_MISO; pin < FTS_PIN_MISO + 4; ++pin) {
++		fts_gpio(pin, 1, 0, 2, false, false); /* qup4, 6 mA, no pull */
++	}
++	if (!fts_se_init()) {
++		goto out;
++	}
++	fts_wait(10);
++	fts_gpio(FTS_PIN_RESET, 0, 0, 0, true, true);
++	err = fts_wait_event(FTS_EVT_READY, 1000);
++	printf("SWEET FTS: after reset pin: ready err=%d irq-pin=%u\n", err,
++	    fts_rd(ft.gpio, FTS_GPIO_IO(FTS_PIN_IRQ)) & 1u);
++	uint8_t id[4] = {0};
++	int ierr = fts_reg_read(FTS_ADDR_CHIPID, id, sizeof(id));
++	printf("SWEET FTS: chip id err=%d %02x %02x fw %02x %02x (want 36 39)\n",
++	    ierr, id[0], id[1], id[2], id[3]);
++	if (ierr || ft.dead) {
++		goto out;
++	}
++	if (err) {
++		/* No ready event after the pin reset: try the register reset. */
++		const uint8_t rst = 0x81;
++		err = fts_reg_write(FTS_ADDR_RESET, &rst, 1);
++		if (!err) {
++			err = fts_wait_event(FTS_EVT_READY, 1000);
++		}
++		printf("SWEET FTS: system reset: ready err=%d\n", err);
++	}
++	/* Sense on: scan mode active, all scans the config supports. */
++	uint8_t scan[3] = {FTS_CMD_SCAN, 0x00, 0xff};
++	err = fts_xfer(scan, sizeof(scan));
++	printf("SWEET FTS: sense on err=%d; polling every 8 ms\n", err);
++	if (err) {
++		goto out;
++	}
++	unsigned errors = 0, events = 0, ticks = 0;
++	while (!ft.dead) {
++		uint8_t ev[8];
++		/* The IRQ line (active low) says the FIFO holds events; also read
++		 * every ~100 ms in case the line does not work as assumed. */
++		bool poll = (++ticks % 12u) == 0;
++		while ((poll || !(fts_rd(ft.gpio, FTS_GPIO_IO(FTS_PIN_IRQ)) & 1u)) && !ft.dead) {
++			poll = false;
++			if (fts_event(ev)) {
++				if ((errors++ % 100u) == 0) {
++					printf("SWEET FTS: read error (%u)\n", errors);
++				}
++				break;
++			}
++			if (ev[0] == FTS_EVT_NONE || ev[0] == 0xffu) {
++				break;
++			}
++			if (events++ < 32 && !ft.log) {
++				fts_log_event("first", ev);
++			}
++			fts_handle(ev);
++		}
++		fts_wait(8);
++	}
++	fts_release_all();
++out:
++	printf("SWEET FTS: thread exits\n");
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_fts_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	if (ft.started) {
++		return;
++	}
++	ft.started = true;
++	(void)PE_parse_boot_argn("flametouch", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("flametouchlog", &ft.log, sizeof(ft.log));
++	if (!enabled) {
++		printf("SWEET FTS: disabled (flametouch=0)\n");
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(fts_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET FTS: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 4da50d882..1c606d87f 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -320,7 +320,7 @@ rh_send(uint32_t address, unsigned mv)
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: ACTIVE vote complete (rail voltage requires hardware verification)\n");
+ 	return 0;
+ }
+ 
+@@ -328,8 +328,12 @@ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+ 	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	/* Redmi touch L11C; flame touch L14A (DVDD) and L17A (AVDD), DT ranges. */
++	bool ok = res && ((!strcmp(res, "ldoc11") && mv >= 2950 && mv <= 3400) ||
++	    (!strcmp(res, "ldoa14") && mv >= 1800 && mv <= 1840) ||
++	    (!strcmp(res, "ldoa17") && mv >= 2856 && mv <= 3008));
++	if (!ok) {
++		printf("SWEET RPMH: %s %u mV is not an allowed touch rail\n", res ? res : "?", mv);
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe00..d8a46b72e 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void sweet_fts_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -659,6 +660,7 @@ sweet_ufs_init(void)
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
++	sweet_fts_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49da9..5d4c63758 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -356,6 +356,9 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+  * app-switcher gesture.
+  */
+ #define SWEET_TOUCH_EDGE_PX 48
++/* Touch reports panel pixels; flame's panel is 1080x2280 (SWEET.h). */
++#define SWEET_PANEL_W 1080
++#define SWEET_PANEL_H 2280
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+@@ -435,9 +438,9 @@ SweetHIDTouch::start(IOService *provider)
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	fLogicalH = native ? SWEET_PANEL_H : 2436;
++	fOffX = (fLogicalW - SWEET_PANEL_W) / 2;
++	fOffY = (fLogicalH - SWEET_PANEL_H) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -458,8 +461,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	x = x < 0 ? 0 : (x > SWEET_PANEL_W - 1 ? SWEET_PANEL_W - 1 : x);
++	y = y < 0 ? 0 : (y > SWEET_PANEL_H - 1 ? SWEET_PANEL_H - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+@@ -472,8 +475,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > SWEET_PANEL_W - 1 - SWEET_TOUCH_EDGE_PX ||
++		    y < SWEET_TOUCH_EDGE_PX || y > SWEET_PANEL_H - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);

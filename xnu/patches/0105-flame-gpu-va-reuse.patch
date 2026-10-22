@@ -1,0 +1,276 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 376418ddb..06f5f9d87 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -838,6 +838,29 @@ int a6_map_pages(struct a6_gpu *g, uint64_t iova, const uint64_t *pages, uint32_
+ 	return map_4k(g, iova, npages << l.shift, list_pa, &l);
+ }
+ 
++/* Clear the 4K entries for [iova, iova + size) (tables stay, for the next mapping there). Then a6_tlb_flush. */
++void a6_unmap(struct a6_gpu *g, uint64_t iova, uint64_t size)
++{
++	static const uint64_t zeros[512];
++	uint64_t l1 = a6_pool_pa(g, A6_OFF_GT_L1);
++	uint64_t end = iova + ((size + 0xfff) & ~0xfffull);
++	for (uint64_t va = iova & ~0xfffull; va < end;) {
++		uint64_t e = 0, l2, l3;
++		a6_read(l1 + 8 * ((va >> 30) & 0x1ff), &e, 8);
++		l2 = (e & 3) == 3 ? e & 0xfffffff000ull : 0;
++		e = 0;
++		if (l2)
++			a6_read(l2 + 8 * ((va >> 21) & 0x1ff), &e, 8);
++		l3 = (e & 3) == 3 ? e & 0xfffffff000ull : 0;
++		uint64_t next = (va | 0x1fffffull) + 1;
++		if (next > end)
++			next = end;
++		if (l3)
++			a6_write(l3 + 8 * ((va >> 12) & 0x1ff), zeros, (size_t)((next - va) >> 12) * 8);
++		va = next;
++	}
++}
++
+ void a6_unmap_high(struct a6_gpu *g)
+ {
+ 	static const uint64_t zeros[511];
+diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
+index b50ef3809..a66f15391 100644
+--- a/bsd/dev/sweet_a6xx.h
++++ b/bsd/dev/sweet_a6xx.h
+@@ -95,6 +95,7 @@ uint32_t a6_fence_read(const struct a6_gpu *g);
+ /* 4K pages (AP=01, NC) at iova -> pa; tables from the arena. Then a6_tlb_flush. */
+ int a6_map(struct a6_gpu *g, uint64_t iova, uint64_t pa, uint64_t size);
+ int a6_map_pages(struct a6_gpu *g, uint64_t iova, const uint64_t *pages, uint32_t npages, uint32_t page_size);
++void a6_unmap(struct a6_gpu *g, uint64_t iova, uint64_t size);	/* clear 4K entries; then a6_tlb_flush */
+ void a6_unmap_high(struct a6_gpu *g);	/* drop all mappings above 1 GB, reset the arena */
+ void a6_tlb_flush(const struct a6_gpu *g);
+ int a6_clear_fault(const struct a6_gpu *g);	/* 1 if an SMMU fault was cleared */
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 86c3b7129..656a0f8dd 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -398,11 +398,70 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 
+ static uint64_t user_va_next = USER_VA_BASE;
+ 
++/* Freed ranges, sorted by address and merged: reused first fit, so page tables are reused too. */
++#define USER_VA_FREE_MAX 1024
++static struct { uint64_t va, size; } user_va_free[USER_VA_FREE_MAX];
++static uint32_t user_va_nfree;
++
++static uint64_t
++user_va_alloc(uint64_t size)
++{
++	for (uint32_t i = 0; i < user_va_nfree; i++) {
++		if (user_va_free[i].size >= size) {
++			uint64_t va = user_va_free[i].va;
++			user_va_free[i].va += size;
++			user_va_free[i].size -= size;
++			if (user_va_free[i].size == 0) {
++				memmove(&user_va_free[i], &user_va_free[i + 1], (user_va_nfree - i - 1) * sizeof(user_va_free[0]));
++				user_va_nfree--;
++			}
++			return va;
++		}
++	}
++	if (user_va_next + size > USER_VA_END) {
++		return 0;
++	}
++	uint64_t va = user_va_next;
++	user_va_next += size;
++	return va;
++}
++
++static void
++user_va_release(uint64_t va, uint64_t size)
++{
++	uint32_t i = 0;
++	while (i < user_va_nfree && user_va_free[i].va < va) {
++		i++;
++	}
++	if (i > 0 && user_va_free[i - 1].va + user_va_free[i - 1].size == va) {
++		user_va_free[i - 1].size += size;
++		if (i < user_va_nfree && va + size == user_va_free[i].va) {
++			user_va_free[i - 1].size += user_va_free[i].size;
++			memmove(&user_va_free[i], &user_va_free[i + 1], (user_va_nfree - i - 1) * sizeof(user_va_free[0]));
++			user_va_nfree--;
++		}
++		return;
++	}
++	if (i < user_va_nfree && va + size == user_va_free[i].va) {
++		user_va_free[i].va = va;
++		user_va_free[i].size += size;
++		return;
++	}
++	if (user_va_nfree == USER_VA_FREE_MAX) {
++		return;         /* leaks the range */
++	}
++	memmove(&user_va_free[i + 1], &user_va_free[i], (user_va_nfree - i) * sizeof(user_va_free[0]));
++	user_va_free[i].va = va;
++	user_va_free[i].size = size;
++	user_va_nfree++;
++}
++
+ /*
+- * Map pages at a fresh GPU VA (never reused yet: freed buffers leak their VA,
+- * and the page-table arena is finite). The caller cleans the CPU caches
+- * through a virtual mapping: physical cache operations panic for RAM outside
+- * the physmap (kernel memory below 4 GB, "phystokv_range: illegal PA").
++ * Map pages at a free GPU VA (64 KB granules; freed ranges are reused, and
++ * with them the page tables, of which the arena has only ~250). The caller
++ * cleans the CPU caches through a virtual mapping: physical cache operations
++ * panic for RAM outside the physmap (kernel memory below 4 GB, "phystokv_range:
++ * illegal PA").
+  */
+ int
+ sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size)
+@@ -410,15 +469,18 @@ sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, u
+ 	if (!gpu_ready || npages == 0) {
+ 		return -1;
+ 	}
+-	uint64_t size = (uint64_t)npages * page_size;
++	uint64_t size = ((uint64_t)npages * page_size + USER_VA_ALIGN - 1) & ~(USER_VA_ALIGN - 1);
+ 	lck_mtx_lock(&sweet_gpu_lock);
+-	uint64_t iova = user_va_next;
+-	if (iova + size > USER_VA_END) {
++	uint64_t iova = user_va_alloc(size);
++	if (iova == 0) {
+ 		lck_mtx_unlock(&sweet_gpu_lock);
+ 		return -1;
+ 	}
+-	user_va_next = (iova + size + USER_VA_ALIGN - 1) & ~(USER_VA_ALIGN - 1);
+ 	int rc = a6_map_pages(&gpu, iova, pages, npages, page_size);
++	if (rc) {
++		a6_unmap(&gpu, iova, size);
++		user_va_release(iova, size);
++	}
+ 	a6_tlb_flush(&gpu);
+ 	lck_mtx_unlock(&sweet_gpu_lock);
+ 	if (rc) {
+@@ -428,6 +490,23 @@ sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, u
+ 	return 0;
+ }
+ 
++/* Undo sweet_gpu_map_user (submissions are synchronous: nothing in flight uses it). */
++void
++sweet_gpu_unmap_user(uint64_t iova, uint64_t len)
++{
++	uint64_t size = (len + USER_VA_ALIGN - 1) & ~(USER_VA_ALIGN - 1);
++	if (iova < USER_VA_BASE || size == 0) {
++		return;
++	}
++	lck_mtx_lock(&sweet_gpu_lock);
++	if (gpu_ready) {
++		a6_unmap(&gpu, iova, size);
++		a6_tlb_flush(&gpu);
++	}
++	user_va_release(iova, size);
++	lck_mtx_unlock(&sweet_gpu_lock);
++}
++
+ /* Run an IB (user GPU memory) and wait for it. 0, or -1 on a hang/fault (cleared, logged). */
+ int
+ sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out)
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index 385a3b728..82f96f3eb 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -16,7 +16,7 @@
+  *   1 buffer alloc    [size] -> [handle, gpu_va, size]  zeroed, wired, cleaned; map it into the task
+  *                     with IOConnectMapMemory64(type = handle): cacheable, so userland does the cache
+  *                     maintenance (the GPU does not snoop)
+- *   2 buffer free     [handle]                          (the GPU VA is not reused yet)
++ *   2 buffer free     [handle]                          (GPU VA and handle are reused)
+  *   3 surface import  [IOSurface id] -> [handle, gpu_va, size]  the surface's pages, wired
+  *   4 submit          [ib_gpu_va, dwords, timeout_ms] -> [fence]  runs the IB and waits for it
+  *   5 cache flush     [handle, offset, length]  clean+invalidate through the kernel mapping: before
+@@ -36,6 +36,7 @@
+ extern "C" {
+ bool sweet_gpu_ready(void);
+ int sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size);
++void sweet_gpu_unmap_user(uint64_t iova, uint64_t len);
+ int sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out);
+ void flush_dcache64(addr64_t addr, unsigned count, int phys);
+ }
+@@ -91,6 +92,8 @@ class SweetAcceleratorUserClient : public IOUserClient {
+ 	IOLock  *fLock;
+ 	OSArray *fMem;          /* index + 1 = handle; IOMemoryDescriptor, or kOSBooleanFalse once freed */
+ 	OSArray *fMaps;         /* same index: the kernel IOMemoryMap, for cache maintenance */
++	uint64_t *fVA;          /* same index: GPU VA and length (0 once freed) */
++	uint64_t *fLen;
+ 
+ 	int addMemory(IOMemoryDescriptor *md, uint64_t *handle, uint64_t *va);
+ 
+@@ -115,7 +118,9 @@ SweetAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID, UI
+ 	fLock = IOLockAlloc();
+ 	fMem = OSArray::withCapacity(64);
+ 	fMaps = OSArray::withCapacity(64);
+-	return fLock != NULL && fMem != NULL && fMaps != NULL;
++	fVA = IONew(uint64_t, SWEET_MTL_MAX_BUFFERS);
++	fLen = IONew(uint64_t, SWEET_MTL_MAX_BUFFERS);
++	return fLock != NULL && fMem != NULL && fMaps != NULL && fVA != NULL && fLen != NULL;
+ }
+ 
+ IOReturn
+@@ -132,10 +137,19 @@ SweetAcceleratorUserClient::free(void)
+ 		for (unsigned i = 0; i < fMem->getCount(); i++) {
+ 			IOMemoryDescriptor *md = OSDynamicCast(IOMemoryDescriptor, fMem->getObject(i));
+ 			if (md != NULL) {
++				sweet_gpu_unmap_user(fVA[i], fLen[i]);
+ 				md->complete();
+ 			}
+ 		}
+ 	}
++	if (fVA != NULL) {
++		IODelete(fVA, uint64_t, SWEET_MTL_MAX_BUFFERS);
++		fVA = NULL;
++	}
++	if (fLen != NULL) {
++		IODelete(fLen, uint64_t, SWEET_MTL_MAX_BUFFERS);
++		fLen = NULL;
++	}
+ 	OSSafeReleaseNULL(fMem);
+ 	OSSafeReleaseNULL(fMaps);
+ 	if (fLock != NULL) {
+@@ -155,8 +169,11 @@ SweetAcceleratorUserClient::addMemory(IOMemoryDescriptor *md, uint64_t *handle,
+ 		return -1;
+ 	}
+ 	IOLockLock(fLock);
+-	uint32_t n = 0;
+-	bool ok = fMem->getCount() < SWEET_MTL_MAX_BUFFERS;
++	uint32_t n = 0, slot = 0;
++	while (slot < fMem->getCount() && fMem->getObject(slot) != kOSBooleanFalse) {
++		slot++;         /* a freed handle, else a new one */
++	}
++	bool ok = slot < SWEET_MTL_MAX_BUFFERS;
+ 	for (uint64_t off = 0; ok && off < len; off += PAGE_SIZE) {
+ 		IOByteCount seg = 0;
+ 		addr64_t pa = md->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
+@@ -174,10 +191,17 @@ SweetAcceleratorUserClient::addMemory(IOMemoryDescriptor *md, uint64_t *handle,
+ 		md->complete();
+ 		return -1;
+ 	}
+-	fMaps->setObject(km);
++	if (slot < fMem->getCount()) {
++		fMaps->replaceObject(slot, km);
++		fMem->replaceObject(slot, md);
++	} else {
++		fMaps->setObject(km);
++		fMem->setObject(md);
++	}
+ 	km->release();
+-	fMem->setObject(md);
+-	*handle = fMem->getCount();
++	fVA[slot] = *va;
++	fLen[slot] = len;
++	*handle = slot + 1;
+ 	IOLockUnlock(fLock);
+ 	return 0;
+ }
+@@ -254,6 +278,7 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
+ 		IOMemoryDescriptor *md = in[0] >= 1 && in[0] <= fMem->getCount() ?
+ 		    OSDynamicCast(IOMemoryDescriptor, fMem->getObject((unsigned)in[0] - 1)) : NULL;
+ 		if (md != NULL) {
++			sweet_gpu_unmap_user(fVA[in[0] - 1], fLen[in[0] - 1]);
+ 			md->complete();
+ 			fMem->replaceObject((unsigned)in[0] - 1, kOSBooleanFalse);
+ 			fMaps->replaceObject((unsigned)in[0] - 1, kOSBooleanFalse);

@@ -1,0 +1,167 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index c0fded89e..61cd483cd 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -739,6 +739,38 @@ uint32_t a6_fence_read(const struct a6_gpu *g)
+ 	return v;
+ }
+ 
++uint32_t a6_submit_ib_async(struct a6_gpu *g, uint64_t iova, uint32_t dwords, unsigned timeout_ms)
++{
++	uint64_t fva = a6_pool_va(A6_OFF_SCRATCH);
++	uint32_t dw[] = {
++		a6_pkt7(A6_CP_INDIRECT_BUFFER, 3), (uint32_t)iova, (uint32_t)(iova >> 32), dwords,
++		a6_pkt7(A6_CP_WAIT_FOR_IDLE, 0),
++		a6_pkt7(A6_CP_MEM_WRITE, 3), (uint32_t)fva, (uint32_t)(fva >> 32), g->fence + 1,
++	};
++	uint32_t n = sizeof(dw) / 4;
++	/* room in the ring: what the CP has not read yet stays intact */
++	for (unsigned i = 0; ; i++) {
++		uint32_t r = rd32(GREG(CP_RB_RPTR)), used = (g->wptr + A6_RING_DW - r) % A6_RING_DW;
++		if (used + n + 16 < A6_RING_DW)
++			break;
++		if (i >= timeout_ms * 50)
++			return 0;
++		a6_delay_us(20);
++	}
++	uint32_t w = g->wptr, first = n < A6_RING_DW - w ? n : A6_RING_DW - w;
++	a6_write(a6_pool_pa(g, A6_OFF_RING) + 4ull * w, dw, 4ull * first);
++	if (first < n)
++		a6_write(a6_pool_pa(g, A6_OFF_RING), dw + first, 4ull * (n - first));
++	g->wptr = (w + n) % A6_RING_DW;
++	wr32(GREG(CP_RB_WPTR), g->wptr);
++	return ++g->fence;
++}
++
++bool a6_fence_done(const struct a6_gpu *g, uint32_t fence)
++{
++	return (int32_t)(a6_fence_read(g) - fence) >= 0;
++}
++
+ int a6_submit_ib(struct a6_gpu *g, uint64_t iova, uint32_t dwords, unsigned timeout_ms)
+ {
+ 	uint64_t fva = a6_pool_va(A6_OFF_SCRATCH);
+diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
+index 6341cb762..dda32265c 100644
+--- a/bsd/dev/sweet_a6xx.h
++++ b/bsd/dev/sweet_a6xx.h
+@@ -94,6 +94,10 @@ uint32_t a6_pkt4(uint32_t reg, uint32_t cnt);
+ int a6_ring(struct a6_gpu *g, const uint32_t *dw, uint32_t n, const char *what, unsigned timeout_ms);
+ /* IB at iova, then WFI + fence write; waits for the fence. 0 = ok. */
+ int a6_submit_ib(struct a6_gpu *g, uint64_t iova, uint32_t dwords, unsigned timeout_ms);
++/* The same without waiting: returns the fence value (0 = no ring space within timeout_ms) */
++uint32_t a6_submit_ib_async(struct a6_gpu *g, uint64_t iova, uint32_t dwords, unsigned timeout_ms);
++/* Has the fence (from a6_submit_ib_async) landed? (wraparound-safe) */
++bool a6_fence_done(const struct a6_gpu *g, uint32_t fence);
+ uint32_t a6_fence_read(const struct a6_gpu *g);
+ 
+ /* 4K pages (AP=01, NC) at iova -> pa; tables from the arena. Then a6_tlb_flush. */
+diff --git a/bsd/dev/sweet_files.c b/bsd/dev/sweet_files.c
+index f0a4a9127..dedded7fe 100644
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -162,6 +162,10 @@ sf_put(socket_t so, const char *path, int mode, uint64_t size)
+ 	vfs_context_t ctx = vfs_context_kernel();
+ 	vnode_t vp = NULLVP;
+ 	int err = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, mode & 07777, 0, &vp, ctx);
++	if (!err) {
++		/* O_TRUNC through vnode_open does not shorten an existing file here: a smaller file kept the old tail */
++		err = vnode_setsize(vp, 0, 0, ctx);
++	}
+ 	uint64_t off = 0;
+ 	while (off < size) {
+ 		size_t chunk = (size_t)MIN((uint64_t)SF_BUF, size - off);
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index f1434a174..91b7ef7de 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -544,6 +544,48 @@ sweet_gpu_unmap_user(uint64_t iova, uint64_t len)
+ 	lck_mtx_unlock(&sweet_gpu_lock);
+ }
+ 
++/* Queue an IB (user GPU memory) without waiting: its fence, or 0 if the GPU is not usable. */
++uint32_t
++sweet_gpu_submit_user_async(uint64_t ib_iova, uint32_t dwords)
++{
++	if (!gpu_ready) {
++		return 0;
++	}
++	lck_mtx_lock(&sweet_gpu_lock);
++	uint32_t fence = a6_submit_ib_async(&gpu, ib_iova, dwords, 1000);
++	lck_mtx_unlock(&sweet_gpu_lock);
++	return fence;
++}
++
++/* Wait for a fence of sweet_gpu_submit_user_async: 0, or -1 after timeout_ms (the GPU is then recovered). */
++int
++sweet_gpu_wait_fence(uint32_t fence, uint32_t timeout_ms)
++{
++	for (unsigned i = 0; i < timeout_ms * 50; i++) {
++		if (!gpu_ready) {
++			return -1;
++		}
++		if (a6_fence_done(&gpu, fence)) {
++			return 0;
++		}
++		delay(20);
++	}
++	lck_mtx_lock(&sweet_gpu_lock);
++	int rc = a6_fence_done(&gpu, fence) ? 0 : -1;
++	if (rc) {
++		uint64_t far;
++		uint32_t syn, fsr = a6_fault_status(&gpu, &far, &syn);
++		a6_log("user fence %u: timeout or fault (fence now %u, smmu fsr %x far %llx fsynr0 %x)\n",
++		    fence, a6_fence_read(&gpu), fsr, far, syn);
++		if (a6_recover(&gpu)) {
++			a6_log("user fence: GPU not recovered\n");
++			gpu_ready = false;
++		}
++	}
++	lck_mtx_unlock(&sweet_gpu_lock);
++	return rc;
++}
++
+ /* Run an IB (user GPU memory) and wait for it. 0, or -1 on a hang/fault (cleared, logged). */
+ int
+ sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out)
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index 82f96f3eb..406cb129a 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -19,6 +19,8 @@
+  *   2 buffer free     [handle]                          (GPU VA and handle are reused)
+  *   3 surface import  [IOSurface id] -> [handle, gpu_va, size]  the surface's pages, wired
+  *   4 submit          [ib_gpu_va, dwords, timeout_ms] -> [fence]  runs the IB and waits for it
++ *   6 submit async    [ib_gpu_va, dwords] -> [fence]      queued, not waited for (fence 0: GPU not usable)
++ *   7 wait fence      [fence, timeout_ms]               0, or timeout (the GPU is recovered)
+  *   5 cache flush     [handle, offset, length]  clean+invalidate through the kernel mapping: before
+  *                     a submit for what the CPU wrote, after it for what the CPU will read
+  *                     (sys_dcache_flush does nothing on iOS: Apple GPUs are coherent)
+@@ -38,6 +40,8 @@ bool sweet_gpu_ready(void);
+ int sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size);
+ void sweet_gpu_unmap_user(uint64_t iova, uint64_t len);
+ int sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out);
++uint32_t sweet_gpu_submit_user_async(uint64_t ib_iova, uint32_t dwords);
++int sweet_gpu_wait_fence(uint32_t fence, uint32_t timeout_ms);
+ void flush_dcache64(addr64_t addr, unsigned count, int phys);
+ }
+ 
+@@ -330,6 +334,18 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
+ 		IOLockUnlock(fLock);
+ 		return ret;
+ 	}
++	case 6: {
++		if (nin < 2 || args->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		out[0] = sweet_gpu_submit_user_async(in[0], (uint32_t)in[1]);
++		return out[0] ? kIOReturnSuccess : kIOReturnNotReady;
++	}
++	case 7:
++		if (nin < 2) {
++			return kIOReturnBadArgument;
++		}
++		return sweet_gpu_wait_fence((uint32_t)in[0], (uint32_t)in[1]) ? kIOReturnTimeout : kIOReturnSuccess;
+ 	default:
+ 		return kIOReturnUnsupported;
+ 	}

@@ -1,0 +1,86 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 345b6f6ff..7cb1ffd1d 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -807,9 +807,9 @@ sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa)
+ 			gpool_used += size;
+ 			if (gpool_used > gpool_peak) {
+ 				gpool_peak = gpool_used;
+-				if ((gpool_peak >> 24) != ((gpool_peak - size) >> 24)) {
+-					a6_log("pool: peak %llu MB in use\n", gpool_peak >> 20);
+-				}
++			}
++			if ((gpool_used >> 25) != ((gpool_used - size) >> 25)) {
++				a6_log("pool: %llu MB in use (peak %llu)\n", gpool_used >> 20, gpool_peak >> 20);
+ 			}
+ 			rc = 0;
+ 			break;
+@@ -828,6 +828,9 @@ sweet_gpu_pool_free(uint64_t pa, uint64_t bytes)
+ 	uint64_t size = (bytes + GPOOL_UNIT - 1) & ~(GPOOL_UNIT - 1);
+ 	lck_mtx_lock(&sweet_gpool_lock);
+ 	gpool_used -= size;
++	if ((gpool_used >> 25) != ((gpool_used + size) >> 25)) {
++		a6_log("pool: %llu MB in use (peak %llu)\n", gpool_used >> 20, gpool_peak >> 20);
++	}
+ 	uint32_t i = 0;
+ 	while (i < gpool_nfree && gpool_free[i].pa < pa) {
+ 		i++;
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index 1cb061b91..e3e5f32e2 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -45,6 +45,7 @@
+ #include "SweetGPUABI.h"
+ 
+ extern "C" {
++void proc_selfname(char *buf, int size);
+ bool sweet_gpu_ready(void);
+ int sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size);
+ void sweet_gpu_unmap_user(uint64_t iova, uint64_t len);
+@@ -146,6 +147,8 @@ class SweetAcceleratorUserClient : public IOUserClient {
+ 	uint32_t fBOCap;
+ 	uint64_t *fPageBuf;
+ 	uint64_t fEpoch, fFaults;       /* GPU resets seen; those that lost this client's work */
++	uint64_t fPoolBytes, fPoolPeak; /* GPU pool memory this client holds */
++	char fName[32];
+ 
+ 	int addMemory(IOMemoryDescriptor *md, uint64_t *handle, uint64_t *va);
+ 	IOReturn v2Method(uint32_t method, const void *in, uint32_t inSize, void *out, uint32_t *outSize);
+@@ -188,6 +191,7 @@ SweetAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID, UI
+ 			return false;
+ 		}
+ 		fEpoch = sweet_gpu_recoveries();
++		proc_selfname(fName, sizeof(fName));
+ 		fV2 = true;
+ 	}
+ 	return true;
+@@ -212,6 +216,7 @@ SweetAcceleratorUserClient::free(void)
+ 		IOLog("SWEET MTL: client freed with fence %u still pending\n", fLastFence);
+ 	}
+ 	if (fBO != NULL) {
++		IOLog("SWEET MTL: v2 %s closed (GPU pool: %llu MB held, peak %llu MB)\n", fName, fPoolBytes >> 20, fPoolPeak >> 20);
+ 		for (uint32_t i = 0; i < fBOCap; i++) {
+ 			v2Release(&fBO[i]);
+ 		}
+@@ -590,6 +595,7 @@ SweetAcceleratorUserClient::v2Release(SweetV2BO *bo)
+ 		bo->md->complete();
+ 		bo->md->release();
+ 	} else {
++		fPoolBytes -= bo->md->getLength();
+ 		sweet_pool_release(bo->md, bo->pool_pa);
+ 	}
+ 	bzero(bo, sizeof(*bo));
+@@ -660,6 +666,13 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 		IOReturn r = v2NewSlot(md, rq->bytes, false, &h);
+ 		if (r == kIOReturnSuccess) {
+ 			fBO[h - 1].pool_pa = pa;
++			fPoolBytes += len;
++			if (fPoolBytes > fPoolPeak) {
++				fPoolPeak = fPoolBytes;
++			}
++			if ((fPoolBytes >> 25) != ((fPoolBytes - len) >> 25)) {
++				IOLog("SWEET MTL: v2 %s holds %llu MB of GPU pool (%llu MB buffer)\n", fName, fPoolBytes >> 20, len >> 20);
++			}
+ 		}
+ 		IOLockUnlock(fLock);
+ 		if (r != kIOReturnSuccess) {

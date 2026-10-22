@@ -1,0 +1,494 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 663e85bbb..453b7302e 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_fts.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_poke.c			standard
++bsd/dev/sweet_files.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_files.c b/bsd/dev/sweet_files.c
+new file mode 100644
+index 000000000..8209bf151
+--- /dev/null
++++ b/bsd/dev/sweet_files.c
+@@ -0,0 +1,325 @@
++/*
++ * File server for the running iOS root, over USB Ethernet: TCP
++ * 192.168.7.2:2223 (on the Mac: 127.0.0.1:2223 through FlameBridge,
++ * tools/flame-files.py). One request per connection, a header line then
++ * data:
++ *
++ *   PUT <path> <mode-octal> <size>\n<size bytes>  -> "OK <size>\n"  (root:wheel)
++ *   GET <path>\n                                  -> "OK <size>\n<bytes>"
++ *   MKDIR <path> <mode-octal>\n                   -> "OK\n"
++ *   LINK <target> <path>\n                        -> "OK\n"  (symlink)
++ *   RM <path>\n                                   -> "OK\n"
++ *   CHMOD <path> <mode-octal>\n                   -> "OK\n"
++ *
++ * Errors: "ERR <errno>\n". Paths have no spaces. Started with the USB
++ * gadget (sweet_usb.c) when the interface comes up.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/kernel.h>
++#include <sys/kauth.h>
++#include <sys/kpi_socket.h>
++#include <sys/socket.h>
++#include <sys/uio.h>
++#include <netinet/in.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <libkern/libkern.h>
++
++extern int sweet_vfs_mkdir(const char *path, int mode);
++extern int sweet_vfs_symlink(const char *target, const char *link);
++extern int sweet_vfs_unlink(const char *path);
++extern kern_return_t thread_terminate(thread_t);
++void sweet_files_start(void);
++
++#define SF_BUF  (64 * 1024)
++
++static char *sf_buf;
++static int sf_chan;
++
++static void
++sf_sleep_ms(int ms)
++{
++	(void)tsleep(&sf_chan, PZERO, "sweetfiles", MAX(1, ms * hz / 1000));
++}
++
++static unsigned long long
++sf_dec(const char *p)
++{
++	unsigned long long v = 0;
++	while (*p == ' ') {
++		p++;
++	}
++	while (*p >= '0' && *p <= '9') {
++		v = v * 10 + (unsigned)(*p++ - '0');
++	}
++	return v;
++}
++
++static int
++sf_recv(socket_t so, void *buf, size_t len, size_t *got, int flags)
++{
++	struct iovec iov = { .iov_base = buf, .iov_len = len };
++	struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
++	return sock_receive(so, &msg, flags, got);
++}
++
++static int
++sf_recv_all(socket_t so, void *buf, size_t len)
++{
++	size_t off = 0;
++	while (off < len) {
++		size_t got = 0;
++		int err = sf_recv(so, (char *)buf + off, len - off, &got, MSG_WAITALL);
++		if (err) {
++			return err;
++		}
++		if (got == 0) {
++			return ECONNRESET;
++		}
++		off += got;
++	}
++	return 0;
++}
++
++static int
++sf_send(socket_t so, const void *buf, size_t len)
++{
++	size_t off = 0;
++	while (off < len) {
++		struct iovec iov = { .iov_base = (char *)buf + off, .iov_len = len - off };
++		struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
++		size_t sent = 0;
++		int err = sock_send(so, &msg, 0, &sent);
++		if (err) {
++			return err;
++		}
++		off += sent;
++	}
++	return 0;
++}
++
++static void
++sf_reply(socket_t so, int err, uint64_t n, bool with_n)
++{
++	char line[48];
++	int len = err ? snprintf(line, sizeof(line), "ERR %d\n", err) :
++	    with_n ? snprintf(line, sizeof(line), "OK %llu\n", n) : snprintf(line, sizeof(line), "OK\n");
++	(void)sf_send(so, line, (size_t)len);
++}
++
++/* Header line: up to '\n', read byte by byte so data after it stays queued. */
++static int
++sf_line(socket_t so, char *line, size_t max)
++{
++	size_t n = 0;
++	while (n + 1 < max) {
++		size_t got = 0;
++		int err = sf_recv(so, line + n, 1, &got, MSG_WAITALL);
++		if (err || got == 0) {
++			return err ? err : ECONNRESET;
++		}
++		if (line[n] == '\n') {
++			break;
++		}
++		n++;
++	}
++	line[n] = 0;
++	return 0;
++}
++
++static int
++sf_setattr(const char *path, int mode, bool owner)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int err = vnode_lookup(path, 0, &vp, ctx);
++	if (err) {
++		return err;
++	}
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, mode & 07777);
++	if (owner) {
++		VATTR_SET(&va, va_uid, 0);
++		VATTR_SET(&va, va_gid, 0);
++	}
++	err = vnode_setattr(vp, &va, ctx);
++	vnode_put(vp);
++	return err;
++}
++
++static int
++sf_put(socket_t so, const char *path, int mode, uint64_t size)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int err = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, mode & 07777, 0, &vp, ctx);
++	uint64_t off = 0;
++	while (off < size) {
++		size_t chunk = (size_t)MIN((uint64_t)SF_BUF, size - off);
++		int rerr = sf_recv_all(so, sf_buf, chunk);
++		if (rerr) {
++			err = err ? err : rerr;
++			break;
++		}
++		if (!err) {
++			int resid = 0;
++			err = vn_rdwr(UIO_WRITE, vp, sf_buf, (int)chunk, (off_t)off, UIO_SYSSPACE, IO_UNIT,
++			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++			if (!err && resid) {
++				err = EIO;
++			}
++		}
++		off += chunk;
++	}
++	if (vp != NULLVP) {
++		vnode_close(vp, FWRITE, ctx);
++	}
++	if (!err) {
++		err = sf_setattr(path, mode, true);
++	}
++	return err;
++}
++
++static int
++sf_get(socket_t so, const char *path)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	off_t size = 0;
++	int err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (!err) {
++		err = vnode_size(vp, &size, ctx);
++	}
++	if (err) {
++		if (vp != NULLVP) {
++			vnode_close(vp, FREAD, ctx);
++		}
++		sf_reply(so, err, 0, false);
++		return err;
++	}
++	sf_reply(so, 0, (uint64_t)size, true);
++	for (off_t off = 0; off < size && !err;) {
++		int chunk = (int)MIN((off_t)SF_BUF, size - off), resid = 0;
++		err = vn_rdwr(UIO_READ, vp, sf_buf, chunk, off, UIO_SYSSPACE, IO_UNIT,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (!err) {
++			err = sf_send(so, sf_buf, (size_t)(chunk - resid));
++		}
++		off += chunk;
++	}
++	vnode_close(vp, FREAD, ctx);
++	return err;
++}
++
++static void
++sf_handle(socket_t so)
++{
++	static char line[1100];
++	char a[512], b[512];
++	unsigned long long n = 0;
++	int err = sf_line(so, line, sizeof(line));
++	if (err) {
++		return;
++	}
++	a[0] = b[0] = 0;
++	if (!strncmp(line, "PUT ", 4)) {
++		unsigned mode = 0644;
++		char *p = line + 4, *sp = strchr(p, ' ');
++		if (!sp || (size_t)(sp - p) >= sizeof(a)) {
++			sf_reply(so, EINVAL, 0, false);
++			return;
++		}
++		memcpy(a, p, (size_t)(sp - p));
++		a[sp - p] = 0;
++		mode = (unsigned)strtoul(sp + 1, &p, 8);
++		n = sf_dec(p);
++		err = sf_put(so, a, (int)mode, n);
++		printf("SWEET FILES: PUT %s %o %llu -> %d\n", a, mode, n, err);
++		sf_reply(so, err, n, true);
++		return;
++	}
++	if (!strncmp(line, "GET ", 4)) {
++		err = sf_get(so, line + 4);
++		printf("SWEET FILES: GET %s -> %d\n", line + 4, err);
++		return;
++	}
++	char *sp = strchr(line, ' ');
++	if (!sp) {
++		sf_reply(so, EINVAL, 0, false);
++		return;
++	}
++	*sp = 0;
++	char *arg1 = sp + 1, *arg2 = strchr(arg1, ' ');
++	if (arg2) {
++		*arg2++ = 0;
++	}
++	if (!strcmp(line, "MKDIR")) {
++		err = sweet_vfs_mkdir(arg1, arg2 ? (int)strtoul(arg2, NULL, 8) : 0755);
++		if (err == EEXIST) {
++			err = 0;
++		}
++	} else if (!strcmp(line, "LINK") && arg2) {
++		err = sweet_vfs_symlink(arg1, arg2);
++	} else if (!strcmp(line, "RM")) {
++		err = sweet_vfs_unlink(arg1);
++	} else if (!strcmp(line, "CHMOD") && arg2) {
++		err = sf_setattr(arg1, (int)strtoul(arg2, NULL, 8), false);
++	} else {
++		err = EINVAL;
++	}
++	printf("SWEET FILES: %s %s %s -> %d\n", line, arg1, arg2 ? arg2 : "", err);
++	sf_reply(so, err, 0, false);
++}
++
++static void
++sf_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	socket_t ls = NULL;
++	struct sockaddr_in me;
++	int one = 1;
++
++	sf_buf = kalloc_data(SF_BUF, Z_WAITOK);
++	for (;;) {
++		if (sock_socket(PF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, NULL, &ls) == 0) {
++			(void)sock_setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++			bzero(&me, sizeof(me));
++			me.sin_len = sizeof(me);
++			me.sin_family = AF_INET;
++			me.sin_port = htons(2223);
++			me.sin_addr.s_addr = htonl(INADDR_ANY);
++			if (sock_bind(ls, (struct sockaddr *)&me) == 0 && sock_listen(ls, 4) == 0) {
++				break;
++			}
++			sock_close(ls);
++		}
++		ls = NULL;
++		sf_sleep_ms(1000);
++	}
++	printf("SWEET FILES: listening on tcp 2223\n");
++	for (;;) {
++		socket_t c = NULL;
++		if (sock_accept(ls, NULL, 0, 0, NULL, NULL, &c) != 0 || c == NULL) {
++			sf_sleep_ms(100);
++			continue;
++		}
++		sf_handle(c);
++		sock_close(c);
++	}
++}
++
++void
++sweet_files_start(void)
++{
++	thread_t thread;
++	if (kernel_thread_start(sf_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 7d06a6cf8..032adc884 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -508,6 +508,36 @@ ud_rx_arm(void)
+ 	ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, UD_FRAME_MAX, TRBCTL_NORMAL);
+ }
+ 
++/* The first frames each way, for link debugging (boot-arg sweetusbframes=N, default 40). */
++static int ud_frame_log = -1;
++
++static void
++ud_log_frame(const char *dir, const uint8_t *f, uint32_t len)
++{
++	if (ud_frame_log < 0) {
++		ud_frame_log = 40;
++		PE_parse_boot_argn("sweetusbframes", &ud_frame_log, sizeof(ud_frame_log));
++	}
++	if (len < 14) {
++		return;
++	}
++	if (len >= 42 && f[12] == 0x08 && f[13] == 0x06) {
++		/* ARP: always, in full (opcode, sender MAC/IP, target MAC/IP) */
++		printf("SWEET ARP %s op %u sha %02x:%02x:%02x:%02x:%02x:%02x spa %u.%u.%u.%u tha %02x:%02x:%02x:%02x:%02x:%02x tpa %u.%u.%u.%u (eth dst %02x:..:%02x)\n",
++		    dir, f[21], f[22], f[23], f[24], f[25], f[26], f[27], f[28], f[29], f[30], f[31],
++		    f[32], f[33], f[34], f[35], f[36], f[37], f[38], f[39], f[40], f[41], f[0], f[5]);
++		return;
++	}
++	if (ud_frame_log <= 0) {
++		return;
++	}
++	ud_frame_log--;
++	printf("SWEET FRAME %s len %u dst %02x:%02x:%02x:%02x:%02x:%02x src %02x:%02x:%02x:%02x:%02x:%02x type %02x%02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
++	    dir, len, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13],
++	    len > 14 ? f[14] : 0, len > 15 ? f[15] : 0, len > 20 ? f[20] : 0, len > 21 ? f[21] : 0,
++	    len > 38 ? f[38] : 0, len > 39 ? f[39] : 0, len > 40 ? f[40] : 0, len > 41 ? f[41] : 0);
++}
++
+ static void
+ ud_rx_done(void)
+ {
+@@ -515,6 +545,7 @@ ud_rx_done(void)
+ 	ud_sync(UD_TRB_RX, 16);
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+ 	ud_sync(UD_RX, UD_FRAME_MAX);
++	ud_log_frame("rx", (const uint8_t *)(ud.dma + UD_RX), len);
+ 	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+ 		/*
+ 		 * One mbuf with a 2 KiB cluster holds any frame. (mbuf_allocpacket
+@@ -560,6 +591,24 @@ ud_tx_kick_locked(void)
+ 		}
+ 		mbuf_copydata(m, 0, len, (void *)(ud.dma + UD_TX));
+ 		mbuf_freem(m);
++		ud_log_frame("tx", (const uint8_t *)(ud.dma + UD_TX), (uint32_t)len);
++		/*
++		 * ARP replies go to the Ethernet broadcast address: macOS's ECM
++		 * driver shows the host as 02:00:5e:77:ee:01 (our iMACAddress) on
++		 * the wire, but en17's own lladdr is 02:00:00:00:00:00, and its
++		 * ARP drops replies unicast to ..:01, so 192.168.7.2 never
++		 * resolved (frames carrying IP are accepted either way).
++		 */
++		uint8_t *fr = (uint8_t *)(ud.dma + UD_TX);
++		if (len >= 42 && fr[12] == 0x08 && fr[13] == 0x06 && fr[20] == 0 && fr[21] == 2) {
++			memset(fr, 0xff, ETHER_ADDR_LEN);
++		}
++		/* Pad to the Ethernet minimum (60 bytes without FCS), as a MAC
++		 * would: macOS drops shorter frames, e.g. our 42-byte ARP replies,
++		 * so the Mac never resolved 192.168.7.2. */
++		while (len < 60) {
++			((uint8_t *)(ud.dma + UD_TX))[len++] = 0;
++		}
+ 		/* A frame of a multiple of 512 bytes would need a zero-length
+ 		 * packet to end it; one pad byte does the same (IP ignores it). */
+ 		if ((len % 512) == 0) {
+@@ -838,6 +887,8 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+  * bootloader, so it lands in fastboot). tools/flame-cmd.py sends them.
+  */
+ extern void sweet_poke_run(const char *text, unsigned len);
++struct sync_args;
++extern int sync(proc_t p, struct sync_args *uap, int32_t *retval);
+ 
+ static void
+ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -874,7 +925,17 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 		}
+ 		cmd[got] = 0;
+ 		printf("SWEET CMD: %u bytes: %.60s\n", (unsigned)got, cmd);
++		if (strncmp(cmd, "sync", 4) == 0 || strncmp(cmd, "reboot", 6) == 0) {
++			/* Flush dirty file data (e.g. sweet_files.c writes) before a reset. */
++			int32_t rv = 0;
++			(void)sync(kernproc, NULL, &rv);
++			printf("SWEET CMD: synced\n");
++			if (cmd[0] == 's') {
++				continue;
++			}
++		}
+ 		if (strncmp(cmd, "reboot", 6) == 0) {
++			ud_sleep_ms(1000);      /* let HFS finish the journal writes */
+ 			printf("SWEET CMD: rebooting (PSCI SYSTEM_RESET)\n");
+ 			ud_sleep_ms(500);       /* let the log go out */
+ 			register uint64_t x0 __asm__("x0") = 0x84000009ULL;
+@@ -1264,5 +1325,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	if (ud.ifp != NULL && kernel_thread_start(ud_cmd_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	if (ud.ifp != NULL) {
++		extern void sweet_files_start(void);
++		sweet_files_start();    /* tcp 2223: bsd/dev/sweet_files.c */
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 90e68bb47..f0bb53374 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -14579,3 +14579,35 @@ fs_snapshot(__unused proc_t p, struct fs_snapshot_args *uap,
+ 
+ 	return error;
+ }
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * Kernel-path wrappers for the SWEET file server (bsd/dev/sweet_files.c):
++ * installs tools into the running root over USB Ethernet.
++ */
++int sweet_vfs_mkdir(const char *path, int mode);
++int sweet_vfs_symlink(const char *target, const char *link);
++int sweet_vfs_unlink(const char *path);
++
++int
++sweet_vfs_mkdir(const char *path, int mode)
++{
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, (mode & ACCESSPERMS) & ~0);
++	return mkdir1at(vfs_context_kernel(), CAST_USER_ADDR_T(path), &va, AT_FDCWD, UIO_SYSSPACE);
++}
++
++int
++sweet_vfs_symlink(const char *target, const char *link)
++{
++	return symlinkat_internal(vfs_context_kernel(), CAST_USER_ADDR_T(target), AT_FDCWD,
++	           CAST_USER_ADDR_T(link), UIO_SYSSPACE);
++}
++
++int
++sweet_vfs_unlink(const char *path)
++{
++	return unlink1(vfs_context_kernel(), NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
