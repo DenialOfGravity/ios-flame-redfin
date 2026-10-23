@@ -714,6 +714,7 @@ static const uint16_t scan_freqs[] = {
 	5745, 5765, 5785, 5805, 5825,
 };
 #define NFREQ ((uint32_t)(sizeof(scan_freqs) / sizeof(scan_freqs[0])))
+#define NFREQ_MAX 64
 #define NBSS 64
 
 struct bss {
@@ -737,6 +738,22 @@ static int scan_send_start(void)
 {
 	static uint8_t m[512];
 	uint8_t *p = m, *c;
+	/* test hook: /var/local/wlan-scan.conf lists the only frequencies to scan (MHz, one per line) */
+	static uint32_t sf[NFREQ_MAX], nsf;
+	static int sf_read;
+	if (!sf_read) {
+		sf_read = 1;
+		FILE *f = fopen("/var/local/wlan-scan.conf", "r");
+		unsigned v;
+		while (f && nsf < NFREQ_MAX && fscanf(f, "%u", &v) == 1)
+			sf[nsf++] = v;
+		if (f)
+			fclose(f);
+		if (!nsf)
+			for (; nsf < NFREQ; nsf++)
+				sf[nsf] = scan_freqs[nsf];
+		LOG("scan: %u frequencies%s", nsf, nsf == NFREQ ? "" : " (wlan-scan.conf)");
+	}
 	memset(m, 0, sizeof(m));
 	c = put_tlv(p, TAG_START_SCAN_CMD, 100);
 	c = put32(c, 0xa000 | (scans + 1));		/* scan_id */
@@ -755,15 +772,15 @@ static int scan_send_start(void)
 	c = put32(c, 5);				/* probe delay */
 	c = put32(c, (0x01 | 0x10) ^ 0x20);		/* passive, chan stat; probe-req filter inverted on TLV */
 	c = put32(c, 0);
-	c = put32(c, NFREQ);
+	c = put32(c, nsf);
 	c = put32(c, 1);				/* bssids */
 	c = put32(c, 0);				/* ssids */
 	c = put32(c, 0);				/* ie_len */
 	c = put32(c, 3);				/* num_probes */
 	p = c + 16;					/* mac addr + mask: zero */
-	c = put_tlv(p, TAG_ARRAY_UINT32, NFREQ * 4);
-	for (uint32_t i = 0; i < NFREQ; i++)
-		c = put32(c, scan_freqs[i]);
+	c = put_tlv(p, TAG_ARRAY_UINT32, nsf * 4);
+	for (uint32_t i = 0; i < nsf; i++)
+		c = put32(c, sf[i]);
 	p = put_tlv(c, TAG_ARRAY_FIXED_STRUCT, 0);
 	c = put_tlv(p, TAG_ARRAY_FIXED_STRUCT, 8);	/* bssid: broadcast */
 	memset(c, 0xff, 6);
