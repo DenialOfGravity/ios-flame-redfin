@@ -1,0 +1,39 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 359965e..45d75f8 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -982,6 +982,34 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 				continue;
+ 			}
+ 		}
++		if (strncmp(cmd, "key ", 4) == 0) {
++			/* sunfish: "key N [MS]": press button N (0 power, 1 vol+, 2 vol-, 3 home) for MS ms */
++			extern void sweet_hid_key(int key, int down);
++			int k = -1, ms = 150;
++			const char *q = cmd + 4;
++			if (*q >= '0' && *q <= '3') {
++				k = *q - '0';
++				q++;
++				while (*q == ' ') {
++					q++;
++				}
++				if (*q >= '0' && *q <= '9') {
++					ms = 0;
++					while (*q >= '0' && *q <= '9') {
++						ms = ms * 10 + (*q++ - '0');
++					}
++				}
++			}
++			if (k < 0 || ms > 5000) {
++				printf("SWEET CMD: key: usage key N [MS] (0 power, 1 vol+, 2 vol-, 3 home)\n");
++				continue;
++			}
++			sweet_hid_key(k, 1);
++			delay((uint32_t)ms * 1000);
++			sweet_hid_key(k, 0);
++			printf("SWEET CMD: key %d pressed %d ms\n", k, ms);
++			continue;
++		}
+ 		if (strncmp(cmd, "tap ", 4) == 0 || strncmp(cmd, "swipe ", 6) == 0) {
+ 			ud_touch_cmd(cmd);
+ 			continue;
