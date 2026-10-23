@@ -1,0 +1,34 @@
+#!/bin/bash
+# Pack kernel + ADT + boot-args into a shim boot image and fastboot-boot it
+# on the Pixel 5 (redfin). RAM only: nothing is flashed.
+#
+#   tools/redfin-boot.sh NAME KERNEL [EXTRA BOOT-ARGS...]
+#
+# Waits for the phone to show up in fastboot (e.g. after flamereboot).
+# Image: work/boot/NAME.img; args: work/boot/NAME.cmdline.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+name=$1 kernel=$2; shift 2
+P=$PWD/work/boot
+base="debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 ufsrw=1 rootrw=1"
+base="$base unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1"
+base="$base wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 ufslogsecs=2 flamereboot=1800"
+base="$base flametouch=0 sweettouch=0 sweetkeys=1 sweetusb=2 sweetgpu=0 sweetgpufreq=5 sweetgpudelay=0 sweetfb_thread=0 sweetmtl=0 sweetddr=0"
+base="$base sweetbattery=1"
+# redfin: touch is Samsung sec_ts on SPI SE0 (no driver yet), so sweettouch/flametouch stay 0.
+# GPU is an A620: sweetgpu=0 sweetmtl=0 (CPU rendering) until the redfin GPU patches exist.
+# Real time: PM8150 RTC + offset (tools/flame-rtc.py LOG calibrates it once).
+[ -f work/rtc-offset ] && base="$base sweetrtcoff=$(cat work/rtc-offset)"
+# Extra args replace defaults with the same key (XNU would take the first).
+for a in "$@"; do
+	k=${a%%=*}
+	base=$(printf '%s\n' $base | grep -v -x -e "$k" -e "$k=.*" | tr '\n' ' ')
+done
+cmdline="$base $*"
+echo "$cmdline" > "$P/$name.cmdline"
+python3 -I tools/mkpayload.py "$kernel" "$P/redfin-hi.adt" "$P/$name.payload" --cmdline "$cmdline" --gpufw "${GPUFW:-$PWD/../restore/fw/gpu}" >/dev/null
+shim/build.sh "$P/$name.payload" "$P/$name.img" >/dev/null
+echo "$(date +%T) built $name.img; waiting for fastboot"
+until fastboot devices | grep -q fastboot; do sleep 2; done
+fastboot boot "$P/$name.img"
+echo "$(date +%T) booted $name: $cmdline"

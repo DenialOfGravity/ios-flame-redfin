@@ -155,7 +155,9 @@ def add_poke_to_adt(adt_blob, script):
     return adt.serialize(root)
 
 
-GPU_FW = ('a618_gmu.bin', 'a630_sqe.fw', 'a615_zap.mdt', 'a615_zap.b02')  # sunfish (flame: a640_*)
+# redfin Adreno 620 (kgsl adreno_gpu_core_a620): a650 GMU + SQE, a620 zap. Which a620_zap.bNN
+# holds the image is unverified: check vendor.img /firmware (sunfish: a618/a630/a615_zap.b02).
+GPU_FW = ('a650_gmu.bin', 'a650_sqe.fw', 'a620_zap.mdt', 'a620_zap.b02')
 
 
 def add_gpufw_to_adt(adt_blob, fw_dir):

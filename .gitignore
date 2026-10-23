@@ -25,3 +25,6 @@ tools/flamebridge/FlameBridge.app/Contents/MacOS/
 tools/flamebridge/FlameBridge.app/Contents/_CodeSignature/
 *.ipa
 .DS_Store
+
+# redfin recon output (live DT has the serial)
+recon/

@@ -1,12 +1,15 @@
 #!/bin/bash
-# Build the sunfish (Pixel 4a) shim and wrap it in a boot image v2 with the stock header
-# layout (base 0, kernel 0x8000, ramdisk 0x1000000, tags 0x100, dtb 0x1f00000).
+# Build the redfin (Pixel 5) shim and wrap it in a boot image v3 (redbull BoardConfig:
+# BOARD_BOOT_HEADER_VERSION 3, page 4096, boot partition 0x06000000).
+# v3 has no load offsets and no DTB: ABL takes the DTB (and a vendor ramdisk) from
+# vendor_boot on flash and places our ramdisk AFTER the vendor ramdisk, so the
+# shim searches the initrd for the payload (loader.c find_payload).
 #
 #   shim/build.sh [PAYLOAD] [OUT]   PAYLOAD: tools/mkpayload.py output (ramdisk);
 #                                   none -> probe-only image
 #   SHIM_CFLAGS=-DSHIM_SHOWLOG shim/build.sh "" OUT
 #                                   show the logs on UFS on screen (showlog.c)
-# Needs Homebrew llvm + lld; the DTB is the stock boot.img's (stock/dtb).
+# Needs llvm + lld + lz4 + mkbootimg (AOSP) + avbtool. No stock DTB is needed (v3).
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=$(cd .. && pwd)
@@ -50,9 +53,8 @@ fi
 OUT=${2:-out/shim-boot.img}
 MKBOOTIMG=${MKBOOTIMG:-$(command -v mkbootimg || echo "python3 $ROOT/downloads/mkbootimg/mkbootimg.py")}
 $MKBOOTIMG \
-	--header_version 2 --kernel out/Image.lz4 --ramdisk out/ramdisk.bin --dtb "$ROOT/stock/dtb" \
-	--base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 --tags_offset 0x100 \
-	--dtb_offset 0x1f00000 --pagesize 4096 --os_version 13.0.0 --os_patch_level 2023-08 \
+	--header_version 3 --kernel out/Image.lz4 --ramdisk out/ramdisk.bin \
+	--os_version 14.0.0 --os_patch_level 2023-08 \
 	--cmdline "console=null" -o "$OUT"
 # Google's ABL refuses "fastboot boot" of an image without an AVB footer
 # ("Error verifying the received boot.img: Unsupported"), even unlocked: add
@@ -60,5 +62,5 @@ $MKBOOTIMG \
 # partition size.
 AVBTOOL=${AVBTOOL:-$(command -v avbtool || echo "python3 $ROOT/downloads/avb/avbtool.py")}
 $AVBTOOL add_hash_footer --image "$OUT" \
-	--partition_size 67108864 --partition_name boot
+	--partition_size 100663296 --partition_name boot	# 0x06000000 (redbull)
 ls -l out/Image "$OUT"

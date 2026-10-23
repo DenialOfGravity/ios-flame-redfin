@@ -24,9 +24,9 @@
 #include "ufs.h"
 #include "util.h"
 
-#define IMEM_RESTART_REASON	0x146aa65cUL	/* sunfish qcom,msm-imem@146aa000 restart_reason@65c */
+#define IMEM_RESTART_REASON	0x146ab65cUL	/* redfin (lito) qcom,msm-imem@146ab000 restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
-#define PON_SOFT_RB_SPARE	0x88f		/* PM6150 (SID 0) PON, reason in [7:1] */
+#define PON_SOFT_RB_SPARE	0x88f		/* redfin: PM8150 (SID 0) PON, reason in [7:1] (as flame) */
 #define PON_REASON_BOOTLOADER	0x02
 #define PON_PS_HOLD_RESET_CTL	0x85a		/* [3:0] type */
 #define PON_PS_HOLD_RESET_CTL2	0x85b		/* [7] enable */
@@ -201,9 +201,12 @@ static void log_gic(void)
 }
 
 /*
- * sunfish PMIC GPIOs (LV/MV subtype): Linux pinctrl sets these, ABL doesn't.
- *  - PM6150 (SID 0) GPIO4 = touch_power_default: output high, VIN 1.
- *  - PM6150L (SID 4) GPIO2 = key_vol_up_default: input, 30 uA pull-up, VIN 0.
+ * redfin PMIC GPIOs (LV/MV subtype): Linux pinctrl sets these, ABL doesn't.
+ *  - PM8150L (SID 4) GPIO5 = volume_up (lito-redbull-common.dtsi gpio_keys): input,
+ *    30 uA pull-up, VIN 0. GPIOn regs at 0xc000 + (n-1)*0x100.
+ *  - No PMIC GPIO for touch power: the sec_ts panel runs from pm8150_l17 (3.3 V,
+ *    regulator-always-on, RPMh) plus TLMM GPIO35 (bus switch, low), GPIO8 reset.
+ *    (sunfish had PM6150 GPIO4 touch power and PM6150L GPIO2 vol+.)
  * Regs: 0x40 MODE (LV/MV: dir 0 in / 1 out), 0x41 VIN, 0x42 PULL,
  * 0x44 OUT_SOURCE ([7] invert: high for source 0), 0x45 OUT_CTL, 0x46 EN.
  */
@@ -218,23 +221,18 @@ static void pmic_gpio_dump(const char *what, uint32_t sid, uint32_t base)
 		   what, sid, base, sub, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
 }
 
-static void sunfish_pmic_gpios(void)
+#define VOLUP_SID	4
+#define VOLUP_GPIO	0xc400	/* PM8150L GPIO5 */
+
+static void redfin_pmic_gpios(void)
 {
-	pmic_gpio_dump("touchpwr", 0, 0xc300);
-	pmic_gpio_dump("volup", 4, 0xc100);
-	/* touch power: drive high first, then enable */
-	spmi_write(0, 0xc300 + 0x41, 1);
-	spmi_write(0, 0xc300 + 0x44, 0x80);
-	spmi_write(0, 0xc300 + 0x45, 0x02);	/* CMOS, low drive */
-	spmi_write(0, 0xc300 + 0x40, 1);
-	spmi_write(0, 0xc300 + 0x46, 0x80);
+	pmic_gpio_dump("volup", VOLUP_SID, VOLUP_GPIO);
 	/* volume up: input with pull-up */
-	spmi_write(4, 0xc100 + 0x40, 0);
-	spmi_write(4, 0xc100 + 0x41, 0);
-	spmi_write(4, 0xc100 + 0x42, 0);
-	spmi_write(4, 0xc100 + 0x46, 0x80);
-	pmic_gpio_dump("touchpwr", 0, 0xc300);
-	pmic_gpio_dump("volup", 4, 0xc100);
+	spmi_write(VOLUP_SID, VOLUP_GPIO + 0x40, 0);
+	spmi_write(VOLUP_SID, VOLUP_GPIO + 0x41, 0);
+	spmi_write(VOLUP_SID, VOLUP_GPIO + 0x42, 0);
+	spmi_write(VOLUP_SID, VOLUP_GPIO + 0x46, 0x80);
+	pmic_gpio_dump("volup", VOLUP_SID, VOLUP_GPIO);
 }
 
 /* Plain RAM where XNU will live: is it there and writable with the MMU off? */
@@ -265,7 +263,7 @@ void shim_main(uintptr_t dtb)
 		log_pmic();
 		set_reboot_bootloader();
 		set_hard_reset();
-		sunfish_pmic_gpios();
+		redfin_pmic_gpios();
 	}
 	/* Probe runs reset themselves; only an XNU boot arms the watchdog. */
 	wdt_off();

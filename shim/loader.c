@@ -2,7 +2,8 @@
  * Milestone 4: act as iBoot for xnu.
  *
  * mkpayload.py already resolved the kernel's chained fixups and built the
- * ADT, so this only has to: find the payload in the ABL ramdisk, copy the
+ * ADT, so this only has to: find the payload in the ABL ramdisk (after the
+ * vendor_boot ramdisk on redfin), copy the
  * segments to phys_base + (vmaddr - virt_base), place the ADT and
  * boot_args behind the kernel, and jump to the entry point with the MMU
  * and caches off, x0 = boot_args (physical).
@@ -77,11 +78,49 @@ static int magic_ok(const char *m)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
+/*
+ * redfin: boot image header v3. ABL loads vendor_boot's ramdisk first and appends
+ * ours right after it, with no alignment guarantee, so the payload is not at
+ * linux,initrd-start. Scan the initrd for the magic; if the payload landed off
+ * an 8-byte boundary, slide it down onto one (moving down, a forward byte copy
+ * is safe) so copy64 and the header checks below work unchanged. Returns the
+ * aligned payload address, or 0. Cached in found_pa: loader_has_payload and
+ * loader_boot both call it, and the slide must only happen once.
+ */
+static uintptr_t found_pa;
+
+static uintptr_t find_payload(uintptr_t dtb, uint64_t *rd_end_out)
+{
+	uint64_t rd_start, rd_end;
+
+	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
+	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end) || rd_end <= rd_start + 8)
+		return 0;
+	if (rd_end_out)
+		*rd_end_out = rd_end;
+	if (found_pa)
+		return found_pa;
+	for (uintptr_t a = rd_start; a + 8 <= rd_end; a++) {
+		if (*(volatile const char *)a != 'S' || !magic_ok((const char *)a))
+			continue;
+		uintptr_t al = a & ~7UL;
+		log_printf("loader: payload at %lx (initrd +%lx)%s\n", a, a - rd_start,
+			   al != a ? ", sliding to 8-byte boundary" : "");
+		if (al != a) {
+			volatile uint8_t *d = (volatile uint8_t *)al;
+			volatile const uint8_t *src = (volatile const uint8_t *)a;
+			for (uint64_t i = 0; i < rd_end - a; i++)
+				d[i] = src[i];
+		}
+		found_pa = al;
+		return al;
+	}
+	return 0;
+}
+
 int loader_has_payload(uintptr_t dtb)
 {
-	uint64_t rd_start;
-	return fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) &&
-	       magic_ok(((const struct payload *)rd_start)->magic);
+	return find_payload(dtb, 0) != 0;
 }
 
 const char *loader_boot(uintptr_t dtb, const struct loader_fb *fb)
@@ -93,9 +132,11 @@ const char *loader_boot(uintptr_t dtb, const struct loader_fb *fb)
 		return "no initrd in /chosen";
 	log_printf("loader: initrd %lx-%lx\n", rd_start, rd_end);
 
-	const struct payload *p = (const struct payload *)rd_start;
-	if (!magic_ok(p->magic))
+	uintptr_t pa = find_payload(dtb, 0);
+	if (!pa)
 		return "no SWEETXNU payload";
+	rd_start = pa;	/* segment offsets are relative to the payload header */
+	const struct payload *p = (const struct payload *)rd_start;
 	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
 		return "bad payload header";
 
