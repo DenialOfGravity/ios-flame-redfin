@@ -164,6 +164,18 @@ Next: r2 = kernel 0152 + `sectouch=1 sectouchlog=1` (first run of the sec_ts dri
 Then USB: Windows has no CDC-ECM class driver (the port's USB Ethernet), so the host side needs work
 (usbipd into WSL, or an NCM/RNDIS variant of sweet_usb).
 
+## Touch works (2026-10-24, `redfin-r2-touch.img`)
+
+Kernel 0152 + `sectouch=1`: the sec_ts SPI driver (0151) works first time; home screen, Settings >
+General > About (iOS 16.7.16, iPhone X) all usable by touch. Display: with the GPU off, SweetFB's
+CPU path copies the centre of the 1125x2436 iPhone X frame, cropping 48 px top and bottom; r3 uses
+`sweetfb_native=1` (1080x2340 = 360x780 pt @3x, the iPhone 12 mini size, which UIKit knows).
+
+Wi-Fi without USB/SSH: `tools/redfin-install-wifi-wsl.sh` puts wland/netsvc (CI ios-userland), modem +
+vendor WLAN firmware (recon\fw), the phone's own rmtfs partitions (backup\) and the launchd job into
+the image in WSL; `tools/redfin-install-root-wsl.sh delta` rewrites only the changed GiBs from TWRP.
+r3 = r2 + `sweetfb_native=1`, `flamereboot=1800`.
+
 ## Done so far
 
 **Shim** (boots in place of iBoot)
