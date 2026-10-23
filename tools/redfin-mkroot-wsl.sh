@@ -119,7 +119,24 @@ hfsmod() {
 	fi
 	local magic; magic=$(modinfo -F vermagic "$ko" | awk '{print $1}')
 	[[ $magic == "$rel" ]] || { echo "vermagic $magic != running $rel: rebuild (delete $ko)"; exit 1; }
-	sudo insmod "$ko" || { sudo dmesg | tail -3; exit 1; }
+	if ! sudo insmod "$ko" 2>/dev/null; then
+		# gcc 15 here vs Microsoft's gcc 13: compiler-detected options (CC_HAS_*, asm-goto) change
+		# preprocessed header text, so the genksyms CRC of module_layout differs although struct module
+		# has the running kernel's size (that check passes). The config is the running one apart from
+		# those options; verify that, then drop the module's __versions table: with
+		# CONFIG_MODULE_FORCE_LOAD=y the kernel loads it as a forced module (taint F) instead of comparing
+		# CRCs. Only this WSL session's kernel is affected; nothing persists past `wsl --shutdown`.
+		local src=$W/WSL2-Linux-Kernel-$tag diffs
+		diffs=$(zcat /proc/config.gz | diff - "$src/.config" | grep '^[<>] CONFIG' |
+			grep -Ev 'CONFIG_(CC_VERSION_TEXT|GCC_VERSION|AS_VERSION|LD_VERSION|PAHOLE_VERSION|CC_HAS_[A-Z0-9_]+|GCC_ASM_GOTO_OUTPUT_BROKEN|HFSPLUS_FS)=' || true)
+		if [[ -n $diffs ]]; then
+			echo "insmod refused and the config differs beyond compiler-detected options:"; echo "$diffs"; sudo dmesg | tail -3; exit 1
+		fi
+		sudo dmesg | tail -1
+		echo "CRC mismatch from the compiler version only: loading as a forced module (no __versions)"
+		objcopy --remove-section=__versions "$ko" "${ko%.ko}-nover.ko"
+		sudo insmod "${ko%.ko}-nover.ko" || { sudo dmesg | tail -3; exit 1; }
+	fi
 	grep -qw hfsplus /proc/filesystems && echo "hfsplus: loaded ($ko)" || { echo "hfsplus: insmod did not register it"; sudo dmesg | tail -5; exit 1; }
 }
 
