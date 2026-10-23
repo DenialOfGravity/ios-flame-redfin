@@ -115,6 +115,27 @@ pages the log (20 s per page) to see the rest (autorefresh, loader, GIC, RAM).
 (0150/0151 must compile), the ADT (`mkadt.py --highmem`, FB already updated), and the iOS root on
 userdata (wipes Android data).
 
+## First CI build and kernel boot image (2026-10-23)
+
+Fork: github.com/DenialOfGravity/ios-flame-redfin, branch `redfin`. CI on push: shim, userland
+(wland built with the redfin changes), metal2, xnu: all green. xnu artifact `kernel.development.sweet`
+(sha256 906b776f…) contains `SWEET SECTS`, `sectouch`, the lito cmd-db fallback and the flame FTS
+default-off: 0150 and 0151 compiled and linked.
+
+`redfin-k1-readonly.img` = that kernel + `mkadt.py --highmem` ADT + shim built with
+`SHIM_NO_UFS_WRITE`. Boot-args: `rd=ufsroot0 ufsrw=0 rootrw=0 sweetlog=0` (the kernel refuses every UFS
+write and starts no log thread), `flamereboot=150`, touch/GPU/Metal off, **`sweetusb=0`**.
+Expected: XNU early console on screen, then "waiting for root device" (userdata is still Android's).
+
+Found while checking startup writers:
+- **USB SMMU stream is hard-coded 0x140** in sweet_usb.c (flame/sunfish); redfin's DWC3 is
+  `iommus = <&apps_smmu 0xe0 0x0>`. Next patch (0152) before `sweetusb=2`. GCC USB clock/GDSC offsets
+  also still unverified for lito.
+- cpufreq-hw on lito: 0x18323000 / 0x18325800 (same as sunfish, same LUT 0x110 / perf state 0x920)
+  **plus a prime cluster at 0x18327800** the driver doesn't know yet (prime core stays at ABL's clock).
+- Kernel has no LC_DYLD_CHAINED_FIXUPS (mkpayload `fixups: 0`), as expected for this build.
+- `research/ipsw-x/d22ap.adt` (iPhone X device tree, /product node) is needed for userland, not here.
+
 ## Done so far
 
 **Shim** (boots in place of iBoot)
