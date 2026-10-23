@@ -1,0 +1,30 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 5479f68..0d6faee 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -357,6 +357,15 @@ static int gmu_smmu(struct a6_gpu *g)
+ 	map_gmu_pages(GMEM_L3_6(g), VA_LOG, GMEM_LOG(g), A6_GMU_LOG_SIZE, 0);
+ 	map_gmu_pages(GMEM_L3_6(g), VA_HFI, GMEM_HFI(g), 0x5000, 0);	/* table + 4 queues */
+ 	smmu_bank(g->gmu_smr, g->gmu_cb, GMEM_L1(g), GMU_SID, GMU_SID_MASK);
++#if A6_GPU_ID == 618
++	/* 0142: the A618 GMU also has SID 4 (DT gmu_user cb); route it to the same bank */
++	int32_t smr4, cb_unused;
++	if (!smmu_pick(&smr4, &cb_unused, g->gmu_cb + 1)) {
++		wr32(S2CR(smr4), (uint32_t)g->gmu_cb);
++		wr32(SMR(smr4), (1u << 31) | 4);
++		a6_log("smmu: smr%d %x (gmu sid 4) -> cb%d\n", smr4, rd32(SMR(smr4)), g->gmu_cb);
++	}
++#endif
+ 	return 0;
+ }
+ 
+@@ -724,6 +733,9 @@ static int gmu_hfi(struct a6_gpu *g)
+ 	wr32(GMU_REG(GMU_H2G_SET), 0);
+ 	a6_log("hfi(v1): init, perf/bw tables, test -> %d; dcvs %u MHz %s ret %x\n", rc, gpu_khz[lvl] / 1000,
+ 	    dack ? "TIMEOUT" : "acked", dret);
++	a6_log("diag: smmu sgfsr %x sgfsynr0 %x sgfar %x%08x; gmu cb fsr %x far %x%08x\n", rd32(SMMU + 0x48),
++	    rd32(SMMU + 0x50), rd32(SMMU + 0x44), rd32(SMMU + 0x40), rd32(SMMU_CB(g->gmu_cb) + CB_FSR),
++	    rd32(SMMU_CB(g->gmu_cb) + CB_FAR + 4), rd32(SMMU_CB(g->gmu_cb) + CB_FAR));
+ #else
+ 	memset(msg, 0, sizeof(msg));
+ 	msg[1] = 6;
