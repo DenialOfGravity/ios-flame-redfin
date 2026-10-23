@@ -38,7 +38,7 @@ jobs:
           #define DROPBEAR_SVR_PASSWORD_AUTH 0
           #define DROPBEAR_SVR_PAM_AUTH 0
           #define DROPBEAR_SVR_PUBKEY_AUTH 1
-          #define DROPBEAR_SVR_MULTIUSER 0
+          #define DROPBEAR_SVR_MULTIUSER 1
           #define DROPBEAR_X11FWD 0
           #define DEFAULT_PATH "/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
           #define DSS_PRIV_FILENAME "/private/etc/dropbear/dropbear_dss_host_key"

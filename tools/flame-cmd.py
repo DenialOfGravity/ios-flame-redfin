@@ -11,7 +11,7 @@ Results are the POKE:/SWEET CMD: lines the phone prints; all received log
 text is also appended to logs/live.txt. Don't run tools/flame-live.py at the
 same time (one listener gets the datagrams).
 """
-import argparse, socket, sys, time
+import argparse, os, socket, sys, time
 
 ap = argparse.ArgumentParser()
 ap.add_argument('cmd', nargs='*')
@@ -40,7 +40,7 @@ except OSError:
     # The Mac has no ARP entry for the phone yet: the subnet broadcast needs none.
     tx.sendto(text.encode(), ('192.168.7.255', 5141))
 end = time.time() + a.wait if rx else 0
-with open('logs/live.txt', 'ab') as f:
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'logs', 'usb-live.log'), 'ab') as f:
     while time.time() < end:
         try:
             data, _ = rx.recvfrom(65536)

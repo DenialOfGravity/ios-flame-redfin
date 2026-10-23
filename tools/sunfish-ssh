@@ -1,0 +1,6 @@
+#!/bin/sh
+# Root shell in iOS on the Pixel 4a (dropbear on 192.168.7.2:22 over USB Ethernet).
+#   tools/sunfish-ssh ['command']
+cd "$(dirname "$0")/.." || exit 1
+exec ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+	-o ConnectTimeout=20 -i work/userland/ssh/id_ed25519 root@192.168.7.2 "$@"
