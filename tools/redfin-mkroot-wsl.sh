@@ -180,11 +180,14 @@ PY
 }
 
 build() {
-	local img="$W/iosroot.img"
+	local final="$W/iosroot.img" img="$W/iosroot.img.partial"
 	grep -qw hfsplus /proc/filesystems || { echo "no hfsplus in the kernel: run '$0 hfsmod' first"; exit 1; }
-	[[ -e $img ]] && { echo "$img exists: move it away to rebuild"; exit 1; }
+	[[ -e $final ]] && { echo "$final exists: move it away to rebuild"; exit 1; }
+	# A failed run leaves only the .partial image: start over from scratch.
+	rm -f "$img"
 	bash "$REPO/tools/mkiosroot.sh" "$W/ipsw/${PARTS[0]}" "$W/ipsw/${PARTS[1]}" "$W/ipsw/${PARTS[2]}" "$img" 16G 2>&1 |
 		tee "$W/mkiosroot.log"
+	[[ ${PIPESTATUS[0]} == 0 ]] || { echo "mkiosroot.sh failed (log: $W/mkiosroot.log)"; exit 1; }
 	echo "== tweaks"
 	sudo fsck.hfsplus -fy "$img" | grep -v 'Illegal name' || true
 	mkdir -p "$W/mnt"
@@ -211,6 +214,7 @@ with open(sys.argv[1], 'rb') as f, open(sys.argv[2], 'w') as o:
         o.write(f'{i} {h.hexdigest()}\n'); i += 1
 print(f'{sys.argv[2]}: {i} GiB')
 PY
+	mv "$img" "$final"; img=$final
 	ls -ls "$img"
 	echo "build: done -> $img (stays in WSL; the install step streams it to the phone from here)"
 }

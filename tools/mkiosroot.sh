@@ -110,22 +110,33 @@ for c in OS App; do
 	done
 done
 
+# Numeric owners are set with Python's os.chown: `install -o 272` fails where no user 272 exists
+# (uutils coreutils on newer Ubuntu: "invalid user: '272'"), and the "+N" spelling is GNU-only.
+own() { sudo python3 -c 'import os, sys; u = int(sys.argv[1]); [os.chown(p, u, u) for p in sys.argv[2:]]' "$@"; }
+
 # logd's log stores, normally made at restore: it checks owner _logd (272)
 # and mode, plus a .migrated marker, else asks a helper and crashes
 # ("BUG IN LIBTRACE: Failed to migrate directory").
 db="$work/root/private/var/db"
-sudo install -d -o 272 -g 272 -m 0751 "$db/diagnostics"
-sudo install -d -o 272 -g 272 -m 0755 "$db/uuidtext" "$db/diagnostics/timesync"
+sudo mkdir -p "$db/diagnostics/timesync" "$db/uuidtext"
+sudo chmod 0751 "$db/diagnostics"
+sudo chmod 0755 "$db/uuidtext" "$db/diagnostics/timesync"
 for d in diagnostics uuidtext diagnostics/timesync; do
-	sudo install -o 272 -g 272 -m 0644 /dev/null "$db/$d/.migrated"
+	sudo touch "$db/$d/.migrated"
+	sudo chmod 0644 "$db/$d/.migrated"
+	own 272 "$db/$d" "$db/$d/.migrated"
 done
 
 # System keybag for the built-in AppleKeyStore (no passcode).
-sudo install -d -m 0700 -o 0 -g 0 "$work/root/private/var/keybags"
+sudo mkdir -p "$work/root/private/var/keybags"
+sudo chmod 0700 "$work/root/private/var/keybags"
+own 0 "$work/root/private/var/keybags"
 printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
 	'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
 	'<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>' |
-	sudo install -m 0600 -o 0 -g 0 /dev/stdin "$work/root/private/var/keybags/systembag.kb"
+	sudo tee "$work/root/private/var/keybags/systembag.kb" >/dev/null
+sudo chmod 0600 "$work/root/private/var/keybags/systembag.kb"
+own 0 "$work/root/private/var/keybags/systembag.kb"
 
 df -h "$work/root"
 sudo umount "$work/root"
