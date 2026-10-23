@@ -11,7 +11,7 @@
 """
 import os, socket, stat, sys
 
-HOST, PORT = '127.0.0.1', 2223
+HOST, PORT = __import__('os').environ.get('PHONE_FILES_HOST', '192.168.7.2'), 2223  # sunfish: direct over USB net (flame: FlameBridge 127.0.0.1)
 
 
 def conn():

@@ -1,0 +1,80 @@
+name: userland
+
+# iOS 16 arm64 userland for SSH into the phone: dropbear (root-only, pubkey
+# only) and dash. Built with the runner's Xcode iOS SDK, ad hoc signed.
+# Install with tools/sunfish-install-ssh.sh over the kernel file server.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [sunfish]
+    paths: [.github/workflows/userland.yml]
+
+env:
+  DROPBEAR_VER: "2022.83"
+  DASH_VER: "0.5.12"
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Toolchain
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK" >> $GITHUB_ENV
+          mkdir -p $HOME/bin
+          printf '#!/bin/sh\nexec %s -arch arm64 -isysroot %s -miphoneos-version-min=16.0 "$@"\n' \
+            "$(xcrun -f clang)" "$SDK" > $HOME/bin/ios-cc
+          chmod +x $HOME/bin/ios-cc
+          echo "$HOME/bin" >> $GITHUB_PATH
+          mkdir -p out
+
+      - name: dropbear
+        run: |
+          curl -fsSL https://matt.ucc.asn.au/dropbear/releases/dropbear-$DROPBEAR_VER.tar.bz2 | tar xj
+          cd dropbear-$DROPBEAR_VER
+          cat > localoptions.h <<'EOF'
+          #define DROPBEAR_SVR_PASSWORD_AUTH 0
+          #define DROPBEAR_SVR_PAM_AUTH 0
+          #define DROPBEAR_SVR_PUBKEY_AUTH 1
+          #define DROPBEAR_SVR_MULTIUSER 0
+          #define DROPBEAR_X11FWD 0
+          #define DEFAULT_PATH "/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+          #define DSS_PRIV_FILENAME "/private/etc/dropbear/dropbear_dss_host_key"
+          #define RSA_PRIV_FILENAME "/private/etc/dropbear/dropbear_rsa_host_key"
+          #define ECDSA_PRIV_FILENAME "/private/etc/dropbear/dropbear_ecdsa_host_key"
+          #define ED25519_PRIV_FILENAME "/private/etc/dropbear/dropbear_ed25519_host_key"
+          EOF
+          ./configure --host=aarch64-apple-darwin CC=ios-cc --disable-zlib --disable-syslog \
+            --disable-lastlog --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx \
+            --disable-loginfunc --disable-pututline --disable-pututxline --disable-harden
+          make -j4 PROGRAMS="dropbear dropbearkey scp dbclient" MULTI=1
+          cp dropbearmulti ../out/
+
+      - name: dash
+        run: |
+          curl -fsSL http://gondor.apana.org.au/~herbert/dash/files/dash-$DASH_VER.tar.gz | tar xz
+          cd dash-$DASH_VER
+          # iOS 16 lacks strchrnul (newer SDKs weak-import it -> PC 0 crash)
+          ./configure --host=aarch64-apple-darwin CC=ios-cc CC_FOR_BUILD=clang \
+            ac_cv_func_strchrnul=no
+          make -j4
+          cp src/dash ../out/
+
+      - name: Check and sign
+        run: |
+          cd out
+          for b in *; do
+            if nm -m "$b" | grep -q "weak external"; then
+              echo "::warning::$b has weak imports:"; nm -m "$b" | grep "weak external"
+            fi
+            codesign -f -s - "$b"
+            file "$b"
+          done
+          shasum -a 256 * > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-userland
+          path: out/
