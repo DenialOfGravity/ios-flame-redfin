@@ -155,7 +155,7 @@ def add_poke_to_adt(adt_blob, script):
     return adt.serialize(root)
 
 
-GPU_FW = ('a640_gmu.bin', 'a630_sqe.fw', 'a640_zap.mdt', 'a640_zap.b02')
+GPU_FW = ('a618_gmu.bin', 'a630_sqe.fw', 'a615_zap.mdt', 'a615_zap.b02')  # sunfish (flame: a640_*)
 
 
 def add_gpufw_to_adt(adt_blob, fw_dir):

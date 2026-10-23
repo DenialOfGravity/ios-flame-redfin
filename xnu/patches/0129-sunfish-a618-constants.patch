@@ -1,0 +1,97 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 0155304..5e591eb 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -198,7 +198,7 @@ static int power_cx(void)
+ 	       rd32(GPUCC + GPUCC_GMU_RCG + 4), rd32(GPUCC + GPUCC_AHB), rd32(GPUCC + GPUCC_CXO),
+ 	       rd32(GPUCC + GPUCC_CX_GMU));
+ 	branch_on("gcc gpu_cfg_ahb", GCC + 0x71004);
+-	branch_on("gcc ddrss_gpu_axi", GCC + 0x71154);
++	branch_on("gcc ddrss_gpu_axi", GCC + 0x4452c);	/* gcc-sdmmagpie (sm8150: 0x71154) */
+ 	branch_on("gcc gpu_memnoc_gfx", GCC + 0x7100c);
+ 	branch_on("gcc gpu_snoc_dvm_gfx", GCC + 0x71018);
+ 
+@@ -337,7 +337,7 @@ static int gmu_smmu(struct a6_gpu *g)
+ 	return 0;
+ }
+ 
+-/* a6xx_gmu_rpmh_init for the A640 (pdc_address_offset 0x30090). */
++/* a6xx_gmu_rpmh_init (pdc_address_offset 0x30090 for A640 and A618; sunfish: TCS3 cmd1 data 2). */
+ static void rpmh_init(void)
+ {
+ 	static const uint32_t rscc[][2] = {
+@@ -352,7 +352,7 @@ static void rpmh_init(void)
+ 		{ 0x1577, 1 }, { 0x1579, 0x10108 }, { 0x157a, 0x30000 }, { 0x157b, 0 }, { 0x157d, 0x10108 },
+ 		{ 0x157e, 0x30090 }, { 0x157f, 0 },
+ 		{ 0x15d7, 7 }, { 0x15d8, 0 }, { 0x15d6, 0 }, { 0x15d9, 0x10108 }, { 0x15da, 0x30010 },
+-		{ 0x15db, 2 }, { 0x15dd, 0x10108 }, { 0x15de, 0x30000 }, { 0x15df, 3 }, { 0x15e1, 0x10108 },
++		{ 0x15db, 2 }, { 0x15dd, 0x10108 }, { 0x15de, 0x30000 }, { 0x15df, 2 }, { 0x15e1, 0x10108 },	/* TCS3 cmd1 data: A618 2, A640 3 */
+ 		{ 0x15e2, 0x30090 }, { 0x15e3, 3 },
+ 		{ 0x1148, 0 }, { 0x1140, 0x80000001 },
+ 	};
+@@ -388,7 +388,7 @@ static void hfi_table(struct a6_gpu *g)
+ static int fw_load(struct a6_gpu *g)
+ {
+ 	uint32_t len;
+-	const uint8_t *fw = a6_firmware("a640_gmu.bin", &len);
++	const uint8_t *fw = a6_firmware("a618_gmu.bin", &len);
+ 	if (!fw)
+ 		return -1;
+ 	const uint8_t *p = fw, *end = fw + len;
+@@ -486,7 +486,8 @@ static int gmu_boot(struct a6_gpu *g)
+ #define LVL_SVS_L2	224
+ #define LVL_NOM		256
+ 
+-static const uint32_t gpu_khz[] = { 0, 257000, 345000, 427000, 499200, 585000 };
++/* A618 (sunfish DT pwrlevels), each at or below the A640 frequency of the same level */
++static const uint32_t gpu_khz[] = { 0, 180000, 267000, 355000, 430000, 565000 };
+ static const uint32_t gpu_lvl[] = { 0, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_SVS_L2, LVL_NOM };
+ static const uint32_t gmu_khz[] = { 0, 200000 };
+ static const uint32_t gmu_lvl[] = { 0, LVL_MIN_SVS };
+@@ -647,7 +648,7 @@ static int gmu_hfi(struct a6_gpu *g)
+ /* ---- zap shader through TrustZone PAS ---- */
+ 
+ #define PAS_GPU		13
+-#define ZAP_REGION	0x9a915000ull	/* reserved-memory pil_gpu_region */
++#define ZAP_REGION	0x98f95000ull	/* sunfish reserved-memory gpu_region (flame 0x9a915000) */
+ #define ZAP_SIZE	0x2000u
+ #define SCM_PIL(cmd)	(0x42000000ull | (2u << 8) | (cmd))
+ 
+@@ -664,7 +665,7 @@ static int zap_load(struct a6_gpu *g)
+ {
+ 	uint64_t r1 = 0;
+ 	uint32_t mlen, slen;
+-	const uint8_t *mdt = a6_firmware("a640_zap.mdt", &mlen), *b02 = a6_firmware("a640_zap.b02", &slen);
++	const uint8_t *mdt = a6_firmware("a615_zap.mdt", &mlen), *b02 = a6_firmware("a615_zap.b02", &slen);
+ 	if (!mdt || !b02 || slen > ZAP_SIZE)
+ 		return -1;
+ 	a6_write(a6_pool_pa(g, A6_OFF_ZAP_META), mdt, mlen);
+diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
+index a9d6c3e..bec34a0 100644
+--- a/bsd/dev/sweet_a6xx.h
++++ b/bsd/dev/sweet_a6xx.h
+@@ -51,8 +51,8 @@
+ #define A6_FB_PA		0x9c000000ull
+ #define A6_FB_SIZE		0xa00000ull	/* mapped for the GPU: 5 x 2 MB */
+ 
+-#define A6_GPU_ID		640
+-#define A6_CHIP_ID		0x06040001ull
++#define A6_GPU_ID		618	/* sunfish (flame: 640) */
++#define A6_CHIP_ID		0x06010800ull	/* sunfish DT qcom,chipid */
+ 
+ struct a6_gpu {
+ 	uint64_t pool_pa;
+@@ -157,10 +157,10 @@ uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *d
+ #define A6_CP_MEMCPY		0x75
+ 
+ /* Register/state access for status and dumps */
+-#define A6_GPU_BASE		0x02c00000ull
++#define A6_GPU_BASE		0x05000000ull	/* sunfish kgsl-3d0 (flame 0x02c00000) */
+ #define A6_GREG(o)		(A6_GPU_BASE + 4ull * (o))
+-#define A6_GPUCC		0x02c90000ull
+-#define A6_SMMU			0x02ca0000ull
++#define A6_GPUCC		0x05090000ull	/* gpucc-sdmmagpie */
++#define A6_SMMU			0x05040000ull	/* sunfish kgsl-iommu */
+ #define A6_SMMU_CB(n)		(A6_SMMU + 0x8000 + 0x1000ull * (n))
+ #define A6_FSR_FAULT		0xc00001feu
+ #define A6_GMEM_LOG_OFF		0x91000ull
