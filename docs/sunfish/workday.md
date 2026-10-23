@@ -155,3 +155,27 @@ After a clean reboot: 3 scans, 14 networks, no modem crash, Settings > Wi-Fi lis
   Screenshot logs/shots/gpu-k25-home.png (read with `flame-shot --stride 4352`).
 - Swipe bench: **20.1 fps** (CPU path 17.2). GPU present ~27 ms/frame → GPU clock probably at minimum:
   HFI messages after INIT still CM3-fault (`info 800000`), so DCVS (clock up) times out. Next: that fault.
+
+## [10:50] Wi-Fi join, round 2 — **still blocked** (2 more attempts), crash decoded
+- Crash PC 0xb01ab7b0 decoded in wlanmdsp.mbn (Hexagon, `llvm-objdump --triple=hexagon`): a **buffer-pool
+  allocator** (global object at gp+0x6b0) walking a pool whose descriptor array was never set up → bad
+  pointer load (`memuh(r18+#0x1c)`). Not an assert.
+- Tried: (1) pdev TX power limits + vdev WMM before vdev start (ath10k does this); (2) WMI INIT resource config
+  exactly as ath10k for wcn3990 (14 peers, not 33; skid 6; beacon offload 3; host_capab 0). Same crash both times.
+- Also verified identical to ath10k: CE pipe/service/shadow maps, INIT layout, vdev create/start layout, channel TLV.
+- Temporary /var/local/wlan.conf deleted after each test (verified absent).
+- Next lead: find which pool (callers of 0xb01ab644 and the pool type/size args) → what host step initializes it.
+
+## [10:50] GPU — 0142: SID 4 mapped, no SMMU faults at all; GMU still faults after HFI INIT
+- SMR1 `80000004` took. After the HFI v1 sequence: sGFSR 0, GMU bank FSR clean → the remaining CM3 fault is
+  internal, not a memory-access fault through the SMMU. GPU still composites (CP/zap fine); only DCVS (clock
+  boost) is missing. 0143 dumps DTCM after the HFI sequence to decode the new fault PC.
+
+## [11:10] GPU — **PASS: GMU HFI fully working** (0143 diag + 0144 fix)
+- 0143 DTCM dump after HFI: GMU fault pc 0x2536 = `bkpt` in the fw's HFI queue reader: message size 0 or >0x100.
+  Our hfi_send padded every message to 4 dwords with 0xfafafafa (HFI v2 rule; kgsl pads only for v2). The
+  legacy v1 fw read the padding as a 250-dword message header.
+- 0144: no padding / no read alignment on A618. Result: `hfi(v1): init, perf/bw tables, test -> 0; dcvs 267 MHz
+  acked`, `oob gpu_set acked`, **bring-up 297 ms** (was 6 s with timeouts). No SMMU faults.
+- GPU present per frame **0.77 ms** (was 27 ms). Swipe bench 16.4 fps average (samples 17–23 while moving);
+  now CPU-bound in backboardd, not GPU-bound.

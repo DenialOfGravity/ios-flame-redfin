@@ -89,3 +89,10 @@ Next session, in order:
    kgsl enables it via the SMMU node's clock + vdd-supply). Fix → expect SMR readback 0x84000005.
 2. Write the DT `attach-impl-defs` pairs (0x6000=0x2378 … 0x6b68=0x9a82a382) before programming the SMR.
 3. Re-run HFI; the 0138 TCM dump (decoded above) shows whether the fault moves.
+
+### 11:10 — HFI solved
+1. SMR mask must be 0 (DT #iommu-cells = 1); the hypervisor drops SMRs with mask 0x400 (0141).
+2. Legacy HFI v1: no 0xfafafafa 4-dword padding of queue messages (0144).
+Also mapped GMU SID 4 (0142). Bring-up 297 ms; DCVS + OOB acked; GPU composites the UI.
+Debug method that found both: copy GMU DTCM to low RAM (0xE2010000) after the fault, read it via
+/dev/pmem (warm reset keeps RAM), decode the CM3 exception frame + crash block (magic 0xdead5aab at 0x41e00).
