@@ -10,3 +10,24 @@
   watchdog returned it to fastboot. Joins now via reboot; recovery boot uses `sweetwifi=0`.
 - wlan.conf deleted after every test, verified absent (last check 13:50 on k46).
 - Next: Phase 3 — firmware debug log (WMI_DBGLOG_CFG + diag pipe) to see what vdev start does before the assert.
+
+## [17:36] STOP — hard hang (demo boot k50, flamereboot=0)
+- k50 (demo: sweettouch=2, sweetwifi=0, flamereboot=0) booted 17:10, USB link came up again at 17:15, the live
+  log stops at 82 s uptime, phone answers neither ARP nor SSH, no fastboot. flamereboot=0 means no timed return.
+- Needs a human: hold power (+vol down) to reach fastboot.
+- Test 8 (scan only 2437 MHz) never ran: the phone was already unreachable when it started. The tests 6 and 8
+  "hangs" earlier may be the same thing: phone alive per its own log but no USB networking.
+- Wi-Fi Phase 3 so far: dbglog over WMI gives nothing (WCN3990 logs via diag). Firmware disassembled
+  (llvm-mc hexagon). Crash function 0xb01ab640 = WMI event buffer-pool allocator; pool struct (0x934 bytes,
+  malloc'd at init, global gp+0x6b0) has its header array pointers (+0x10/+0x14/+0x18) overwritten →
+  firmware heap overflow from a neighbouring block, somewhere between init and vdev start.
+- wlan.conf: not present at last check (k49, 17:0x); test 8 rerun never wrote it (phone unreachable).
+
+## [18:56] STOP — iOS USB (USB 2) dead on every boot since ~17:15; fastboot (USB 3) fine
+- PC: `usb 5-2-port2: Cannot enable. Maybe the USB cable is bad?` on every iOS boot (k51–k56).
+- Not software: fails with Wi-Fi off, after `fastboot reboot-bootloader`, and with this morning's kernel14
+  (GPU off) that ran all day. Port power-cycle and dock USB2 hub reset changed nothing.
+- Needs a human: unplug/replug the cable (or another port/cable), full power-off of the phone.
+- Found on the way, fixed: GPU pool range 2 began at 0xe1000000 = wland's rmtfs buffer (hyp-assigned to
+  the modem). xnu 0150 starts it at 0xe1400000 (kernel26).
+- No wlan.conf written since k49 (verified absent then).

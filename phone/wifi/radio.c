@@ -547,6 +547,26 @@ static int wmi_init_sent, wmi_ready, wmi_seen_bmap, wmi_seen_reqs;
 static uint32_t wmi_eeprom_rd = 0xffffffff;	/* HAL_REG_CAPABILITIES.eeprom_rd */
 static uint8_t wmi_mac[6];
 static uint32_t wmi_rf_chains;
+/*
+ * Test hook: /var/local/wlan-steps.conf, a hex mask of ath10k station steps we used to skip (default all on):
+ * bit 0 keepalive off, bit 1 sta ps params, bit 2 rts threshold, bit 3 vdev start in HT20 mode.
+ */
+static uint32_t w_steps = 0xf;
+static int w_steps_read;
+static uint32_t steps(void)
+{
+	if (!w_steps_read) {
+		w_steps_read = 1;
+		FILE *f = fopen("/var/local/wlan-steps.conf", "r");
+		unsigned v;
+		if (f && fscanf(f, "%x", &v) == 1)
+			w_steps = v;
+		if (f)
+			fclose(f);
+		printf("radio: steps %#x\n", w_steps);
+	}
+	return w_steps;
+}
 static int w_pdev_param(uint32_t param, uint32_t value);
 
 /* ath10k WMI_SERVICE_IS_ENABLED: 4 service bits per 32-bit word (sizeof(u32)) */
@@ -714,6 +734,7 @@ static const uint16_t scan_freqs[] = {
 	5745, 5765, 5785, 5805, 5825,
 };
 #define NFREQ ((uint32_t)(sizeof(scan_freqs) / sizeof(scan_freqs[0])))
+#define NFREQ_MAX 64
 #define NBSS 64
 
 struct bss {
@@ -737,6 +758,22 @@ static int scan_send_start(void)
 {
 	static uint8_t m[512];
 	uint8_t *p = m, *c;
+	/* test hook: /var/local/wlan-scan.conf lists the only frequencies to scan (MHz, one per line) */
+	static uint32_t sf[NFREQ_MAX], nsf;
+	static int sf_read;
+	if (!sf_read) {
+		sf_read = 1;
+		FILE *f = fopen("/var/local/wlan-scan.conf", "r");
+		unsigned v;
+		while (f && nsf < NFREQ_MAX && fscanf(f, "%u", &v) == 1)
+			sf[nsf++] = v;
+		if (f)
+			fclose(f);
+		if (!nsf)
+			for (; nsf < NFREQ; nsf++)
+				sf[nsf] = scan_freqs[nsf];
+		LOG("scan: %u frequencies%s", nsf, nsf == NFREQ ? "" : " (wlan-scan.conf)");
+	}
 	memset(m, 0, sizeof(m));
 	c = put_tlv(p, TAG_START_SCAN_CMD, 100);
 	c = put32(c, 0xa000 | (scans + 1));		/* scan_id */
@@ -755,15 +792,15 @@ static int scan_send_start(void)
 	c = put32(c, 5);				/* probe delay */
 	c = put32(c, (0x01 | 0x10) ^ 0x20);		/* passive, chan stat; probe-req filter inverted on TLV */
 	c = put32(c, 0);
-	c = put32(c, NFREQ);
+	c = put32(c, nsf);
 	c = put32(c, 1);				/* bssids */
 	c = put32(c, 0);				/* ssids */
 	c = put32(c, 0);				/* ie_len */
 	c = put32(c, 3);				/* num_probes */
 	p = c + 16;					/* mac addr + mask: zero */
-	c = put_tlv(p, TAG_ARRAY_UINT32, NFREQ * 4);
-	for (uint32_t i = 0; i < NFREQ; i++)
-		c = put32(c, scan_freqs[i]);
+	c = put_tlv(p, TAG_ARRAY_UINT32, nsf * 4);
+	for (uint32_t i = 0; i < nsf; i++)
+		c = put32(c, sf[i]);
 	p = put_tlv(c, TAG_ARRAY_FIXED_STRUCT, 0);
 	c = put_tlv(p, TAG_ARRAY_FIXED_STRUCT, 8);	/* bssid: broadcast */
 	memset(c, 0xff, 6);
@@ -846,6 +883,35 @@ static void scan_start(void)
 		q = put32(q, 0x22);
 		put32(q, nss);
 		LOG("vdev: nss %u %s", nss, wmi_send(0x5008, vp, sizeof(vp)) ? "FAILED" : "ok");
+	}
+	/* ath10k_add_interface for a station, after NSS */
+	if (steps() & 1) {			/* ath10k_mac_vif_disable_keepalive: STA_KEEPALIVE 0x1c005, interval 0 */
+		uint8_t ka[4 + 16 + 4 + 16] = { 0 }, *q = put_tlv(ka, 0x7f, 16);
+		q = put32(q, 0);
+		q = put32(q, 1);		/* enabled */
+		q = put32(q, 1);		/* method: null frame */
+		q = put32(q, 0);		/* interval 0: off */
+		put_tlv(q, 0x80, 16);		/* arp response: zero */
+		LOG("vdev: keepalive off %s", wmi_send(0x1c005, ka, sizeof(ka)) ? "FAILED" : "ok");
+	}
+	if (steps() & 2) {			/* sta ps: rx wake policy WAKE, tx wake threshold ALWAYS, pspoll count NO_MAX */
+		static const uint32_t ps[3][2] = { { 0, 0 }, { 1, 1 }, { 2, 0 } };
+		int e = 0;
+		for (int i = 0; i < 3; i++) {
+			uint8_t m[4 + 12], *q = put_tlv(m, 0x6d, 12);
+			q = put32(q, 0);
+			q = put32(q, ps[i][0]);
+			put32(q, ps[i][1]);
+			e |= wmi_send(0x9002, m, sizeof(m));
+		}
+		LOG("vdev: sta ps params %s", e ? "FAILED" : "ok");
+	}
+	if (steps() & 4) {			/* ath10k_mac_set_rts: vdev param 1, wiphy default (u32)-1 */
+		uint8_t m[4 + 12], *q = put_tlv(m, 0x5f, 12);
+		q = put32(q, 0);
+		q = put32(q, 1);
+		put32(q, 0xffffffffu);
+		LOG("vdev: rts threshold %s", wmi_send(0x5008, m, sizeof(m)) ? "FAILED" : "ok");
 	}
 	scanning = !scan_send_start();
 	LOG("scan: channel list (%u) %s, vdev %s, passive scan %s", NFREQ, a ? "FAILED" : "ok", b ? "FAILED" : "ok",
@@ -1257,7 +1323,8 @@ static uint8_t *w_channel(uint8_t *p, uint32_t freq)
 	c = put32(c, freq);
 	c = put32(c, freq);
 	c = put32(c, 0);
-	c = put32(c, freq < 4000 ? 1 : 0);
+	/* ath10k chan_to_phymode for an HT AP: 11NG_HT20 (5) / 11NA_HT20 (4); bit 3 off: legacy 11G (1) / 11A (0) */
+	c = put32(c, (steps() & 8) ? (freq < 4000 ? 5 : 4) : (freq < 4000 ? 1 : 0));
 	c = put32(c, (40u << 8) | (40u << 16));
 	return put32(c, 40u << 8);
 }

@@ -1,0 +1,89 @@
+From af3a2fa3dddcd7081c42734171314adc76e5e0f0 Mon Sep 17 00:00:00 2001
+From: Yofuness <compiledchickennuggets@gmail.com>
+Date: Fri, 23 Oct 2026 19:48:52 -0400
+Subject: [PATCH] 0151 sunfish: QUSB2 v2 HS PHY init (block reset + Linux v2
+ table) instead of flame's femto sequence
+
+sunfish's HS PHY at 0x088e2000 is a QUSB2 v2 (mainline sm7150.dtsi), but the driver
+wrote flame's Synopsys femto init into it and never pulsed GCC_QUSB2PHY_PRIM_BCR.
+Since ~17:15 every iOS boot fails USB 2 enumeration while fastboot (SS) works.
+Boot-arg sweetqusb=0 keeps the old path.
+---
+ bsd/dev/sweet_usb.c | 54 ++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 45d75f8..b5f0bec 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1316,6 +1316,56 @@ ud_hsphy_init(void)
+ 	ud_hsphy_dump(p, "after init");
+ }
+ 
++/*
++ * sunfish: the HS PHY at 0x088e2000 is a QUSB2 v2 (mainline sm7150.dtsi: "qcom,sm7150-qusb2-phy",
++ * "qcom,qusb2-v2-phy"), not flame's femto PHY: ud_hsphy_init wrote femto registers into it. This is Linux
++ * qusb2_phy_init for qusb2_v2_phy_cfg: GCC_QUSB2PHY_PRIM_BCR pulse (clears what a warm reset leaves),
++ * power down, the v2 table, power up, PLL ready check. Boot-arg sweetqusb=0: the old femto path.
++ */
++#define GCC_QUSB2PHY_PRIM_BCR_PA        0x00126000
++static const struct { uint16_t off; uint8_t val; } qusb2_v2_tbl[] = {
++	{ 0x004, 0x03 }, { 0x18c, 0x7c }, { 0x02c, 0x80 }, { 0x184, 0x0a }, { 0x0b4, 0x19 }, { 0x194, 0x40 },
++	{ 0x198, 0x20 }, { 0x214, 0x21 }, { 0x220, 0x00 }, { 0x224, 0x58 },
++	{ 0x240, 0x30 }, { 0x244, 0x29 }, { 0x248, 0xca }, { 0x24c, 0x04 }, { 0x250, 0x03 },   /* PORT_TUNE1..5 */
++	{ 0x23c, 0x00 },
++};
++
++static int
++ud_qusb2_init(void)
++{
++	int doinit = 1;
++	PE_parse_boot_argn("sweetqusb", &doinit, sizeof(doinit));
++	if (!doinit) {
++		return 0;
++	}
++	vm_offset_t p = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	vm_offset_t bcr = ml_io_map(GCC_QUSB2PHY_PRIM_BCR_PA, 0x1000);
++	if (!p || !bcr) {
++		return 0;
++	}
++	printf("SWEET USB: qusb2 before: PLL_STATUS %x POWERDOWN %x TUNE1 %x\n",
++	    usb_rd(p, 0x1a0), usb_rd(p, 0x210), usb_rd(p, 0x240));
++	*(volatile uint32_t *)bcr = 1;                  /* block reset assert */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(150);
++	*(volatile uint32_t *)bcr = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(100);
++	/* disable: VREF_SUPPLY_TRIM | CLAMP_N_EN | POWER_DOWN (qusb2_v2_phy_cfg.disable_ctrl) */
++	*(volatile uint32_t *)(p + 0x210) = usb_rd(p, 0x210) | (1u << 5) | (1u << 1) | (1u << 0);
++	for (unsigned i = 0; i < sizeof(qusb2_v2_tbl) / sizeof(qusb2_v2_tbl[0]); i++) {
++		*(volatile uint32_t *)(p + qusb2_v2_tbl[i].off) = qusb2_v2_tbl[i].val;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(p + 0x210) = usb_rd(p, 0x210) & ~1u;     /* enable: clear POWER_DOWN */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(300);
++	uint32_t st = usb_rd(p, 0x1a0);
++	printf("SWEET USB: qusb2 init: PLL_STATUS %x (%s) POWERDOWN %x TUNE1 %x\n", st,
++	    (st & 1) ? "core ready" : "NOT READY", usb_rd(p, 0x210), usb_rd(p, 0x240));
++	return 1;
++}
++
+ static void
+ sweet_usb_gadget_start(vm_offset_t dwc)
+ {
+@@ -1398,7 +1448,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	printf("SWEET USB: step start setup\n");
+ 	ud_start_setup();
+ 	printf("SWEET USB: step qscratch\n");
+-	ud_hsphy_init();
++	if (!ud_qusb2_init()) {
++		ud_hsphy_init();
++	}
+ 
+ 	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+ 	if (qs != 0) {
+-- 
+2.56.0
+

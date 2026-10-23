@@ -1,0 +1,29 @@
+From 005db148af09454c89aa47e3ea716841b5526872 Mon Sep 17 00:00:00 2001
+From: Yofuness <compiledchickennuggets@gmail.com>
+Date: Fri, 23 Oct 2026 18:22:44 -0400
+Subject: [PATCH] 0150 sunfish: GPU pool skips wland's rmtfs buffer at
+ 0xe1000000
+
+The second v2 pool range began at 0xe1000000, where wland's rmtfs buffer
+(0xe1001000 + 2 MB) is hypervisor-assigned to the modem. GPU buffers there
+overlapped modem-owned RAM: USB and SSH died on Wi-Fi + GPU boots.
+---
+ bsd/dev/sweet_gpu.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index a3f251e..56c8556 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -941,7 +941,7 @@ sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, ui
+ #define GPOOL_FREE_MAX  4096
+ static const struct { uint64_t pa, size; } gpool_ranges[] = {
+ 	{ 0xc4000000ULL, 0x1c000000ULL },       /* 448 MB (the first 64 MB left to ABL's ramdisk) */
+-	{ 0xe1000000ULL, 0x1f000000ULL },       /* 496 MB */
++	{ 0xe1400000ULL, 0x1ec00000ULL },       /* 492 MB; 0xe1000000-0xe1400000 is wland's rmtfs buffer (hyp-assigned to the modem) */
+ };
+ static struct { uint64_t pa, size; } gpool_free[GPOOL_FREE_MAX];       /* sorted by address, merged */
+ static uint32_t gpool_nfree;
+-- 
+2.56.0
+
