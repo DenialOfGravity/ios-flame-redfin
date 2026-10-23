@@ -101,6 +101,10 @@ hfsmod() {
 			fi
 		done
 		make -j"$(nproc)" modules_prepare >>"$W/kbuild.log" 2>&1 || { tail -30 "$W/kbuild.log"; exit 1; }
+		# Our vmlinux was built without BTF; with it present, the module's BTF step fails ("failed to
+		# find '.BTF'"). Without a vmlinux, Makefile.modfinal skips module BTF, which the running kernel
+		# does not need (MODULE_ALLOW_BTF_MISMATCH=y, BTF is optional for modules).
+		[[ -f vmlinux ]] && mv vmlinux vmlinux.nobtf
 		make -j"$(nproc)" M=fs/hfsplus modules >>"$W/kbuild.log" 2>&1 || { tail -30 "$W/kbuild.log"; exit 1; }
 		cp fs/hfsplus/hfsplus.ko "$ko"
 		cd "$REPO"
