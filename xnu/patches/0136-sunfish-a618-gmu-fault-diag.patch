@@ -1,0 +1,18 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 51b60ba..f1f059b 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -665,6 +665,13 @@ static int gmu_hfi(struct a6_gpu *g)
+ 	wr32(GMU_REG(GMU_HFI_CTRL_INIT), 1);
+ 	int hs = wait_bit(GMU_REG(GMU_HFI_CTRL), 1, 1, 100);
+ 	a6_log("hfi: ctrl init -> status %x %s\n", rd32(GMU_REG(GMU_HFI_CTRL)), hs ? "TIMEOUT" : "ok");
++	/* diagnostic: GMU SMMU context bank fault state + CM3 registers after the fault */
++	{
++		uint64_t cb = SMMU_CB(g->gmu_cb);
++		a6_log("diag: gmu cb%u fsr %x far %x%08x fsynr0 %x; g2h %x cm3 sysreset %x init %x\n", g->gmu_cb,
++		    rd32(cb + CB_FSR), rd32(cb + CB_FAR + 4), rd32(cb + CB_FAR), rd32(cb + CB_FSYNR0),
++		    rd32(GMU_REG(GMU_G2H_INFO)), rd32(GMU_REG(GMU_SYSRESET)), rd32(GMU_REG(GMU_INIT_RESULT)));
++	}
+ 	memset(msg, 0, sizeof(msg));
+ 	msg[1] = 0;			/* seg_id */
+ 	msg[2] = 0;			/* dbg_buffer_addr: none */
