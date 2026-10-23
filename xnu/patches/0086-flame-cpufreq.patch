@@ -15,7 +15,7 @@ new file mode 100644
 index 000000000..82097a3aa
 --- /dev/null
 +++ b/bsd/dev/sweet_cpufreq.c
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,91 @@
 +/*
 + * flame (SM8150) CPU frequency: the OSM hardware DCVS keeps a frequency
 + * table per cluster and takes a desired table index per cluster; voltage
@@ -45,9 +45,8 @@ index 000000000..82097a3aa
 +	const char *name;
 +	uint32_t pa;
 +} osm_clusters[] = {
-+	{"pwrcl (A55 x4)", 0x18323000u},
-+	{"perfcl (A76 x3)", 0x18325800u},
-+	{"perfpcl (A76 prime)", 0x18327800u},
++	{"pwrcl (A55 x6)", 0x18323000u},
++	{"perfcl (A76 x2)", 0x18325800u},
 +};
 +
 +static uint32_t
