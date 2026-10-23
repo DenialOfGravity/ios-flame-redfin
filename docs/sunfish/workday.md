@@ -197,3 +197,12 @@ After a clean reboot: 3 scans, 14 networks, no modem crash, Settings > Wi-Fi lis
   Metal2 + Turnip **18.2** · CPU render + GPU composite **16.7–17.6**. Old bench (with pauses): all paths ~16–17.
 - Metal halves backboardd CPU (49 s → 22 s per bench). Neither CPU (~0.55 core) nor GPU (11–29% busy) is
   saturated → the ~18 fps ceiling is frame pacing/latency, not throughput. Next: where backboardd waits per frame.
+
+## [12:35] 0147 big-core preference — **backboardd ~2x faster; panel path is now the cap**
+- 0147: threads with priority ≥ foreground take an idle A76 (CPUs 6-7) first (ADT has one SMP cluster).
+- Tight bench (k38, Metal2, 565 MHz): backboardd **30–34 swaps/s** (was ~18), panel **16.5–18.6 updates/s**.
+- Cap: each panel copy waits ~25–34 ms because the present blit queues behind backboardd's render jobs
+  (12–19 ms each, GPU 40–67% busy) on the single ring, and the copy is synchronous.
+- Next: 0148 adds the A618's stock 650/800/825 MHz levels (shorter render jobs); later: present on a
+  higher-priority path or asynchronous panel copy.
+- CI: incremental xnu builds (cache of source/objects/fakeroot; `clean=true` input for a full build).
