@@ -393,7 +393,7 @@ static void htc_connect(uint16_t svc)
 }
 
 /* WMI waits here while its endpoint has no credit */
-#define WMIQ_LEN	8
+#define WMIQ_LEN	32
 #define WMIQ_MAX	2040
 static uint8_t wmiq[WMIQ_LEN][WMIQ_MAX];
 static uint16_t wmiq_len[WMIQ_LEN];
