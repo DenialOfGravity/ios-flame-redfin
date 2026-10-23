@@ -72,6 +72,8 @@ hfsmod() {
 	[[ -r /proc/config.gz ]] || { echo "no /proc/config.gz: cannot match the running kernel's config"; exit 1; }
 	if [[ ! -f $ko ]]; then
 		sudo apt-get install -y build-essential flex bison bc libelf-dev libssl-dev cpio dwarves
+		# GCC plugin headers, so CONFIG_GCC_PLUGINS (on in the running config) is kept
+		sudo apt-get install -y "gcc-$(gcc -dumpversion | cut -d. -f1)-plugin-dev" || true
 		src=$W/WSL2-Linux-Kernel-$tag
 		if [[ ! -d $src ]]; then
 			curl -fL "https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/$tag.tar.gz" -o "$W/$tag.tar.gz"
