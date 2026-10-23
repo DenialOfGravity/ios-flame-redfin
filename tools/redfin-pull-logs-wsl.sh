@@ -47,7 +47,8 @@ for f in local/wland.log local/wland.log.prev local/wland.boot; do
 	sudo test -f "$V/$f" && sudo cp "$V/$f" "$OUT/${f##*/}" && echo "  $f"
 done
 sudo find "$V/mobile/Library/Logs/CrashReporter" "$V/root/Library/Logs/CrashReporter" "$V/db/diagnostics" \
-	-maxdepth 1 -type f -mmin -600 \( -name '*.ips' -o -name '*.crash' \) 2>/dev/null | head -50 |
+	-maxdepth 1 -type f \( -name '*.ips' -o -name '*.crash' \) -printf '%T@ %p\n' 2>/dev/null |
+	sort -rn | head -50 | cut -d' ' -f2- |	# newest 50 (the phone's clock may be off: no age filter)
 	while read -r f; do sudo cp "$f" "$OUT/"; echo "  ${f#"$M"}"; done || true
 sudo umount "$M"; trap - EXIT
 sudo chown -R "$(id -u):$(id -g)" "$OUT" 2>/dev/null || true
