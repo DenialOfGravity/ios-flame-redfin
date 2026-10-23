@@ -102,15 +102,20 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
 ## Redfin patches
 
 Pixel 5 (`redfin`, SM7250 lito) on top of the sunfish series; plan and hardware map in
-[docs/redfin/port-plan.md](docs/redfin/port-plan.md). Written without a build: compile them in CI first.
+[docs/redfin/port-plan.md](docs/redfin/port-plan.md). Numbered 09xx (were 0150-0152 until
+2026-10-24) so upstream's next sunfish patches (0150, 0151, ...) never share a number; they apply after
+all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
 
-- 0150 redfin basics: early framebuffer 0xa0000000 (SWEET.h), vol+ PM8150L GPIO5 (0xc400, SID 4),
+- 0900 redfin basics: early framebuffer 0xa0000000 (SWEET.h), vol+ PM8150L GPIO5 (0xc400, SID 4),
   USB femto HS PHY at 0x088e3000 with the redfin param-override-seq, battery/charger reads on PM7250B
   (SID 2) and the SPMI read allowlist for it (RTC stays on SID 0).
-- 0151 sec_ts touch (`bsd/dev/sweet_sects.c`, `sectouch=1`): Samsung S6SY79x on GENI SPI SE0 (0x880000),
+- 0901 sec_ts touch (`bsd/dev/sweet_sects.c`, `sectouch=1`): Samsung S6SY79x on GENI SPI SE0 (0x880000),
   mode 3, TX-only/RX-only framing as sec_ts.c; L17A 3304 mV allowed in sweet_rpmh; RPMh cmd-db falls
   back to lito's fixed region 0x80860000; flame's FTS driver now off by default (its TLMM address is
   the GPU on lito).
-- 0152 USB on lito: GCC USB clock offsets from gcc-lito.c (sleep 0xf018, utmi 0xf01c, cfg-noc 0xf07c,
+- 0902 USB on lito: GCC USB clock offsets from gcc-lito.c (sleep 0xf018, utmi 0xf01c, cfg-noc 0xf07c,
   aggre 0xf080, aux 0xf054, clkref 0x8c010), DWC3 SMMU stream `USB_SID` 0xe0 (was 0x140); cpufreq-hw prime
   cluster 0x18327800 (boost = fewer cores than the cluster, as Linux); battery label PM7250B.
+- 0903 upstream sunfish 0151's QUSB2 v2 init off by default (`sweetqusb=1` to force): redfin's HS PHY is
+  the femto at 0x088e3000 and 0x088e2000 is its EUD register. Upstream 0150 (GPU pool skips wland's
+  rmtfs buffer at 0xe1000000) applies to redfin unchanged: same pool range, same rmtfs address.

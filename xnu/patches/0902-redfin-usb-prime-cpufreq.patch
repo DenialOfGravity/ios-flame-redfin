@@ -1,3 +1,14 @@
+From 6f1e865ceb1ee158ec82f32c0f95d238abc52bca Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Fri, 23 Oct 2026 22:35:12 +0200
+Subject: [PATCH] 0152 redfin usb sid/clocks, prime cpufreq, battery label
+
+---
+ bsd/dev/sweet_cpufreq.c           | 15 ++++++++++-----
+ bsd/dev/sweet_usb.c               | 27 +++++++++++++++------------
+ iokit/Kernel/arm/SweetBattery.cpp |  2 +-
+ 3 files changed, 26 insertions(+), 18 deletions(-)
+
 diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
 index 23f7ffd..ffcbe4a 100644
 --- a/bsd/dev/sweet_cpufreq.c
@@ -34,7 +45,7 @@ index 23f7ffd..ffcbe4a 100644
  			}
  			if (khz > best_khz) {
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
-index cd9a014..cb9cd0e 100644
+index 2725782..7afa60e 100644
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
 @@ -45,21 +45,24 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
@@ -112,3 +123,6 @@ index 6b254b8..019443e 100644
  		    percent, mv, external, charging);
  		fLastMode = mode;
  	}
+-- 
+2.43.0
+

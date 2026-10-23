@@ -189,6 +189,10 @@ has no rfclka2 and the icnss node has no clocks, so wland now skips the vote whe
 makes the qdss AOSS message non-fatal and logs the cmd-db list (a2a825f). Crash reports were only
 background extensions (Spotlight importers, TTS, mediaserverd) with the clock unset (1969).
 
+Upstream sync (2026-10-24): merged Yofuness `sunfish` up to 8dcca4d (wland ath10k station steps +
+wlan-steps.conf / wlan-scan.conf hooks, sunfish-wifitest.sh, xnu 0150 GPU pool vs rmtfs, 0151 QUSB2).
+Redfin patches renamed 0900-0902 (+0903: QUSB2 off on redfin). Patch numbers above are the old ones.
+
 Working copy: one git clone in WSL, `~/ios-redfin`; the PC folder keeps only `backup\` and `recon\`
 (data the scripts read; never in git). Image and checksum list: `~/redfin-work`, `work/iosroot/`.
 

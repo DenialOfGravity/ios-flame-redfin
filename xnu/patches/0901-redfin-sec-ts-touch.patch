@@ -1,3 +1,17 @@
+From a41fc4762b44e17a875782ecc357be5345fd23a8 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Fri, 23 Oct 2026 20:31:01 +0200
+Subject: [PATCH] 0151 redfin sec_ts touch
+
+---
+ bsd/conf/files        |   1 +
+ bsd/dev/sweet_fts.c   |   4 +-
+ bsd/dev/sweet_rpmh.c  |  18 +-
+ bsd/dev/sweet_sects.c | 664 ++++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_ufs.c   |   2 +
+ 5 files changed, 684 insertions(+), 5 deletions(-)
+ create mode 100644 bsd/dev/sweet_sects.c
+
 diff --git a/bsd/conf/files b/bsd/conf/files
 index df7c863..7ed73d5 100644
 --- a/bsd/conf/files
@@ -760,3 +774,6 @@ index 50acc55..096ee1b 100644
  	sweet_usb_probe();
  	return 0;
  }
+-- 
+2.43.0
+

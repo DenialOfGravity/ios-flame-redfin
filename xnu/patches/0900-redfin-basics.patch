@@ -1,3 +1,16 @@
+From d8e0eedd8868b533b4391c5631256deab5272201 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Fri, 23 Oct 2026 20:26:00 +0200
+Subject: [PATCH] 0150 redfin basics
+
+---
+ bsd/dev/sweet_keys.c              |  5 +++--
+ bsd/dev/sweet_spmi.c              |  9 ++++++---
+ bsd/dev/sweet_usb.c               |  8 ++++++--
+ iokit/Kernel/arm/SweetBattery.cpp | 24 ++++++++++++++----------
+ pexpert/pexpert/arm64/SWEET.h     |  6 ++++--
+ 5 files changed, 33 insertions(+), 19 deletions(-)
+
 diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
 index ddf0614..2cb21a5 100644
 --- a/bsd/dev/sweet_keys.c
@@ -49,7 +62,7 @@ index 6a121c5..5cb96be 100644
  	}
  	IOLockLock(sp_lock);
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
-index 45d75f8..cd9a014 100644
+index b5f0bec..2725782 100644
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
 @@ -1255,7 +1255,9 @@ ud_smmu_setup(uint64_t dma_pa)
@@ -148,3 +161,6 @@ index 0bd911c..1a6c571 100644
  #define SWEET_EARLY_FB_WIDTH      1080
  #define SWEET_EARLY_FB_HEIGHT     2340
  #define SWEET_EARLY_FB_STRIDE     4320
+-- 
+2.43.0
+
