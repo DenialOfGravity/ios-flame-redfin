@@ -105,7 +105,7 @@ jobs:
           rsync -rlc --no-times --delete --exclude .git --itemize-changes "$P/xnu/" xnu/ | grep -v '^\.' | head -50 || true
           # build.sh must not re-run its seds over the tree (they rewrite files and bump mtimes)
           sed -i '' 's/^    patches$/    true # patched by the cache step/' build.sh
-          rm -f build/xnu.obj/kernel.* fakeroot/System/Library/Kernels/kernel.*
+          rm -rf build/xnu.obj/kernel.* fakeroot/System/Library/Kernels/kernel.*
 
       - name: Build
         working-directory: dxb
