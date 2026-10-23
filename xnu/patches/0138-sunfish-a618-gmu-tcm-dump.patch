@@ -1,0 +1,18 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index f1f059b..62baf6c 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -671,6 +671,13 @@ static int gmu_hfi(struct a6_gpu *g)
+ 		a6_log("diag: gmu cb%u fsr %x far %x%08x fsynr0 %x; g2h %x cm3 sysreset %x init %x\n", g->gmu_cb,
+ 		    rd32(cb + CB_FSR), rd32(cb + CB_FAR + 4), rd32(cb + CB_FAR), rd32(cb + CB_FSYNR0),
+ 		    rd32(GMU_REG(GMU_G2H_INFO)), rd32(GMU_REG(GMU_SYSRESET)), rd32(GMU_REG(GMU_INIT_RESULT)));
++		/* diagnostic (0138): GMU DTCM (16 KB) and ITCM (16 KB) copied to low RAM 0xE2010000 /
++		 * 0xE2014000 for /dev/pmem: the CM3 exception frame (r0-r3, r12, lr, pc, xpsr) is on its stack. */
++		for (uint32_t i = 0; i < 0x4000 / 4; i++) {
++			wr32(0xE2010000ull + 4 * i, rd32(GMU_REG(GMU_DTCM) + 4 * i));
++			wr32(0xE2014000ull + 4 * i, rd32(GMU_REG(GMU_ITCM) + 4 * i));
++		}
++		a6_log("diag: GMU DTCM/ITCM copied to 0xE2010000/0xE2014000\n");
+ 	}
+ 	memset(msg, 0, sizeof(msg));
+ 	msg[1] = 0;			/* seg_id */
