@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 W=${REDFIN_WORK:-$HOME/redfin-work}
-IMG=$W/iosroot.img SUMS=work/iosroot/iosroot.gib.sha256 COPY=$W/iosroot-phone.img
+IMG=$W/iosroot.img COPY=$W/iosroot-phone.img
 PART=/dev/block/sda19
 OUT=${1:-/mnt/c/ClaudeProjects/iOS_Pixel5/logs/$(date +%Y%m%d-%H%M%S)}
 ADB=${ADB:-$(command -v adb.exe || command -v adb || true)}
@@ -19,6 +19,31 @@ grep -qw hfsplus /proc/filesystems || { echo "no hfsplus: run tools/redfin-mkroo
 [[ $(sh_ readlink -f /dev/block/by-name/userdata) == "$PART" ]] || { echo "userdata is not $PART"; exit 1; }
 mkdir -p "$OUT"
 
+[[ -f $IMG ]] || { echo "no $IMG"; exit 1; }
+# per-GiB checksums of the image as installed: wherever the image was built from, else recompute
+SUMS=
+for c in work/iosroot/iosroot.gib.sha256 "$W/iosroot.gib.sha256" \
+	$(find "$HOME" -maxdepth 5 -name iosroot.gib.sha256 -newer "$IMG" 2>/dev/null); do
+	[[ -f $c && ! $c -ot $IMG ]] && { SUMS=$c; break; }
+done
+if [[ -z $SUMS ]]; then
+	echo "== no checksum list found: hashing $IMG (a minute or two)"
+	SUMS=$W/iosroot.gib.sha256
+	python3 -I - "$IMG" "$SUMS" <<'PY2'
+import hashlib, sys
+with open(sys.argv[1], 'rb') as f, open(sys.argv[2], 'w') as o:
+    i = 0
+    while True:
+        h = hashlib.sha256(); n = 0
+        while n < 1 << 30:
+            c = f.read(1 << 22)
+            if not c: break
+            h.update(c); n += len(c)
+        if not n: break
+        o.write(f'{i} {h.hexdigest()}\n'); i += 1
+PY2
+fi
+echo "  checksums: $SUMS"
 echo "== copy of the image, then the GiBs that changed on the phone"
 cp --sparse=always "$IMG" "$COPY"
 n=0
