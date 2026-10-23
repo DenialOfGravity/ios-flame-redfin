@@ -1,0 +1,87 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index c5bd306..0ef61c5 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -547,8 +547,19 @@ static int gmu_boot(struct a6_gpu *g)
+ #define LVL_NOM		256
+ 
+ /* A618 (sunfish DT pwrlevels), each at or below the A640 frequency of the same level */
++#if A6_GPU_ID == 618
++/* 0148: the A618's stock levels up to 825 MHz (gpucc-sdmmagpie rate_max: 650 NOM_L1, 800 TURBO, 825 TURBO_L1) */
++#define LVL_NOM_L1	320
++#define LVL_TURBO	384
++#define LVL_TURBO_L1	416
++static const uint32_t gpu_khz[] = { 0, 180000, 267000, 355000, 430000, 565000, 650000, 800000, 825000 };
++static const uint32_t gpu_lvl[] = { 0, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_SVS_L2, LVL_NOM, LVL_NOM_L1, LVL_TURBO,
++    LVL_TURBO_L1 };
++#else
+ static const uint32_t gpu_khz[] = { 0, 180000, 267000, 355000, 430000, 565000 };
+ static const uint32_t gpu_lvl[] = { 0, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_SVS_L2, LVL_NOM };
++#endif
++#define NLVL	(int)(sizeof(gpu_khz) / sizeof(gpu_khz[0]))
+ static const uint32_t gmu_khz[] = { 0, 200000 };
+ static const uint32_t gmu_lvl[] = { 0, LVL_MIN_SVS };
+ 
+@@ -661,8 +672,8 @@ static int hfi_send(struct a6_gpu *g, uint32_t id, uint32_t *msg, uint32_t dword
+ static int gmu_hfi(struct a6_gpu *g)
+ {
+ 	static uint32_t msg[256];
+-	uint32_t gx[6], cx[2];
+-	if (arc_votes(gx, gpu_lvl, 6, "gfx.lvl", "mx.lvl") || arc_votes(cx, gmu_lvl, 2, "cx.lvl", "mx.lvl")) {
++	uint32_t gx[NLVL], cx[2];
++	if (arc_votes(gx, gpu_lvl, NLVL, "gfx.lvl", "mx.lvl") || arc_votes(cx, gmu_lvl, 2, "cx.lvl", "mx.lvl")) {
+ 		a6_log("hfi: cmd-db levels not found\n");
+ 		return -1;
+ 	}
+@@ -672,7 +683,7 @@ static int gmu_hfi(struct a6_gpu *g)
+ 	 * HFI_CTRL_INIT, H2F_MSG_INIT, v1 perf table, BW table, H2F_MSG_TEST; the
+ 	 * GPU level then goes through the DCVS registers + OOB 7, not HFI.
+ 	 */
+-	uint32_t lvl0 = g->perf_level >= 1 && g->perf_level <= 5 ? g->perf_level : 1;
++	uint32_t lvl0 = g->perf_level >= 1 && (int)g->perf_level < NLVL ? g->perf_level : 1;
+ 	/* kgsl a6xx_gmu_gfx_rail_on (hfi-use-reg): GX/MX vote, OOB 6 boot_slumber (legacy bits 22/30) */
+ 	wr32(GMU_REG(GMU_BOOT_SLUMBER_OPTION), 0);	/* OOB_BOOT_OPTION */
+ 	wr32(GMU_REG(GMU_GX_VOTE_IDX), gx[lvl0] & 0xff);
+@@ -703,9 +714,9 @@ static int gmu_hfi(struct a6_gpu *g)
+ 	msg[4] = 1;			/* boot_state: GMU_COLD_BOOT */
+ 	int rc = hfi_send(g, 0, msg, 5);	/* H2F_MSG_INIT */
+ 	memset(msg, 0, sizeof(msg));
+-	msg[1] = 6;
++	msg[1] = NLVL;
+ 	msg[2] = 2;
+-	for (int i = 0; i < 6; i++) {	/* v1: struct opp_desc { vote, freq } x 16 */
++	for (int i = 0; i < NLVL; i++) {	/* v1: struct opp_desc { vote, freq } x 16 */
+ 		msg[3 + 2 * i] = gx[i];
+ 		msg[4 + 2 * i] = gpu_khz[i];
+ 	}
+@@ -728,7 +739,7 @@ static int gmu_hfi(struct a6_gpu *g)
+ 	rc |= hfi_send(g, 3, msg, 32 + 128);
+ 	memset(msg, 0, sizeof(msg));
+ 	rc |= hfi_send(g, 5, msg, 1);	/* H2F_MSG_TEST */
+-	uint32_t lvl = g->perf_level >= 1 && g->perf_level <= 5 ? g->perf_level : 1;
++	uint32_t lvl = g->perf_level >= 1 && (int)g->perf_level < NLVL ? g->perf_level : 1;
+ 	wr32(GMU_REG(GMU_DCVS_ACK_OPTION), 0);			/* DCVS_ACK_NONBLOCK */
+ 	wr32(GMU_REG(GMU_DCVS_PERF_SETTING), (lvl & 0xff) | (3u << 28));	/* CLKSET_OPTION_ATLEAST */
+ 	wr32(GMU_REG(GMU_DCVS_BW_SETTING), 0);
+@@ -770,7 +781,7 @@ static int gmu_hfi(struct a6_gpu *g)
+ 	msg[1] = 0;
+ 	rc |= hfi_send(g, 14, msg, 2);
+ 	rc |= hfi_send(g, 10, msg, 1);
+-	uint32_t lvl = g->perf_level >= 1 && g->perf_level <= 5 ? g->perf_level : 1;
++	uint32_t lvl = g->perf_level >= 1 && (int)g->perf_level < NLVL ? g->perf_level : 1;
+ 	msg[1] = 1;
+ 	msg[2] = lvl;			/* index into gpu_khz */
+ 	msg[3] = 0;
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index b8fa2e0..a3f251e 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -330,7 +330,7 @@ sweet_gpu_init(void)
+ 	}
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
+ 	a6_init_state(&gpu, ptoa_64(pn));
+-	uint32_t lvl = 4;	/* 499 MHz; boot-arg sweetgpufreq=1 (257) .. 5 (585) */
++	uint32_t lvl = 4;	/* boot-arg sweetgpufreq=1 (180) .. 5 (565); A618 also 6 (650), 7 (800), 8 (825) */
+ 	PE_parse_boot_argn("sweetgpufreq", &lvl, sizeof(lvl));
+ 	gpu.perf_level = lvl;
+ 	pool_kva = va;
