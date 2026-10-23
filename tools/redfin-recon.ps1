@@ -17,10 +17,11 @@ if ($Mode -eq "android") {
 	& adb wait-for-device
 	Save "getprop.txt" "getprop"
 	Save "cmdline-android.txt" "cat /proc/cmdline"
-	foreach ($k in "ro.product.device", "ro.build.fingerprint", "ro.bootloader", "ro.build.version.security_patch",
-		"ro.boot.flash.locked", "ro.boot.verifiedbootstate", "ro.boot.slot_suffix", "ro.boot.hardware.revision") {
-		"{0,-34} {1}" -f $k, (Adb-Sh "getprop $k").Trim()
-	} | Tee-Object (Join-Path $O "summary-android.txt")
+	# (a foreach statement can't be piped in Windows PowerShell 5: collect with $( ) first)
+	$keys = "ro.product.device", "ro.build.fingerprint", "ro.bootloader", "ro.build.version.security_patch",
+		"ro.boot.flash.locked", "ro.boot.verifiedbootstate", "ro.boot.slot_suffix", "ro.boot.hardware.revision"
+	$lines = $(foreach ($k in $keys) { "{0,-34} {1}" -f $k, (Adb-Sh "getprop $k").Trim() })
+	$lines | Tee-Object -FilePath (Join-Path $O "summary-android.txt")
 	exit 0
 }
 
