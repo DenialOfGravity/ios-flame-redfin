@@ -22,14 +22,19 @@ Write-Host "device: $model"
 if ($model -notmatch "redfin") { Write-Warning "this is not a redfin; stopping"; exit 1 }
 
 $skip = @("userdata", "super")
+# TWRP also lists whole disks (sda = all 128 GB of storage, sdb-sdf): never copy those.
 $names = (Adb-Sh "ls /dev/block/by-name/").Split("`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
-# RAM free in TWRP, in bytes (shell arithmetic: awk may print large numbers as 7.5e+09)
-$free = [int64](Adb-Sh 'echo $(( $(grep MemAvailable /proc/meminfo | tr -s [:space:] | cut -d: -f2 | cut -d k -f1) * 1024 ))')
+# RAM free in TWRP, in bytes: parse /proc/meminfo here, not in the phone's shell
+$memLine = (Adb-Sh "cat /proc/meminfo").Split("`n") | Where-Object { $_ -match '^MemAvailable:\s+(\d+)' } | Select-Object -First 1
+$free = 0
+if ($memLine -match '^MemAvailable:\s+(\d+)') { $free = [int64]$Matches[1] * 1024 }
+Write-Host ("TWRP free RAM: {0:N0} bytes" -f $free)
+if ($free -lt 512MB) { throw "could not read TWRP's free RAM (got $free); stopping" }
 $log = Join-Path $Out "backup-log.txt"
 "redfin backup $(Get-Date -Format s)" | Out-File $log -Encoding ascii
 
 foreach ($n in $names) {
-	if ($skip -contains $n) { Write-Host "skip  $n"; continue }
+	if ($skip -contains $n -or $n -match '^sd[a-z]$') { Write-Host "skip  $n"; continue }
 	$dev = Adb-Sh "readlink -f /dev/block/by-name/$n"
 	$size = [int64](Adb-Sh "blockdev --getsize64 $dev")
 	if ($size -gt ($free / 2)) { Write-Warning "skip  $n ($size bytes, too big for /tmp)"; "SKIPPED $n $size" | Add-Content $log; continue }
