@@ -807,6 +807,12 @@ static void scan_start(void)
 		for (uint32_t i = 0; i < sizeof(pp) / sizeof(pp[0]); i++)
 			e |= w_pdev_param(pp[i][0], pp[i][1]);
 		e |= w_pdev_param(1, mask) | w_pdev_param(2, mask);
+		/* fw debug log: all modules verbose (ath10k_wmi_tlv_op_gen_dbglog_cfg; cmd 0x1d003, tag 0xbe) */
+		uint8_t dl[4 + 8 + 4], *q = put_tlv(dl, 0xbe, 8);
+		q = put32(q, 1);
+		q = put32(q, 0xffffu << 16);
+		put_tlv(q, TAG_ARRAY_UINT32, 0);
+		LOG("dbglog: verbose %s", wmi_send(0x1d003, dl, sizeof(dl)) ? "FAILED" : "on");
 		LOG("pdev: chain mask %#x (rf chains %u), pmf/bw/idle-ps/ani %s", mask, wmi_rf_chains, e ? "FAILED" : "ok");
 	}
 	/* channel list: 2.4 GHz 1-11 and 5 GHz 36-48 may transmit, the rest passive */
@@ -1691,6 +1697,7 @@ static void w_join_begin(void)
 	w_ps_off();
 	int t2 = w_pdev_param(3, 40), t5 = w_pdev_param(4, 40), wm = w_vdev_wmm();
 	LOG("join: tx power limit 2G/5G 20 dBm %s, vdev wmm %s", t2 || t5 ? "FAILED" : "ok", wm ? "FAILED" : "ok");
+	fflush(stdout);
 	if (w_vdev_start(s_freq, bcn, dtim)) {
 		w_join_end(EIO);
 		return;
@@ -2042,6 +2049,19 @@ static void wmi_rx(const uint8_t *d, uint32_t len)
 	case EV_PEER_STA_KICKOUT:
 	case EV_ROAM:
 		sta_wmi_event(id, d + 4, len - 4);
+		break;
+	case 0x1d003:					/* WMI_TLV_DEBUG_MESG_EVENTID: fw dbglog, raw words */
+		for (uint32_t o = 4; o + 4 <= len; o += 32) {
+			char line[128];
+			int n = 0;
+			for (uint32_t k = o; k < o + 32 && k + 4 <= len; k += 4) {
+				uint32_t w;
+				memcpy(&w, d + k, 4);
+				n += snprintf(line + n, sizeof(line) - n, " %08x", w);
+			}
+			LOG("dbglog%s", line);
+		}
+		fflush(stdout);
 		break;
 	default:
 		break;
