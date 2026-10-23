@@ -73,7 +73,7 @@ PY
 
 sudo umount "$M"; trap - EXIT
 sudo fsck.hfsplus -fy "$IMG" | grep -v 'Illegal name' | tail -1 || true
-echo "== per-GiB SHA-256"
+echo "== per-GiB SHA-256"; mkdir -p "$REPO/work/iosroot"
 python3 - "$IMG" "$REPO/work/iosroot/iosroot.gib.sha256" <<'PY'
 import hashlib, sys
 with open(sys.argv[1], 'rb') as f, open(sys.argv[2], 'w') as o:
