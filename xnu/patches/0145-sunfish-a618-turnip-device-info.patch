@@ -1,0 +1,76 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 20a7fd1..ff299f6 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -1168,7 +1168,11 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
+ 		/* UCHE: write range max, trap base, write-through base (trap 0x1fffffffff000) */
+ 		{ 0x0e05, 0xffffffc0 }, { 0x0e06, 0x1ffff }, { 0x0e09, 0xfffff000 }, { 0x0e0a, 0x1ffff },
+ 		{ 0x0e07, 0xfffff000 }, { 0x0e08, 0x1ffff },
++#if A6_GPU_ID == 618
++		{ 0x0e0b, 0x100000 }, { 0x0e0c, 0 }, { 0x0e0d, 0x17ffff }, { 0x0e0e, 0 },	/* GMEM range: 512 KB */
++#else
+ 		{ 0x0e0b, 0x100000 }, { 0x0e0c, 0 }, { 0x0e0d, 0x1fffff }, { 0x0e0e, 0 },	/* GMEM range */
++#endif
+ 		{ 0x0e18, 0x804 }, { 0x0e17, 0x4 },	/* UCHE_FILTER_CNTL, CACHE_WAYS */
+ 		{ 0x08c2, 0x02000140 }, { 0x08c1, 0x8040362c }, { 0x08c3, 128 },	/* ROQ, mem pool */
+ 		{ 0x098d, 1 }, { 0x0500, 1 },		/* CP_AHB_CNTL, RBBM_PERFCTR_CNTL */
+@@ -1176,9 +1180,15 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
+ 		{ 0x0e19, (1u << 7) | 1 },		/* UCHE_CLIENT_PF */
+ 		{ 0x9e00, 0x00180000 },			/* PC_DBG_ECO_CNTL: prim_fifo_threshold */
+ 		{ 0x08d0, 0 },				/* CP_PERFCTR_CP_SEL[0]: always count */
++#if A6_GPU_ID == 618
++		/* a6xx_set_ubwc_config for A618 (0145): highest bank bit 14 (DT, hbb_lo 1), no AMSBC */
++		{ 0x8e08, 1u << 1 }, { 0xb604, 1u << 1 }, { 0xae02, 1u << 1 },
++		{ 0x0e01, 1u << 21 }, { 0x0534, 0 },
++#else
+ 		/* a6xx_set_ubwc_config: highest bank bit 15 (hbb_lo 2), AMSBC, UBWC 3 */
+ 		{ 0x8e08, (1u << 4) | (2u << 1) }, { 0xb604, 2u << 1 }, { 0xae02, 2u << 1 },
+ 		{ 0x0e01, 2u << 21 }, { 0x0534, 0 },
++#endif
+ 	};
+ 	for (unsigned i = 0; i < sizeof(init) / sizeof(init[0]); i++)
+ 		wr32(GREG(init[i][0]), init[i][1]);
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index 0254860..e9bac02 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -119,7 +119,7 @@ SweetAccelerator::start(IOService *provider)
+ 	setProperty("MetalPluginName", plugin);
+ 	setProperty("MetalPluginClassName", which == 2 ? "SweetMTL2Device" : "SweetMTLDevice");
+ 	setProperty("IOGLBundleName", plugin);
+-	setProperty("model", "Adreno 640");
++	setProperty("model", "Adreno 618");
+ 	setProperty(kIOUserClientClassKey, "SweetAcceleratorUserClient");
+ 	registerService();
+ 	IOLog("SWEET MTL: IOAcceleratorES published (MetalPluginName %s)\n", plugin);
+@@ -413,7 +413,7 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
+ 		if (args->scalarOutputCount < 3) {
+ 			return kIOReturnBadArgument;
+ 		}
+-		out[0] = 640;
++		out[0] = 618;
+ 		out[1] = 0x06040001;
+ 		out[2] = sweet_gpu_ready();
+ 		return kIOReturnSuccess;
+@@ -663,16 +663,17 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 	case NativeAdrenoMethodGetDeviceInfo: {
+ 		V2_OUT(NativeAdrenoAbiDeviceInfo);
+ 		/* what bsd/dev/sweet_a6xx.c's hw_init programs: GMEM 1 MB at 0x100000, UBWC 3 (hbb 15, lvl 2+3 swizzle) */
+-		rp->chip_id = 0x06040001;
+-		rp->gmem_bytes = 0x100000;
++		/* sunfish A618 (0145): chip id, 512 KB GMEM, highest bank bit 14, UBWC 2 (DT qcom,ubwc-mode) */
++		rp->chip_id = 0x06010800;
++		rp->gmem_bytes = 0x80000;
+ 		rp->gmem_base = 0x100000;
+ 		rp->uche_trap_base = 0x1fffffffff000ULL;
+ 		rp->va_start = fWinBase;
+ 		rp->va_size = fWinSize;
+-		rp->highest_bank_bit = 15;
++		rp->highest_bank_bit = 14;
+ 		rp->ubwc_swizzle = 0x6;
+ 		rp->macrotile_mode = 0;
+-		rp->ubwc_version = 3;
++		rp->ubwc_version = 2;
+ 		rp->flags = NativeAdrenoDeviceClientIova;
+ 		return kIOReturnSuccess;
+ 	}
