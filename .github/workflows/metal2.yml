@@ -1,0 +1,72 @@
+name: metal2
+
+# SweetMetal2.bundle for iOS 16 arm64: Turnip (Mesa 85fda3b3 + UniXNU's mesa patches at the commit flame used +
+# phone/turnip/patches) and the metal2vulkan bridge (steelbrain/metal2vulkan 720ef1ce + phone/metal2/bridge/patches),
+# linked by phone/metal2/build.sh. Install with tools/flame-metal2-install.sh; boot with sweetmtl=2.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [sunfish]
+    paths: [.github/workflows/metal2.yml, "phone/metal2/**", "phone/turnip/**"]
+
+env:
+  MESA_COMMIT: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
+  UNIXNU_COMMIT: e95b37d97875bd8b30c976fcdef44d35d9c27bf3
+  M2V_COMMIT: 720ef1ce
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir -p work/userland/bin
+          printf '#!/bin/sh\nexec %s -arch arm64 -isysroot %s -miphoneos-version-min=16.0 "$@"\n' \
+            "$(xcrun -f clang)" "$SDK" > work/userland/bin/ios-cc
+          chmod +x work/userland/bin/ios-cc
+          brew install meson ninja bison flex glslang llvm >/dev/null
+          python3 -m venv work/turnip/venv
+          work/turnip/venv/bin/pip install -q meson mako pyyaml packaging
+          rustup toolchain install 1.98.0 --profile minimal --target aarch64-apple-ios
+
+      - name: Mesa source
+        run: |
+          git clone -q --filter=blob:none --no-checkout https://gitlab.freedesktop.org/mesa/mesa.git work/turnip/mesa
+          git -C work/turnip/mesa checkout -q $MESA_COMMIT
+          git clone -q --filter=blob:none https://github.com/UniXNU/UniXNU.git work/unixnu
+          git -C work/unixnu checkout -q $UNIXNU_COMMIT
+          cd work/turnip/mesa
+          for p in $(python3 -c "import json;print(' '.join(json.load(open('../../unixnu/scripts/data/adreno-compiler-inputs.json'))['patches']))"); do
+            echo "apply $p"; git apply --whitespace=nowarn ../../unixnu/$p
+          done
+          for p in ../../../phone/turnip/patches/*.patch; do echo "apply $p"; git apply --whitespace=nowarn "$p"; done
+
+      - name: Turnip
+        run: sh tools/build-turnip-ios.sh
+
+      - name: metal2vulkan bridge
+        run: |
+          git clone -q https://github.com/steelbrain/metal2vulkan.git work/metal2vulkan
+          git -C work/metal2vulkan checkout -q $M2V_COMMIT
+          for p in phone/metal2/bridge/patches/*.patch; do echo "apply $p"; git -C work/metal2vulkan apply --whitespace=nowarn "$PWD/$p"; done
+          sed -i '' 's|/opt/homebrew/opt/llvm/bin/llvm-as|'"$(brew --prefix llvm)"'/bin/llvm-as|' tools/build-m2v-bridge.sh
+          sh tools/build-m2v-bridge.sh
+
+      - name: SweetMetal2.bundle
+        run: |
+          sh phone/metal2/build.sh
+          cp work/turnip/build-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib phone/metal2/out/
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: metal2
+          path: |
+            phone/metal2/out/
+            work/turnip/*.log
+            work/m2v-bridge/*.log
