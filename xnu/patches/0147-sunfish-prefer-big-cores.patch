@@ -1,0 +1,36 @@
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 8e29586..a06a80c 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -5055,6 +5055,31 @@ choose_processor(
+ 		}
+ 	}
+ 
++#if defined(__arm64__)
++	/*
++	 * sunfish (0147): the ADT describes one SMP cluster, but CPUs 6-7 are the A76 big cores (6 x A55 + 2 x A76).
++	 * Foreground and UI threads (render server, apps) take an idle big core first. Boot-arg sweetbig=0: off.
++	 */
++	{
++		static int sweet_big = -1;
++		if (sweet_big < 0) {
++			int v = 1;
++			PE_parse_boot_argn("sweetbig", &v, sizeof(v));
++			sweet_big = v;
++		}
++		if (sweet_big && thread->sched_pri >= BASEPRI_FOREGROUND) {
++			for (int i = 7; i >= 6; i--) {
++				processor_t bp = processor_array[i];
++				if (bp != PROCESSOR_NULL && bp->processor_set == pset && bp->state == PROCESSOR_IDLE &&
++				    bp->is_recommended) {
++					processor = bp;
++					break;
++				}
++			}
++		}
++	}
++#endif
++
+ 	/*
+ 	 * At this point, we may have a processor hint, and we may have
+ 	 * an initial starting pset. If the hint is not in the pset, or
