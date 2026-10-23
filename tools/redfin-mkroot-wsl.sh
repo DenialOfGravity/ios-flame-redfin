@@ -44,7 +44,7 @@ check() {
 
 deps() {
 	sudo apt-get update
-	sudo apt-get install -y python3 curl rsync hfsprogs fuse3 build-essential cmake git \
+	sudo apt-get install -y python3 curl rsync hfsprogs fuse3 dwarves build-essential cmake git \
 		libfuse3-dev zlib1g-dev libbz2-dev libattr1-dev libicu-dev
 	if ! sudo apt-get install -y apfs-fuse 2>/dev/null; then
 		echo "apfs-fuse not packaged here: building it from source"
@@ -57,43 +57,56 @@ deps() {
 
 hfsmod() {
 	# Microsoft's WSL kernel is built without CONFIG_HFSPLUS_FS. Build just that module from the exact
-	# kernel source tag and the running kernel's config. Config has MODVERSIONS (genksyms, type based),
-	# no module signing, no randstruct: a vmlinux build of the same source + config gives matching symbol
-	# CRCs, so the module loads normally. Debug info is turned off to save time; it does not change
-	# types or CRCs. Nothing about the installed WSL kernel is changed; the module is gone after
-	# `wsl --shutdown` (run this again: it reuses the built .ko).
-	local rel ver tag src ko=$W/hfsplus.ko
+	# kernel source tag. Two configs:
+	#  A) for vmlinux, only to get the symbol CRCs (vmlinux.symvers): the running config with debug info
+	#     off (fast; debug info does not change the genksyms CRCs).
+	#  B) for the module itself: the running config EXACTLY, plus HFSPLUS_FS=m. struct module must have
+	#     the running kernel's size, and CONFIG_DEBUG_INFO_BTF_MODULES adds fields to it (keeping BTF on
+	#     in Kconfig needs pahole, from dwarves). The .gnu.linkonce.this_module size check is what
+	#     rejected the first build ("Invalid module format").
+	# Nothing about the installed WSL kernel is changed; the module is gone after `wsl --shutdown` (run
+	# this again: it reuses the built .ko).
+	local rel ver tag src ko=$W/hfsplus-v2.ko
 	rel=$(uname -r); ver=${rel%%-*}; tag=linux-msft-wsl-$ver
 	if grep -qw hfsplus /proc/filesystems; then echo "hfsplus already available"; return; fi
+	[[ -r /proc/config.gz ]] || { echo "no /proc/config.gz: cannot match the running kernel's config"; exit 1; }
 	if [[ ! -f $ko ]]; then
-		sudo apt-get install -y build-essential flex bison bc libelf-dev libssl-dev cpio
+		sudo apt-get install -y build-essential flex bison bc libelf-dev libssl-dev cpio dwarves
 		src=$W/WSL2-Linux-Kernel-$tag
 		if [[ ! -d $src ]]; then
 			curl -fL "https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/$tag.tar.gz" -o "$W/$tag.tar.gz"
 			tar -xzf "$W/$tag.tar.gz" -C "$W"
 		fi
 		cd "$src"
-		if [[ ! -f .config ]]; then
-			if [[ -r /proc/config.gz ]]; then zcat /proc/config.gz > .config; else cp arch/x86/configs/config-wsl .config; fi
+		if [[ ! -s vmlinux.symvers ]]; then
+			zcat /proc/config.gz > .config
+			scripts/config --module HFSPLUS_FS --disable DEBUG_INFO_BTF --disable DEBUG_INFO_DWARF5 \
+				--disable DEBUG_INFO_DWARF4 --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT --enable DEBUG_INFO_NONE
+			make olddefconfig >/dev/null
+			echo "A) building vmlinux for symbol versions ($(nproc) jobs; 15-30 min)"
+			make -j"$(nproc)" vmlinux >"$W/kbuild.log" 2>&1 || { tail -30 "$W/kbuild.log"; exit 1; }
 		fi
-		scripts/config --module HFSPLUS_FS --disable DEBUG_INFO_BTF --disable DEBUG_INFO_DWARF5 \
-			--disable DEBUG_INFO_DWARF4 --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT --enable DEBUG_INFO_NONE
+		cp vmlinux.symvers Module.symvers
+		grep -q 'register_filesystem' Module.symvers || { echo "no register_filesystem CRC in Module.symvers"; exit 1; }
+		echo "B) module against the running config"
+		zcat /proc/config.gz > .config
+		scripts/config --module HFSPLUS_FS
 		make olddefconfig >/dev/null
 		grep -q '^CONFIG_HFSPLUS_FS=m' .config || { echo "HFSPLUS_FS did not stick in .config"; exit 1; }
-		echo "building vmlinux for symbol versions ($(nproc) jobs; 15-30 min)"
-		make -j"$(nproc)" vmlinux modules_prepare >"$W/kbuild.log" 2>&1 || { tail -30 "$W/kbuild.log"; exit 1; }
-		# `make vmlinux` writes the kernel's symbol CRCs to vmlinux.symvers; Module.symvers only appears
-		# after a full `make modules`. The external module build reads Module.symvers.
-		[[ -s Module.symvers ]] || cp vmlinux.symvers Module.symvers
-		grep -q 'register_filesystem' Module.symvers || { echo "no register_filesystem CRC in Module.symvers"; exit 1; }
+		for o in DEBUG_INFO_BTF_MODULES MODVERSIONS MODULE_UNLOAD; do
+			if zcat /proc/config.gz | grep -q "^CONFIG_$o=y" && ! grep -q "^CONFIG_$o=y" .config; then
+				echo "CONFIG_$o is on in the running kernel but dropped here (struct module would differ)"; exit 1
+			fi
+		done
+		make -j"$(nproc)" modules_prepare >>"$W/kbuild.log" 2>&1 || { tail -30 "$W/kbuild.log"; exit 1; }
 		make -j"$(nproc)" M=fs/hfsplus modules >>"$W/kbuild.log" 2>&1 || { tail -30 "$W/kbuild.log"; exit 1; }
 		cp fs/hfsplus/hfsplus.ko "$ko"
 		cd "$REPO"
 	fi
 	local magic; magic=$(modinfo -F vermagic "$ko" | awk '{print $1}')
 	[[ $magic == "$rel" ]] || { echo "vermagic $magic != running $rel: rebuild (delete $ko)"; exit 1; }
-	sudo insmod "$ko"
-	grep -qw hfsplus /proc/filesystems && echo "hfsplus: loaded ($ko)" || { echo "hfsplus: insmod did not register it"; dmesg | tail -5; exit 1; }
+	sudo insmod "$ko" || { sudo dmesg | tail -3; exit 1; }
+	grep -qw hfsplus /proc/filesystems && echo "hfsplus: loaded ($ko)" || { echo "hfsplus: insmod did not register it"; sudo dmesg | tail -5; exit 1; }
 }
 
 fetch() {
