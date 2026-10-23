@@ -544,6 +544,7 @@ struct wmi_mem_req { uint32_t req_id, unit_size, num_unit_info, num_units; };
 static uint32_t wmi_svc_map[32], wmi_svc_ext[4], wmi_nreq;
 static struct wmi_mem_req wmi_req[MAX_MEM_REQS];
 static int wmi_init_sent, wmi_ready, wmi_seen_bmap, wmi_seen_reqs;
+static uint32_t wmi_eeprom_rd = 0xffffffff;	/* HAL_REG_CAPABILITIES.eeprom_rd */
 static uint8_t wmi_mac[6];
 
 /* ath10k WMI_SERVICE_IS_ENABLED: 4 service bits per 32-bit word (sizeof(u32)) */
@@ -593,6 +594,9 @@ static void wmi_svc_ready(const uint8_t *p, uint32_t len)
 			memcpy(&a0, v + 4, 4);
 			memcpy(&rf, v + 36, 4);
 			LOG("wmi: fw %08x abi %08x rf chains %u", fw, a0, rf);
+		} else if (tag == 0x21 && l >= 4) {	/* WMI_TLV_TAG_STRUCT_HAL_REG_CAPABILITIES */
+			memcpy(&wmi_eeprom_rd, v, 4);
+			LOG("wmi: eeprom regdomain %#x", wmi_eeprom_rd);
 		} else if (tag == TAG_ARRAY_UINT32 && !wmi_seen_bmap) {
 			wmi_seen_bmap = 1;
 			memcpy(wmi_svc_map, v, MIN((uint32_t)l, (uint32_t)sizeof(wmi_svc_map)));
@@ -772,12 +776,30 @@ static void scan_start(void)
 	if (scan_started)
 		return;
 	scan_started = 1;
-	/* channel list, every channel passive: nothing is transmitted */
+	/*
+	 * sunfish: WMI_PDEV_SET_REGDOMAIN first (ath10k_regd_update; tag 0x51, cmd 0x4001), with the
+	 * firmware's own eeprom code, FCC conformance limits. The HL3.2.2 firmware asserted in vdev
+	 * start (first TX) without it and with every channel passive.
+	 */
+	{
+		uint8_t rd[4 + 24] = { 0 }, *q = put_tlv(rd, 0x51, 24);
+		uint32_t code = wmi_eeprom_rd != 0xffffffff ? (wmi_eeprom_rd & 0xffff) : 0;
+		q = put32(q, 0);	/* pdev */
+		q = put32(q, code);
+		q = put32(q, code);
+		q = put32(q, code);
+		q = put32(q, 0x10);	/* CTL_FCC 2 GHz */
+		put32(q, 0x10);		/* CTL_FCC 5 GHz */
+		int rc = wmi_send(0x4001, rd, sizeof(rd));
+		LOG("regdomain: %#x -> %d", code, rc);
+	}
+	/* channel list: 2.4 GHz 1-11 and 5 GHz 36-48 may transmit, the rest passive */
 	p = put32(put_tlv(p, TAG_SCAN_CHAN_LIST_CMD, 4), NFREQ);
 	p = put_tlv(p, TAG_ARRAY_STRUCT, NFREQ * (4 + 24));
 	for (uint32_t i = 0; i < NFREQ; i++) {
 		uint32_t mode = scan_freqs[i] < 4000 ? 1 : 0;
-		uint32_t flags = mode | (1u << 7) | (1u << 11) | (scan_freqs[i] < 4000 ? 0 : (1u << 12));
+		int tx_ok = (scan_freqs[i] >= 2412 && scan_freqs[i] <= 2462) || (scan_freqs[i] >= 5180 && scan_freqs[i] <= 5240);
+		uint32_t flags = mode | (tx_ok ? 0 : (1u << 7)) | (1u << 11) | (scan_freqs[i] < 4000 ? 0 : (1u << 12));
 		c = put_tlv(p, TAG_CHANNEL, 24);
 		c = put32(c, scan_freqs[i]);
 		c = put32(c, scan_freqs[i]);
