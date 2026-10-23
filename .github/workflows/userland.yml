@@ -13,6 +13,7 @@ on:
 env:
   DROPBEAR_VER: "2022.83"
   DASH_VER: "0.5.12"
+  TOYBOX_VER: "0.8.11"
 
 jobs:
   build:
@@ -61,6 +62,20 @@ jobs:
             ac_cv_func_strchrnul=no
           make -j4
           cp src/dash ../out/
+
+      - name: toybox
+        continue-on-error: true
+        run: |
+          brew install gnu-sed >/dev/null
+          export PATH="$(brew --prefix gnu-sed)/libexec/gnubin:$PATH"
+          curl -fsSL https://landley.net/toybox/downloads/toybox-$TOYBOX_VER.tar.gz | tar xz
+          cd toybox-$TOYBOX_VER
+          # iOS SDK has no sys/disk.h (macOS block-device ioctls used by portability.c)
+          mkdir -p ios-inc/sys
+          printf '#include <sys/ioctl.h>\n#include <stdint.h>\n#define DKIOCGETBLOCKSIZE _IOR(%s, 24, uint32_t)\n#define DKIOCGETBLOCKCOUNT _IOR(%s, 25, uint64_t)\n' "'d'" "'d'" > ios-inc/sys/disk.h
+          make macos_defconfig HOSTCC=cc
+          CC=ios-cc HOSTCC=cc CFLAGS="-I$PWD/ios-inc" make -j4 toybox
+          cp toybox ../out/
 
       - name: Check and sign
         run: |

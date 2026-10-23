@@ -24,6 +24,15 @@ for l in dropbear dropbearkey scp dbclient; do
 	$F link /var/local/bin/dropbearmulti /var/local/bin/$l || true
 done
 $F link /var/local/bin/dash /bin/sh || echo "(/bin/sh exists)"
+if [ -f $U/stage/toybox ]; then
+	$F put $U/stage/toybox /var/local/bin/toybox 755
+	for a in ls cat cp mv rm mkdir rmdir ln chmod chown ps kill grep sed head tail wc find xargs \
+		sort uniq cut tr df du mount uname date env id whoami hexdump od dd sleep touch stat \
+		which file tee printf echo true false test basename dirname readlink realpath uptime \
+		free top hostname nc ping ifconfig netstat dmesg sync md5sum sha256sum tar gzip less vi; do
+		$F link /var/local/bin/toybox /var/local/bin/$a >/dev/null 2>&1 || true
+	done
+fi
 $F put $U/ssh/id_ed25519.pub /var/root/.ssh/authorized_keys 600
 printf 'export PATH=/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\nexport PS1="sunfish# "\n' > $U/profile
 $F put $U/profile /var/root/.profile 644
