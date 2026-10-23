@@ -42,6 +42,7 @@ jobs:
           #define DROPBEAR_SVR_MULTIUSER 1
           #define DROPBEAR_X11FWD 0
           #define DEFAULT_PATH "/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+          #define DEFAULT_ROOT_PATH "/var/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
           #define DSS_PRIV_FILENAME "/private/etc/dropbear/dropbear_dss_host_key"
           #define RSA_PRIV_FILENAME "/private/etc/dropbear/dropbear_rsa_host_key"
           #define ECDSA_PRIV_FILENAME "/private/etc/dropbear/dropbear_ecdsa_host_key"
