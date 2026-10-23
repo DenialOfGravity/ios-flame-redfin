@@ -136,6 +136,19 @@ Found while checking startup writers:
 - Kernel has no LC_DYLD_CHAINED_FIXUPS (mkpayload `fixups: 0`), as expected for this build.
 - `research/ipsw-x/d22ap.adt` (iPhone X device tree, /product node) is needed for userland, not here.
 
+## First XNU boot (2026-10-23, `redfin-k1-readonly.img`): kernel runs
+
+Photos of the screen: all 8 CPUs (`mcache: 8 CPU(s)`); AMFI/Sandbox stand-ins, SWEET HFS, Skywalk
+self-tests PASSED, lo0/gif0/stf0; `SWEET UFS: "userdata" on LUN 0: first block 0x27d000, 111727 MiB,
+read-only`; cpufreq pwrcl -> 1804 MHz, perfcl -> 2208 MHz (prime cluster untouched); keys found (pon APID
+210, vol+ APID 271, subtype 0x10); battery `55% 3931mV external=1 charging=1` (PM7250B SID 2 works);
+AMFI published; `BSD root: ufsroot0` -> HFS `unknown Volume Signature : 5d17` -> `cannot mount root,
+errno = 19`, retried every few seconds (expected: Android data); `FLAME WDT: flamereboot=150 reached` ->
+back in fastboot. Bottom-edge colour bar = start.s progress bar.
+
+Kernel bring-up on redfin works first time. 0152 (USB SID/clocks, prime cpufreq) follows; then the iOS
+root image on userdata.
+
 ## Done so far
 
 **Shim** (boots in place of iBoot)

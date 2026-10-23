@@ -111,3 +111,6 @@ Pixel 5 (`redfin`, SM7250 lito) on top of the sunfish series; plan and hardware 
   mode 3, TX-only/RX-only framing as sec_ts.c; L17A 3304 mV allowed in sweet_rpmh; RPMh cmd-db falls
   back to lito's fixed region 0x80860000; flame's FTS driver now off by default (its TLMM address is
   the GPU on lito).
+- 0152 USB on lito: GCC USB clock offsets from gcc-lito.c (sleep 0xf018, utmi 0xf01c, cfg-noc 0xf07c,
+  aggre 0xf080, aux 0xf054, clkref 0x8c010), DWC3 SMMU stream `USB_SID` 0xe0 (was 0x140); cpufreq-hw prime
+  cluster 0x18327800 (boost = fewer cores than the cluster, as Linux); battery label PM7250B.
