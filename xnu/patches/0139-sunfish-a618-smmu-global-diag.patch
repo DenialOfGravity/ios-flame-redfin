@@ -1,0 +1,25 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 62baf6c..e8da7fb 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -671,13 +671,13 @@ static int gmu_hfi(struct a6_gpu *g)
+ 		a6_log("diag: gmu cb%u fsr %x far %x%08x fsynr0 %x; g2h %x cm3 sysreset %x init %x\n", g->gmu_cb,
+ 		    rd32(cb + CB_FSR), rd32(cb + CB_FAR + 4), rd32(cb + CB_FAR), rd32(cb + CB_FSYNR0),
+ 		    rd32(GMU_REG(GMU_G2H_INFO)), rd32(GMU_REG(GMU_SYSRESET)), rd32(GMU_REG(GMU_INIT_RESULT)));
+-		/* diagnostic (0138): GMU DTCM (16 KB) and ITCM (16 KB) copied to low RAM 0xE2010000 /
+-		 * 0xE2014000 for /dev/pmem: the CM3 exception frame (r0-r3, r12, lr, pc, xpsr) is on its stack. */
+-		for (uint32_t i = 0; i < 0x4000 / 4; i++) {
+-			wr32(0xE2010000ull + 4 * i, rd32(GMU_REG(GMU_DTCM) + 4 * i));
+-			wr32(0xE2014000ull + 4 * i, rd32(GMU_REG(GMU_ITCM) + 4 * i));
+-		}
+-		a6_log("diag: GMU DTCM/ITCM copied to 0xE2010000/0xE2014000\n");
++		/* diagnostic (0139): the 0138 TCM dump showed the CM3 bus-faults on its first read of the HFI
++		 * table (fw 0x19a8, r3 = 0x60001000); our SMR reads back 0. Log the global SMMU state. */
++		a6_log("diag: smmu scr0 %x sgfsr %x sgfsynr0 %x sgfar %x%08x idr0 %x idr1 %x\n", rd32(SMMU + 0x0),
++		    rd32(SMMU + 0x48), rd32(SMMU + 0x50), rd32(SMMU + 0x44), rd32(SMMU + 0x40), rd32(SMMU + 0x20),
++		    rd32(SMMU + 0x24));
++		for (int i = 0; i < 8; i++)
++			a6_log("diag: smr%d %x s2cr%d %x\n", i, rd32(SMR(i)), i, rd32(S2CR(i)));
+ 	}
+ 	memset(msg, 0, sizeof(msg));
+ 	msg[1] = 0;			/* seg_id */
