@@ -1,0 +1,60 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 7c8434b..edce7e3 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -377,7 +377,12 @@ static void hfi_table(struct a6_gpu *g)
+ 		uint64_t h = t + 24 + 48 * q;
+ 		wr32(h + 0, 1);
+ 		wr32(h + 4, VA_HFI + 0x1000 * (q + 1));
++#if A6_GPU_ID == 618
++		static const uint32_t legacy_idx[3] = { 0, 4, 5 };	/* cmd, msg, dbg (HFI_*_IDX_LEGACY) */
++		wr32(h + 8, (10u << 8) | legacy_idx[q]);
++#else
+ 		wr32(h + 8, (10u << 8) | q);
++#endif
+ 		wr32(h + 12, 0x1000 >> 2);
+ 		wr32(h + 24, 1);
+ 		wr32(h + 28, 1);
+@@ -391,6 +396,16 @@ static int fw_load(struct a6_gpu *g)
+ 	const uint8_t *fw = a6_firmware("a618_gmu.bin", &len);
+ 	if (!fw)
+ 		return -1;
++#if A6_GPU_ID == 618
++	/* a615 family (A618): legacy GMU firmware, one raw image at ITCM start
++	 * (kgsl _load_legacy_gmu_fw, max 32 KB). */
++	if (len == 0 || len > 0x8000) {
++		a6_log("gmu fw: legacy image size %u\n", len);
++		return -1;
++	}
++	a6_write(GMU_REG(GMU_ITCM), fw, (len + 3) & ~3u);
++	return 1;
++#endif
+ 	const uint8_t *p = fw, *end = fw + len;
+ 	int n = 0;
+ 	while (p + 16 <= end) {
+@@ -442,7 +457,7 @@ static int gmu_boot(struct a6_gpu *g)
+ 	wr32(GMU_REG(GMU_QTBL_INFO), 1);
+ 	wr32(GMU_REG(GMU_FENCE0), (1u << 31) | (0xau << 18) | 0xa0);
+ 	wr32(GMU_REG(GMU_CM3_CFG), 0x4052);
+-	wr32(GMU_REG(GMU_SFR_ADDR), 0x06040100);
++	wr32(GMU_REG(GMU_SFR_ADDR), (uint32_t)A6_CHIP_ID);	/* kgsl writes the chip id (flame had 0x06040100) */
+ 	for (uint32_t i = 0; i < 4; i++)
+ 		wr32(GPU + 4 * (0x3c03 + i), 0x00071620);
+ 	wr32(GMU_REG(GMU_CP_MSG), VA_LOG | (A6_GMU_LOG_SIZE / 0x1000 - 1));
+@@ -634,9 +649,16 @@ static int gmu_hfi(struct a6_gpu *g)
+ 	rc |= hfi_send(g, 30, msg, 4);
+ 	a6_log("hfi: perf/bw tables, core fw start, start, perf vote %u MHz -> %d\n", gpu_khz[lvl] / 1000, rc);
+ 
++#if A6_GPU_ID == 618
++	/* legacy GMU (a630/a615 family): set BIT(req+16), ack BIT(req+24), req 0 = GPU */
++	wr32(GMU_REG(GMU_H2G_SET), 1u << 16);
++	int ack = wait_bit(GMU_REG(GMU_G2H_INFO), 1u << 24, 1, 1000);
++	wr32(GMU_REG(GMU_G2H_CLR), 1u << 24);
++#else
+ 	wr32(GMU_REG(GMU_H2G_SET), 1u << 30);	/* OOB GPU_SET */
+ 	int ack = wait_bit(GMU_REG(GMU_G2H_INFO), 1u << 31, 1, 1000);
+ 	wr32(GMU_REG(GMU_G2H_CLR), 1u << 31);
++#endif
+ 	a6_log("oob gpu_set %s, gx gdsc %x\n", ack ? "TIMEOUT" : "acked", rd32(GPUCC + GPUCC_GX_GDSCR));
+ 	if (!a6_gx_up()) {
+ 		a6_log("GX not powered; not touching GPU registers\n");
