@@ -49,3 +49,10 @@ Tools: `flame-cmd.py reboot|swipe|tap`, `flame-files.py get|put`, `flame-shot OU
 ## Recovery
 Backups: `backup/` (+ Lily). Restore Android: `restore/factory/…s2…zip` → `flash-all.sh`.
 Never flash xbl/abl/tz/etc.; never relock.
+
+## Update 2026-10-23 10:00
+- UI 17 fps while swiping (was 4.3): dropped launchd jobs vmd, ReportCrash, axassetsd; sweetfb_hz=60.
+- GPU (A618): GMU boots; HFI blocked. The GMU bus-faults on its first SMMU read (fw pc 0x19a8). Suspect: the GPU
+  SMMU clock gcc_gpu_memnoc_gfx stays halted → SMR writes dropped. Next steps are in gpu-notes.md.
+- Wi-Fi: scan OK, join blocked (WLAN fw assert at vdev start, PC 0xb01ab7b0).
+- Sleep/wake via power button: stable (11/11).
