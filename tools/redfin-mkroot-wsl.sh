@@ -4,9 +4,12 @@
 #
 #   bash tools/redfin-mkroot-wsl.sh check      tools + kernel HFS+ support (changes nothing)
 #   bash tools/redfin-mkroot-wsl.sh deps       apt install the build tools (sudo)
+#   bash tools/redfin-mkroot-wsl.sh hfsmod     build + load hfsplus.ko for THIS WSL kernel (WSL's kernel has
+#                                               no HFS+; ~15-30 min once; reload after `wsl --shutdown` with
+#                                               the same command, which then only runs insmod)
 #   bash tools/redfin-mkroot-wsl.sh fetch      download the IPSW parts from Apple (~6-7 GB)
 #   bash tools/redfin-mkroot-wsl.sh build      mkiosroot.sh + sweet-root-tweaks.py -> iosroot.img (16 GiB)
-#   bash tools/redfin-mkroot-wsl.sh all        deps + fetch + build
+#   bash tools/redfin-mkroot-wsl.sh all        deps + hfsmod + fetch + build
 #
 # Work files live in ~/redfin-work (WSL's own ext4 disk: fast, and loop mounts work there).
 # The finished image and its per-GiB SHA-256 list are copied next to the repo in work/iosroot/.
@@ -52,6 +55,41 @@ deps() {
 	fi
 }
 
+hfsmod() {
+	# Microsoft's WSL kernel is built without CONFIG_HFSPLUS_FS. Build just that module from the exact
+	# kernel source tag and the running kernel's config. Config has MODVERSIONS (genksyms, type based),
+	# no module signing, no randstruct: a vmlinux build of the same source + config gives matching symbol
+	# CRCs, so the module loads normally. Debug info is turned off to save time; it does not change
+	# types or CRCs. Nothing about the installed WSL kernel is changed; the module is gone after
+	# `wsl --shutdown` (run this again: it reuses the built .ko).
+	local rel ver tag src ko=$W/hfsplus.ko
+	rel=$(uname -r); ver=${rel%%-*}; tag=linux-msft-wsl-$ver
+	if grep -qw hfsplus /proc/filesystems; then echo "hfsplus already available"; return; fi
+	if [[ ! -f $ko ]]; then
+		sudo apt-get install -y build-essential flex bison bc libelf-dev libssl-dev cpio
+		src=$W/WSL2-Linux-Kernel-$tag
+		if [[ ! -d $src ]]; then
+			curl -fL "https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/$tag.tar.gz" -o "$W/$tag.tar.gz"
+			tar -xzf "$W/$tag.tar.gz" -C "$W"
+		fi
+		cd "$src"
+		if [[ -r /proc/config.gz ]]; then zcat /proc/config.gz > .config; else cp arch/x86/configs/config-wsl .config; fi
+		scripts/config --module HFSPLUS_FS --disable DEBUG_INFO_BTF --disable DEBUG_INFO_DWARF5 \
+			--disable DEBUG_INFO_DWARF4 --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT --enable DEBUG_INFO_NONE
+		make olddefconfig >/dev/null
+		grep -q '^CONFIG_HFSPLUS_FS=m' .config || { echo "HFSPLUS_FS did not stick in .config"; exit 1; }
+		echo "building vmlinux for symbol versions ($(nproc) jobs; 15-30 min)"
+		make -j"$(nproc)" vmlinux modules_prepare >"$W/kbuild.log" 2>&1 || { tail -30 "$W/kbuild.log"; exit 1; }
+		make -j"$(nproc)" M=fs/hfsplus modules >>"$W/kbuild.log" 2>&1 || { tail -30 "$W/kbuild.log"; exit 1; }
+		cp fs/hfsplus/hfsplus.ko "$ko"
+		cd "$REPO"
+	fi
+	local magic; magic=$(modinfo -F vermagic "$ko" | awk '{print $1}')
+	[[ $magic == "$rel" ]] || { echo "vermagic $magic != running $rel: rebuild (delete $ko)"; exit 1; }
+	sudo insmod "$ko"
+	grep -qw hfsplus /proc/filesystems && echo "hfsplus: loaded ($ko)" || { echo "hfsplus: insmod did not register it"; dmesg | tail -5; exit 1; }
+}
+
 fetch() {
 	local url
 	url=$(curl -sfL "https://api.ipsw.me/v4/device/$DEV?type=ipsw" |
@@ -93,6 +131,7 @@ PY
 
 build() {
 	local img="$W/iosroot.img"
+	grep -qw hfsplus /proc/filesystems || { echo "no hfsplus in the kernel: run '$0 hfsmod' first"; exit 1; }
 	[[ -e $img ]] && { echo "$img exists: move it away to rebuild"; exit 1; }
 	bash "$REPO/tools/mkiosroot.sh" "$W/ipsw/${PARTS[0]}" "$W/ipsw/${PARTS[1]}" "$W/ipsw/${PARTS[2]}" "$img" 16G 2>&1 |
 		tee "$W/mkiosroot.log"
@@ -129,8 +168,9 @@ PY
 case "${1:-}" in
 check) check ;;
 deps) deps ;;
+hfsmod) hfsmod ;;
 fetch) fetch ;;
 build) build ;;
-all) deps; fetch; build ;;
-*) sed -n 2,13p "$0"; exit 2 ;;
+all) deps; hfsmod; fetch; build ;;
+*) sed -n 2,16p "$0"; exit 2 ;;
 esac
