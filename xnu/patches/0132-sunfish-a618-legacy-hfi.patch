@@ -1,0 +1,86 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index edce7e3..41e467b 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -125,7 +125,12 @@ static void zero_pa(uint64_t pa, uint64_t size)
+ #define GMU_RPMH_CTRL	0x1f8e8
+ #define GMU_CP_MSG	0x1f900
+ #define GMU_CP_RESP	0x1f901
+-#define GMU_HFI_CTRL	0x1f980
++#define GMU_HFI_CTRL	0x1f980	/* HFI_CTRL_STATUS */
++#define GMU_HFI_CTRL_INIT	0x1f986
++#define GMU_DCVS_ACK_OPTION	0x1cbfc
++#define GMU_DCVS_PERF_SETTING	0x1cbfd
++#define GMU_DCVS_BW_SETTING	0x1cbfe
++#define GMU_DCVS_RETURN	0x1cbff
+ #define GMU_SFR_ADDR	0x1f982
+ #define GMU_QTBL_INFO	0x1f984
+ #define GMU_QTBL_ADDR	0x1f985
+@@ -615,6 +620,59 @@ static int gmu_hfi(struct a6_gpu *g)
+ 		a6_log("hfi: cmd-db levels not found\n");
+ 		return -1;
+ 	}
++#if A6_GPU_ID == 618
++	/*
++	 * Legacy GMU (a615 family, HFI v1, qcom,gpu-quirk-hfi-use-reg), as kgsl:
++	 * HFI_CTRL_INIT, H2F_MSG_INIT, v1 perf table, BW table, H2F_MSG_TEST; the
++	 * GPU level then goes through the DCVS registers + OOB 7, not HFI.
++	 */
++	wr32(GMU_REG(GMU_HFI_CTRL_INIT), 1);
++	int hs = wait_bit(GMU_REG(GMU_HFI_CTRL), 1, 1, 100);
++	a6_log("hfi: ctrl init -> status %x %s\n", rd32(GMU_REG(GMU_HFI_CTRL)), hs ? "TIMEOUT" : "ok");
++	memset(msg, 0, sizeof(msg));
++	msg[1] = 0;			/* seg_id */
++	msg[2] = 0;			/* dbg_buffer_addr: none */
++	msg[3] = 0;			/* dbg_buffer_size */
++	msg[4] = 1;			/* boot_state: GMU_COLD_BOOT */
++	int rc = hfi_send(g, 0, msg, 5);	/* H2F_MSG_INIT */
++	memset(msg, 0, sizeof(msg));
++	msg[1] = 6;
++	msg[2] = 2;
++	for (int i = 0; i < 6; i++) {	/* v1: struct opp_desc { vote, freq } x 16 */
++		msg[3 + 2 * i] = gx[i];
++		msg[4 + 2 * i] = gpu_khz[i];
++	}
++	for (int i = 0; i < 2; i++) {
++		msg[3 + 32 + 2 * i] = cx[i];
++		msg[4 + 32 + 2 * i] = gmu_khz[i];
++	}
++	rc |= hfi_send(g, 4, msg, 3 + 32 + 8);
++	memset(msg, 0, sizeof(msg));
++	/* hfi_bwtable_cmd: levels 1, cnoc 1 (CN0 0x500a8 on sunfish), ddr 3 (MC0/SH0/ACV,
++	 * same addresses as flame), wait masks; cnoc data [2][6] at 12, ddr addrs 24, data 32 */
++	static const uint32_t bw[][2] = {
++		{ 1, 1 }, { 2, 1 }, { 3, 3 }, { 4, 1 }, { 5, 1 }, { 6, 0x500a8 },
++		{ 12, 0x40000000 }, { 18, 0x60000001 },
++		{ 24, 0x50000 }, { 25, 0x5003c }, { 26, 0x5000c }, { 32, 0x40000000 }, { 33, 0x40000000 },
++		{ 34, 0x40000000 },
++	};
++	for (unsigned i = 0; i < sizeof(bw) / sizeof(bw[0]); i++)
++		msg[bw[i][0]] = bw[i][1];
++	rc |= hfi_send(g, 3, msg, 32 + 128);
++	memset(msg, 0, sizeof(msg));
++	rc |= hfi_send(g, 5, msg, 1);	/* H2F_MSG_TEST */
++	uint32_t lvl = g->perf_level >= 1 && g->perf_level <= 5 ? g->perf_level : 1;
++	wr32(GMU_REG(GMU_DCVS_ACK_OPTION), 0);			/* DCVS_ACK_NONBLOCK */
++	wr32(GMU_REG(GMU_DCVS_PERF_SETTING), (lvl & 0xff) | (3u << 28));	/* CLKSET_OPTION_ATLEAST */
++	wr32(GMU_REG(GMU_DCVS_BW_SETTING), 0);
++	wr32(GMU_REG(GMU_H2G_SET), 1u << (7 + 16));		/* legacy OOB 7 (dcvs) */
++	int dack = wait_bit(GMU_REG(GMU_G2H_INFO), 1u << (7 + 24), 1, 1000);
++	uint32_t dret = rd32(GMU_REG(GMU_DCVS_RETURN));
++	wr32(GMU_REG(GMU_G2H_CLR), 1u << (7 + 24));
++	wr32(GMU_REG(GMU_H2G_SET), 0);
++	a6_log("hfi(v1): init, perf/bw tables, test -> %d; dcvs %u MHz %s ret %x\n", rc, gpu_khz[lvl] / 1000,
++	    dack ? "TIMEOUT" : "acked", dret);
++#else
+ 	memset(msg, 0, sizeof(msg));
+ 	msg[1] = 6;
+ 	msg[2] = 2;
+@@ -648,6 +706,7 @@ static int gmu_hfi(struct a6_gpu *g)
+ 	msg[3] = 0;
+ 	rc |= hfi_send(g, 30, msg, 4);
+ 	a6_log("hfi: perf/bw tables, core fw start, start, perf vote %u MHz -> %d\n", gpu_khz[lvl] / 1000, rc);
++#endif
+ 
+ #if A6_GPU_ID == 618
+ 	/* legacy GMU (a630/a615 family): set BIT(req+16), ack BIT(req+24), req 0 = GPU */
