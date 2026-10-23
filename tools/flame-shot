@@ -30,9 +30,9 @@ def png(path, w, h, rows):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('out')
-    ap.add_argument('--pa', type=lambda x: int(x, 0), default=0x9c400000)
+    ap.add_argument('--pa', type=lambda x: int(x, 0), default=0x9c000000)  # sunfish splash (flame 0x9c400000)
     ap.add_argument('--w', type=int, default=1080)
-    ap.add_argument('--h', type=int, default=2280)
+    ap.add_argument('--h', type=int, default=2340)
     ap.add_argument('--stride', type=int, default=0)
     ap.add_argument('--fmt', choices=['bgra', 'rgba'], default='bgra')
     ap.add_argument('--raw', help='also save the raw bytes')
