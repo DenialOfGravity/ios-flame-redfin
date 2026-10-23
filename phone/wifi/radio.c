@@ -832,6 +832,15 @@ static void scan_start(void)
 	c = put32(c, 0);
 	memcpy(c, radio_mac, 6);
 	int b = wmi_send(CMD_VDEV_CREATE, v, sizeof(v));
+	/* ath10k_add_interface: vdev NSS from the chain mask (2 streams), WMI_TLV_VDEV_PARAM_NSS 0x22 */
+	{
+		uint32_t nss = wmi_rf_chains >= 1 && wmi_rf_chains <= 3 ? wmi_rf_chains : 2;
+		uint8_t vp[4 + 12], *q = put_tlv(vp, 0x5f, 12);
+		q = put32(q, 0);
+		q = put32(q, 0x22);
+		put32(q, nss);
+		LOG("vdev: nss %u %s", nss, wmi_send(0x5008, vp, sizeof(vp)) ? "FAILED" : "ok");
+	}
 	scanning = !scan_send_start();
 	LOG("scan: channel list (%u) %s, vdev %s, passive scan %s", NFREQ, a ? "FAILED" : "ok", b ? "FAILED" : "ok",
 	    scanning ? "requested" : "FAILED");
