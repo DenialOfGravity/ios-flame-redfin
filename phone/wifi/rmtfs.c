@@ -19,6 +19,7 @@
 #include "scm.h"
 
 #define RMTFS_DIR	"/var/local/fw/rmtfs"
+#define RMTFS_PA	0xE1000000ull	/* below 4 GB: see rmtfs_init */
 #define BUF_SIZE	0x200000u
 #define SECTOR		512
 
@@ -64,10 +65,14 @@ int rmtfs_init(void)
 		buf_pa = fpa;
 		printf("rmtfs: buffer %llx from this boot's first run\n", (unsigned long long)buf_pa);
 	} else {
-		uint64_t a = pm_alloc(BUF_SIZE + 0x2000, 0x1000);
-		if (!a)
-			return -1;
-		buf_pa = a + 0x1000;
+		/*
+		 * sunfish: the modem takes rmtfs buffer addresses as 32 bits; a
+		 * pm_alloc buffer above 4 GB (0x1_0613d000) was truncated and the
+		 * modem died with "XPU violation". Use fixed low RAM that XNU does
+		 * not manage, after radio.c's CE pool (0xE0000000 + 16 MB), with a
+		 * guard page on each side as msm_sharedmem.
+		 */
+		buf_pa = RMTFS_PA + 0x1000;
 		static const uint32_t src[] = { VMID_HLOS }, dst[] = { VMID_HLOS, VMID_MSS_MSA };
 		if (hyp_assign(buf_pa, BUF_SIZE, src, 1, dst, 2))
 			return -1;
