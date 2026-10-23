@@ -1,0 +1,15 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 0d6faee..dc81f7d 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -733,6 +733,10 @@ static int gmu_hfi(struct a6_gpu *g)
+ 	wr32(GMU_REG(GMU_H2G_SET), 0);
+ 	a6_log("hfi(v1): init, perf/bw tables, test -> %d; dcvs %u MHz %s ret %x\n", rc, gpu_khz[lvl] / 1000,
+ 	    dack ? "TIMEOUT" : "acked", dret);
++	/* 0143: GMU DTCM (16 KB) → low RAM 0xE2010000 for /dev/pmem: the CM3 exception frame after the HFI fault */
++	for (uint32_t i = 0; i < 0x4000 / 4; i++)
++		wr32(0xE2010000ull + 4 * i, rd32(GMU_REG(GMU_DTCM) + 4 * i));
++	a6_log("diag: GMU DTCM copied to 0xE2010000\n");
+ 	a6_log("diag: smmu sgfsr %x sgfsynr0 %x sgfar %x%08x; gmu cb fsr %x far %x%08x\n", rd32(SMMU + 0x48),
+ 	    rd32(SMMU + 0x50), rd32(SMMU + 0x44), rd32(SMMU + 0x40), rd32(SMMU_CB(g->gmu_cb) + CB_FSR),
+ 	    rd32(SMMU_CB(g->gmu_cb) + CB_FAR + 4), rd32(SMMU_CB(g->gmu_cb) + CB_FAR));
