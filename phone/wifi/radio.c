@@ -1345,6 +1345,32 @@ static void htt_tx_compl(const uint8_t *p, uint32_t len)
 
 /* ---- WMI commands for the join (layouts: ath10k wmi-tlv) */
 
+/* ath10k_start / ath10k_conf_tx: pdev tx power limits (0.5 dBm units) and vdev WMM (mac80211 STA defaults)
+ * are set before the first vdev start; without them the firmware asserted there (RT:0x1084/0x1089). */
+static int w_pdev_param(uint32_t param, uint32_t value)
+{
+	uint8_t m[4 + 12], *p = put_tlv(m, 0x52, 12);
+	p = put32(p, 0);
+	p = put32(p, param);
+	put32(p, value);
+	return wmi_send(0x4003, m, sizeof(m));
+}
+
+static int w_vdev_wmm(void)
+{
+	/* BE, BK, VI, VO: cwmin, cwmax, aifs, txop (32 us units), acm, no_ack */
+	static const uint32_t ac[4][6] = { { 15, 1023, 3, 0, 0, 0 }, { 15, 1023, 7, 0, 0, 0 },
+					   { 7, 15, 2, 94, 0, 0 }, { 3, 7, 2, 47, 0, 0 } };
+	uint8_t m[4 + 4 + 4 * 28] = { 0 }, *p = put_tlv(m, 0xc7, 4 + 4 * 28);
+	p = put32(p, 0);				/* vdev 0 */
+	for (int i = 0; i < 4; i++) {
+		p = put32(p, 0);			/* dummy */
+		for (int j = 0; j < 6; j++)
+			p = put32(p, ac[i][j]);
+	}
+	return wmi_send(0x500d, m, sizeof(m));
+}
+
 static int w_vdev_start(uint32_t freq, uint32_t bcn, uint32_t dtim)
 {
 	uint8_t m[4 + 72 + 4 + 24 + 4] = { 0 }, *p;
@@ -1638,6 +1664,8 @@ static void w_join_begin(void)
 	LOG("join: '%.*s' %02x:%02x:%02x:**:**:** %u MHz %d dBm %s", (int)s_ssid_len, s_ssid, s_bssid[0], s_bssid[1],
 	    s_bssid[2], s_freq, bss[best].rssi, s_rsn ? "WPA2" : "open");
 	w_ps_off();
+	int t2 = w_pdev_param(3, 40), t5 = w_pdev_param(4, 40), wm = w_vdev_wmm();
+	LOG("join: tx power limit 2G/5G 20 dBm %s, vdev wmm %s", t2 || t5 ? "FAILED" : "ok", wm ? "FAILED" : "ok");
 	if (w_vdev_start(s_freq, bcn, dtim)) {
 		w_join_end(EIO);
 		return;
