@@ -13,7 +13,7 @@ P=$PWD/work/boot
 base="debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 ufsrw=1 rootrw=1"
 base="$base unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1"
 base="$base wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 ufslogsecs=2 flamereboot=1800"
-base="$base flametouch=0 sweettouch=0 sweetkeys=1 sweetusb=2 sweetgpu=0 sweetmtl=0 sweetddr=0"
+base="$base flametouch=0 sweettouch=0 sweetkeys=1 sweetusb=2 sweetgpu=1 sweetgpufreq=2 sweetgpudelay=60 sweetmtl=0 sweetddr=0"
 base="$base sweetbattery=1"
 # Real time: PM6150 RTC + offset (tools/flame-rtc.py LOG calibrates it once).
 [ -f work/rtc-offset ] && base="$base sweetrtcoff=$(cat work/rtc-offset)"
@@ -24,7 +24,7 @@ for a in "$@"; do
 done
 cmdline="$base $*"
 echo "$cmdline" > "$P/$name.cmdline"
-python3 -I tools/mkpayload.py "$kernel" "$P/sunfish-hi.adt" "$P/$name.payload" --cmdline "$cmdline" ${GPUFW:+--gpufw "$GPUFW"} >/dev/null
+python3 -I tools/mkpayload.py "$kernel" "$P/sunfish-hi.adt" "$P/$name.payload" --cmdline "$cmdline" --gpufw "${GPUFW:-$PWD/../restore/fw/gpu}" >/dev/null
 shim/build.sh "$P/$name.payload" "$P/$name.img" >/dev/null
 echo "$(date +%T) built $name.img; waiting for fastboot"
 until fastboot devices | grep -q fastboot; do sleep 2; done
