@@ -62,11 +62,18 @@ jobs:
           sh phone/metal2/build.sh
           cp work/turnip/build-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib phone/metal2/out/
 
+      - name: Turnip tests (vktest, v2test)
+        run: |
+          sh phone/turnip/build.sh
+          work/userland/bin/ios-cc -x c++ -std=c++17 -O2 -I phone/turnip -o phone/turnip/out/v2test phone/turnip/v2test.cpp -lc++ -framework IOKit -framework CoreFoundation || true
+          codesign -f -s - phone/turnip/out/v2test 2>/dev/null || true
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: metal2
           path: |
             phone/metal2/out/
+            phone/turnip/out/
             work/turnip/*.log
             work/m2v-bridge/*.log
