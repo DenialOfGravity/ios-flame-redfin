@@ -69,7 +69,7 @@ static void mem_wr(uint64_t pa, const void *buf, uint32_t len)
 
 #define SMMU_PA		0x15000000ull
 #define SMMU_SIZE	0x00100000u
-#define WLAN_SID	0x640
+#define WLAN_SID	0x240	/* sunfish icnss iommus (flame: 0x640) */
 #define WLAN_SID_MASK	0x1
 #define CB_CBAR		0x0001f000u	/* S1 translation, S2 bypass, as ABL's banks */
 #define CB_CBA2R	0x00000001u	/* AArch64 */

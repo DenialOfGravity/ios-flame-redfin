@@ -31,10 +31,10 @@
 #define FW_INIT_DONE_IND 0x38
 
 #define CLIENT_ID	0x4b4e454c	/* ath10k's */
-#define MSA_PA		0x8bc00000ull	/* pil_wlan_fw_region */
+#define MSA_PA		0x98d00000ull	/* sunfish wlan_msa_region (flame: 0x8bc00000) */
 #define MSA_SIZE	0x100000u	/* qcom,wlan-msa-memory */
-#define BDF_PATH	"/var/local/fw/modem/bdwlan-flame.bin"
-#define BDF_PATH2	"/var/local/fw/modem/bdwlan-flame-PROTO1.1.bin"
+#define BDF_PATH	"/var/local/fw/modem/bdwlan-sunfish.bin"
+#define BDF_PATH2	"/var/local/fw/modem/bdwlan-sunfish-EVT1.0.bin"
 
 static uint32_t srv_node, srv_port;
 static int srv_up, started;

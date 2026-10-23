@@ -128,7 +128,8 @@ static int qmp_send(const char *msg);
 static int wlan_power(void)
 {
 	static const struct { const char *res; uint32_t mv; } ldo[] = {
-		{ "ldoa1", 752 }, { "ldoa7", 1800 }, { "ldoc2", 1304 }, { "ldoc11", 3104 },
+		/* sunfish icnss: vdd-cx-mx L9A (640 mV), 1.8-xo L1C, 1.3-rfa L2C, 3.3-ch0 L10C, 3.3-ch1 L11C */
+		{ "ldoa9", 640 }, { "ldoc1", 1800 }, { "ldoc2", 1304 }, { "ldoc10", 3304 }, { "ldoc11", 3304 },
 	};
 	for (unsigned i = 0; i < sizeof(ldo) / sizeof(ldo[0]); i++) {
 		uint32_t off[3] = { 0, 8, 4 }, val[3] = { ldo[i].mv, 7, 1 };
@@ -356,8 +357,8 @@ static int qmp_send(const char *msg)
 /* ---- modem boot: TrustZone PAS (Linux qcom_q6v5_pas + qcom_mdt_loader) ---- */
 
 #define PAS_MODEM	4
-#define MPSS_PA		0x8dc00000ull	/* flame modem_region */
-#define MPSS_SIZE	0x0b400000ull
+#define MPSS_PA		0x8b000000ull	/* sunfish modem_region (flame: 0x8dc00000) */
+#define MPSS_SIZE	0x09800000ull
 #define FW_DIR		"/var/local/fw/modem"
 #define SCM_PIL(cmd)	(0x42000000ull | (2u << 8) | (cmd))
 

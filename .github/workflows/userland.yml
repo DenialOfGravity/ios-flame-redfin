@@ -2,7 +2,8 @@ name: userland
 
 # iOS 16 arm64 userland for SSH into the phone: dropbear (root-only, pubkey
 # only) and dash. Built with the runner's Xcode iOS SDK, ad hoc signed.
-# Install with tools/sunfish-install-ssh.sh over the kernel file server.
+# Also wland (phone/wifi, sunfish constants) and phone/tools. Install with
+# tools/sunfish-install-ssh.sh over the kernel file server.
 
 on:
   workflow_dispatch:
@@ -78,6 +79,20 @@ jobs:
           CC=ios-cc HOSTCC=cc CFLAGS="-I$PWD/ios-inc" make -j4 toybox
           cp toybox ../out/
 
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: wland + phone tools
+        run: |
+          cd repo
+          sh phone/wifi/build.sh
+          cp phone/wifi/out/wland ../out/
+          bash phone/tools/build.sh || echo "::warning::some phone tools failed"
+          for t in psx pstack netsvc nettest oslog prefs openapp lsreg; do
+            [ -f phone/tools/out/$t ] && cp phone/tools/out/$t ../out/ || true
+          done
+
       - name: Check and sign
         run: |
           cd out
@@ -85,7 +100,7 @@ jobs:
             if nm -m "$b" | grep -q "weak external"; then
               echo "::warning::$b has weak imports:"; nm -m "$b" | grep "weak external"
             fi
-            codesign -f -s - "$b"
+            case $b in dash|dropbearmulti|toybox) codesign -f -s - "$b";; esac  # others keep their entitlements
             file "$b"
           done
           shasum -a 256 * > SHA256SUMS
