@@ -535,7 +535,7 @@ static void htc_rx(uint32_t c, const uint8_t *d, uint32_t len)
 #define ABI_NS1			0x00004c4du	/* "ML" */
 #define SVC_RX_FULL_REORDER	65
 #define SVC_EXTEND_ADDRESS	179
-#define NUM_PEERS		33
+#define NUM_PEERS		14	/* ath10k wcn3990: TARGET_HL_10_TLV_NUM_PEERS (was 33; suspected cause of the vdev-start assert) */
 #define NUM_VDEVS		4
 #define MAX_MEM_REQS		8
 #define MAX_MEM_TOTAL		(4u << 20)
@@ -659,8 +659,8 @@ static void wmi_send_init(void)
 		rc[3] = NUM_VDEVS;
 	}
 	rc[4] = 2;					/* peer keys */
-	rc[5] = NUM_PEERS * 2;				/* tids */
-	rc[6] = 16;					/* ast skid limit */
+	rc[5] = 33 * 2;					/* tids: TARGET_TLV_NUM_TIDS */
+	rc[6] = 6;					/* ast skid limit (wcn3990) */
 	rc[7] = 0x7;					/* tx chain mask */
 	rc[8] = 0x7;					/* rx chain mask */
 	rc[9] = 0x64; rc[10] = 0x64; rc[11] = 0x64; rc[12] = 0x28;
@@ -676,13 +676,13 @@ static void wmi_send_init(void)
 	rc[29] = 2;					/* frag entries */
 	rc[30] = 1;					/* tdls vdevs */
 	rc[31] = 0x20;					/* tdls conn table */
-	rc[32] = 2;					/* beacon tx offload */
+	rc[32] = 3;					/* beacon tx offload */
 	rc[33] = 5;					/* mcast filter entries */
 	rc[34] = 22;					/* wow filters */
 	rc[35] = 6;					/* keepalive patterns */
 	rc[37] = 1;
 	rc[38] = 1;
-	rc[43] = 1u << 9;				/* MGMT_BUNDLE_TX_COMPL */
+	rc[43] = 0;					/* host_capab: 0 as ath10k */
 	p = put_tlv(p, TAG_RESOURCE_CONFIG, sizeof(rc));
 	memcpy(p, rc, sizeof(rc));
 	p += sizeof(rc);
