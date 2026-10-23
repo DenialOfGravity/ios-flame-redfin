@@ -28,7 +28,7 @@ SOC_BASE = 0x01000000
 GICD, GICD_SIZE = 0x17a00000, 0x10000
 GICR, GICR_SIZE = 0x17a60000, 0x100000
 # cont_splash_region; ABL scans it out (autorefreshed command-mode panel)
-FB, FB_SIZE = 0x9c000000, 0x1700000
+FB, FB_SIZE = 0xa0000000, 0x2300000  # redfin (live DT); sunfish 0x9c000000/0x1700000
 SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 1080, 2340, 1080 * 4
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none

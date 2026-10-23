@@ -40,12 +40,13 @@ Save "reserved-memory.txt" 'ls /proc/device-tree/reserved-memory/'
 Save "model.txt" 'cat /proc/device-tree/model; echo; od -An -tx4 /proc/device-tree/qcom,msm-id; od -An -tx4 /proc/device-tree/qcom,board-id'
 Save "dmesg-twrp.txt" "dmesg"
 
-# Firmware: GPU from vendor, Wi-Fi/modem from the modem partition. Both mounted read-only.
+# Firmware: GPU and (on redfin) the WLAN user PD, modemuw.jsn and BDFs from vendor; the modem from the
+# modem partition. Both mounted read-only.
 $slot = (Adb-Sh "getprop ro.boot.slot_suffix").Trim()
 Adb-Sh "mkdir -p /tmp/rv /tmp/rm; mount -o ro /dev/block/mapper/vendor$slot /tmp/rv 2>&1 || mount -o ro /vendor 2>&1; mount -t vfat -o ro /dev/block/by-name/modem$slot /tmp/rm 2>&1" | Out-File "$O\mounts.txt" -Encoding ascii
 Save "vendor-firmware.txt" "ls -l /tmp/rv/firmware /vendor/firmware 2>/dev/null"
 Save "modem-firmware.txt" "ls -lR /tmp/rm/image 2>/dev/null | head -400"
-foreach ($f in (Adb-Sh "cd /tmp/rv/firmware 2>/dev/null || cd /vendor/firmware; ls a6*_gmu.bin a6*_sqe.fw a620_zap.* 2>/dev/null").Split("`n")) {
+foreach ($f in (Adb-Sh "cd /tmp/rv/firmware 2>/dev/null || cd /vendor/firmware; ls a6*_gmu.bin a6*_sqe.fw a620_zap.* wlanmdsp.mbn modemuw.jsn bdwlan*redfin.bin 2>/dev/null").Split("`n")) {
 	$f = $f.Trim(); if ($f) { & adb pull "/tmp/rv/firmware/$f" "$O\fw\$f" 2>$null | Out-Null; if (-not (Test-Path "$O\fw\$f")) { & adb pull "/vendor/firmware/$f" "$O\fw\$f" | Out-Null } }
 }
 foreach ($f in (Adb-Sh "cd /tmp/rm/image && ls wlanmdsp.mbn modemuw.jsn modemr.jsn modem.mdt modem.b* bdwlan* 2>/dev/null").Split("`n")) {

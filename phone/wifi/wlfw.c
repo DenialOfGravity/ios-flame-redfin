@@ -33,9 +33,9 @@
 #define CLIENT_ID	0x4b4e454c	/* ath10k's */
 #define MSA_PA		0x8ba00000ull	/* redfin icnss qcom,wlan-msa-fixed-region = pil_wlan_fw_mem */
 #define MSA_SIZE	0x200000u	/* its size (sunfish qcom,wlan-msa-memory 0x100000) */
-/* redfin: the BDF name is not known yet (tools/redfin-recon.ps1 lists the modem image); copy it here */
-#define BDF_PATH	"/var/local/fw/modem/bdwlan.bin"
-#define BDF_PATH2	"/var/local/fw/modem/bdwlan-redfin.bin"
+/* redfin: /vendor/firmware/bdwlan-redfin.bin (also bdwlan-u-redfin.bin), found by recon 2026-10-23 */
+#define BDF_PATH	"/var/local/fw/modem/bdwlan-redfin.bin"
+#define BDF_PATH2	"/var/local/fw/modem/bdwlan-u-redfin.bin"
 
 static uint32_t srv_node, srv_port;
 static int srv_up, started;
