@@ -19,7 +19,18 @@
  	return true;
  }
  
-@@ -242,7 +247,31 @@
+@@ -221,6 +226,10 @@
+ 	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+ 	valid = valid && mv >= 2800 && mv <= 4600;
+ 	if (!valid) {
++		/* sunfish: one bad read used to flash 100%; keep the last value. */
++		if (fShown >= 0) {
++			return;
++		}
+ 		publish(100, 4200, 0, true, true, false, true, false, false);
+ 		return;
+ 	}
+@@ -242,7 +251,37 @@
  		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */
  		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
  	}
@@ -39,10 +50,16 @@
 +	int target = full ? 100 : (int)estimatePercent(fEmaMv);
 +	if (fShown < 0) {
 +		fShown = target;
-+	} else if (target > fShown && (charging || external || full)) {
-+		fShown++;
-+	} else if (target < fShown && !charging) {
-+		fShown--;
++	} else {
++		/* Direction from the measured current: a weak USB port can say
++		 * "charging" while the battery still drains (-137 mA seen). */
++		bool gaining = full || (currentValid ? ma > 50 : charging);
++		bool losing = currentValid ? ma < -50 : !external;
++		if (target > fShown && gaining) {
++			fShown++;
++		} else if (target < fShown && losing) {
++			fShown--;
++		}
 +	}
 +	if ((fPolls++ % 10u) == 0) {
 +		IOLog("SWEET BATTERY: %umV %dmA ocv %u ema %u -> target %d%% shown %d%% ext=%d chg=%d\n",
