@@ -1,0 +1,36 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index ff299f6..c5bd306 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -1163,7 +1163,11 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
+ 		/* 64-bit addressing: CP VSC GRAS RB PC HLSQ VFD VPC UCHE SP TPL1 SECVID */
+ 		{ 0x0842, 1 }, { 0x0c01, 1 }, { 0x8601, 1 }, { 0x8e05, 1 }, { 0x9e01, 1 }, { 0xbe05, 1 },
+ 		{ 0xa601, 1 }, { 0x9601, 1 }, { 0x0e00, 1 }, { 0xae01, 1 }, { 0xb601, 1 }, { 0xf810, 1 },
++#if A6_GPU_ID == 618
++		{ 0x0010, 3 },				/* RBBM_VBIF_CLIENT_QOS_CNTL (kgsl a615_gbif) */
++#else
+ 		{ 0x0011, 3 },				/* RBBM_GBIF_CLIENT_QOS_CNTL */
++#endif
+ 		{ 0x050b, 0xffffffff },			/* RBBM_PERFCTR_GPU_BUSY_MASKED */
+ 		/* UCHE: write range max, trap base, write-through base (trap 0x1fffffffff000) */
+ 		{ 0x0e05, 0xffffffc0 }, { 0x0e06, 0x1ffff }, { 0x0e09, 0xfffff000 }, { 0x0e0a, 0x1ffff },
+@@ -1174,10 +1178,19 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
+ 		{ 0x0e0b, 0x100000 }, { 0x0e0c, 0 }, { 0x0e0d, 0x1fffff }, { 0x0e0e, 0 },	/* GMEM range */
+ #endif
+ 		{ 0x0e18, 0x804 }, { 0x0e17, 0x4 },	/* UCHE_FILTER_CNTL, CACHE_WAYS */
++#if A6_GPU_ID == 618
++		/* 0146: ROQ thresholds of the A618 (kgsl: the A640's are twice as big) */
++		{ 0x08c2, 0x010000c0 }, { 0x08c1, 0x8040362c }, { 0x08c3, 128 },	/* ROQ, mem pool */
++#else
+ 		{ 0x08c2, 0x02000140 }, { 0x08c1, 0x8040362c }, { 0x08c3, 128 },	/* ROQ, mem pool */
++#endif
+ 		{ 0x098d, 1 }, { 0x0500, 1 },		/* CP_AHB_CNTL, RBBM_PERFCTR_CNTL */
+ 		{ 0x001f, (1u << 30) | 0x1fffff },	/* RBBM_INTERFACE_HANG_INT_CNTL */
++#if A6_GPU_ID == 618
++		{ 0x0e19, 1 },				/* UCHE_CLIENT_PF (kgsl) */
++#else
+ 		{ 0x0e19, (1u << 7) | 1 },		/* UCHE_CLIENT_PF */
++#endif
+ 		{ 0x9e00, 0x00180000 },			/* PC_DBG_ECO_CNTL: prim_fifo_threshold */
+ 		{ 0x08d0, 0 },				/* CP_PERFCTR_CP_SEL[0]: always count */
+ #if A6_GPU_ID == 618
