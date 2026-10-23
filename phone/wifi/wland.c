@@ -158,14 +158,36 @@ static int wlan_power(void)
 		if (rc)
 			return -1;
 	}
-	/* the WCN399x reference clock (mainline: clocks = <&rpmhcc RPMH_RF_CLK2>, "cxo_ref_clk_pin"): VRM enable */
-	uint32_t off[1] = { 4 }, val[1] = { 1 };
-	int rc = pm_rpmh("rfclka2", 1, off, val);
-	printf("wlan power: rfclka2 on -> %d\n", rc);
-	if (rc)
-		return -1;
-	/* mainline sm8150 wifi: clocks "cxo_ref_clk_pin", "qdss" = <&aoss_qmp>: the QDSS clock is an AOSS message */
-	return qmp_send("{class: clock, res: qdss, val: 1}") ? -1 : 0;
+	/*
+	 * The WCN399x reference clock. sunfish/sm8150 (mainline: clocks = <&rpmhcc RPMH_RF_CLK2>,
+	 * "cxo_ref_clk_pin") need the rfclka2 VRM vote; redfin's icnss node has no clocks and lito's
+	 * cmd-db has no rfclka2 (log 2026-10-24: "lookup matches=0"), so the vote is only made when
+	 * cmd-db has the resource. /var/local/wlan-rfclk names another resource to vote instead.
+	 */
+	char clk[16] = "rfclka2";
+	FILE *cf = fopen("/var/local/wlan-rfclk", "r");
+	if (cf) {
+		if (fscanf(cf, "%15s", clk) != 1)
+			snprintf(clk, sizeof(clk), "rfclka2");
+		fclose(cf);
+	}
+	uint64_t aux;
+	uint32_t alen;
+	if (cmddb_aux(clk, &aux, &alen)) {
+		printf("wlan power: %s not in cmd-db: no RF clock vote (redfin icnss has no clocks); cmd-db:\n", clk);
+		cmddb_list();
+	} else {
+		uint32_t off[1] = { 4 }, val[1] = { 1 };
+		int rc = pm_rpmh(clk, 1, off, val);
+		printf("wlan power: %s on -> %d\n", clk, rc);
+		if (rc)
+			return -1;
+	}
+	/* mainline sm8150 wifi: clocks "cxo_ref_clk_pin", "qdss" = <&aoss_qmp>: the QDSS clock is an AOSS
+	 * message. Trace clock only: a failure is logged, not fatal. */
+	if (qmp_send("{class: clock, res: qdss, val: 1}"))
+		printf("wlan power: qdss clock message failed (continuing)\n");
+	return 0;
 }
 
 /* SMP2P item: magic "$SMP", version/features, local/remote pid, total/valid entries, flags, entries[16+4] */
