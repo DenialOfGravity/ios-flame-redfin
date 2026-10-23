@@ -535,7 +535,7 @@ static void htc_rx(uint32_t c, const uint8_t *d, uint32_t len)
 #define ABI_NS1			0x00004c4du	/* "ML" */
 #define SVC_RX_FULL_REORDER	65
 #define SVC_EXTEND_ADDRESS	179
-#define NUM_PEERS		14	/* ath10k wcn3990: TARGET_HL_10_TLV_NUM_PEERS (was 33; suspected cause of the vdev-start assert) */
+#define NUM_PEERS		33	/* ath10k wcn3990: TARGET_HL_TLV_NUM_PEERS */
 #define NUM_VDEVS		4
 #define MAX_MEM_REQS		8
 #define MAX_MEM_TOTAL		(4u << 20)
@@ -546,6 +546,8 @@ static struct wmi_mem_req wmi_req[MAX_MEM_REQS];
 static int wmi_init_sent, wmi_ready, wmi_seen_bmap, wmi_seen_reqs;
 static uint32_t wmi_eeprom_rd = 0xffffffff;	/* HAL_REG_CAPABILITIES.eeprom_rd */
 static uint8_t wmi_mac[6];
+static uint32_t wmi_rf_chains;
+static int w_pdev_param(uint32_t param, uint32_t value);
 
 /* ath10k WMI_SERVICE_IS_ENABLED: 4 service bits per 32-bit word (sizeof(u32)) */
 static int wmi_svc(uint32_t bit)
@@ -593,6 +595,7 @@ static void wmi_svc_ready(const uint8_t *p, uint32_t len)
 			memcpy(&fw, v, 4);
 			memcpy(&a0, v + 4, 4);
 			memcpy(&rf, v + 36, 4);
+			wmi_rf_chains = rf;
 			LOG("wmi: fw %08x abi %08x rf chains %u", fw, a0, rf);
 		} else if (tag == 0x21 && l >= 4) {	/* WMI_TLV_TAG_STRUCT_HAL_REG_CAPABILITIES */
 			memcpy(&wmi_eeprom_rd, v, 4);
@@ -660,7 +663,7 @@ static void wmi_send_init(void)
 	}
 	rc[4] = 2;					/* peer keys */
 	rc[5] = 33 * 2;					/* tids: TARGET_TLV_NUM_TIDS */
-	rc[6] = 6;					/* ast skid limit (wcn3990) */
+	rc[6] = 16;					/* ast skid limit: TARGET_HL_TLV_AST_SKID_LIMIT */
 	rc[7] = 0x7;					/* tx chain mask */
 	rc[8] = 0x7;					/* rx chain mask */
 	rc[9] = 0x64; rc[10] = 0x64; rc[11] = 0x64; rc[12] = 0x28;
@@ -676,13 +679,13 @@ static void wmi_send_init(void)
 	rc[29] = 2;					/* frag entries */
 	rc[30] = 1;					/* tdls vdevs */
 	rc[31] = 0x20;					/* tdls conn table */
-	rc[32] = 3;					/* beacon tx offload */
+	rc[32] = 2;					/* beacon tx offload */
 	rc[33] = 5;					/* mcast filter entries */
 	rc[34] = 22;					/* wow filters */
 	rc[35] = 6;					/* keepalive patterns */
 	rc[37] = 1;
 	rc[38] = 1;
-	rc[43] = 0;					/* host_capab: 0 as ath10k */
+	rc[43] = 1u << 9;				/* host_capab: WMI_TLV_FLAG_MGMT_BUNDLE_TX_COMPL as ath10k */
 	p = put_tlv(p, TAG_RESOURCE_CONFIG, sizeof(rc));
 	memcpy(p, rc, sizeof(rc));
 	p += sizeof(rc);
@@ -792,6 +795,19 @@ static void scan_start(void)
 		put32(q, 0x10);		/* CTL_FCC 5 GHz */
 		int rc = wmi_send(0x4001, rd, sizeof(rd));
 		LOG("regdomain: %#x -> %d", code, rc);
+	}
+	/*
+	 * ath10k_start's pdev setup. Above all the chain masks: INIT says 0x7 (3 chains), the firmware has 2 and
+	 * ath10k narrows it here ((1 << num_rf_chains) - 1); without it the fw indexes per-chain state past 2.
+	 */
+	{
+		uint32_t mask = (wmi_rf_chains >= 1 && wmi_rf_chains <= 3) ? (1u << wmi_rf_chains) - 1 : 3;
+		static const uint32_t pp[][2] = { { 0x22, 1 }, { 0x0a, 1 }, { 0x2c, 1 }, { 0x23, 0 }, { 0x25, 1 } };
+		int e = 0;
+		for (uint32_t i = 0; i < sizeof(pp) / sizeof(pp[0]); i++)
+			e |= w_pdev_param(pp[i][0], pp[i][1]);
+		e |= w_pdev_param(1, mask) | w_pdev_param(2, mask);
+		LOG("pdev: chain mask %#x (rf chains %u), pmf/bw/idle-ps/ani %s", mask, wmi_rf_chains, e ? "FAILED" : "ok");
 	}
 	/* channel list: 2.4 GHz 1-11 and 5 GHz 36-48 may transmit, the rest passive */
 	p = put32(put_tlv(p, TAG_SCAN_CHAN_LIST_CMD, 4), NFREQ);
