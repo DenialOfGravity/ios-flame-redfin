@@ -200,6 +200,43 @@ static void log_gic(void)
 	}
 }
 
+/*
+ * sunfish PMIC GPIOs (LV/MV subtype): Linux pinctrl sets these, ABL doesn't.
+ *  - PM6150 (SID 0) GPIO4 = touch_power_default: output high, VIN 1.
+ *  - PM6150L (SID 4) GPIO2 = key_vol_up_default: input, 30 uA pull-up, VIN 0.
+ * Regs: 0x40 MODE (LV/MV: dir 0 in / 1 out), 0x41 VIN, 0x42 PULL,
+ * 0x44 OUT_SOURCE ([7] invert: high for source 0), 0x45 OUT_CTL, 0x46 EN.
+ */
+static void pmic_gpio_dump(const char *what, uint32_t sid, uint32_t base)
+{
+	uint8_t v[8] = {0}, sub = 0;
+	spmi_read(sid, base + 0x05, &sub);
+	for (int i = 0; i < 7; i++)
+		spmi_read(sid, base + 0x40 + i, &v[i]);
+	spmi_read(sid, base + 0x08, &v[7]);	/* STATUS1 (input level in [0]) */
+	log_printf("pmic %s sid%u %x: sub %x mode %x vin %x pull %x in %x src %x out %x en %x st %x\n",
+		   what, sid, base, sub, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+}
+
+static void sunfish_pmic_gpios(void)
+{
+	pmic_gpio_dump("touchpwr", 0, 0xc300);
+	pmic_gpio_dump("volup", 4, 0xc100);
+	/* touch power: drive high first, then enable */
+	spmi_write(0, 0xc300 + 0x41, 1);
+	spmi_write(0, 0xc300 + 0x44, 0x80);
+	spmi_write(0, 0xc300 + 0x45, 0x02);	/* CMOS, low drive */
+	spmi_write(0, 0xc300 + 0x40, 1);
+	spmi_write(0, 0xc300 + 0x46, 0x80);
+	/* volume up: input with pull-up */
+	spmi_write(4, 0xc100 + 0x40, 0);
+	spmi_write(4, 0xc100 + 0x41, 0);
+	spmi_write(4, 0xc100 + 0x42, 0);
+	spmi_write(4, 0xc100 + 0x46, 0x80);
+	pmic_gpio_dump("touchpwr", 0, 0xc300);
+	pmic_gpio_dump("volup", 4, 0xc100);
+}
+
 /* Plain RAM where XNU will live: is it there and writable with the MMU off? */
 static void log_ram(void)
 {
@@ -228,6 +265,7 @@ void shim_main(uintptr_t dtb)
 		log_pmic();
 		set_reboot_bootloader();
 		set_hard_reset();
+		sunfish_pmic_gpios();
 	}
 	/* Probe runs reset themselves; only an XNU boot arms the watchdog. */
 	wdt_off();

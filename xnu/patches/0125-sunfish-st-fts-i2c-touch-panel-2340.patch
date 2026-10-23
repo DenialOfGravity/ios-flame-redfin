@@ -1,0 +1,302 @@
+diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
+index d9d7860..a9d6c3e 100644
+--- a/bsd/dev/sweet_a6xx.h
++++ b/bsd/dev/sweet_a6xx.h
+@@ -48,7 +48,7 @@
+ #define A6_RING_SIZE		0x8000u
+ #define A6_RING_DW		(A6_RING_SIZE / 4)
+ 
+-#define A6_FB_PA		0x9c400000ull
++#define A6_FB_PA		0x9c000000ull
+ #define A6_FB_SIZE		0xa00000ull	/* mapped for the GPU: 5 x 2 MB */
+ 
+ #define A6_GPU_ID		640
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index c87ed5d..ee61a5f 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -546,7 +546,7 @@ present_wait_locked(uint32_t k, const char *why)
+ 	return 0;
+ }
+ #define PANEL_W         1080
+-#define PANEL_H         2280
++#define PANEL_H         2340
+ #define DISPLAY_MASK_OFF        0x500000ULL     /* 2x2 corner mattes, one per corner */
+ #define DISPLAY_MASK_SIDE       256u
+ #define DISPLAY_MASK_DIM        (DISPLAY_MASK_SIDE * 2)
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 31bc961..6a33392 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -32,6 +32,22 @@ void sweet_touch_init(void);
+ #define TOUCH_MAX        10u
+ #define TOUCH_GOODIX     1
+ #define TOUCH_FTS        2
++#define TOUCH_STFTS      3 /* sunfish: ST FTM5 over I2C (sweettouch=2) */
++/* ST FTM5, I2C variant (Google sunfish fts_lib/ftsHardware.h): no dummy bytes. */
++#define STFTS_ADDR       0x49u
++#define STFTS_HW_REG     0xfau
++#define STFTS_FIFO_READ  0x86u
++#define STFTS_SCAN       0xa0u
++#define STFTS_CHIPID     0x20000000u
++#define STFTS_RESET      0x20000024u
++#define STFTS_EVT_READY  0x03u
++#define STFTS_EVT_ENTER  0x13u
++#define STFTS_EVT_MOTION 0x23u
++#define STFTS_EVT_LEAVE  0x33u
++#define STFTS_EVT_ERROR  0xf3u
++#define STFTS_PIN_IRQ    9
++#define STFTS_PIN_RESET  8
++#define STFTS_PIN_SWITCH 72 /* low: the AP owns the touch I2C, high: SLPI */
+ /* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */
+ #define GOODIX_PID_REG   0x4022u
+ #define GOODIX_EVENT_REG 0x4180u
+@@ -209,12 +225,12 @@ touch_irq(void)
+ 	return st.irq_last;
+ }
+ 
+-/* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
++/* One Linux-style FIFO message. TX is at most 8 bytes; RX at most 90. */
+ static int
+ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+     unsigned nr, bool stretch)
+ {
+-	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
++	if (st.dead || nt > 8 || nr > 90 || (nt && nr) || (!nt && !nr)) {
+ 		return EIO;
+ 	}
+ 	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
+@@ -247,11 +263,14 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ 			break;
+ 		}
+ 		if (nt && !st.sent && (irq & SE_TX_WM_IRQ)) {
+-			uint32_t word = 0;
+-			for (unsigned j = 0; j < nt; ++j) {
+-				word |= (uint32_t)tx[j] << (8u * j);
++			/* Up to two FIFO words (TX depth >= 2 is checked at init). */
++			for (unsigned w = 0; w * 4u < nt; ++w) {
++				uint32_t word = 0;
++				for (unsigned j = 0; j < 4 && w * 4u + j < nt; ++j) {
++					word |= (uint32_t)tx[w * 4u + j] << (8u * j);
++				}
++				touch_wr(st.se, SE_TX, word);
+ 			}
+-			touch_wr(st.se, SE_TX, word);
+ 			st.sent = nt;
+ 			touch_wr(st.se, SE_TX_WM, 0);
+ 		}
+@@ -487,6 +506,158 @@ touch_focaltech(void)
+ 	return 0;
+ }
+ 
++/* ---- sunfish: ST FTM5 on SE7 I2C 0x49 ---- */
++static int
++stfts_reg_read(uint32_t addr, uint8_t *out, unsigned n)
++{
++	const uint8_t cmd[5] = {STFTS_HW_REG, (uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
++		                    (uint8_t)(addr >> 8), (uint8_t)addr};
++	int err = touch_msg(STFTS_ADDR, cmd, sizeof(cmd), NULL, 0, true);
++	return err ? err : touch_msg(STFTS_ADDR, NULL, 0, out, n, false);
++}
++
++static int
++stfts_reg_write8(uint32_t addr, uint8_t v)
++{
++	const uint8_t cmd[6] = {STFTS_HW_REG, (uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
++		                    (uint8_t)(addr >> 8), (uint8_t)addr, v};
++	return touch_msg(STFTS_ADDR, cmd, sizeof(cmd), NULL, 0, false);
++}
++
++static int
++stfts_event(uint8_t ev[8])
++{
++	const uint8_t cmd = STFTS_FIFO_READ;
++	int err = touch_msg(STFTS_ADDR, &cmd, 1, NULL, 0, true);
++	return err ? err : touch_msg(STFTS_ADDR, NULL, 0, ev, 8, false);
++}
++
++static void
++stfts_log(const char *what, const uint8_t ev[8])
++{
++	printf("SWEET STFTS: %s %02x %02x %02x %02x %02x %02x %02x %02x\n", what,
++	    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
++}
++
++static int
++stfts_wait_event(uint8_t id, unsigned ms)
++{
++	uint8_t ev[8];
++	for (unsigned t = 0; t < ms; t += 5) {
++		int err = stfts_event(ev);
++		if (err) {
++			return err;
++		}
++		if (ev[0] != 0 && ev[0] != 0xffu) {
++			stfts_log("event", ev);
++			if (ev[0] == id) {
++				return 0;
++			}
++		} else {
++			touch_wait(5);
++		}
++	}
++	return ETIMEDOUT;
++}
++
++/* Same event layout as flame's SPI driver (sweet_fts.c fts_handle). */
++static void
++stfts_handle(const uint8_t ev[8])
++{
++	unsigned id = ev[1] >> 4;
++	if (id >= TOUCH_MAX) {
++		return;
++	}
++	int x = ((ev[3] & 0x0f) << 8) | ev[2];
++	int y = (ev[4] << 4) | (ev[3] >> 4);
++	switch (ev[0]) {
++	case STFTS_EVT_ENTER:
++	case STFTS_EVT_MOTION:
++		st.active |= 1u << id;
++		st.x[id] = x;
++		st.y[id] = y;
++		sweet_hid_touch((int)id, 1, x, y);
++		break;
++	case STFTS_EVT_LEAVE:
++		if (st.active & (1u << id)) {
++			st.active &= ~(1u << id);
++			sweet_hid_touch((int)id, 0, st.x[id], st.y[id]);
++		}
++		break;
++	case STFTS_EVT_ERROR:
++		stfts_log("error", ev);
++		break;
++	default:
++		break;
++	}
++}
++
++/*
++ * Rails: PM6150 GPIO4 (touch_power_default, output high) is switched on by
++ * the shim before XNU starts; this side only does TLMM pins and the bus.
++ */
++static void
++stfts_run(void)
++{
++	printf("SWEET STFTS: TLMM irq=%#x/%#x reset=%#x/%#x switch=%#x/%#x\n",
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(STFTS_PIN_IRQ)), touch_rd(st.gpio, TOUCH_GPIO_IO(STFTS_PIN_IRQ)),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(STFTS_PIN_RESET)), touch_rd(st.gpio, TOUCH_GPIO_IO(STFTS_PIN_RESET)),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(STFTS_PIN_SWITCH)), touch_rd(st.gpio, TOUCH_GPIO_IO(STFTS_PIN_SWITCH)));
++	touch_gpio(STFTS_PIN_SWITCH, 0, 0, 0, true, false);
++	touch_gpio(STFTS_PIN_IRQ, 0, 0, 0, false, false);
++	touch_gpio(STFTS_PIN_RESET, 0, 0, 0, true, false);
++	touch_gpio(6, 1, 0, 3, false, false); /* qup11 SDA/SCL, 8 mA as the DT */
++	touch_gpio(7, 1, 0, 3, false, false);
++	touch_wait(10);
++	touch_gpio(STFTS_PIN_RESET, 0, 0, 0, true, true);
++	int err = stfts_wait_event(STFTS_EVT_READY, 1000);
++	printf("SWEET STFTS: after reset pin: ready err=%d irq-pin=%u\n", err,
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(STFTS_PIN_IRQ)) & 1u);
++	uint8_t id[4] = {0};
++	int ierr = stfts_reg_read(STFTS_CHIPID, id, sizeof(id));
++	printf("SWEET STFTS: chip id err=%d %02x %02x fw %02x %02x (want 36 39)\n",
++	    ierr, id[0], id[1], id[2], id[3]);
++	if (ierr || st.dead) {
++		return;
++	}
++	if (err) {
++		err = stfts_reg_write8(STFTS_RESET, 0x81);
++		if (!err) {
++			err = stfts_wait_event(STFTS_EVT_READY, 1000);
++		}
++		printf("SWEET STFTS: system reset: ready err=%d\n", err);
++	}
++	const uint8_t scan[3] = {STFTS_SCAN, 0x00, 0xff};
++	err = touch_msg(STFTS_ADDR, scan, sizeof(scan), NULL, 0, false);
++	printf("SWEET STFTS: sense on err=%d; polling\n", err);
++	if (err) {
++		return;
++	}
++	unsigned errors = 0, events = 0, ticks = 0;
++	while (!st.dead) {
++		uint8_t ev[8];
++		bool poll = (++ticks % 12u) == 0;
++		while ((poll || !(touch_rd(st.gpio, TOUCH_GPIO_IO(STFTS_PIN_IRQ)) & 1u)) && !st.dead) {
++			poll = false;
++			if (stfts_event(ev)) {
++				if ((errors++ % 100u) == 0) {
++					printf("SWEET STFTS: read error (%u) irq=%#x\n", errors, st.irq_status);
++				}
++				break;
++			}
++			if (ev[0] == 0 || ev[0] == 0xffu) {
++				break;
++			}
++			if (events++ < 32) {
++				stfts_log("first", ev);
++			}
++			stfts_handle(ev);
++		}
++		touch_wait(8);
++	}
++	touch_report(0, st.x, st.y);
++}
++
+ static bool
+ touch_se_init(void)
+ {
+@@ -569,6 +740,10 @@ touch_thread(void *arg, wait_result_t result)
+ 	if (!touch_clocks() || !touch_se_init()) {
+ 		goto out;
+ 	}
++	if (st.kind == TOUCH_STFTS) {
++		stfts_run();
++		goto out;
++	}
+ 	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
+@@ -651,9 +826,12 @@ sweet_touch_init(void)
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
+ 	if (!enabled) {
+-		printf("SWEET TOUCH: disabled (Redmi driver; sweettouch=1 forces it)\n");
++		printf("SWEET TOUCH: disabled (sweettouch=1 Redmi, =2 sunfish ST FTM5)\n");
+ 		return;
+ 	}
++	if (enabled == 2) {
++		st.kind = TOUCH_STFTS;
++	}
+ 	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index 963e02d..0bd911c 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -56,10 +56,10 @@
+  * 4320-byte rows. The bootstrap console uses it before the ADT is parsed.
+  * SWEET_EARLY_FB_BLOCK_PA is the 32MB L2 block holding it.
+  */
+-#define SWEET_EARLY_FB_PA         0x9c400000
++#define SWEET_EARLY_FB_PA         0x9c000000
+ #define SWEET_EARLY_FB_BLOCK_PA   0x9c000000
+ #define SWEET_EARLY_FB_WIDTH      1080
+-#define SWEET_EARLY_FB_HEIGHT     2280
++#define SWEET_EARLY_FB_HEIGHT     2340
+ #define SWEET_EARLY_FB_STRIDE     4320
+ 
+ #define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -359,9 +359,9 @@
+ #define SWEET_TOUCH_EDGE_PX 48
+ extern "C" int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
+ 
+-/* Touch reports panel pixels; flame's panel is 1080x2280 (SWEET.h). */
++/* Touch reports panel pixels; sunfish's panel is 1080x2340 (SWEET.h). */
+ #define SWEET_PANEL_W 1080
+-#define SWEET_PANEL_H 2280
++#define SWEET_PANEL_H 2340
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
