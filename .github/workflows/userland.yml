@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
   push:
     branches: [sunfish]
-    paths: [.github/workflows/userland.yml]
+    paths: [.github/workflows/userland.yml, "phone/**"]
 
 env:
   DROPBEAR_VER: "2022.83"
