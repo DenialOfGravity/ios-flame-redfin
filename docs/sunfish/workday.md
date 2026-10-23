@@ -189,3 +189,11 @@ After a clean reboot: 3 scans, 14 networks, no modem crash, Settings > Wi-Fi lis
   Vulkan DeviceLost → black screen), VBIF QoS reg 0x10, UCHE_CLIENT_PF 1.
 - Result (k35): home screen correct (logs/shots/mtl-k35.png), no GPU hangs, swipe **22.8 fps** (peaks 27.4;
   CPU path 17.2, GPU-composite-only 16.4). backboardd CPU 49 s → 22 s per bench. GPU 33–53% busy at 267 MHz.
+
+## [12:10] FPS reality check — benchmark metric corrected
+- The bench counted `swaps`; the screen shows `panel copies`. With Metal at 267 MHz many swaps never reached the
+  panel (k35: 22.8 swaps/s but 13.2 panel updates/s). Bench now reports both; `BENCH_TIGHT=1` = continuous swipes.
+- Panel updates/s, continuous swipes (k36/k37, GPU 565 MHz acked via DCVS):
+  Metal2 + Turnip **18.2** · CPU render + GPU composite **16.7–17.6**. Old bench (with pauses): all paths ~16–17.
+- Metal halves backboardd CPU (49 s → 22 s per bench). Neither CPU (~0.55 core) nor GPU (11–29% busy) is
+  saturated → the ~18 fps ceiling is frame pacing/latency, not throughput. Next: where backboardd waits per frame.
