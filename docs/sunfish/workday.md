@@ -145,3 +145,13 @@ After a clean reboot: 3 scans, 14 networks, no modem crash, Settings > Wi-Fi lis
 - Best lead for next time: `gcc gpu_memnoc_gfx … (still halted)`. That is the GPU SMMU's clock per the DT, which fits
   "SMR readback 0" + "GMU bus fault on first SMMU read". Exact next steps are in docs/gpu-notes.md.
 - Phone: k23 (k14, no GPU) running with flamereboot=600 → returns to fastboot to charge. Battery 3806 mV at 09:48.
+
+## [10:20] GPU — **PASS: Adreno 618 composites the UI** (0140 + 0141)
+- 0140: kgsl SMMU `attach-impl-defs` written; SMMU state logged at setup: impl regs stick, SMR/S2CR read 0.
+  The hypervisor emulates the SMMU global space (Google arm-smmu.c comment) and dropped our SMRs.
+- 0141: **SMR mask 0** (DT `#iommu-cells = 1` = exact SIDs; flame's mask 0x400 was refused). SMR now `80000005`,
+  `hfi: ctrl init -> status 1 ok`, CP `me_init` executes (rptr = wptr, idle), zap ok, **"GPU ready in 5979 ms"**.
+- Framebuffer switched to GPU present by itself ("frames now scaled to fit by the GPU, panel stride 4352").
+  Screenshot logs/shots/gpu-k25-home.png (read with `flame-shot --stride 4352`).
+- Swipe bench: **20.1 fps** (CPU path 17.2). GPU present ~27 ms/frame → GPU clock probably at minimum:
+  HFI messages after INIT still CM3-fault (`info 800000`), so DCVS (clock up) times out. Next: that fault.
