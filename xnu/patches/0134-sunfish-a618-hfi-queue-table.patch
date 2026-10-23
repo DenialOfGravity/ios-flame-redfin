@@ -1,0 +1,46 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 29f3495..e270aeb 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -342,7 +342,7 @@ static int gmu_smmu(struct a6_gpu *g)
+ 	map_gmu_pages(GMEM_L3_LOW(g), VA_DCACHE, GMEM_DCACHE(g), CACHE_SIZE, 1);
+ 	map_gmu_pages(GMEM_L3_6(g), VA_DUMMY, GMEM_DUMMY(g), 0x1000, 0);
+ 	map_gmu_pages(GMEM_L3_6(g), VA_LOG, GMEM_LOG(g), A6_GMU_LOG_SIZE, 0);
+-	map_gmu_pages(GMEM_L3_6(g), VA_HFI, GMEM_HFI(g), 0x4000, 0);
++	map_gmu_pages(GMEM_L3_6(g), VA_HFI, GMEM_HFI(g), 0x5000, 0);	/* table + 4 queues */
+ 	smmu_bank(g->gmu_smr, g->gmu_cb, GMEM_L1(g), GMU_SID, GMU_SID_MASK);
+ 	return 0;
+ }
+@@ -377,18 +377,27 @@ static void rpmh_init(void)
+ static void hfi_table(struct a6_gpu *g)
+ {
+ 	uint64_t t = GMEM_HFI(g);
++#if A6_GPU_ID == 618
++	/* kgsl hfi_init: HFI_QUEUE_MAX = 4 queues (the 4th, dispatch, disabled),
++	 * sizes in dwords (flame wrote bytes for 3 queues; the A640 fw tolerated it). */
++	const uint32_t nq = 4;
++	wr32(t + 0, 0);
++	wr32(t + 4, (6 * 4 + nq * 12 * 4) / 4);
++#else
++	const uint32_t nq = 3;
+ 	wr32(t + 0, 0);
+ 	wr32(t + 4, 6 * 4 + 3 * 12 * 4);
++#endif
+ 	wr32(t + 8, 6);
+ 	wr32(t + 12, 12);
+-	wr32(t + 16, 3);
+-	wr32(t + 20, 3);
+-	for (uint32_t q = 0; q < 3; q++) {
++	wr32(t + 16, nq);
++	wr32(t + 20, nq);
++	for (uint32_t q = 0; q < nq; q++) {
+ 		uint64_t h = t + 24 + 48 * q;
+-		wr32(h + 0, 1);
++		wr32(h + 0, q < 3 ? 1 : 0);	/* the dispatch queue is disabled */
+ 		wr32(h + 4, VA_HFI + 0x1000 * (q + 1));
+ #if A6_GPU_ID == 618
+-		static const uint32_t legacy_idx[3] = { 0, 4, 5 };	/* cmd, msg, dbg (HFI_*_IDX_LEGACY) */
++		static const uint32_t legacy_idx[4] = { 0, 4, 5, 1 };	/* cmd, msg, dbg, dsp0 (HFI_*_IDX_LEGACY) */
+ 		wr32(h + 8, (10u << 8) | legacy_idx[q]);
+ #else
+ 		wr32(h + 8, (10u << 8) | q);
