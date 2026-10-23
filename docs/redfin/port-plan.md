@@ -149,6 +149,21 @@ back in fastboot. Bottom-edge colour bar = start.s progress bar.
 Kernel bring-up on redfin works first time. 0152 (USB SID/clocks, prime cpufreq) follows; then the iOS
 root image on userdata.
 
+## iOS boots on the Pixel 5 (2026-10-24, `redfin-r1-iosroot.img`)
+
+Root image: `tools/redfin-mkroot-wsl.sh` in WSL (Ubuntu 26.04; WSL's kernel has no HFS+, so `hfsmod`
+builds hfsplus.ko from the linux-msft-wsl-6.18.54.1 source with the running config and force-loads it:
+gcc 15 vs Microsoft's gcc 13 only moves the genksyms CRCs). Written to sda19 with
+`tools/redfin-install-root-wsl.sh` from TWRP, all 16 GiB SHA-256 verified.
+
+Boot r1 = kernel 0151 + ADT with D22AP /product + `rd=ufsroot0 ufsrw=1 rootrw=1`, touch/USB/GPU off:
+**iOS 16.7.16 (iPhone X userland) boots into the OS on the Pixel 5**; power and volume keys work.
+Touch off by design (sectouch=0).
+
+Next: r2 = kernel 0152 + `sectouch=1 sectouchlog=1` (first run of the sec_ts driver), USB still off.
+Then USB: Windows has no CDC-ECM class driver (the port's USB Ethernet), so the host side needs work
+(usbipd into WSL, or an NCM/RNDIS variant of sweet_usb).
+
 ## Done so far
 
 **Shim** (boots in place of iBoot)
