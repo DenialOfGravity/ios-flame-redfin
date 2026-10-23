@@ -15,6 +15,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      clean:
+        description: ignore the incremental build cache (full build)
+        default: "false"
   push:
     branches: [main]
     paths:
@@ -67,12 +70,59 @@ jobs:
           xcodebuild -version
           xcrun --find iig
 
+      # Incremental builds: dxb/xnu (patched source), dxb/build/xnu.obj and the fakeroot (mig, ctf tools,
+      # libfirehose, headers) come from the last successful run. The new patch set is applied to a pristine
+      # copy of the source with build.sh's own patches(); rsync --checksum then copies only files whose
+      # content changed, so make recompiles just those. A miss or clean=true is the old full build.
+      - name: Restore incremental build cache
+        id: cache
+        if: inputs.clean != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            dxb/xnu
+            dxb/build/xnu.obj
+            dxb/fakeroot
+          key: xnu-inc-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-${{ github.run_id }}
+          restore-keys: xnu-inc-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-
+
+      - name: Re-patch cached source (changed files only)
+        if: steps.cache.outputs.cache-matched-key != ''
+        working-directory: dxb
+        run: |
+          set -euo pipefail
+          P=$RUNNER_TEMP/prep
+          rm -rf "$P" && mkdir -p "$P"
+          cp -a xnu "$P/xnu"
+          (cd "$P/xnu" && git checkout -q -- . && git clean -fdqx)
+          ln -s "$PWD/patches" "$P/patches"
+          (
+            WORK_DIR=$P CODEQL=0 KDKROOT=${KDKROOT:-/nonexistent}
+            running() { echo "$*"; }; warning() { echo "$*"; }; error() { echo "$*" >&2; }
+            eval "$(sed -n '/^patches() {/,/^}/p' build.sh)"
+            patches
+          )
+          rsync -rlc --no-times --delete --exclude .git --itemize-changes "$P/xnu/" xnu/ | grep -v '^\.' | head -50 || true
+          # build.sh must not re-run its seds over the tree (they rewrite files and bump mtimes)
+          sed -i '' 's/^    patches$/    true # patched by the cache step/' build.sh
+          rm -f build/xnu.obj/kernel.* fakeroot/System/Library/Kernels/kernel.*
+
       - name: Build
         working-directory: dxb
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: bash build.sh
+
+      - name: Save incremental build cache
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            dxb/xnu
+            dxb/build/xnu.obj
+            dxb/fakeroot
+          key: xnu-inc-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-${{ github.run_id }}
 
       - name: Package build tree for local compiles
         if: always()
