@@ -73,13 +73,19 @@ hfsmod() {
 			tar -xzf "$W/$tag.tar.gz" -C "$W"
 		fi
 		cd "$src"
-		if [[ -r /proc/config.gz ]]; then zcat /proc/config.gz > .config; else cp arch/x86/configs/config-wsl .config; fi
+		if [[ ! -f .config ]]; then
+			if [[ -r /proc/config.gz ]]; then zcat /proc/config.gz > .config; else cp arch/x86/configs/config-wsl .config; fi
+		fi
 		scripts/config --module HFSPLUS_FS --disable DEBUG_INFO_BTF --disable DEBUG_INFO_DWARF5 \
 			--disable DEBUG_INFO_DWARF4 --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT --enable DEBUG_INFO_NONE
 		make olddefconfig >/dev/null
 		grep -q '^CONFIG_HFSPLUS_FS=m' .config || { echo "HFSPLUS_FS did not stick in .config"; exit 1; }
 		echo "building vmlinux for symbol versions ($(nproc) jobs; 15-30 min)"
 		make -j"$(nproc)" vmlinux modules_prepare >"$W/kbuild.log" 2>&1 || { tail -30 "$W/kbuild.log"; exit 1; }
+		# `make vmlinux` writes the kernel's symbol CRCs to vmlinux.symvers; Module.symvers only appears
+		# after a full `make modules`. The external module build reads Module.symvers.
+		[[ -s Module.symvers ]] || cp vmlinux.symvers Module.symvers
+		grep -q 'register_filesystem' Module.symvers || { echo "no register_filesystem CRC in Module.symvers"; exit 1; }
 		make -j"$(nproc)" M=fs/hfsplus modules >>"$W/kbuild.log" 2>&1 || { tail -30 "$W/kbuild.log"; exit 1; }
 		cp fs/hfsplus/hfsplus.ko "$ko"
 		cd "$REPO"
