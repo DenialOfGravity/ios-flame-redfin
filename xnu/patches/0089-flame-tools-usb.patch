@@ -277,7 +277,7 @@ index 6cefbe88b..ac07c2fba 100644
 + *   +0x1000 ring bytes (offset of byte n = n % ring size)
 + * The next shim boot copies its tail to UFS (tools/flame-log-pull.sh rescue).
 + */
-+#define SWEET_MIRROR_PA         0x1fe000000ULL
++#define SWEET_MIRROR_PA         0x1fa000000ULL
 +struct sweet_mirror_header {
 +	char magic[8];
 +	uint64_t total;

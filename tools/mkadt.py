@@ -21,16 +21,16 @@ MEM_SIZE = 0x4d000000
 # limited below 4G. ABL puts the ramdisk (our payload) at 0x84700000 or, if
 # big, 0xc0000000, so XNU takes 0x1_00000000 up (same size as on the Redmi).
 HIGH_PHYS_BASE = 0x100000000
-HIGH_MEM_SIZE = 0xfcc00000
+HIGH_MEM_SIZE = 0xf8c00000  # sunfish: RAM ends 0x1fcc00000; top 64 MiB kept for log stashes
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
 GICD, GICD_SIZE = 0x17a00000, 0x10000
 GICR, GICR_SIZE = 0x17a60000, 0x100000
 # cont_splash_region; ABL scans it out (autorefreshed command-mode panel)
-FB, FB_SIZE = 0x9c400000, 0x2400000
+FB, FB_SIZE = 0x9c000000, 0x1700000
 SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
-FB_W, FB_H, FB_STRIDE = 1080, 2280, 1080 * 4
+FB_W, FB_H, FB_STRIDE = 1080, 2340, 1080 * 4
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 TIMEBASE = 19200000
@@ -67,7 +67,7 @@ u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
 
 
-PANIC_LOG_PA = 0x1fd000000
+PANIC_LOG_PA = 0x1f9000000
 PANIC_LOG_SIZE = 0x80000
 
 
@@ -218,7 +218,7 @@ def build(seed=None, qemu=False, highmem=False):
     ])
 
     # iBoot's panic region (pe_init.c check_for_panic_log): RAM above XNU's range
-    # (which ends at 0x1fcc00000) and below the console mirror at 0x1fe000000.
+    # (which ends at 0x1f8c00000 on sunfish) and below the console mirror at 0x1fa000000.
     pram = node('pram', [ph(), ('reg', struct.pack('<2Q', PANIC_LOG_PA, PANIC_LOG_SIZE))])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).

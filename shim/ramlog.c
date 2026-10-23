@@ -13,7 +13,7 @@
 #include "ufs.h"
 #include "util.h"
 
-#define MAILBOX_PA	0x1ffe00000UL	/* top of RAM, above XNU's range; kept across ABL (probe: 0x1fff00000 held TWRP data) */
+#define MAILBOX_PA	0x1fbe00000UL	/* sunfish: below RAM end 0x1fcc00000, above XNU range */
 #define RING_SIZE	(4u << 20)
 #define RESCUE_DATA	((UFS_RESCUE_BLOCKS - 1) * 4096u)
 
@@ -45,7 +45,7 @@ void ramlog_arm(uint64_t ring_pa, uint64_t total_pa)
 	log_printf("ramlog: armed, ring %lx total %lx\n", ring_pa, total_pa);
 }
 
-#define MIRROR_PA	0x1fe000000UL	/* XNU's uncached ring mirror (sweet_ufs.c) */
+#define MIRROR_PA	0x1fa000000UL	/* XNU's uncached ring mirror (sweet_ufs.c) */
 
 static int rescue_from(uint64_t ring, uint64_t total, const char *what);
 

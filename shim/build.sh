@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build the flame shim and wrap it in a boot image v2 with the stock header
+# Build the sunfish (Pixel 4a) shim and wrap it in a boot image v2 with the stock header
 # layout (base 0, kernel 0x8000, ramdisk 0x1000000, tags 0x100, dtb 0x1f00000).
 #
 #   shim/build.sh [PAYLOAD] [OUT]   PAYLOAD: tools/mkpayload.py output (ramdisk);
@@ -10,8 +10,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=$(cd .. && pwd)
-LLVM=/opt/homebrew/opt/llvm/bin
-LLD=/opt/homebrew/opt/lld/bin
+if [ -d /opt/homebrew/opt/llvm/bin ]; then
+	LLVM=/opt/homebrew/opt/llvm/bin LLD=/opt/homebrew/opt/lld/bin
+else
+	LLVM=$(dirname "$(command -v clang)") LLD=$(dirname "$(command -v ld.lld)")
+fi
 CC="$LLVM/clang --target=aarch64-none-elf"
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-builtin -fno-pic -fno-pie -mgeneral-regs-only -mstrict-align
 	-fno-stack-protector -fno-asynchronous-unwind-tables -Wall -Wextra ${SHIM_CFLAGS:-}"
@@ -45,15 +48,17 @@ else
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
 OUT=${2:-out/shim-boot.img}
-PYTHONPATH="$ROOT/downloads/mkbootimg" python3 "$ROOT/downloads/mkbootimg/mkbootimg.py" \
+MKBOOTIMG=${MKBOOTIMG:-$(command -v mkbootimg || echo "python3 $ROOT/downloads/mkbootimg/mkbootimg.py")}
+$MKBOOTIMG \
 	--header_version 2 --kernel out/Image.lz4 --ramdisk out/ramdisk.bin --dtb "$ROOT/stock/dtb" \
 	--base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 --tags_offset 0x100 \
-	--dtb_offset 0x1f00000 --pagesize 4096 --os_version 13.0.0 --os_patch_level 2022-10 \
+	--dtb_offset 0x1f00000 --pagesize 4096 --os_version 13.0.0 --os_patch_level 2023-08 \
 	--cmdline "console=null" -o "$OUT"
 # Google's ABL refuses "fastboot boot" of an image without an AVB footer
 # ("Error verifying the received boot.img: Unsupported"), even unlocked: add
 # an unsigned hash footer (algorithm NONE) like TWRP's, padding to the boot
 # partition size.
-python3 "$ROOT/downloads/avb/avbtool.py" add_hash_footer --image "$OUT" \
+AVBTOOL=${AVBTOOL:-$(command -v avbtool || echo "python3 $ROOT/downloads/avb/avbtool.py")}
+$AVBTOOL add_hash_footer --image "$OUT" \
 	--partition_size 67108864 --partition_name boot
 ls -l out/Image "$OUT"

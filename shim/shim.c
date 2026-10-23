@@ -24,9 +24,9 @@
 #include "ufs.h"
 #include "util.h"
 
-#define IMEM_RESTART_REASON	0x146bf65cUL	/* qcom,msm-imem restart_reason@65c */
+#define IMEM_RESTART_REASON	0x146aa65cUL	/* sunfish qcom,msm-imem@146aa000 restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
-#define PON_SOFT_RB_SPARE	0x88f		/* PM8150 (SID 0) PON, reason in [7:1] */
+#define PON_SOFT_RB_SPARE	0x88f		/* PM6150 (SID 0) PON, reason in [7:1] */
 #define PON_REASON_BOOTLOADER	0x02
 #define PON_PS_HOLD_RESET_CTL	0x85a		/* [3:0] type */
 #define PON_PS_HOLD_RESET_CTL2	0x85b		/* [7] enable */
@@ -203,7 +203,7 @@ static void log_gic(void)
 /* Plain RAM where XNU will live: is it there and writable with the MMU off? */
 static void log_ram(void)
 {
-	static const uint64_t probe[] = { 0x100000000ULL, 0x180000000ULL, 0x1fff00000ULL };
+	static const uint64_t probe[] = { 0x100000000ULL, 0x180000000ULL, 0x1fbf00000ULL };
 	for (unsigned i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
 		volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)probe[i];
 		uint64_t old = p[0];
