@@ -1,0 +1,150 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index ddf0614..2cb21a5 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -1,7 +1,8 @@
+ /*
+  * Minimal polled SWEET keys. Call once after the scheduler is running.
+  * flame: power (KPDPWR) and volume down (RESIN) on the PM8150 PON block,
+- * volume up: sunfish PM6150L GPIO2 (SID 4, 0xc100, active low; was Pixel 4 PM8150 GPIO6).
++ * volume up: redfin PM8150L GPIO5 (SID 4, 0xc400, active low; sunfish PM6150L GPIO2 0xc100,
++ * Pixel 4 PM8150 GPIO6). The shim sets its pull-up (shim.c redfin_pmic_gpios).
+  * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+  * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
+  */
+@@ -23,7 +24,7 @@ void sweet_keys_init(void);
+ #define KEYS_CNFG_PA     0x0c40a000u
+ #define KEYS_PON_RT      0x0810u
+ #define KEYS_GPIO_SID    4u
+-#define KEYS_GPIO_BASE   0xc100u
++#define KEYS_GPIO_BASE   0xc400u
+ #define KEYS_GPIO_RT     (KEYS_GPIO_BASE + 0x10u)
+ #define KEYS_NO_APID     0xffffu
+ 
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 6a121c5..5cb96be 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -5,6 +5,7 @@
+  * Init is serialized by the single built-in SweetBattery personality.
+  * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
+  * Also the PM8150 RTC (peripheral 0x60) for the time of day (SweetPlatformExpert.cpp).
++ * redfin: the battery blocks are on PM7250B (SID 2), the RTC stays on SID 0.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -89,9 +90,11 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+ 	/* Restrict access to the battery blocks and the RTC (0x60); keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x60)) {
++	/* redfin: battery blocks on PM7250B (SID 2), RTC on PM8150 (SID 0). */
++	bool batt = sid == 2 && (peripheral == 0x10 || peripheral == 0x11 ||
++	    peripheral == 0x12 || peripheral == 0x13 || peripheral == 0x48);
++	bool rtc = sid == 0 && peripheral == 0x60;
++	if (!sp_ready || !out || addr > 0xffffu || !(batt || rtc)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 45d75f8..cd9a014 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1255,7 +1255,9 @@ ud_smmu_setup(uint64_t dma_pa)
+  * as Linux qcom_snps_hsphy_init (phy-qcom-snps-femto-v2.c) minus the
+  * regulators and the GCC block reset.
+  */
+-#define HSPHY_PA        0x088e2000
++/* redfin (lito): the primary port's femto PHY is hsphy@88e3000; 0x088e2000 is the
++ * EUD enable register there, never written. */
++#define HSPHY_PA        0x088e3000
+ #define HP_UTMI_CTRL0   0x3c
+ #define HP_UTMI_CTRL5   0x50
+ #define HP_COMMON0      0x54
+@@ -1311,7 +1313,9 @@ ud_hsphy_init(void)
+ 	hp_rmw(p, HP_UTMI_CTRL5, 1u << 1, 0);           /* POR release */
+ 	hp_rmw(p, HP_CTRL2, 1u << 3, 0);
+ 	hp_rmw(p, HP_CFG0, 1u << 1, 0);
+-	hp_rmw(p, 0x70, 0xff, 0x43);                    /* DT qcom,param-override-seq: 0x43 @ X1 */
++	/* redfin DT qcom,param-override-seq <0xC7 0x6C 0xCC 0x70> (lito-redfin-usb.dtsi) */
++	hp_rmw(p, 0x6c, 0xff, 0xc7);
++	hp_rmw(p, 0x70, 0xff, 0xcc);
+ 	delay(1000);
+ 	ud_hsphy_dump(p, "after init");
+ }
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index b46c78f..6b254b8 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -12,6 +12,10 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
++/* redfin: QG fuel gauge (0x4800) and charger (0x1000) are on PM7250B, SID 2
++ * (pm7250b.dtsi qcom,qgauge@4800); sunfish had them on PM6150 SID 0. */
++#define BATT_SID 2
++
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+@@ -174,8 +178,8 @@ SweetBattery::readWord(unsigned address, uint16_t *value)
+ 	uint16_t previous = 0;
+ 	for (unsigned attempt = 0; attempt < 4; ++attempt) {
+ 		uint8_t lo, hi;
+-		if (sweet_spmi_read(0, address, &lo) ||
+-		    sweet_spmi_read(0, address + 1, &hi)) {
++		if (sweet_spmi_read(BATT_SID, address, &lo) ||
++		    sweet_spmi_read(BATT_SID, address + 1, &hi)) {
+ 			return false;
+ 		}
+ 		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
+@@ -214,14 +218,14 @@ SweetBattery::poll(void)
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+-	    !sweet_spmi_read(0, 0x4804, &type) && type == 0x0d &&
+-	    !sweet_spmi_read(0, 0x4808, &present) && (present & 1u) &&
++	    !sweet_spmi_read(BATT_SID, 0x4804, &type) && type == 0x0d &&
++	    !sweet_spmi_read(BATT_SID, 0x4808, &present) && (present & 1u) &&
+ 	    readWord(0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
+-	    !sweet_spmi_read(0, 0x1310, &usb) &&
+-	    !sweet_spmi_read(0, 0x110b, &path) &&
+-	    !sweet_spmi_read(0, 0x1006, &charger) &&
+-	    !sweet_spmi_read(0, 0x1007, &error) &&
+-	    !sweet_spmi_read(0, 0x100d, &temperature);
++	    !sweet_spmi_read(BATT_SID, 0x1310, &usb) &&
++	    !sweet_spmi_read(BATT_SID, 0x110b, &path) &&
++	    !sweet_spmi_read(BATT_SID, 0x1006, &charger) &&
++	    !sweet_spmi_read(BATT_SID, 0x1007, &error) &&
++	    !sweet_spmi_read(BATT_SID, 0x100d, &temperature);
+ 	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u) : 0;
+ 	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+ 	valid = valid && mv >= 2800 && mv <= 4600;
+@@ -243,7 +247,7 @@ SweetBattery::poll(void)
+ 	int ma = 0;
+ 	uint8_t subtype;
+ 	uint16_t rawCurrent;
+-	bool currentValid = !sweet_spmi_read(0, 0x4805, &subtype) &&
++	bool currentValid = !sweet_spmi_read(BATT_SID, 0x4805, &subtype) &&
+ 	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
+ 	    rawCurrent != 0x8000;
+ 	if (currentValid) {
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index 0bd911c..1a6c571 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -56,8 +56,10 @@
+  * 4320-byte rows. The bootstrap console uses it before the ADT is parsed.
+  * SWEET_EARLY_FB_BLOCK_PA is the 32MB L2 block holding it.
+  */
+-#define SWEET_EARLY_FB_PA         0x9c000000
+-#define SWEET_EARLY_FB_BLOCK_PA   0x9c000000
++/* redfin (Pixel 5, lito): cont_splash_region 0xa0000000 + 0x2300000, S6E3HC2 cmd-mode
++ * panel 1080x2340 (32MB-aligned, so the block PA is the buffer itself). */
++#define SWEET_EARLY_FB_PA         0xa0000000
++#define SWEET_EARLY_FB_BLOCK_PA   0xa0000000
+ #define SWEET_EARLY_FB_WIDTH      1080
+ #define SWEET_EARLY_FB_HEIGHT     2340
+ #define SWEET_EARLY_FB_STRIDE     4320

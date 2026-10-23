@@ -3,7 +3,7 @@
 #define SMEM_H
 #include <stdint.h>
 
-#define SMEM_BASE	0x86000000ull	/* smem_mem, sm8150 */
+#define SMEM_BASE	0x80900000ull	/* smem_mem, lito (redfin); sm8150 0x86000000 */
 #define SMEM_SIZE	0x200000ull
 #define SMEM_HOST_APPS	0
 #define SMEM_HOST_MODEM	1

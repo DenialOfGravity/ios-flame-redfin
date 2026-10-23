@@ -7,8 +7,7 @@
 #define DESC_ITEM	478
 #define FIFO_TX_ITEM	479	/* ours: apps -> modem */
 #define FIFO_RX_ITEM	480	/* the modem's */
-#define APCS_IPC	0x17c0000cull
-#define IPC_GLINK	12
+#include "ipcc.h"
 
 static uint64_t desc, tx_fifo, rx_fifo;
 static uint32_t tx_len, rx_len;
@@ -74,7 +73,7 @@ int glink_send(uint16_t cmd, uint16_t p1, uint32_t p2, const void *data, size_t 
 	head = tx_write(head, buf, padded);
 	__asm__ volatile("dsb sy" ::: "memory");
 	wr32(TX_HEAD, head);
-	wr32(APCS_IPC, 1u << IPC_GLINK);
+	wr32(IPCC_SEND_ID, DB_MODEM_GLINK);
 	return 0;
 }
 

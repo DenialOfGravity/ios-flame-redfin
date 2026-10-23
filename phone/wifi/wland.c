@@ -28,6 +28,7 @@
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include "pmem.h"
+#include "ipcc.h"
 #include "smem.h"
 #include "link.h"
 #include "rmtfs.h"
@@ -128,12 +129,14 @@ static int qmp_send(const char *msg);
 static int wlan_power(void)
 {
 	/*
-	 * sunfish icnss rails in the driver's order (icnss_vreg_info): cx-mx L9A (DT cx-mx-config
-	 * 640 mV), 1.8-xo L1C, 1.3-rfa L2C, 3.3-ch1 L11C, 3.3-ch0 L10C, both 3312 mV.
+	 * redfin (lito.dtsi icnss) rails in the driver's order (icnss_vreg_info): cx-mx L1A (DT
+	 * cx-mx-config <0 0>: enable only, no voltage), 1.8-xo L14A, 1.3-rfa L2C, 3.3-ch1 L11C,
+	 * 3.3-ch0 L10C, both 3312 mV. (sunfish: L9A 640, L1C, L2C, L11C, L10C.)
+	 * mv 0 = enable + mode only.
 	 * /var/local/wlan-rails.conf ("ldoXN MV" per line) replaces the table for experiments.
 	 */
 	static struct { char res[16]; uint32_t mv; } ldo[8] = {
-		{ "ldoa9", 640 }, { "ldoc1", 1800 }, { "ldoc2", 1304 }, { "ldoc11", 3312 }, { "ldoc10", 3312 },
+		{ "ldoa1", 0 }, { "ldoa14", 1800 }, { "ldoc2", 1304 }, { "ldoc11", 3312 }, { "ldoc10", 3312 },
 	};
 	unsigned nldo = 5;
 	FILE *rf = fopen("/var/local/wlan-rails.conf", "r");
@@ -150,7 +153,7 @@ static int wlan_power(void)
 	}
 	for (unsigned i = 0; i < nldo; i++) {
 		uint32_t off[3] = { 0, 8, 4 }, val[3] = { ldo[i].mv, 7, 1 };
-		int rc = pm_rpmh(ldo[i].res, 3, off, val);
+		int rc = ldo[i].mv ? pm_rpmh(ldo[i].res, 3, off, val) : pm_rpmh(ldo[i].res, 2, off + 1, val + 1);
 		printf("wlan power: %s %u mV on -> %d\n", ldo[i].res, ldo[i].mv, rc);
 		if (rc)
 			return -1;
@@ -188,17 +191,16 @@ static void smp2p_show(const char *what, unsigned item)
 	}
 }
 
-/* ---- SMP2P outbound (Linux qcom_smp2p_alloc_outbound_item) and the APCS doorbell ---- */
+/* ---- SMP2P outbound (Linux qcom_smp2p_alloc_outbound_item) and the IPCC doorbell (ipcc.h) ---- */
 
-#define APCS_IPC	0x17c0000cull	/* apss_shared + 12: write BIT(n) */
-#define IPC_MODEM_SMP2P	14
-#define IPC_MODEM_GLINK	12
-#define SMP2P_OUT	428
+#define IPC_MODEM_SMP2P	DB_MODEM_SMP2P
+#define IPC_MODEM_GLINK	DB_MODEM_GLINK
+#define SMP2P_OUT	428	/* lito-smp2p.dtsi qcom,smp2p-mpss qcom,smem = <435>, <428> */
 #define SMP2P_IN	435
 
-static void kick(unsigned bit)
+static void kick(uint32_t id)
 {
-	wr32(APCS_IPC, 1u << bit);
+	wr32(IPCC_SEND_ID, id);
 }
 
 static void wr_name(uint64_t pa, const char *name)
@@ -312,7 +314,7 @@ static int smp2p_init(void)
 /* ---- AOSS QMP (Linux qcom_aoss.c): messages to the always-on processor ---- */
 
 #define QMP_RAM		0x0c300000ull
-#define IPC_AOSS	0
+#define IPC_AOSS	DB_AOSS	/* lito qmp-aop@c300000: mboxes <&ipcc_mproc IPCC_CLIENT_AOP 0> */
 #define QMP_UP		0x0000ffffu
 
 static int wait_eq(uint64_t pa, uint32_t want, int ms)
@@ -374,8 +376,8 @@ static int qmp_send(const char *msg)
 /* ---- modem boot: TrustZone PAS (Linux qcom_q6v5_pas + qcom_mdt_loader) ---- */
 
 #define PAS_MODEM	4
-#define MPSS_PA		0x8b000000ull	/* sunfish modem_region (flame: 0x8dc00000) */
-#define MPSS_SIZE	0x09800000ull
+#define MPSS_PA		0x8c000000ull	/* redfin modem_wlan_mem (lito-redbull-memory.dtsi; sunfish 0x8b000000) */
+#define MPSS_SIZE	0x11800000ull
 #define FW_DIR		"/var/local/fw/modem"
 #define SCM_PIL(cmd)	(0x42000000ull | (2u << 8) | (cmd))
 

@@ -98,3 +98,16 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
 - 0123 en0 + Apple80211 for wifid (ios-topaz 0900 + 0128, from HackiOS), the station over /dev/wlan to
   wland in userland.
 - 0124 10-bit surfaces as BGRA only for WebContent (`sweetsurf10`); the joined network keeps its scan record.
+
+## Redfin patches
+
+Pixel 5 (`redfin`, SM7250 lito) on top of the sunfish series; plan and hardware map in
+[docs/redfin/port-plan.md](docs/redfin/port-plan.md). Written without a build: compile them in CI first.
+
+- 0150 redfin basics: early framebuffer 0xa0000000 (SWEET.h), vol+ PM8150L GPIO5 (0xc400, SID 4),
+  USB femto HS PHY at 0x088e3000 with the redfin param-override-seq, battery/charger reads on PM7250B
+  (SID 2) and the SPMI read allowlist for it (RTC stays on SID 0).
+- 0151 sec_ts touch (`bsd/dev/sweet_sects.c`, `sectouch=1`): Samsung S6SY79x on GENI SPI SE0 (0x880000),
+  mode 3, TX-only/RX-only framing as sec_ts.c; L17A 3304 mV allowed in sweet_rpmh; RPMh cmd-db falls
+  back to lito's fixed region 0x80860000; flame's FTS driver now off by default (its TLMM address is
+  the GPU on lito).

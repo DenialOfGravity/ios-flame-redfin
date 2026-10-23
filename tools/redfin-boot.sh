@@ -14,7 +14,7 @@ base="debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=u
 base="$base unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1"
 base="$base wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 ufslogsecs=2 flamereboot=1800"
 base="$base flametouch=0 sweettouch=0 sweetkeys=1 sweetusb=2 sweetgpu=0 sweetgpufreq=5 sweetgpudelay=0 sweetfb_thread=0 sweetmtl=0 sweetddr=0"
-base="$base sweetbattery=1"
+base="$base sweetbattery=1 sectouch=0"
 # redfin: touch is Samsung sec_ts on SPI SE0 (no driver yet), so sweettouch/flametouch stay 0.
 # GPU is an A620: sweetgpu=0 sweetmtl=0 (CPU rendering) until the redfin GPU patches exist.
 # Real time: PM8150 RTC + offset (tools/flame-rtc.py LOG calibrates it once).

@@ -1,0 +1,39 @@
+name: shim
+
+# redfin: build the shim boot images on a Linux runner (no Mac or local toolchain needed).
+#   probe-safe : -DSHIM_NO_UFS_WRITE -DSHIM_HOLDLOG, never writes storage, log on screen 60 s
+#   probe      : normal probe (writes its log to the end of userdata: only once Android data is gone)
+on:
+  workflow_dispatch:
+  push:
+    branches: [redfin]
+    paths: [.github/workflows/shim.yml, "shim/**"]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld llvm lz4 cpio
+          git clone -q --depth 1 https://github.com/LineageOS/android_system_tools_mkbootimg "$RUNNER_TEMP/mkbootimg"
+          git clone -q --depth 1 https://github.com/LineageOS/android_external_avb "$RUNNER_TEMP/avb"
+          echo "MKBOOTIMG=python3 $RUNNER_TEMP/mkbootimg/mkbootimg.py" >> "$GITHUB_ENV"
+          echo "AVBTOOL=python3 $RUNNER_TEMP/avb/avbtool.py" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          mkdir -p out
+          SHIM_CFLAGS="-DSHIM_NO_UFS_WRITE -DSHIM_HOLDLOG" bash shim/build.sh "" "$PWD/out/redfin-probe-safe.img"
+          bash shim/build.sh "" "$PWD/out/redfin-probe.img"
+          python3 "$RUNNER_TEMP/mkbootimg/unpack_bootimg.py" --boot_img out/redfin-probe-safe.img --out "$RUNNER_TEMP/u" | head -8
+          python3 "$RUNNER_TEMP/avb/avbtool.py" info_image --image out/redfin-probe-safe.img | head -6
+          (cd out && sha256sum *.img > SHA256SUMS && cat SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: redfin-shim
+          path: out/

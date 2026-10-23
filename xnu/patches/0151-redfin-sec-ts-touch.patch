@@ -1,0 +1,762 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index df7c863..7ed73d5 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_fts.c			standard
++bsd/dev/sweet_sects.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_poke.c			standard
+ bsd/dev/sweet_files.c			standard
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+index 7d77ffd..33231ca 100644
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -572,7 +572,9 @@ out:
+ void
+ sweet_fts_init(void)
+ {
+-	int enabled = 1;
++	/* redfin: off unless asked. Its TLMM SOUTH address (0x03d00000) is the GPU
++	 * on lito, so a forgotten flametouch=0 must not mean writes there. */
++	int enabled = 0;
+ 	thread_t thread;
+ 	if (ft.started) {
+ 		return;
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 7c05343..a19ef45 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -18,6 +18,8 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ #define RH_TCS_PA       0x18220d00u
+ #define RH_TCS_SIZE     0x3000u
+ #define RH_DICT_PA      0x0c3f000cu
++#define RH_DB_LITO_PA   0x80860000u
++#define RH_DB_LITO_SIZE 0x20000u
+ #define RH_DRV          2u
+ #define RH_ACTIVE_N     2u       /* DT order: ACTIVE 2, SLEEP 3, WAKE 3 */
+ #define RH_NORMAL_N     8u       /* hidden CONTROL TCS is not in this bank */
+@@ -138,8 +140,15 @@ rh_map(void)
+ 		if (pa < 0x80000000u || (pa & 3u) || (size & 3u) ||
+ 		    size < RH_DB_HEADER || size > RH_DB_MAX ||
+ 		    (uint64_t)pa + size > 0x100000000ULL) {
+-			printf("SWEET RPMH: invalid cmd-db locator\n");
+-			return EINVAL;
++			/*
++			 * redfin (lito): cmd-db is a fixed reserved-memory region
++			 * (lito.dtsi qcom,cmd-db reg <0x80860000 0x20000>), not an AOP
++			 * locator. Use it only if the locator is unusable; the magic and
++			 * version check below still has to pass.
++			 */
++			printf("SWEET RPMH: invalid cmd-db locator; trying lito cmd-db %#x\n", RH_DB_LITO_PA);
++			pa = RH_DB_LITO_PA;
++			size = RH_DB_LITO_SIZE;
+ 		}
+ 		rh_db = ml_io_map(pa, size);
+ 		if (!rh_db) {
+@@ -369,10 +378,11 @@ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+ 	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	/* Redmi touch L11C; flame touch L14A (DVDD) and L17A (AVDD), DT ranges. */
++	/* Redmi touch L11C; flame touch L14A (DVDD) and L17A (AVDD), DT ranges;
++	 * redfin touch AVDD L17A fixed at 3304 mV (lito-redfin-touch.dtsi). */
+ 	bool ok = res && ((!strcmp(res, "ldoc11") && mv >= 2950 && mv <= 3400) ||
+ 	    (!strcmp(res, "ldoa14") && mv >= 1800 && mv <= 1840) ||
+-	    (!strcmp(res, "ldoa17") && mv >= 2856 && mv <= 3008));
++	    (!strcmp(res, "ldoa17") && ((mv >= 2856 && mv <= 3008) || mv == 3304)));
+ 	if (!ok) {
+ 		printf("SWEET RPMH: %s %u mV is not an allowed touch rail\n", res ? res : "?", mv);
+ 		return EINVAL;
+diff --git a/bsd/dev/sweet_sects.c b/bsd/dev/sweet_sects.c
+new file mode 100644
+index 0000000..64090d6
+--- /dev/null
++++ b/bsd/dev/sweet_sects.c
+@@ -0,0 +1,664 @@
++/*
++ * redfin (Pixel 5) touch: Samsung sec_ts (S6SY79x) on GENI SPI QUPv3 wrapper 0 SE0.
++ * Call once after the scheduler is running; all work runs on one thread.
++ *
++ * Sources: lito-redfin-touch.dtsi (spi@880000/touchscreen@0), lito-qupv3.dtsi,
++ * pinctrl-lito.c, gcc-lito.c, and Google's driver drivers/input/touchscreen/
++ * sec_touch/sec_ts.c in the redbull kernel. Structure and the GENI FIFO code
++ * follow flame's sweet_fts.c.
++ *
++ * The IC keeps its firmware in flash. Commands sent: SW_RESET (only if no
++ * boot-complete event arrives), CLEAR_EVENT_STACK, SET_TOUCHFUNCTION, SENSE_ON.
++ * Nothing is written to the IC's flash. Reads: events, ID, panel info, status.
++ *
++ * Bus framing (SPI, sec_ts_write / sec_ts_read_internal):
++ *   write: AA, (n+1)>>8, (n+1), 00, 00, reg, data[n], sum    -> padded to 4 bytes
++ *   read:  AA, 00, 01, n>>8, n, reg, sum (TX only, CS released), wait,
++ *          then RX only: AA .. reg(5) .. [7 header bytes] data[n] sum
++ * Each half is its own GENI command (TX_ONLY / RX_ONLY), so CS drops between
++ * them as with Linux's two spi_sync calls. Events are read one at a time
++ * (READ_ONE_EVENT), which keeps every transfer inside one FIFO fill.
++ *
++ * Boot-args: sectouch=1 on (default off until it has run on a phone),
++ * sectouchdelay=N start after N s, sectouchlog=1 log every event.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_sects_init(void);
++
++#define ST_SE_PA        0x00880000u     /* spi@880000, QUPv3 wrap0 SE0 */
++#define ST_GCC_PA       0x00100000u     /* qcom,gcc@100000 */
++#define ST_WEST_PA      0x0f500000u     /* TLMM 0xf000000 + WEST (pinctrl-lito.c) */
++#define ST_EAST_PA      0x0f900000u     /* TLMM 0xf000000 + EAST */
++#define ST_GCC_VOTE     0x52008u        /* APCS_CLOCK_BRANCH_ENA_VOTE_1 */
++/* wrap0 m_ahb (6), s_ahb (7), core (8), core_2x (9), s0 (10) */
++#define ST_GCC_BITS     (0x1fu << 6)
++#define ST_RCG          0x17010u        /* gcc_qupv3_wrap0_s0_clk_src */
++#define ST_GPIO_CFG(n)  ((uint32_t)(n) * 0x1000u)
++#define ST_GPIO_IO(n)   (ST_GPIO_CFG(n) + 4u)
++#define ST_PIN_SPI0     42              /* EAST 42-45 = qup00 (function 1) */
++#define ST_PIN_SWITCH   35              /* EAST; 0 = AP owns the bus, 1 = SLPI */
++#define ST_PIN_RESET    8               /* WEST; DT default output high */
++#define ST_PIN_IRQ      9               /* WEST; level low */
++#define ST_MAX          10u             /* MAX_SUPPORT_TOUCH_COUNT */
++#define ST_PANEL_W      1080            /* SweetHID takes panel pixels */
++#define ST_PANEL_H      2340
++
++#define SE_STATUS       0x040u
++#define SE_MCLK         0x048u
++#define SE_FIFO_OFF     0x064u
++#define SE_FW           0x068u
++#define SE_CLK_SEL      0x07cu
++#define SE_SPI_CPHA     0x224u
++#define SE_SPI_LOOP     0x22cu
++#define SE_SPI_CPOL     0x230u
++#define SE_SPI_INV      0x24cu
++#define SE_SPI_DEMUX    0x250u
++#define SE_DMA          0x258u
++#define SE_SPI_TRANS    0x25cu
++#define SE_SPI_WORD     0x268u
++#define SE_TX_LEN       0x26cu
++#define SE_RX_LEN       0x270u
++#define SE_SPI_DELAY    0x278u
++#define SE_CMD          0x600u
++#define SE_CTRL         0x604u
++#define SE_IRQ          0x610u
++#define SE_IRQ_EN       0x614u
++#define SE_IRQ_CLR      0x618u
++#define SE_TX           0x700u
++#define SE_RX           0x780u
++#define SE_TX_COUNT     0x800u
++#define SE_RX_COUNT     0x804u
++#define SE_TX_WM        0x80cu
++#define SE_HW_TX        0xe24u
++#define SE_HW_RX        0xe28u
++#define SE_DONE         (1u << 0)
++#define SE_RX_WM_IRQ    (1u << 26)
++#define SE_RX_LAST      (1u << 27)
++#define SE_TX_WM_IRQ    (1u << 30)
++#define SE_ERRORS       (0x3eu | (3u << 28))
++#define SE_EVENTS       (SE_DONE | SE_ERRORS | SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ)
++#define SPI_TX_ONLY     1u
++#define SPI_RX_ONLY     2u
++#define SE_PACK0        0x0007f8feu
++#define SE_PACK1        0x000ffefeu
++
++/* sec_ts.h */
++#define SEC_SYNC                0xaau
++#define SEC_RD_HDR              7u
++#define SEC_CMD_SENSE_ON        0x10u
++#define SEC_CMD_SW_RESET        0x12u
++#define SEC_READ_PANEL_INFO     0x23u
++#define SEC_CMD_SET_TOUCHFUNC   0x30u
++#define SEC_READ_ID             0x52u
++#define SEC_READ_BOOT_STATUS    0x55u
++#define SEC_READ_ONE_EVENT      0x60u
++#define SEC_CMD_CLEAR_EVENTS    0x62u
++#define SEC_READ_TS_STATUS      0xafu
++#define SEC_STATUS_APP_MODE     0x20u
++#define SEC_ACK_BOOT_COMPLETE   0x00u
++#define SEC_EVT_COORD           0u
++#define SEC_EVT_STATUS          1u
++#define SEC_STYPE_INFO          2u
++#define SEC_STYPE_VENDOR_INFO   7u
++#define SEC_ACT_PRESS           1u
++#define SEC_ACT_MOVE            2u
++#define SEC_ACT_RELEASE         3u
++#define SEC_TTYPE_PALM          5u
++#define SEC_TTYPE_GRIP          10u
++/* SEC_TS_DEFAULT_ENABLE_BIT_SETFUNC: touch | palm | wet */
++#define SEC_SETFUNC_DEFAULT     ((1u << 0) | (1u << 5) | (1u << 6))
++
++static struct {
++	vm_offset_t se, gcc, west, east;
++	bool started, dead;
++	int log;
++	unsigned fifo_words;
++	uint32_t active;
++	int max_x, max_y;
++	int x[ST_MAX], y[ST_MAX];
++} st;
++static int st_sleep_chan;
++
++static uint32_t
++st_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++st_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++st_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&st_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++st_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(st_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* TLMM: [1:0] pull, [5:2] function, [8:6] drive (mA/2 - 1), [9] output. */
++static void
++st_gpio(vm_offset_t tile, unsigned pin, unsigned mux, unsigned pull, unsigned drive,
++    bool out, bool high)
++{
++	uint32_t off = ST_GPIO_CFG(pin);
++	if (out) {
++		st_wr(tile, ST_GPIO_IO(pin),
++		    (st_rd(tile, ST_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++	}
++	uint32_t cfg = st_rd(tile, off) & ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	st_wr(tile, off, cfg);
++}
++
++static bool
++st_irq_asserted(void)
++{
++	return !(st_rd(st.west, ST_GPIO_IO(ST_PIN_IRQ)) & 1u);
++}
++
++static bool
++st_clocks(void)
++{
++	st_wr(st.gcc, ST_GCC_VOTE, st_rd(st.gcc, ST_GCC_VOTE) | ST_GCC_BITS);
++	uint32_t cmd = st_rd(st.gcc, ST_RCG), cfg = st_rd(st.gcc, ST_RCG + 4u);
++	uint32_t dfs = st_rd(st.gcc, ST_RCG + 0x14u);
++	printf("SWEET SECTS: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
++	    st_rd(st.gcc, ST_GCC_VOTE), cmd, cfg, dfs);
++	if (dfs & 1u) {
++		/* CLK_SEL 0 picks DFS level 0; it must be XO (19.2 MHz) undivided. */
++		cfg = st_rd(st.gcc, ST_RCG + 0x1cu);
++		printf("SWEET SECTS: DFS level0 cfg=%#x\n", cfg);
++		if ((cfg & 0x371fu) != 1u) {
++			printf("SWEET SECTS: DFS level 0 is not XO/1; stopping\n");
++			return false;
++		}
++	} else {
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
++		st_wr(st.gcc, ST_RCG + 4u, cfg);
++		st_wr(st.gcc, ST_RCG, st_rd(st.gcc, ST_RCG) | 1u);
++		if (!st_wait_clear(st.gcc, ST_RCG, 1u)) {
++			printf("SWEET SECTS: RCG update timeout\n");
++			return false;
++		}
++	}
++	/* Branch halt bits: wrap0 m_ahb, s_ahb, s0 (gcc-lito.c halt_reg). */
++	const uint32_t branches[] = {0x17004, 0x17008, 0x1700c};
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		uint32_t cbcr = st_rd(st.gcc, branches[i]);
++		printf("SWEET SECTS: GCC branch %#x = %#x\n", branches[i], cbcr);
++		if (cbcr & 2u) {
++			continue;       /* hardware clock gating: reads halted while idle */
++		}
++		if (!st_wait_clear(st.gcc, branches[i], 1u << 31)) {
++			printf("SWEET SECTS: GCC branch %#x halted (%#x)\n", branches[i],
++			    st_rd(st.gcc, branches[i]));
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool
++st_se_init(void)
++{
++	uint32_t fw = st_rd(st.se, SE_FW);
++	uint32_t tx = st_rd(st.se, SE_HW_TX), rx = st_rd(st.se, SE_HW_RX);
++	printf("SWEET SECTS: se0 fw=%#x proto=%u status=%#x fifo-off=%#x tx=%#x rx=%#x\n",
++	    fw, (fw >> 8) & 0xffu, st_rd(st.se, SE_STATUS), st_rd(st.se, SE_FIFO_OFF), tx, rx);
++	/* Protocol 1 = SPI; 32-bit FIFO words. */
++	if (((fw >> 8) & 0xffu) != 1u || (st_rd(st.se, SE_FIFO_OFF) & 1u) ||
++	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
++	    ((tx >> 16) & 0x3fu) < 4u || ((rx >> 16) & 0x3fu) < 4u) {
++		printf("SWEET SECTS: need XBL/ABL-loaded SPI firmware and 32-bit FIFOs; stopping\n");
++		return false;
++	}
++	if (st_rd(st.se, SE_STATUS) & 0x1001u) {
++		printf("SWEET SECTS: SE0 already busy; stopping\n");
++		return false;
++	}
++	st.fifo_words = (tx >> 16) & 0x3fu;
++	if (((rx >> 16) & 0x3fu) < st.fifo_words) {
++		st.fifo_words = (rx >> 16) & 0x3fu;
++	}
++	/* geni_se_init + FIFO mode, polled (no GSI, no IRQ routing). */
++	st_wr(st.se, 0xe18, 0);
++	st_wr(st.se, 0xe1c, 0);
++	st_wr(st.se, 0x644, 0);
++	st_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	st_wr(st.se, 0x648, 0xffffffffu);
++	st_wr(st.se, SE_DMA, 0);
++	st_wr(st.se, 0x28, st_rd(st.se, 0x28) | 0x7fu);
++	st_wr(st.se, 0xe30, st_rd(st.se, 0xe30) | 0x0fu);
++	st_wr(st.se, 0x24, 0x7f);
++	st_wr(st.se, 0x20, 1);
++	/* SPI mode 3 (DT spi-cpol, spi-cpha), CS0, no loopback; 19.2 MHz / 4 = 4.8 MHz (DT max 10). */
++	st_wr(st.se, SE_SPI_LOOP, st_rd(st.se, SE_SPI_LOOP) & ~3u);
++	st_wr(st.se, SE_SPI_DEMUX, 0);
++	st_wr(st.se, SE_SPI_CPHA, st_rd(st.se, SE_SPI_CPHA) | 1u);
++	st_wr(st.se, SE_SPI_CPOL, st_rd(st.se, SE_SPI_CPOL) | 4u);
++	st_wr(st.se, SE_SPI_INV, 0);
++	st_wr(st.se, SE_CLK_SEL, 0);
++	st_wr(st.se, SE_MCLK, (4u << 4) | 1u);
++	st_wr(st.se, SE_SPI_DELAY, 0);
++	st_wr(st.se, SE_SPI_WORD, (st_rd(st.se, SE_SPI_WORD) & ~0x3ffu) | (8u - 4u));
++	st_wr(st.se, SE_SPI_TRANS, st_rd(st.se, SE_SPI_TRANS) & ~1u); /* no CS toggle per word */
++	st_wr(st.se, 0x254, 0);
++	st_wr(st.se, 0x260, SE_PACK0);
++	st_wr(st.se, 0x264, SE_PACK1);
++	st_wr(st.se, 0x284, SE_PACK0);
++	st_wr(st.se, 0x288, SE_PACK1);
++	st_wr(st.se, SE_TX_WM, 0);
++	st_wr(st.se, 0x810, 0);
++	st_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 2u);
++	st_wr(st.se, SE_IRQ_EN, SE_EVENTS);
++	if ((st_rd(st.se, SE_TX_COUNT) & 0xfffffffu) ||
++	    (st_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
++		printf("SWEET SECTS: inherited FIFO data; stopping\n");
++		return false;
++	}
++	return true;
++}
++
++static void
++st_abort(void)
++{
++	st_wr(st.se, SE_CTRL, 2);
++	bool done = false;
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (st_rd(st.se, SE_IRQ) & (1u << 5)) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	for (unsigned i = 0; i < 64 && (st_rd(st.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)st_rd(st.se, SE_RX);
++	}
++	st_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	if (!done || !st_wait_clear(st.se, SE_STATUS, 1u)) {
++		st.dead = true;
++		printf("SWEET SECTS: abort failed status=%#x irq=%#x; stopping\n",
++		    st_rd(st.se, SE_STATUS), st_rd(st.se, SE_IRQ));
++	}
++}
++
++/*
++ * One half-duplex GENI command: TX_ONLY sends buf[0..len), RX_ONLY clocks
++ * len bytes into buf. CS is asserted for the command and released after it.
++ * Bounded by one FIFO fill (len <= fifo_words * 4).
++ */
++static int
++st_xfer(unsigned op, uint8_t *buf, unsigned len)
++{
++	unsigned words = (len + 3u) / 4u, sent = 0, got = 0;
++	bool tx = op == SPI_TX_ONLY;
++	if (st.dead || len == 0 || words > st.fifo_words) {
++		return EIO;
++	}
++	if (!st_wait_clear(st.se, SE_STATUS, 1u)) {
++		st.dead = true;
++		return EBUSY;
++	}
++	st_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	st_wr(st.se, SE_TX_LEN, tx ? len : 0);
++	st_wr(st.se, SE_RX_LEN, tx ? 0 : len);
++	st_wr(st.se, SE_TX_WM, tx ? 1 : 0);
++	st_wr(st.se, SE_CMD, op << 27);
++	for (unsigned i = 0; i < 20000; ++i) {
++		uint32_t irq = st_rd(st.se, SE_IRQ);
++		if (irq & SE_ERRORS) {
++			printf("SWEET SECTS: xfer error op=%u irq=%#x\n", op, irq);
++			break;
++		}
++		if (tx && !sent && (irq & SE_TX_WM_IRQ)) {
++			for (unsigned w = 0; w < words; ++w) {
++				uint32_t word = 0;
++				for (unsigned j = 0; j < 4 && w * 4u + j < len; ++j) {
++					word |= (uint32_t)buf[w * 4u + j] << (8u * j);
++				}
++				st_wr(st.se, SE_TX, word);
++			}
++			sent = len;
++			st_wr(st.se, SE_TX_WM, 0);
++		}
++		if (!tx) {
++			uint32_t count = st_rd(st.se, SE_RX_COUNT) & 0x1ffffffu;
++			while (count-- && got < len) {
++				uint32_t word = st_rd(st.se, SE_RX);
++				for (unsigned j = 0; j < 4 && got < len; ++j) {
++					buf[got++] = (uint8_t)(word >> (8u * j));
++				}
++			}
++		}
++		if (irq & SE_DONE) {
++			st_wr(st.se, SE_IRQ_CLR, irq);
++			if (tx ? sent == len : got == len) {
++				return 0;
++			}
++			if (!tx) {
++				continue; /* final RX words may land after DONE */
++			}
++			break;
++		}
++		st_wr(st.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
++		delay(1);
++	}
++	printf("SWEET SECTS: xfer op=%u len=%u sent=%u got=%u irq=%#x status=%#x\n", op, len,
++	    sent, got, st_rd(st.se, SE_IRQ), st_rd(st.se, SE_STATUS));
++	st_abort();
++	return EIO;
++}
++
++static uint8_t
++st_sum(const uint8_t *p, unsigned n)
++{
++	uint8_t s = 0;
++	while (n--) {
++		s += *p++;
++	}
++	return s;
++}
++
++/* sec_ts_write over SPI: header, register, data, checksum, zero-padded to 4. */
++static int
++st_write(uint8_t reg, const uint8_t *data, unsigned n)
++{
++	uint8_t buf[32] = {0};
++	if (6u + n + 1u + 3u > sizeof(buf)) {
++		return EINVAL;
++	}
++	buf[0] = SEC_SYNC;
++	buf[1] = (uint8_t)((n + 1u) >> 8);
++	buf[2] = (uint8_t)(n + 1u);
++	buf[5] = reg;
++	for (unsigned i = 0; i < n; ++i) {
++		buf[6 + i] = data[i];
++	}
++	unsigned len = 6u + n;
++	buf[len] = st_sum(buf, len);
++	len = (len + 1u + 3u) & ~3u;
++	int err = st_xfer(SPI_TX_ONLY, buf, len);
++	delay(100);
++	return err;
++}
++
++/* sec_ts_read_internal over SPI (len <= io_burstmax path), with its checks. */
++static int
++st_read(uint8_t reg, uint8_t *out, unsigned n)
++{
++	uint8_t hdr[8] = {SEC_SYNC, 0x00, 0x01, (uint8_t)(n >> 8), (uint8_t)n, reg, 0, 0};
++	uint8_t rx[64];
++	unsigned rlen = (SEC_RD_HDR + n + 1u + 3u) & ~3u;
++	if (rlen > sizeof(rx)) {
++		return EINVAL;
++	}
++	hdr[6] = st_sum(hdr, 6);
++	for (unsigned attempt = 0; attempt < 3; ++attempt) {
++		int err = st_xfer(SPI_TX_ONLY, hdr, sizeof(hdr));
++		if (err) {
++			return err;
++		}
++		delay(100);     /* sec_ts_spi_delay default */
++		memset(rx, 0, sizeof(rx));
++		err = st_xfer(SPI_RX_ONLY, rx, rlen);
++		if (err) {
++			return err;
++		}
++		if (rx[0] == SEC_SYNC && rx[5] == reg &&
++		    st_sum(rx, SEC_RD_HDR + n) == rx[SEC_RD_HDR + n]) {
++			memcpy(out, rx + SEC_RD_HDR, n);
++			return 0;
++		}
++		if (st.log || attempt == 2) {
++			printf("SWEET SECTS: read %#x bad frame %02x %02x %02x %02x %02x %02x %02x\n",
++			    reg, rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6]);
++		}
++		delay(1000);
++	}
++	return EIO;
++}
++
++static void
++st_log_event(const char *what, const uint8_t ev[8])
++{
++	printf("SWEET SECTS: %s %02x %02x %02x %02x %02x %02x %02x %02x\n", what,
++	    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
++}
++
++/* sec_ts_wait_for_ready: an INFO or VENDOR_INFO status event carrying ack. */
++static int
++st_wait_ready(uint8_t ack, unsigned tries)
++{
++	uint8_t ev[8];
++	for (unsigned i = 0; i < tries && !st.dead; ++i) {
++		if (!st_read(SEC_READ_ONE_EVENT, ev, sizeof(ev)) && ev[0]) {
++			st_log_event("boot", ev);
++			unsigned stype = (ev[0] >> 2) & 0xfu;
++			if ((stype == SEC_STYPE_INFO || stype == SEC_STYPE_VENDOR_INFO) && ev[1] == ack) {
++				return 0;
++			}
++		}
++		st_wait(20);
++	}
++	return ETIMEDOUT;
++}
++
++static void
++st_handle(const uint8_t ev[8])
++{
++	unsigned eid = ev[0] & 3u;
++	if (st.log) {
++		st_log_event("event", ev);
++	}
++	if (eid != SEC_EVT_COORD) {
++		if (eid == SEC_EVT_STATUS && ((ev[0] >> 2) & 0xfu) && !st.log) {
++			st_log_event("status", ev);
++		}
++		return;
++	}
++	/* struct sec_ts_event_coordinate (little-endian bitfields) */
++	unsigned tid = (ev[0] >> 2) & 0xfu, action = ev[0] >> 6;
++	int x = (ev[1] << 4) | (ev[3] >> 4);
++	int y = (ev[2] << 4) | (ev[3] & 0x0f);
++	unsigned ttype = ((ev[6] >> 6) << 2) | (ev[7] >> 6);
++	if (tid == 0 || tid > ST_MAX) {
++		return;
++	}
++	unsigned id = tid - 1u;
++	/* IC coordinates -> panel pixels (the IC reports its own resolution). */
++	x = st.max_x > 0 ? x * ST_PANEL_W / (st.max_x + 1) : x;
++	y = st.max_y > 0 ? y * ST_PANEL_H / (st.max_y + 1) : y;
++	bool palm = ttype == SEC_TTYPE_PALM || ttype == SEC_TTYPE_GRIP;
++	if ((action == SEC_ACT_PRESS || action == SEC_ACT_MOVE) && !palm) {
++		st.active |= 1u << id;
++		st.x[id] = x;
++		st.y[id] = y;
++		sweet_hid_touch((int)id, 1, x, y);
++	} else if (action == SEC_ACT_RELEASE || palm) {
++		if (st.active & (1u << id)) {
++			st.active &= ~(1u << id);
++			sweet_hid_touch((int)id, 0, st.x[id], st.y[id]);
++		}
++	}
++}
++
++static void
++st_release_all(void)
++{
++	for (unsigned id = 0; id < ST_MAX; ++id) {
++		if (st.active & (1u << id)) {
++			sweet_hid_touch((int)id, 0, st.x[id], st.y[id]);
++		}
++	}
++	st.active = 0;
++}
++
++static void
++st_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 20;
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("sectouchdelay", &delay_s, sizeof(delay_s));
++	printf("SWEET SECTS: starting in %u s\n", delay_s);
++	st_wait(delay_s * 1000u);
++	st.gcc = ml_io_map(ST_GCC_PA, 0x60000);
++	st.west = ml_io_map(ST_WEST_PA, ST_GPIO_CFG(ST_PIN_IRQ + 1));
++	st.east = ml_io_map(ST_EAST_PA, ST_GPIO_CFG(ST_PIN_SPI0 + 4));
++	st.se = ml_io_map(ST_SE_PA, 0x4000);
++	if (!st.gcc || !st.west || !st.east || !st.se) {
++		printf("SWEET SECTS: MMIO mapping failed\n");
++		goto out;
++	}
++	printf("SWEET SECTS: TLMM cfg/io spi0=%#x/%#x irq=%#x/%#x switch=%#x/%#x reset=%#x/%#x\n",
++	    st_rd(st.east, ST_GPIO_CFG(ST_PIN_SPI0)), st_rd(st.east, ST_GPIO_IO(ST_PIN_SPI0)),
++	    st_rd(st.west, ST_GPIO_CFG(ST_PIN_IRQ)), st_rd(st.west, ST_GPIO_IO(ST_PIN_IRQ)),
++	    st_rd(st.east, ST_GPIO_CFG(ST_PIN_SWITCH)), st_rd(st.east, ST_GPIO_IO(ST_PIN_SWITCH)),
++	    st_rd(st.west, ST_GPIO_CFG(ST_PIN_RESET)), st_rd(st.west, ST_GPIO_IO(ST_PIN_RESET)));
++	/* DT pinctrl default: reset out high, irq in, bus switch out low (AP). */
++	st_gpio(st.west, ST_PIN_RESET, 0, 0, 0, true, true);
++	st_gpio(st.west, ST_PIN_IRQ, 0, 0, 0, false, false);
++	st_gpio(st.east, ST_PIN_SWITCH, 0, 0, 0, true, false);
++	/* AVDD: pm8150_l17 at 3.304 V (Linux keeps it always-on; vote it anyway). */
++	int err = sweet_rpmh_vreg_enable("ldoa17", 3304);
++	if (err) {
++		printf("SWEET SECTS: L17A vote failed %d (continuing: ABL may have left it on)\n", err);
++	}
++	st_wait(70);
++	if (!st_clocks()) {
++		goto out;
++	}
++	for (unsigned pin = ST_PIN_SPI0; pin < ST_PIN_SPI0 + 4; ++pin) {
++		st_gpio(st.east, pin, 1, 0, 2, false, false); /* qup00, 6 mA, no pull */
++	}
++	if (!st_se_init()) {
++		goto out;
++	}
++	st_wait(10);
++	/* sec_ts_probe: wait for BOOT_COMPLETE; if ABL already took it, soft reset. */
++	err = st_wait_ready(SEC_ACK_BOOT_COMPLETE, 15);
++	if (err && !st.dead) {
++		err = st_write(SEC_CMD_SW_RESET, NULL, 0);
++		printf("SWEET SECTS: no boot event; SW_RESET err=%d\n", err);
++		st_wait(30);
++		err = st_wait_ready(SEC_ACK_BOOT_COMPLETE, 100);
++	}
++	printf("SWEET SECTS: ready err=%d irq-pin=%u\n", err,
++	    st_rd(st.west, ST_GPIO_IO(ST_PIN_IRQ)) & 1u);
++	uint8_t id[3] = {0}, info[11] = {0}, boot = 0, status[4] = {0};
++	int ierr = st_read(SEC_READ_ID, id, sizeof(id));
++	printf("SWEET SECTS: id err=%d %02x %02x %02x\n", ierr, id[0], id[1], id[2]);
++	if (ierr || st.dead) {
++		goto out;
++	}
++	if (!st_read(SEC_READ_PANEL_INFO, info, sizeof(info))) {
++		st.max_x = ((info[0] << 8) | info[1]) - 1;
++		st.max_y = ((info[2] << 8) | info[3]) - 1;
++	}
++	(void)st_read(SEC_READ_BOOT_STATUS, &boot, 1);
++	(void)st_read(SEC_READ_TS_STATUS, status, sizeof(status));
++	printf("SWEET SECTS: res %dx%d tx %u rx %u boot %#x status %02x %02x %02x %02x\n",
++	    st.max_x + 1, st.max_y + 1, info[8], info[9], boot, status[0], status[1],
++	    status[2], status[3]);
++	if (boot != SEC_STATUS_APP_MODE) {
++		printf("SWEET SECTS: IC not in app mode (firmware needs Linux's updater); stopping\n");
++		goto out;
++	}
++	(void)st_write(SEC_CMD_CLEAR_EVENTS, NULL, 0);
++	const uint8_t func[2] = {SEC_SETFUNC_DEFAULT & 0xffu, SEC_SETFUNC_DEFAULT >> 8};
++	err = st_write(SEC_CMD_SET_TOUCHFUNC, func, sizeof(func));
++	if (!err) {
++		err = st_write(SEC_CMD_SENSE_ON, NULL, 0);
++	}
++	printf("SWEET SECTS: sense on err=%d; polling every 8 ms\n", err);
++	if (err) {
++		goto out;
++	}
++	unsigned errors = 0, events = 0, ticks = 0;
++	while (!st.dead) {
++		uint8_t ev[8];
++		/* The IRQ line (level low) says events are queued; also read every
++		 * ~100 ms in case the line does not work as assumed. */
++		bool poll = (++ticks % 12u) == 0;
++		for (unsigned n = 0; n < 32 && (poll || st_irq_asserted()) && !st.dead; ++n) {
++			poll = false;
++			if (st_read(SEC_READ_ONE_EVENT, ev, sizeof(ev))) {
++				if ((errors++ % 100u) == 0) {
++					printf("SWEET SECTS: read error (%u)\n", errors);
++				}
++				break;
++			}
++			if (ev[0] == 0) {
++				break;  /* event buffer empty */
++			}
++			if (events++ < 32 && !st.log) {
++				st_log_event("first", ev);
++			}
++			st_handle(ev);
++		}
++		st_wait(8);
++	}
++	st_release_all();
++out:
++	printf("SWEET SECTS: thread exits\n");
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_sects_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++	if (st.started) {
++		return;
++	}
++	st.started = true;
++	(void)PE_parse_boot_argn("sectouch", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("sectouchlog", &st.log, sizeof(st.log));
++	if (!enabled) {
++		printf("SWEET SECTS: disabled (sectouch=1 enables the redfin sec_ts driver)\n");
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(st_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET SECTS: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 50acc55..096ee1b 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_fts_init(void);
++extern void sweet_sects_init(void);
+ extern void sweet_cpufreq_init(void);
+ extern void sweet_pmem_init(void);
+ extern void flame_wlan_init(void);
+@@ -669,6 +670,7 @@ sweet_ufs_init(void)
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_fts_init();
++	sweet_sects_init();	/* redfin sec_ts (sectouch=1) */
+ 	sweet_usb_probe();
+ 	return 0;
+ }

@@ -31,10 +31,11 @@
 #define FW_INIT_DONE_IND 0x38
 
 #define CLIENT_ID	0x4b4e454c	/* ath10k's */
-#define MSA_PA		0x98d00000ull	/* sunfish wlan_msa_region (flame: 0x8bc00000) */
-#define MSA_SIZE	0x100000u	/* qcom,wlan-msa-memory */
-#define BDF_PATH	"/var/local/fw/modem/bdwlan-sunfish.bin"
-#define BDF_PATH2	"/var/local/fw/modem/bdwlan-sunfish-EVT1.0.bin"
+#define MSA_PA		0x8ba00000ull	/* redfin icnss qcom,wlan-msa-fixed-region = pil_wlan_fw_mem */
+#define MSA_SIZE	0x200000u	/* its size (sunfish qcom,wlan-msa-memory 0x100000) */
+/* redfin: the BDF name is not known yet (tools/redfin-recon.ps1 lists the modem image); copy it here */
+#define BDF_PATH	"/var/local/fw/modem/bdwlan.bin"
+#define BDF_PATH2	"/var/local/fw/modem/bdwlan-redfin.bin"
 
 static uint32_t srv_node, srv_port;
 static int srv_up, started;

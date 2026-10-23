@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include "ipcc.h"
 #include "glink.h"
 #include "link.h"
 #include "pmem.h"
@@ -209,7 +210,7 @@ static int rx_one(void)
 		break;
 	}
 	case GLINK_CMD_READ_NOTIF:
-		wr32(0x17c0000cull, 1u << 12);
+		wr32(IPCC_SEND_ID, DB_MODEM_GLINK);
 		break;
 	case GLINK_CMD_SIGNALS:
 		LOG("glink: < SIGNALS %#x\n", p2);

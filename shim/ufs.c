@@ -290,6 +290,12 @@ int ufs_rescue_write(uint32_t idx, uint32_t count, const void *buf)
 
 static int write_lba(uint64_t lba, uint32_t count, const void *buf)
 {
+#ifdef SHIM_NO_UFS_WRITE
+	/* redfin first probes: userdata still holds Android's (encrypted) data, so the
+	 * shim must not touch it. Logs only go to the screen (SHIM_HOLDLOG). */
+	(void)lba; (void)count; (void)buf;
+	return -1;
+#endif
 	if (lba < part_first || lba + count > part_first + part_blocks)
 		return -1;
 	vcopy(data, buf, count * BLOCK);

@@ -9,6 +9,9 @@
 #                                   none -> probe-only image
 #   SHIM_CFLAGS=-DSHIM_SHOWLOG shim/build.sh "" OUT
 #                                   show the logs on UFS on screen (showlog.c)
+#   SHIM_CFLAGS="-DSHIM_NO_UFS_WRITE -DSHIM_HOLDLOG" shim/build.sh "" OUT
+#                                   redfin first probe: never write UFS (Android data still
+#                                   in userdata), hold the log on screen for 60 s, then reset
 # Needs llvm + lld + lz4 + mkbootimg (AOSP) + avbtool. No stock DTB is needed (v3).
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -48,13 +51,29 @@ if [ -n "${1:-}" ]; then
 	cp "$1" out/ramdisk.bin
 else
 	# ABL dislikes a zero-size ramdisk on some builds: an empty newc cpio.
-	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
+	# (Python fallback where cpio is missing, e.g. Git Bash on Windows: same bytes, a
+	# newc archive holding only "." and the trailer.)
+	if command -v cpio >/dev/null; then
+		(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
+	else
+		python3 -I - out/ramdisk.bin <<'PY'
+import gzip, sys
+def ent(name, mode, nlink):
+    n = name.encode() + b'\0'
+    h = b'070701' + b''.join(b'%08X' % v for v in (0, mode, 0, 0, nlink, 0, 0, 0, 0, 0, 0, len(n), 0))
+    h += n
+    return h + b'\0' * (-len(h) % 4)
+data = ent('.', 0o40755, 2) + ent('TRAILER!!!', 0, 1)
+data += b'\0' * (-len(data) % 512)
+open(sys.argv[1], 'wb').write(gzip.compress(data, 9))
+PY
+	fi
 fi
 OUT=${2:-out/shim-boot.img}
 MKBOOTIMG=${MKBOOTIMG:-$(command -v mkbootimg || echo "python3 $ROOT/downloads/mkbootimg/mkbootimg.py")}
 $MKBOOTIMG \
 	--header_version 3 --kernel out/Image.lz4 --ramdisk out/ramdisk.bin \
-	--os_version 14.0.0 --os_patch_level 2023-08 \
+	--os_version 14.0.0 --os_patch_level 2023-11 \
 	--cmdline "console=null" -o "$OUT"
 # Google's ABL refuses "fastboot boot" of an image without an AVB footer
 # ("Error verifying the received boot.img: Unsupported"), even unlocked: add

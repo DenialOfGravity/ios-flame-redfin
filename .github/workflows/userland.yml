@@ -8,7 +8,7 @@ name: userland
 on:
   workflow_dispatch:
   push:
-    branches: [sunfish]
+    branches: [sunfish, redfin]
     paths: [.github/workflows/userland.yml, "phone/**"]
 
 env:

@@ -19,7 +19,7 @@ on:
         description: ignore the incremental build cache (full build)
         default: "false"
   push:
-    branches: [main]
+    branches: [main, redfin]
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
