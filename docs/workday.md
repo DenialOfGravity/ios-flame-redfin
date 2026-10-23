@@ -22,3 +22,12 @@
   malloc'd at init, global gp+0x6b0) has its header array pointers (+0x10/+0x14/+0x18) overwritten →
   firmware heap overflow from a neighbouring block, somewhere between init and vdev start.
 - wlan.conf: not present at last check (k49, 17:0x); test 8 rerun never wrote it (phone unreachable).
+
+## [18:56] STOP — iOS USB (USB 2) dead on every boot since ~17:15; fastboot (USB 3) fine
+- PC: `usb 5-2-port2: Cannot enable. Maybe the USB cable is bad?` on every iOS boot (k51–k56).
+- Not software: fails with Wi-Fi off, after `fastboot reboot-bootloader`, and with this morning's kernel14
+  (GPU off) that ran all day. Port power-cycle and dock USB2 hub reset changed nothing.
+- Needs a human: unplug/replug the cable (or another port/cable), full power-off of the phone.
+- Found on the way, fixed: GPU pool range 2 began at 0xe1000000 = wland's rmtfs buffer (hyp-assigned to
+  the modem). xnu 0150 starts it at 0xe1400000 (kernel26).
+- No wlan.conf written since k49 (verified absent then).
