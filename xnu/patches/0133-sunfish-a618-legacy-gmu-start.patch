@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
-index 41e467b..95d6182 100644
+index 41e467b..29f3495 100644
 --- a/bsd/dev/sweet_a6xx.c
 +++ b/bsd/dev/sweet_a6xx.c
 @@ -127,6 +127,11 @@ static void zero_pa(uint64_t pa, uint64_t size)
@@ -24,7 +24,17 @@ index 41e467b..95d6182 100644
  	for (uint32_t i = 0; i < 4; i++)
  		wr32(GPU + 4 * (0x3c03 + i), 0x00071620);
  	wr32(GMU_REG(GMU_CP_MSG), VA_LOG | (A6_GMU_LOG_SIZE / 0x1000 - 1));
-@@ -626,6 +632,20 @@ static int gmu_hfi(struct a6_gpu *g)
+@@ -478,6 +484,9 @@ static int gmu_boot(struct a6_gpu *g)
+ 	uint32_t want = v <= 0x20010004 ? 0xbabeface : 0x100;
+ 	wr32(GMU_REG(GMU_SYSRESET), 1);
+ 	wr32(GMU_REG(GMU_CP_RESP), 0);
++	/* kgsl a6xx_gmu_start: CX_GMU_WFI_CONFIG 0 and GBIF out of halt before releasing the CM3 */
++	wr32(GMU_REG(0x1f802), 0);
++	wr32(GREG(0x3c45), 0);			/* GBIF_HALT (CX) */
+ 	wr32(GMU_REG(GMU_SYSRESET), 0);
+ 	uint32_t r = 0;
+ 	bool ok = false;
+@@ -626,6 +635,20 @@ static int gmu_hfi(struct a6_gpu *g)
  	 * HFI_CTRL_INIT, H2F_MSG_INIT, v1 perf table, BW table, H2F_MSG_TEST; the
  	 * GPU level then goes through the DCVS registers + OOB 7, not HFI.
  	 */
