@@ -281,7 +281,8 @@ void shim_main(uintptr_t dtb)
 	sde_sample("before", 8, 20);
 	uintptr_t fb = sde.pipe ? rd32(sde.pipe + 0x14) : 0;
 	uint32_t stride = sde.pipe ? rd32(sde.pipe + 0x24) & 0xffff : 0;
-	if (!con_init(fb, stride)) {
+	int con_ok = !con_init(fb, stride);
+	if (con_ok) {
 		con_clear(0xff203040);
 		con_str("FLAME", "shim probe v1");
 	}
@@ -300,5 +301,15 @@ void shim_main(uintptr_t dtb)
 	log_ram();
 	log_printf("done, resetting\n");
 	save_log("done");
+#ifdef SHIM_HOLDLOG
+	/* sunfish bring-up: no working UFS log yet, so show it and wait. */
+	if (con_ok) {
+		con_clear(0xff203040);
+		con_text(log_buf, log_len, WHITE);
+		uint64_t t0 = ticks_now();
+		while (ticks_now() - t0 < 60ull * 19200000)
+			;
+	}
+#endif
 	reset();
 }

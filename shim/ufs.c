@@ -70,6 +70,8 @@ static uint64_t ticks(void)
  * One SCSI command in slot 0. dir: 0 none, 1 data out (to the device),
  * 2 data in. Returns 0 on success, else the failing stage.
  */
+static uint8_t cur_lun;	/* 0, or a W-LUN like 0xd0 for one command */
+
 static uint32_t scsi(const uint8_t *cdb, unsigned cdb_len, void *buf, uint32_t len, int dir)
 {
 	static uint8_t tag;
@@ -80,7 +82,7 @@ static uint32_t scsi(const uint8_t *cdb, unsigned cdb_len, void *buf, uint32_t l
 
 	ucd.cmd[0] = 0x01;				/* COMMAND UPIU */
 	ucd.cmd[1] = dir == 1 ? 0x20 : dir == 2 ? 0x40 : 0;	/* W / R flag */
-	ucd.cmd[2] = 0;					/* LUN 0 */
+	ucd.cmd[2] = cur_lun;				/* LUN 0 unless cur_lun */
 	ucd.cmd[3] = ++tag;
 	ucd.cmd[12] = len >> 24;
 	ucd.cmd[13] = len >> 16;
@@ -206,6 +208,34 @@ int ufs_init(void)
 			break;
 	}
 	log_printf("ufs: test unit ready rc=%x\n", rc);
+	if (rc & 0x200) {
+		/* sense data: resp[32..33] length, then fixed-format sense */
+		log_printf("ufs: sense len %x key %x asc %x ascq %x\n",
+			   ucd.resp[32] << 8 | ucd.resp[33], ucd.resp[36] & 0xf,
+			   ucd.resp[46], ucd.resp[47]);
+		/*
+		 * sunfish: ABL may leave the device powered down. Wake it like
+		 * ufshcd does: START STOP UNIT, power condition ACTIVE, to the
+		 * UFS Device W-LUN (0xd0), then retry LUN 0.
+		 */
+		static const uint8_t ssu[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
+		for (int i = 0; i < 3; i++) {
+			cur_lun = 0xd0;
+			uint32_t src = scsi(ssu, sizeof(ssu), 0, 0, 0);
+			cur_lun = 0;
+			log_printf("ufs: ssu active (wlun d0) rc=%x key %x asc %x\n", src,
+				   ucd.resp[36] & 0xf, ucd.resp[46]);
+			if (!src)
+				break;
+		}
+		for (int i = 0; i < 5; i++) {
+			rc = scsi(tur, sizeof(tur), 0, 0, 0);
+			if (!rc)
+				break;
+		}
+		log_printf("ufs: tur after ssu rc=%x key %x asc %x ascq %x\n", rc,
+			   ucd.resp[36] & 0xf, ucd.resp[46], ucd.resp[47]);
+	}
 	int prc = find_userdata();
 	if (prc) {
 		log_printf("ufs: userdata not found (%d)\n", prc);
