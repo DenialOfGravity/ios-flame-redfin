@@ -9,6 +9,7 @@
 #                                               the same command, which then only runs insmod)
 #   bash tools/redfin-mkroot-wsl.sh fetch      download the IPSW parts from Apple (~6-7 GB)
 #   bash tools/redfin-mkroot-wsl.sh build      mkiosroot.sh + sweet-root-tweaks.py -> iosroot.img (16 GiB)
+#   bash tools/redfin-mkroot-wsl.sh finish     resume after build's tweaks: d22ap.adt, checksums, rename
 #   bash tools/redfin-mkroot-wsl.sh all        deps + hfsmod + fetch + build
 #
 # Work files live in ~/redfin-work (WSL's own ext4 disk: fast, and loop mounts work there).
@@ -196,9 +197,21 @@ build() {
 	sudo umount "$W/mnt"
 	sudo fsck.hfsplus -f -y "$img" | grep -v 'Illegal name' || true
 	sudo fsck.hfsplus -f -n "$img" || echo "warning: fsck_hfs still reports minor issues; continuing"
+	finish
+}
+
+finish() {
+	# The steps after the image is built and tweaked (also usable on its own to resume after a
+	# failure here, without rebuilding the image).
+	local final="$W/iosroot.img" img="$W/iosroot.img.partial" im4p
+	[[ -f $img ]] || { [[ -f $final ]] && img=$final; } || true
+	[[ -f $img ]] || { echo "no $W/iosroot.img(.partial): run build"; exit 1; }
 	echo "== d22ap.adt (iPhone X device tree, /product node for mkadt.py)"
+	# remotezip.py keeps the member's path (Firmware/all_flash/DeviceTree.d22ap.im4p)
+	im4p=$(find "$W/ipsw" -name 'DeviceTree.d22ap.im4p' | head -1)
+	[[ -n $im4p ]] || { echo "DeviceTree.d22ap.im4p not found under $W/ipsw: run fetch"; exit 1; }
 	mkdir -p "$REPO/research/ipsw-x"
-	d22ap "$W/ipsw/${PARTS[3]}" "$REPO/research/ipsw-x/d22ap.adt"
+	d22ap "$im4p" "$REPO/research/ipsw-x/d22ap.adt"
 	echo "== per-GiB SHA-256 (to check the copy on the phone)"
 	mkdir -p "$REPO/work/iosroot"
 	python3 - "$img" "$REPO/work/iosroot/iosroot.gib.sha256" <<'PY'
@@ -215,7 +228,7 @@ with open(sys.argv[1], 'rb') as f, open(sys.argv[2], 'w') as o:
         o.write(f'{i} {h.hexdigest()}\n'); i += 1
 print(f'{sys.argv[2]}: {i} GiB')
 PY
-	mv "$img" "$final"; img=$final
+	[[ $img == "$final" ]] || { mv "$img" "$final"; img=$final; }
 	ls -ls "$img"
 	echo "build: done -> $img (stays in WSL; the install step streams it to the phone from here)"
 }
@@ -226,6 +239,7 @@ deps) deps ;;
 hfsmod) hfsmod ;;
 fetch) fetch ;;
 build) build ;;
+finish) finish ;;
 all) deps; hfsmod; fetch; build ;;
-*) sed -n 2,16p "$0"; exit 2 ;;
+*) sed -n 2,17p "$0"; exit 2 ;;
 esac
