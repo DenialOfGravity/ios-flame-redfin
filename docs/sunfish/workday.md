@@ -179,3 +179,13 @@ After a clean reboot: 3 scans, 14 networks, no modem crash, Settings > Wi-Fi lis
   acked`, `oob gpu_set acked`, **bring-up 297 ms** (was 6 s with timeouts). No SMMU faults.
 - GPU present per frame **0.77 ms** (was 27 ms). Swipe bench 16.4 fps average (samples 17–23 while moving);
   now CPU-bound in backboardd, not GPU-bound.
+
+## [11:55] Metal on the GPU — **PASS: backboardd renders through Metal2 + Turnip on the A618**
+- New CI workflow `metal2.yml` (macos-14): Mesa 85fda3b3 + UniXNU mesa patches (pinned e95b37d9) + our turnip
+  patch → Turnip; metal2vulkan 720ef1ce + bridge patches → SweetMetal2.bundle; also vktest/v2test.
+  Install: `tools/sunfish-metal2-install.sh DIR`. Boot: `sweetmtl=2 sweetgpudelay=0`. Cache dir mode 1777.
+- 0145: Turnip device info for the A618 (chip 0x06010800 → "Adreno 618", GMEM 512 KB, hbb 14) + hw_init GMEM/UBWC.
+- 0146: hw_init as kgsl for the A618: **CP ROQ thresholds 0x010000c0** (A640 values hung the CP in Turnip's IBs →
+  Vulkan DeviceLost → black screen), VBIF QoS reg 0x10, UCHE_CLIENT_PF 1.
+- Result (k35): home screen correct (logs/shots/mtl-k35.png), no GPU hangs, swipe **22.8 fps** (peaks 27.4;
+  CPU path 17.2, GPU-composite-only 16.4). backboardd CPU 49 s → 22 s per bench. GPU 33–53% busy at 267 MHz.
