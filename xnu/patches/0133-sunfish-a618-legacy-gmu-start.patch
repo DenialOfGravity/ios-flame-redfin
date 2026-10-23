@@ -1,0 +1,47 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 41e467b..95d6182 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -127,6 +127,11 @@ static void zero_pa(uint64_t pa, uint64_t size)
+ #define GMU_CP_RESP	0x1f901
+ #define GMU_HFI_CTRL	0x1f980	/* HFI_CTRL_STATUS */
+ #define GMU_HFI_CTRL_INIT	0x1f986
++#define GMU_BOOT_SLUMBER_OPTION	0x1cbf8
++#define GMU_GX_VOTE_IDX	0x1cbf9
++#define GMU_MX_VOTE_IDX	0x1cbfa
++#define GMU_GX_SPTPRAC_POWER_CONTROL	0x1a881
++#define GMU_SPTPRAC_PWR_CLK_STATUS	0x1f8d0
+ #define GMU_DCVS_ACK_OPTION	0x1cbfc
+ #define GMU_DCVS_PERF_SETTING	0x1cbfd
+ #define GMU_DCVS_BW_SETTING	0x1cbfe
+@@ -462,7 +467,8 @@ static int gmu_boot(struct a6_gpu *g)
+ 	wr32(GMU_REG(GMU_QTBL_INFO), 1);
+ 	wr32(GMU_REG(GMU_FENCE0), (1u << 31) | (0xau << 18) | 0xa0);
+ 	wr32(GMU_REG(GMU_CM3_CFG), 0x4052);
+-	wr32(GMU_REG(GMU_SFR_ADDR), (uint32_t)A6_CHIP_ID);	/* kgsl writes the chip id (flame had 0x06040100) */
++	/* kgsl: (chipid & 0xffff0000) | minor << 12 | patch << 8 (A640 0x06040001 -> 0x06040100, A618 -> 0x06018000) */
++	wr32(GMU_REG(GMU_SFR_ADDR), (uint32_t)((A6_CHIP_ID & 0xffff0000u) | (((A6_CHIP_ID >> 8) & 0xffu) << 12) | ((A6_CHIP_ID & 0xffu) << 8)));
+ 	for (uint32_t i = 0; i < 4; i++)
+ 		wr32(GPU + 4 * (0x3c03 + i), 0x00071620);
+ 	wr32(GMU_REG(GMU_CP_MSG), VA_LOG | (A6_GMU_LOG_SIZE / 0x1000 - 1));
+@@ -626,6 +632,20 @@ static int gmu_hfi(struct a6_gpu *g)
+ 	 * HFI_CTRL_INIT, H2F_MSG_INIT, v1 perf table, BW table, H2F_MSG_TEST; the
+ 	 * GPU level then goes through the DCVS registers + OOB 7, not HFI.
+ 	 */
++	uint32_t lvl0 = g->perf_level >= 1 && g->perf_level <= 5 ? g->perf_level : 1;
++	/* kgsl a6xx_gmu_gfx_rail_on (hfi-use-reg): GX/MX vote, OOB 6 boot_slumber (legacy bits 22/30) */
++	wr32(GMU_REG(GMU_BOOT_SLUMBER_OPTION), 0);	/* OOB_BOOT_OPTION */
++	wr32(GMU_REG(GMU_GX_VOTE_IDX), gx[lvl0] & 0xff);
++	wr32(GMU_REG(GMU_MX_VOTE_IDX), (gx[lvl0] >> 8) & 0xff);
++	wr32(GMU_REG(GMU_H2G_SET), 1u << (6 + 16));
++	int rack = wait_bit(GMU_REG(GMU_G2H_INFO), 1u << (6 + 24), 1, 1000);
++	wr32(GMU_REG(GMU_G2H_CLR), 1u << (6 + 24));
++	/* kgsl a6xx_gmu_sptprac_enable (a630/a615 family) */
++	wr32(GMU_REG(GMU_GX_SPTPRAC_POWER_CONTROL), 0x00778000);
++	int sp = wait_bit(GMU_REG(GMU_SPTPRAC_PWR_CLK_STATUS), 1u << 3, 1, 100);
++	a6_log("legacy: gfx rail (gx idx %u mx idx %u) %s, sptprac %s (status %x), g2h %x\n",
++	    gx[lvl0] & 0xff, (gx[lvl0] >> 8) & 0xff, rack ? "TIMEOUT" : "acked", sp ? "TIMEOUT" : "on",
++	    rd32(GMU_REG(GMU_SPTPRAC_PWR_CLK_STATUS)), rd32(GMU_REG(GMU_G2H_INFO)));
+ 	wr32(GMU_REG(GMU_HFI_CTRL_INIT), 1);
+ 	int hs = wait_bit(GMU_REG(GMU_HFI_CTRL), 1, 1, 100);
+ 	a6_log("hfi: ctrl init -> status %x %s\n", rd32(GMU_REG(GMU_HFI_CTRL)), hs ? "TIMEOUT" : "ok");
