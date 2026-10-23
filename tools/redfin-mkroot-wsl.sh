@@ -170,9 +170,9 @@ while o < end:
     t, vo, vl = tlv(o)
     if t == 0x04:
         data = b[vo:vo + vl]
-        assert data[:4] != b'bvx2', 'LZFSE-compressed payload: use `ipsw img4 im4p extract`'
-        open(sys.argv[2], 'wb').write(data)
-        print(f'{sys.argv[2]}: {len(data)} bytes')
+        out = sys.argv[2] + ('.lzfse' if data[:4] == b'bvx2' else '')
+        open(out, 'wb').write(data)
+        print(f'{out}: {len(data)} bytes')
         break
     o = vo + vl
 else:
@@ -211,7 +211,27 @@ finish() {
 	im4p=$(find "$W/ipsw" -name 'DeviceTree.d22ap.im4p' | head -1)
 	[[ -n $im4p ]] || { echo "DeviceTree.d22ap.im4p not found under $W/ipsw: run fetch"; exit 1; }
 	mkdir -p "$REPO/research/ipsw-x"
-	d22ap "$im4p" "$REPO/research/ipsw-x/d22ap.adt"
+	local adt=$REPO/research/ipsw-x/d22ap.adt
+	rm -f "$adt" "$adt.lzfse"
+	d22ap "$im4p" "$adt"
+	if [[ -f $adt.lzfse ]]; then
+		# The payload is LZFSE (bvx2): decode it with Apple's reference lzfse tool, built from the
+		# copy that came with the apfs-fuse source (or a fresh clone).
+		local lz=$W/lzfse-bin
+		if [[ ! -x $lz ]]; then
+			local lsrc=$W/apfs-fuse/3rdparty/lzfse
+			[[ -f $lsrc/src/lzfse_main.c ]] || { rm -rf "$W/lzfse"; git clone -q --depth 1 https://github.com/lzfse/lzfse "$W/lzfse"; lsrc=$W/lzfse; }
+			cc -O2 -o "$lz" "$lsrc"/src/*.c
+		fi
+		"$lz" -decode -i "$adt.lzfse" -o "$adt"
+		rm -f "$adt.lzfse"
+		ls -l "$adt"
+	fi
+	if python3 -I "$REPO/tools/adt.py" dump "$adt" 2>/dev/null | grep -q 'product'; then
+		echo "d22ap.adt parses, /product present"
+	else
+		echo "d22ap.adt does not parse as an ADT:"; head -c 64 "$adt" | od -A x -t x1z | head -4; exit 1
+	fi
 	echo "== per-GiB SHA-256 (to check the copy on the phone)"
 	mkdir -p "$REPO/work/iosroot"
 	python3 - "$img" "$REPO/work/iosroot/iosroot.gib.sha256" <<'PY'
