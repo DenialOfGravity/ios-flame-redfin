@@ -1,0 +1,54 @@
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -28,6 +28,8 @@
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
+ 	int fLastMode;
++	int fShown;		/* sunfish: smoothed % shown to iOS, -1 until the first reading */
++	unsigned fEmaMv, fPolls;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -72,6 +74,9 @@
+ 		}
+ 	}
+ 	fLastMode = -1;
++	fShown = -1;
++	fEmaMv = 0;
++	fPolls = 0;
+ 	return true;
+ }
+ 
+@@ -242,7 +247,31 @@
+ 		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */
+ 		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
+ 	}
+-	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
++	/*
++	 * sunfish: the voltage-only estimate jumped 17% <-> 46% with load and
++	 * charging. Correct for the IR drop (~150 mOhm cell + path) to approximate
++	 * the open-circuit voltage, average it, then move the shown value at most
++	 * 1% per poll, never down while charging and never up on battery.
++	 */
++	unsigned ocv = mv;
++	if (currentValid) {
++		int adj = -(ma * 150) / 1000;	/* ma > 0 charging: the terminal reads high */
++		ocv = (unsigned)((int)mv + adj);
++	}
++	fEmaMv = fEmaMv ? (fEmaMv * 3u + ocv) / 4u : ocv;
++	int target = full ? 100 : (int)estimatePercent(fEmaMv);
++	if (fShown < 0) {
++		fShown = target;
++	} else if (target > fShown && (charging || external || full)) {
++		fShown++;
++	} else if (target < fShown && !charging) {
++		fShown--;
++	}
++	if ((fPolls++ % 10u) == 0) {
++		IOLog("SWEET BATTERY: %umV %dmA ocv %u ema %u -> target %d%% shown %d%% ext=%d chg=%d\n",
++		    mv, ma, ocv, fEmaMv, target, fShown, external, charging);
++	}
++	publish((unsigned)fShown, mv, ma, external, capable,
+ 	    charging, full, true, currentValid);
+ }
+ 
