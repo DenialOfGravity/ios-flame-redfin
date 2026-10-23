@@ -1,0 +1,32 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index e270aeb..51b60ba 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -110,7 +110,11 @@ static void zero_pa(uint64_t pa, uint64_t size)
+ #define CACHE_SIZE	0x3c000u
+ #define VA_DUMMY	0x60000000u
+ #define VA_LOG		A6_GMU_LOG_VA
++#if A6_GPU_ID == 618
++#define VA_HFI		0x60001000u	/* kgsl: first NONCACHED_KERNEL alloc after the dummy page */
++#else
+ #define VA_HFI		0x60005000u
++#endif
+ 
+ #define RSCC		(A6_GPU_BASE + 0x6a000ull + 0x23000)	/* GMU + 0x23000; sunfish 0x0508d000 (was hardcoded flame 0x02c6a000) */
+ #define RSCC_REG(o)	(RSCC + 4ull * (o))
+diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
+index bec34a0..2ae7440 100644
+--- a/bsd/dev/sweet_a6xx.h
++++ b/bsd/dev/sweet_a6xx.h
+@@ -164,7 +164,11 @@ uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *d
+ #define A6_SMMU_CB(n)		(A6_SMMU + 0x8000 + 0x1000ull * (n))
+ #define A6_FSR_FAULT		0xc00001feu
+ #define A6_GMEM_LOG_OFF		0x91000ull
++#if A6_GPU_ID == 618
++#define A6_GMU_LOG_VA		0x60010000u	/* sunfish: kgsl order puts HFI at 0x60001000 */
++#else
+ #define A6_GMU_LOG_VA		0x60001000u
++#endif
+ #define A6_GMU_LOG_SIZE		0x4000u
+ 
+ #endif
