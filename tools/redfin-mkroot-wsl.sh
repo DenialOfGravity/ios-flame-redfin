@@ -66,7 +66,7 @@ hfsmod() {
 	#     rejected the first build ("Invalid module format").
 	# Nothing about the installed WSL kernel is changed; the module is gone after `wsl --shutdown` (run
 	# this again: it reuses the built .ko).
-	local rel ver tag src ko=$W/hfsplus-v2.ko
+	local rel ver tag src ko=$W/hfsplus-v3.ko
 	rel=$(uname -r); ver=${rel%%-*}; tag=linux-msft-wsl-$ver
 	if grep -qw hfsplus /proc/filesystems; then echo "hfsplus already available"; return; fi
 	[[ -r /proc/config.gz ]] || { echo "no /proc/config.gz: cannot match the running kernel's config"; exit 1; }
@@ -80,13 +80,20 @@ hfsmod() {
 			tar -xzf "$W/$tag.tar.gz" -C "$W"
 		fi
 		cd "$src"
-		if [[ ! -s vmlinux.symvers ]]; then
+		# Symbol CRCs (genksyms) must come from the EXACT running config: CONFIG_DEBUG_INFO_BTF_MODULES
+		# changes struct module, and with it the CRC of module_layout ("disagrees about version of symbol
+		# module_layout" with CRCs from a BTF-off build). Same config, but compiled with -g0: debug info
+		# does not change any type, and `vmlinux.o modpost` writes vmlinux.symvers without the final
+		# link, so no BTF/pahole pass over a DWARF-less vmlinux is needed.
+		if [[ ! -f .symvers-exact-config ]]; then
 			zcat /proc/config.gz > .config
-			scripts/config --module HFSPLUS_FS --disable DEBUG_INFO_BTF --disable DEBUG_INFO_DWARF5 \
-				--disable DEBUG_INFO_DWARF4 --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT --enable DEBUG_INFO_NONE
+			scripts/config --module HFSPLUS_FS
 			make olddefconfig >/dev/null
-			echo "A) building vmlinux for symbol versions ($(nproc) jobs; 15-30 min)"
-			make -j"$(nproc)" vmlinux >"$W/kbuild.log" 2>&1 || { tail -30 "$W/kbuild.log"; exit 1; }
+			rm -f vmlinux vmlinux.nobtf vmlinux.o vmlinux.symvers Module.symvers
+			echo "A) building vmlinux.o for symbol versions, exact config ($(nproc) jobs; 15-30 min)"
+			make -j"$(nproc)" KCFLAGS=-g0 vmlinux.o modpost >"$W/kbuild.log" 2>&1 || { tail -30 "$W/kbuild.log"; exit 1; }
+			[[ -s vmlinux.symvers ]] || { echo "vmlinux.symvers was not produced"; tail -30 "$W/kbuild.log"; exit 1; }
+			touch .symvers-exact-config
 		fi
 		cp vmlinux.symvers Module.symvers
 		grep -q 'register_filesystem' Module.symvers || { echo "no register_filesystem CRC in Module.symvers"; exit 1; }
@@ -100,12 +107,12 @@ hfsmod() {
 				echo "CONFIG_$o is on in the running kernel but dropped here (struct module would differ)"; exit 1
 			fi
 		done
-		make -j"$(nproc)" modules_prepare >>"$W/kbuild.log" 2>&1 || { tail -30 "$W/kbuild.log"; exit 1; }
+		make -j"$(nproc)" KCFLAGS=-g0 modules_prepare >>"$W/kbuild.log" 2>&1 || { tail -30 "$W/kbuild.log"; exit 1; }
 		# Our vmlinux was built without BTF; with it present, the module's BTF step fails ("failed to
 		# find '.BTF'"). Without a vmlinux, Makefile.modfinal skips module BTF, which the running kernel
 		# does not need (MODULE_ALLOW_BTF_MISMATCH=y, BTF is optional for modules).
-		[[ -f vmlinux ]] && mv vmlinux vmlinux.nobtf
-		make -j"$(nproc)" M=fs/hfsplus modules >>"$W/kbuild.log" 2>&1 || { tail -30 "$W/kbuild.log"; exit 1; }
+		[[ -f vmlinux ]] && mv vmlinux vmlinux.nobtf || true
+		make -j"$(nproc)" KCFLAGS=-g0 M=fs/hfsplus modules >>"$W/kbuild.log" 2>&1 || { tail -30 "$W/kbuild.log"; exit 1; }
 		cp fs/hfsplus/hfsplus.ko "$ko"
 		cd "$REPO"
 	fi
