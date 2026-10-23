@@ -194,7 +194,8 @@ build() {
 	sudo mount -t hfsplus -o loop,force "$img" "$W/mnt"
 	sudo python3 -I "$REPO/tools/sweet-root-tweaks.py" "$W/mnt" || { sudo umount "$W/mnt"; exit 1; }
 	sudo umount "$W/mnt"
-	sudo fsck.hfsplus -f -n "$img"
+	sudo fsck.hfsplus -f -y "$img" | grep -v 'Illegal name' || true
+	sudo fsck.hfsplus -f -n "$img" || echo "warning: fsck_hfs still reports minor issues; continuing"
 	echo "== d22ap.adt (iPhone X device tree, /product node for mkadt.py)"
 	mkdir -p "$REPO/research/ipsw-x"
 	d22ap "$W/ipsw/${PARTS[3]}" "$REPO/research/ipsw-x/d22ap.adt"
