@@ -78,11 +78,22 @@ L1A/L14A/L2C/L11C/L10C; touch `sec,sec_ts` on spi@880000 (mode 3, 10 MHz, IRQ 9,
   0x1f9000000-0x1fcc00000 are plain RAM with no reserved regions: layout kept. `mkadt.py` FB updated.
   Reserved regions below 4 GB besides the carve-outs: 0xb7e01000-0xb8652000, 0xc8000000+0x10000 (outside
   XNU and outside the 0xE0000000 pools).
-- **userdata** = `sda19`, start 20873216 x 512 B (4K LBA 0x27cf00), 228818904 x 512 B; 4K logical blocks.
+- **userdata** = `sda19`, start 20873216 x 512 B (4K LBA 0x27d000, confirmed by probe 1), 228818904 x 512 B; 4K logical blocks.
 - **GPU**: DT `qcom,chipid = <0x6020000>` (not lito-v2's 0x06020001; kgsl reads the real ID from hardware).
   Firmware present: a650_gmu.bin, a650_sqe.fw, a620_zap.mdt/.b00-.b02 (pulled to `recon\fw`).
 - **Wi-Fi**: wlanmdsp.mbn, modemuw.jsn and the BDFs (`bdwlan-redfin.bin`, `bdwlan-u-redfin.bin`) are in
   `/vendor/firmware`, not the modem partition. `wlfw.c` now uses bdwlan-redfin.bin.
+
+## Probe 1 (2026-10-23, `redfin-probe1.img`): shim runs on the Pixel 5
+
+Photo of the held log: v3 boot image accepted; console on 0xa0000000; EL1, MIDR 0x51df805e, MPIDR
+0x81000000; DTB at 0xae200000 from vendor_boot; initrd 0xafe00000-0xb1abfaa0 (about 30 MB: vendor
+ramdisk first, ours last, as predicted); PSCI 1.1 (CPU_ON/RESET/RESET2 yes, SYSTEM_SUSPEND no); SPMI arb
+v5, 512 APIDs; PON reason set (0x10 -> 4) and IMEM 0x77665500; PS_HOLD hard reset armed; vol+ PM8150L
+GPIO5 found (subtype 0x10, reads high = released); UFS 3.0 asleep (TUR sense key 2), woken by SSU,
+userdata 0x27d000 + 0x1b46ffb blocks (= recon); writes refused by SHIM_NO_UFS_WRITE (`save: write rc -1`);
+SDE hw 0x60010000, CTL0 drives DSC0+DSC1 into INTF1 (as flame). The screen ended at ctl4: probe 2
+pages the log (20 s per page) to see the rest (autorefresh, loader, GIC, RAM).
 
 ## Done so far
 

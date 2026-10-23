@@ -339,12 +339,31 @@ void shim_main(uintptr_t dtb)
 	save_log("done");
 #ifdef SHIM_HOLDLOG
 	/* sunfish bring-up: no working UFS log yet, so show it and wait. */
+	/* redfin: the log is longer than one screen, so show it a page at a time,
+	 * 20 s per page, "-- page N --" at the top, then reset. */
 	if (con_ok) {
-		con_clear(0xff203040);
-		con_text(log_buf, log_len, WHITE);
-		uint64_t t0 = ticks_now();
-		while (ticks_now() - t0 < 60ull * 19200000)
-			;
+		unsigned off = 0, page = 0;
+		while (off < log_len) {
+			con_clear(0xff203040);
+			con_home();
+			page++;
+			char tag[16] = "-- page ", *t = tag + 8;
+			if (page >= 10)
+				*t++ = (char)('0' + page / 10);
+			*t++ = (char)('0' + page % 10);
+			*t++ = ' ';
+			*t++ = '-';
+			*t++ = '-';
+			*t++ = '\n';
+			con_text(tag, (unsigned)(t - tag), YELLOW);
+			unsigned n = con_text(log_buf + off, log_len - off, WHITE);
+			if (n == 0)
+				break;
+			off += n;
+			uint64_t t0 = ticks_now();
+			while (ticks_now() - t0 < 20ull * 19200000)
+				;
+		}
 	}
 #endif
 	reset();
