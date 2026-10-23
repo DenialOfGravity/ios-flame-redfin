@@ -1,0 +1,35 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index e8da7fb..ec733b5 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -268,8 +268,16 @@ static void smmu_bank(int smr, int cb, uint64_t ttbr0, uint32_t sid, uint32_t ma
+ 	wr32(SMMU + 0x68, 0);					/* TLBIALLNSNH */
+ 	wr32(SMMU + 0x70, 0);					/* TLBGSYNC */
+ 	wait_bit(SMMU + 0x74, 1, 0, 10);
++	/* A618 (0140): DT attach-impl-defs of arm,smmu-kgsl@5040000, written by arm-smmu at attach */
++	static const uint32_t impl[][2] = { {0x6000, 0x2378}, {0x6060, 0x1055}, {0x678c, 0x08}, {0x6794, 0x28},
++	    {0x6800, 0x06}, {0x6900, 0x3ff}, {0x6924, 0x204}, {0x6928, 0x11000}, {0x6930, 0x800},
++	    {0x6960, 0xffffffff}, {0x6b64, 0x1a5551}, {0x6b68, 0x9a82a382} };
++	for (unsigned i = 0; i < sizeof(impl) / sizeof(impl[0]); i++)
++		wr32(SMMU + impl[i][0], impl[i][1]);
+ 	wr32(S2CR(smr), (uint32_t)cb);
+ 	wr32(SMR(smr), (1u << 31) | (mask << 16) | sid);
++	a6_log("smmu: scr0 %x sgfsr %x s2cr%d %x impl6000 %x; smr0-4 %x %x %x %x %x\n", rd32(SMMU), rd32(SMMU + 0x48),
++	    smr, rd32(S2CR(smr)), rd32(SMMU + 0x6000), rd32(SMR(0)), rd32(SMR(1)), rd32(SMR(2)), rd32(SMR(3)), rd32(SMR(4)));
+ 	a6_log("smmu: smr%d %x -> cb%d cbar %x sctlr %x tcr %x tcr2 %x\n", smr, rd32(SMR(smr)), cb,
+ 	       rd32(CBAR(cb)), rd32(c + CB_SCTLR), rd32(c + CB_TCR), rd32(c + CB_TCR2));
+ }
+@@ -671,13 +679,6 @@ static int gmu_hfi(struct a6_gpu *g)
+ 		a6_log("diag: gmu cb%u fsr %x far %x%08x fsynr0 %x; g2h %x cm3 sysreset %x init %x\n", g->gmu_cb,
+ 		    rd32(cb + CB_FSR), rd32(cb + CB_FAR + 4), rd32(cb + CB_FAR), rd32(cb + CB_FSYNR0),
+ 		    rd32(GMU_REG(GMU_G2H_INFO)), rd32(GMU_REG(GMU_SYSRESET)), rd32(GMU_REG(GMU_INIT_RESULT)));
+-		/* diagnostic (0139): the 0138 TCM dump showed the CM3 bus-faults on its first read of the HFI
+-		 * table (fw 0x19a8, r3 = 0x60001000); our SMR reads back 0. Log the global SMMU state. */
+-		a6_log("diag: smmu scr0 %x sgfsr %x sgfsynr0 %x sgfar %x%08x idr0 %x idr1 %x\n", rd32(SMMU + 0x0),
+-		    rd32(SMMU + 0x48), rd32(SMMU + 0x50), rd32(SMMU + 0x44), rd32(SMMU + 0x40), rd32(SMMU + 0x20),
+-		    rd32(SMMU + 0x24));
+-		for (int i = 0; i < 8; i++)
+-			a6_log("diag: smr%d %x s2cr%d %x\n", i, rd32(SMR(i)), i, rd32(S2CR(i)));
+ 	}
+ 	memset(msg, 0, sizeof(msg));
+ 	msg[1] = 0;			/* seg_id */
