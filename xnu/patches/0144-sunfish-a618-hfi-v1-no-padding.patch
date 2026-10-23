@@ -1,0 +1,38 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index dc81f7d..20a7fd1 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -624,8 +624,12 @@ static int hfi_send(struct a6_gpu *g, uint32_t id, uint32_t *msg, uint32_t dword
+ 		wr32(QDATA(g, HFI_Q_CMD) + 4 * w, msg[i]);
+ 		w = (w + 1) % QSIZE;
+ 	}
++#if A6_GPU_ID != 618
++	/* HFI v2 only (kgsl hfi_queue_write): the A618's legacy v1 firmware reads messages back to back and
++	 * took the 0xfafafafa padding for a 250-dword message header (0144) */
+ 	for (; w % 4; w = (w + 1) % QSIZE)
+ 		wr32(QDATA(g, HFI_Q_CMD) + 4 * w, 0xfafafafa);
++#endif
+ 	wr32(h + 44, w);
+ 	wr32(GMU_REG(GMU_H2G_SET), 1);
+ 
+@@ -640,7 +644,9 @@ static int hfi_send(struct a6_gpu *g, uint32_t id, uint32_t *msg, uint32_t dword
+ 					buf[i] = rd32(QDATA(g, HFI_Q_RESP) + 4 * r);
+ 					r = (r + 1) % QSIZE;
+ 				}
++#if A6_GPU_ID != 618
+ 				r = ((r + 3) & ~3u) % QSIZE;
++#endif
+ 				wr32(rh + 40, r);
+ 				if ((hdr & 0xff) != 100 && (buf[1] >> 20) == seq)
+ 					return (int)buf[2];
+@@ -733,10 +739,6 @@ static int gmu_hfi(struct a6_gpu *g)
+ 	wr32(GMU_REG(GMU_H2G_SET), 0);
+ 	a6_log("hfi(v1): init, perf/bw tables, test -> %d; dcvs %u MHz %s ret %x\n", rc, gpu_khz[lvl] / 1000,
+ 	    dack ? "TIMEOUT" : "acked", dret);
+-	/* 0143: GMU DTCM (16 KB) → low RAM 0xE2010000 for /dev/pmem: the CM3 exception frame after the HFI fault */
+-	for (uint32_t i = 0; i < 0x4000 / 4; i++)
+-		wr32(0xE2010000ull + 4 * i, rd32(GMU_REG(GMU_DTCM) + 4 * i));
+-	a6_log("diag: GMU DTCM copied to 0xE2010000\n");
+ 	a6_log("diag: smmu sgfsr %x sgfsynr0 %x sgfar %x%08x; gmu cb fsr %x far %x%08x\n", rd32(SMMU + 0x48),
+ 	    rd32(SMMU + 0x50), rd32(SMMU + 0x44), rd32(SMMU + 0x40), rd32(SMMU_CB(g->gmu_cb) + CB_FSR),
+ 	    rd32(SMMU_CB(g->gmu_cb) + CB_FAR + 4), rd32(SMMU_CB(g->gmu_cb) + CB_FAR));
