@@ -1,0 +1,70 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index ee61a5f..784de5f 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -44,6 +44,8 @@ extern int vprintf(const char *fmt, va_list ap);
+ extern void sweet_smc(uint64_t x[8]);
+ 
+ void sweet_gpu_init(void);
++#define GPU_TRAIL_PA	0xE2000000ull	/* sunfish: low RAM outside XNU (a6_log mirror) */
++#define GPU_TRAIL_SIZE	0x10000u
+ bool sweet_gpu_ready(void);
+ int sweet_gpu_surface_slot(uint64_t key);
+ int sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint32_t page_size);
+@@ -196,6 +198,36 @@ void
+ a6_log(const char *fmt, ...)
+ {
+ 	va_list ap;
++	/*
++	 * sunfish: also mirror into RAM XNU does not manage (GPU_TRAIL_PA, read
++	 * with /dev/pmem): a stalled register access can wedge the console.
++	 * Layout: "A6TRAIL\0" | u32 bytes | text.
++	 */
++	static volatile char *trail;
++	if (trail == NULL) {
++		trail = (volatile char *)ml_io_map(GPU_TRAIL_PA, GPU_TRAIL_SIZE);
++		if (trail != NULL) {
++			const char m[8] = "A6TRAIL";
++			for (int i = 0; i < 8; i++) {
++				trail[i] = m[i];
++			}
++			*(volatile uint32_t *)(trail + 8) = 0;
++		}
++	}
++	if (trail != NULL) {
++		char line[256];
++		va_start(ap, fmt);
++		int n = vsnprintf(line, sizeof(line), fmt, ap);
++		va_end(ap);
++		uint32_t used = *(volatile uint32_t *)(trail + 8);
++		if (n > 0 && used + (uint32_t)n < GPU_TRAIL_SIZE - 16) {
++			for (int i = 0; i < n && i < (int)sizeof(line) - 1; i++) {
++				trail[16 + used + i] = line[i];
++			}
++			*(volatile uint32_t *)(trail + 8) = used + (uint32_t)MIN(n, (int)sizeof(line) - 1);
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
+ 	printf("SWEET GPU: ");
+ 	va_start(ap, fmt);
+ 	vprintf(fmt, ap);
+@@ -254,7 +286,18 @@ gpu_bus_vote(void)
+ static void
+ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+-	uint64_t t0 = mach_absolute_time(), ns;
++	uint64_t t0, ns;
++	uint32_t delay_s = 0;
++	PE_parse_boot_argn("sweetgpudelay", &delay_s, sizeof(delay_s));
++	if (delay_s) {
++		static int gpu_delay_chan;
++		uint64_t deadline;
++		clock_interval_to_deadline(delay_s, NSEC_PER_SEC, &deadline);
++		(void)assert_wait_deadline(&gpu_delay_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++	t0 = mach_absolute_time();
++	a6_log("bring-up start (sweetgpudelay=%u)\n", delay_s);
+ 	gpu_bus_vote();
+ 	lck_mtx_lock(&sweet_gpu_lock);
+ 	int rc = a6_power_up(&gpu);

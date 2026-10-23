@@ -24,7 +24,7 @@ for a in "$@"; do
 done
 cmdline="$base $*"
 echo "$cmdline" > "$P/$name.cmdline"
-python3 -I tools/mkpayload.py "$kernel" "$P/sunfish-hi.adt" "$P/$name.payload" --cmdline "$cmdline" >/dev/null
+python3 -I tools/mkpayload.py "$kernel" "$P/sunfish-hi.adt" "$P/$name.payload" --cmdline "$cmdline" ${GPUFW:+--gpufw "$GPUFW"} >/dev/null
 shim/build.sh "$P/$name.payload" "$P/$name.img" >/dev/null
 echo "$(date +%T) built $name.img; waiting for fastboot"
 until fastboot devices | grep -q fastboot; do sleep 2; done
