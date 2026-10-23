@@ -49,7 +49,7 @@ deps() {
 	if ! sudo apt-get install -y apfs-fuse 2>/dev/null; then
 		echo "apfs-fuse not packaged here: building it from source"
 		rm -rf "$W/apfs-fuse" && git clone --depth 1 --recursive https://github.com/sgan81/apfs-fuse "$W/apfs-fuse"
-		cmake -S "$W/apfs-fuse" -B "$W/apfs-fuse/build" -DCMAKE_CXX_FLAGS="-include cstdint"
+		cmake -S "$W/apfs-fuse" -B "$W/apfs-fuse/build" -DCMAKE_CXX_FLAGS="-include cstdint" -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 		make -C "$W/apfs-fuse/build" -j"$(nproc)"
 		sudo install -m 0755 "$W/apfs-fuse/build/apfs-fuse" /usr/local/bin/apfs-fuse
 	fi
