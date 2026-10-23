@@ -83,7 +83,8 @@ hfsmod() {
 		# Symbol CRCs (genksyms) must come from the EXACT running config: CONFIG_DEBUG_INFO_BTF_MODULES
 		# changes struct module, and with it the CRC of module_layout ("disagrees about version of symbol
 		# module_layout" with CRCs from a BTF-off build). Same config, but compiled with -g0: debug info
-		# does not change any type, and `vmlinux.o modpost` writes vmlinux.symvers without the final
+		# does not change any type, and `vmlinux_o modpost` (not `vmlinux.o`: a .o goal switches kbuild
+		# to single-file mode) writes vmlinux.symvers without the final
 		# link, so no BTF/pahole pass over a DWARF-less vmlinux is needed.
 		if [[ ! -f .symvers-exact-config ]]; then
 			zcat /proc/config.gz > .config
@@ -91,7 +92,7 @@ hfsmod() {
 			make olddefconfig >/dev/null
 			rm -f vmlinux vmlinux.nobtf vmlinux.o vmlinux.symvers Module.symvers
 			echo "A) building vmlinux.o for symbol versions, exact config ($(nproc) jobs; 15-30 min)"
-			make -j"$(nproc)" KCFLAGS=-g0 vmlinux.o modpost >"$W/kbuild.log" 2>&1 || { tail -30 "$W/kbuild.log"; exit 1; }
+			make -j"$(nproc)" KCFLAGS=-g0 vmlinux_o modpost >"$W/kbuild.log" 2>&1 || { tail -30 "$W/kbuild.log"; exit 1; }
 			[[ -s vmlinux.symvers ]] || { echo "vmlinux.symvers was not produced"; tail -30 "$W/kbuild.log"; exit 1; }
 			touch .symvers-exact-config
 		fi
