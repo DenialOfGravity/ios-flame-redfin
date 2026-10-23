@@ -57,7 +57,7 @@ stub headers.
 | WLAN MSA | 0x98d00000 + 0x100000 | **0x8ba00000 + 0x200000** | icnss wlan-msa-fixed-region | wlfw.c; *verify* |
 | WLAN SID | 0x240 | **0xC0** | lito.dtsi icnss iommus | radio.c |
 | WLAN rails | L9A, L1C, L2C, L11C, L10C | **L1A (enable only), L14A 1.8, L2C 1.304, L11C/L10C 3.312** | lito.dtsi icnss | wland.c |
-| WLAN ref clock | rfclka2 | *verify* (not in lito icnss node) | | wland.c unchanged |
+| WLAN ref clock | none | icnss node has no clocks; lito cmd-db has no rfclka2 | | wland votes only if cmd-db has it |
 | WLAN BDF | bdwlan-sunfish.bin | *verify* name (recon lists modem image) | | wlfw.c placeholder |
 | RAM | ends 0x1fcc00000 | 8 GB, *verify* map | live DT | keep sunfish layout first |
 
@@ -175,6 +175,22 @@ Wi-Fi without USB/SSH: `tools/redfin-install-wifi-wsl.sh` puts wland/netsvc (CI 
 vendor WLAN firmware (recon\fw), the phone's own rmtfs partitions (backup\) and the launchd job into
 the image in WSL; `tools/redfin-install-root-wsl.sh delta` rewrites only the changed GiBs from TWRP.
 r3 = r2 + `sweetfb_native=1`, `flamereboot=1800`.
+
+r3 **hangs** after SpringBoard/backboardd start (console stays up); r2 boots the same root to the GUI, so
+`sweetfb_native=1` is the cause (its kernel log was overwritten by the r2 boot: re-run r3 and pull
+logs straight after to see why). Next images are based on r2.
+
+## Wi-Fi round 1 (2026-10-24)
+
+`tools/redfin-pull-logs-wsl.sh` (TWRP) pulls wland.log, the XNU ring and crash reports from the phone's
+HFS+ root into `logs\<time>`. wland: SMMU (SID 0xc0 -> CB4) ok, rails L1A, L14A, L2C, L11C, L10C ok
+(match the live icnss node), then `rfclka2 on -> 19`: kernel "rfclka2 lookup matches=0". lito's cmd-db
+has no rfclka2 and the icnss node has no clocks, so wland now skips the vote when cmd-db lacks it,
+makes the qdss AOSS message non-fatal and logs the cmd-db list (a2a825f). Crash reports were only
+background extensions (Spotlight importers, TTS, mediaserverd) with the clock unset (1969).
+
+Working copy: one git clone in WSL, `~/ios-redfin`; the PC folder keeps only `backup\` and `recon\`
+(data the scripts read; never in git). Image and checksum list: `~/redfin-work`, `work/iosroot/`.
 
 ## Done so far
 
