@@ -206,3 +206,22 @@ After a clean reboot: 3 scans, 14 networks, no modem crash, Settings > Wi-Fi lis
 - Next: 0148 adds the A618's stock 650/800/825 MHz levels (shorter render jobs); later: present on a
   higher-priority path or asynchronous panel copy.
 - CI: incremental xnu builds (cache of source/objects/fakeroot; `clean=true` input for a full build).
+
+## [13:15] Display/GPU tuning — **best: 23.4 panel updates/s** (Metal2, 565 MHz, defaults updated)
+Tight bench (continuous swipes), kernel with 0147+0148+0149; panel updates/s (what the screen shows):
+| config | swaps/s | panel/s |
+|---|---|---|
+| CPU render + GPU composite (k37) | 17.0 | 17.2 |
+| Metal2 565 MHz, no big-core pref (k36) | 18.6 | 18.2 |
+| Metal2 565 + 0147 big cores (k38) | 32 | 17.6 |
+| + 0149 present thread, 650 MHz (k40) | 22.3 | 13.9 |
+| + 0149 thread, DDR vote (k41) | 22.3 | 11.9 |
+| **0149 thread off, 565 MHz, no DDR vote (k42)** | 25.6 | **23.4** |
+| thread off + DDR vote (k43) | 31.5 | 17.7 |
+- 825 MHz (0148 level 8): GMU acks, but CP me_init times out (GX not running; likely needs ACD/MX vote) → don't use.
+  650 MHz works but is not faster: render jobs stay ~15 ms → not clock-bound.
+- 0149 (present thread) hurts → off by default (`sweetfb_thread=0`, kept for later). DDR vote: more swaps, fewer panel
+  updates (more GPU contention for the present).
+- sunfish-boot.sh defaults now: `sweetmtl=2 sweetgpufreq=5 sweetgpudelay=0 sweetfb_thread=0` (Metal2 needs the
+  bundle installed: tools/sunfish-metal2-install.sh).
+- CI incremental build: build step **109 s** (full build 406 s), run wall time 4.7 min incl. queue.
