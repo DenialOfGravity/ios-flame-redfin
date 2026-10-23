@@ -95,6 +95,26 @@ userdata 0x27d000 + 0x1b46ffb blocks (= recon); writes refused by SHIM_NO_UFS_WR
 SDE hw 0x60010000, CTL0 drives DSC0+DSC1 into INTF1 (as flame). The screen ended at ctl4: probe 2
 pages the log (20 s per page) to see the rest (autorefresh, loader, GIC, RAM).
 
+## Probe 2 (2026-10-23, `redfin-probe2.img`, log paged): the rest of the log
+
+- Scanout as ABL leaves it: SSPP VIG0 + VIG1, each 540x2340, both at 0xa0000000, stride 0x10e0 (4320),
+  a8r8g8b8 (fmt 0x237ff); CTL0 @0xae02000 -> LM0/LM1 (@0xae45000/0xae46000) -> PP0/PP1 (@0xae71000/
+  0xae71800) -> DSC0 (@0xae81000) -> INTF1 (@0xae6b800). Same shape as flame.
+- **Autorefresh: ABL already leaves it on** (`ctl ae02000 pipe ae05000 tear 1 autorefresh 80000001`); the
+  shim keeps it, and the frame/line counters keep advancing over the sample window (e.g. 9b1 -> 1124
+  frames). The command-mode panel scans out the splash buffer by itself, so the XNU early console and
+  SweetFB's CPU path need no display driver work to start.
+- Loader: `no SWEETXNU payload` (expected: probe image, empty ramdisk). initrd 0xafe00000-0xb1abfaa0.
+- GIC-600: GICD ctlr 0x10, typer 0x7b041d, iidr 0x201143b; 8 redistributors (typer 0:21 .. 700:731),
+  all awake (waker 0).
+- RAM probes at 0x100000000, 0x180000000 and 0x1fbf00000 read back the test pattern: the XNU window and
+  the log-stash area are writable RAM.
+- Ended with `done, resetting`.
+
+**The shim side of bring-up is done for now.** What's left before an XNU boot: a kernel from CI
+(0150/0151 must compile), the ADT (`mkadt.py --highmem`, FB already updated), and the iOS root on
+userdata (wipes Android data).
+
 ## Done so far
 
 **Shim** (boots in place of iBoot)
