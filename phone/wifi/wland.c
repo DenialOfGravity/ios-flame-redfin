@@ -127,11 +127,28 @@ static int qmp_send(const char *msg);
 
 static int wlan_power(void)
 {
-	static const struct { const char *res; uint32_t mv; } ldo[] = {
-		/* sunfish icnss: vdd-cx-mx L9A (640 mV), 1.8-xo L1C, 1.3-rfa L2C, 3.3-ch0 L10C, 3.3-ch1 L11C */
-		{ "ldoa9", 640 }, { "ldoc1", 1800 }, { "ldoc2", 1304 }, { "ldoc10", 3304 }, { "ldoc11", 3304 },
+	/*
+	 * sunfish icnss rails in the driver's order (icnss_vreg_info): cx-mx L9A (DT cx-mx-config
+	 * 640 mV), 1.8-xo L1C, 1.3-rfa L2C, 3.3-ch1 L11C, 3.3-ch0 L10C, both 3312 mV.
+	 * /var/local/wlan-rails.conf ("ldoXN MV" per line) replaces the table for experiments.
+	 */
+	static struct { char res[16]; uint32_t mv; } ldo[8] = {
+		{ "ldoa9", 640 }, { "ldoc1", 1800 }, { "ldoc2", 1304 }, { "ldoc11", 3312 }, { "ldoc10", 3312 },
 	};
-	for (unsigned i = 0; i < sizeof(ldo) / sizeof(ldo[0]); i++) {
+	unsigned nldo = 5;
+	FILE *rf = fopen("/var/local/wlan-rails.conf", "r");
+	if (rf) {
+		char res[16];
+		unsigned mv;
+		nldo = 0;
+		while (nldo < 8 && fscanf(rf, "%15s %u", res, &mv) == 2) {
+			snprintf(ldo[nldo].res, sizeof(ldo[nldo].res), "%s", res);
+			ldo[nldo++].mv = mv;
+		}
+		fclose(rf);
+		printf("wlan power: %u rails from /var/local/wlan-rails.conf\n", nldo);
+	}
+	for (unsigned i = 0; i < nldo; i++) {
 		uint32_t off[3] = { 0, 8, 4 }, val[3] = { ldo[i].mv, 7, 1 };
 		int rc = pm_rpmh(ldo[i].res, 3, off, val);
 		printf("wlan power: %s %u mV on -> %d\n", ldo[i].res, ldo[i].mv, rc);
