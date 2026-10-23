@@ -12,10 +12,18 @@ index 5e591eb..7c8434b 100644
  #define PDC		0x0b290000ull
  #define PDC_REG(o)	(PDC + 4ull * (o))
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index ee61a5f..784de5f 100644
+index ee61a5f..b8fa2e0 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -44,6 +44,8 @@ extern int vprintf(const char *fmt, va_list ap);
+@@ -37,6 +37,7 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern boolean_t pmap_valid_address(uint64_t pa);
+ extern vm_map_address_t phystokv(uint64_t pa);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -44,6 +45,8 @@ extern int vprintf(const char *fmt, va_list ap);
  extern void sweet_smc(uint64_t x[8]);
  
  void sweet_gpu_init(void);
@@ -24,7 +32,7 @@ index ee61a5f..784de5f 100644
  bool sweet_gpu_ready(void);
  int sweet_gpu_surface_slot(uint64_t key);
  int sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint32_t page_size);
-@@ -196,6 +198,36 @@ void
+@@ -196,6 +199,36 @@ void
  a6_log(const char *fmt, ...)
  {
  	va_list ap;
@@ -61,7 +69,7 @@ index ee61a5f..784de5f 100644
  	printf("SWEET GPU: ");
  	va_start(ap, fmt);
  	vprintf(fmt, ap);
-@@ -254,7 +286,18 @@ gpu_bus_vote(void)
+@@ -254,7 +287,18 @@ gpu_bus_vote(void)
  static void
  gpu_thread(void *arg __unused, wait_result_t wr __unused)
  {
