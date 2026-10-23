@@ -1,0 +1,36 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 1116ace..359965e 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1033,7 +1033,11 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	struct sockaddr_in to;
+ 	uint64_t pos = sweet_log_position();
+ 
+-	pos = pos > 65536 ? pos - 65536 : 0;
++	/* sunfish: replay the whole console ring by default (boot-arg
++	 * sweetusblogback = bytes) so early boot (cpufreq, keys) is included. */
++	uint32_t back = 4u << 20;
++	(void)PE_parse_boot_argn("sweetusblogback", &back, sizeof(back));
++	pos = pos > back ? pos - back : 0;
+ 	bzero(&to, sizeof(to));
+ 	to.sin_len = sizeof(to);
+ 	to.sin_family = AF_INET;
+@@ -1048,7 +1052,7 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			so = NULL;
+ 			continue;
+ 		}
+-		uint32_t n;
++		uint32_t n, burst = 0;
+ 		while ((n = sweet_log_copy(&pos, chunk, sizeof(chunk))) > 0) {
+ 			struct iovec iov = { .iov_base = chunk, .iov_len = n };
+ 			struct msghdr msg = {
+@@ -1059,6 +1063,9 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			if (sock_send(so, &msg, 0, &sent) != 0) {
+ 				break;          /* no route/ARP yet: retry later */
+ 			}
++			if (++burst % 32u == 0) {
++				ud_sleep_ms(5);  /* pace a large backlog */
++			}
+ 		}
+ 	}
+ }
