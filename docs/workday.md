@@ -55,3 +55,11 @@
 - Open: wland's own wlan.conf join (bridge mode) gets no IP on en0 — iOS (configd) only does DHCP for
   networks wifid joined. Next: join from Settings → Wi-Fi.
 - wlan.conf deleted + verified after every test.
+
+## [21:10] Wi-Fi — **ON THE INTERNET**
+- Join from Settings → Wi-Fi works (wifid → /dev/wlan → wland): associated, state 4, link up.
+- No IP at first: iOS's preferences.plist had no network set (written before en0 existed), so configd never
+  made a Wi-Fi service and IPConfiguration never ran DHCP. tools/sunfish-netprefs.py adds the Wi-Fi (en0,
+  DHCP) service + set and restarts configd (backup: logs/preferences.plist.bak-*).
+- Result: en0 192.168.2.30/24, router + DNS 192.168.2.1, primary interface en0;
+  nettest: DNS apple.com OK, TCP OK, HTTPS 200.
