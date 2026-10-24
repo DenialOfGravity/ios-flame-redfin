@@ -11,6 +11,8 @@ looks only; =2 switches it (poke "t MA [MS]", sysctl kern.sweet_torch 0..1000);
 cap 200; Android's torch is 300), at most sweettorch_secs (120, cap 600) at a
 time, faults (LED fault, open/short, VPH droop) and the PM8150L temperature
 alarm checked ten times a second while lit; switching off is always allowed.
+At start it writes the settings leds-qpnp-flash-v2.c init writes for this DT
+(headroom auto mode off, ISC and warm-up delays, ramp rates, VPH droop).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01WuzsiVGCDDmN2GPRLJvX3w
@@ -73,10 +75,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/sweet_torch.c b/bsd/dev/sweet_torch.c
 new file mode 100644
-index 0000000..837909e
+index 0000000..7de5556
 --- /dev/null
 +++ b/bsd/dev/sweet_torch.c
-@@ -0,0 +1,529 @@
+@@ -0,0 +1,568 @@
 +/*
 + * redfin (Pixel 5) flashlight: the PM8150L flash LED module ("qcom,qpnp-flash-led-v2"), SPMI slave 5,
 + * peripheral 0xd3 (registers 0xd300..0xd3ff). The rear flash LED is on channels 0 and 1 together
@@ -303,6 +305,7 @@ index 0000000..837909e
 +	case FL_MOD_CTRL: case FL_IRES:
 +	case FL_STROBE(0): case FL_STROBE(1):
 +	case FL_EN_LED:
++	case 0x50: case 0x51: case 0x52: case 0x55: case 0x5b: case 0x61: case 0x62: case 0x76:
 +		return true;
 +	default:
 +		return false;
@@ -354,9 +357,9 @@ index 0000000..837909e
 +{
 +	static const uint8_t regs[] = { FL_TYPE, FL_SUBTYPE, FL_STATUS1, FL_STATUS2, FL_INT_RT_STS,
 +		                        FL_SAFETY(0), FL_SAFETY(1), FL_TGR(0), FL_TGR(1), FL_MOD_CTRL, FL_IRES,
-+		                        FL_STROBE(0), FL_STROBE(1), FL_EN_LED, FL_HDRM(0), FL_HDRM(1), 0x55, 0x56, 0x57, 0x58,
-+		                        0x76, FL_CHICKEN };
-+	char line[200];
++		                        FL_STROBE(0), FL_STROBE(1), FL_EN_LED, FL_HDRM(0), FL_HDRM(1), 0x48, 0x50, 0x51, 0x52,
++		                        0x55, 0x56, 0x57, 0x58, 0x5b, 0x61, 0x62, 0x67, 0x6e, 0x70, 0x71, 0x76, FL_CHICKEN };
++	char line[300];
 +	int n = snprintf(line, sizeof(line), "SWEET TORCH: %s:", why);
 +	for (unsigned i = 0; i < sizeof(regs) && n < (int)sizeof(line) - 12; i++) {
 +		uint8_t v = 0;
@@ -367,6 +370,32 @@ index 0000000..837909e
 +		}
 +	}
 +	printf("%s\n", line);
++}
++
++/*
++ * qpnp_flash_led_init_settings() with this DT's values (no thermal-thrsh, derate slow/fast, droop or ramp
++ * properties: the driver's defaults). r15b: lit, then INT_RT_STS led-fault after ~1.7 s with
++ * STATUS1/2 clear; headroom auto mode (0x50), which Linux turns off, is the first suspect.
++ */
++static int
++tc_linux_init(void)
++{
++	static const struct { uint8_t reg, mask, val; } init[] = {
++		{ 0x50, 0xff, 0x00 },   /* HDRM_AUTO_MODE_CTRL: off */
++		{ 0x52, 0x03, 0x03 },   /* ISC_DELAY: FLASH_LED_ISC_DELAY_DEFAULT */
++		{ 0x51, 0x03, 0x02 },   /* WARMUP_DELAY: FLASH_LED_WARMUP_DELAY_DEFAULT */
++		{ 0x76, 0x07, 0x07 },   /* CURRENT_DERATE_EN: vph droop, open, short circuit detection */
++		{ 0x55, 0x80, 0x80 },   /* THERMAL_RMP_DN_RATE: OTST1 ramp back up */
++		{ 0x5b, 0x77, 0x55 },   /* RGLR_RAMP_RATE: 6.4 us up and down */
++		{ 0x62, 0x03, 0x02 },   /* VPH_DROOP_DEBOUNCE */
++		{ 0x61, 0x07, 0x05 },   /* VPH_DROOP_THRESHOLD */
++		{ 0x61, 0x30, 0x20 },   /* ... hysteresis */
++	};
++	int err = 0;
++	for (unsigned i = 0; i < sizeof(init) / sizeof(init[0]) && !err; i++) {
++		err |= tc_write(init[i].reg, init[i].mask, init[i].val);
++	}
++	return err;
 +}
 +
 +static void
@@ -509,11 +538,13 @@ index 0000000..837909e
 +		printf("SWEET TORCH: look only (sweettorch=%u)\n", mode);
 +		goto out;
 +	}
-+	/* Start from a known dark state. */
++	/* Start from a known dark state, then Linux's settings. */
 +	tc_off("start");
-+	if (tc.dead) {
++	if (tc.dead || tc_linux_init()) {
++		tc_off("init failed");
 +		goto out;
 +	}
++	tc_dump("configured");
 +	tc.ready = true;
 +	printf("SWEET TORCH: ready: at most %u mA per channel, %u s at a time; current change while lit %s\n",
 +	    tc.max_ma, tc.max_s, tc.on_the_fly ? "yes" : "no");
@@ -545,7 +576,17 @@ index 0000000..837909e
 +		}
 +		if (tc.lit) {
 +			if (!tc_check()) {
++				uint8_t raw[0x16];
++				for (unsigned i = 0; i < sizeof(raw); i++) {
++					if (tc_read((uint8_t)(0x06 + i), &raw[i])) {
++						raw[i] = 0xee;
++					}
++				}
 +				tc_off("fault");
++				printf("SWEET TORCH: at the fault 06..1b: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
++				    "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", raw[0], raw[1], raw[2], raw[3],
++				    raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14],
++				    raw[15], raw[16], raw[17], raw[18], raw[19], raw[20], raw[21]);
 +				tc_dump("after fault");
 +			} else if (now >= off_at) {
 +				tc_off(torch_req_ms ? "time" : "time limit");
