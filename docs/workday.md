@@ -85,3 +85,21 @@
 - A real GPU hang also happened once at 565 MHz (k70); none at 430 MHz (sweetgpufreq=4) so far.
 - Next: find the small-BO owner (bridge runtime vs Turnip) — per-BO alloc call-site tagging; cap the
   render-target churn (reuse instead of alloc+bzero); then smoothness (CP_WAIT_FOR_IDLE, async waits).
+
+## [23:05] Smoothness measurements + memory work (stopped at 16% battery)
+Bench (tools/sunfish-fpsbench.sh, BENCH_TIGHT=1, Settings swipes, 30 s):
+| build | GPU MHz | swaps/s | panel updates/s |
+|---|---|---|---|
+| 0157 no WFI | 430 | 34.6 | 15.5 |
+| 0157 + sweetwfi=1 | 430 | 34.3 | 15.4 |
+| 0157 | 565 | 29.5 | 17.4 |
+| 0157 | 650 | 28.5 | 17.8 |
+| 0158 non-blocking present (+ TU census on) | 565 | 22.7 | 12.5 |
+- Bottleneck: the present path, not GPU clock or WFI. present() ~23 ms wall (blit queued behind
+  backboardd jobs of 10-42 ms on the single ring) for ~2.4 ms of GPU work; GPU only ~50% busy.
+- 0158 (present returns busy instead of waiting) did not help (put off 701 of 600 frames). Not kept as
+  default; next idea: present on a second ringbuffer / priority, or scan out without the blit.
+- 0156 per-client pool reuse works (73 hits in 6 app switches, no 10 MB bzero each).
+- Turnip TU_DEBUG=bos census (phone/turnip/patches/0101, /var/local/tubos): at the first print backboardd
+  held ~128 MB but Turnip listed 5 BOs (1 MB); later prints were buffered (fflush added, re-run pending).
+- Phone left on k91 (kernel33, 565 MHz, flamereboot=0) to charge, battery 3706 mV.
