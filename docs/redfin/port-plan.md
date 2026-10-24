@@ -196,6 +196,13 @@ BUF_SIZE is now 2.5 MB (0xe1001000-0xe1281000, System RAM on redfin, inside upst
 gap). wland now logs grant/refuse and the modem's crash reason (SMEM 421). Later, for the GPU:
 kregistry_mem 0xc8000000 (64 KB) sits inside the first GPU pool range 0xc4000000-0xe0000000.
 
+Wi-Fi round 3 + USB (2026-10-24, `redfin-r4-usb.img`, kernel 0903): **USB Ethernet works** (usbipd into
+WSL, cdc_ether, live log over UDP 5140, file server 2223). Wi-Fi: modem + WLAN firmware up (WLAN.HL.3.3.1,
+chip 0x320), 38 networks scanned on 2.4 and 5 GHz, **WPA2 join and 4-way handshake complete** on both bands,
+rx frames reach en0, but en0 sends nothing: configd's preferences.plist (written by the first boots, before
+en0 existed) has no network services, so no DHCP on en0 (same as flame 2026-10-22). Removed over USB;
+redfin-install-wifi-wsl.sh now moves such a file aside.
+
 Upstream sync (2026-10-24): merged Yofuness `sunfish` up to 8dcca4d (wland ath10k station steps +
 wlan-steps.conf / wlan-scan.conf hooks, sunfish-wifitest.sh, xnu 0150 GPU pool vs rmtfs, 0151 QUSB2).
 Redfin patches renamed 0900-0902 (+0903: QUSB2 off on redfin). Patch numbers above are the old ones.

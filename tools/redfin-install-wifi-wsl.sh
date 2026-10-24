@@ -71,6 +71,18 @@ plistlib.dump(p, open(path, 'wb'), fmt=plistlib.FMT_BINARY)
 print('  launchd jobs:', len(p['LaunchDaemons']))
 PY
 
+echo "== configd preferences"
+# A root that booted before en0 existed has a preferences.plist with no network services; configd never
+# adds one for en0 later, so iOS never does DHCP on Wi-Fi (flame 2026-10-22, redfin 2026-10-24). Move it
+# aside: configd writes a default configuration with a Wi-Fi service on the next boot.
+SC=$M/private/var/preferences/SystemConfiguration/preferences.plist
+if sudo test -f "$SC" && ! sudo python3 -I -c 'import plistlib, sys; sys.exit(0 if plistlib.load(open(sys.argv[1], "rb")).get("NetworkServices") else 1)' "$SC"; then
+	sudo mv "$SC" "$SC.pre-wifi"
+	echo "  preferences.plist had no network services: moved to preferences.plist.pre-wifi"
+else
+	echo "  ok (none yet, or it has network services)"
+fi
+
 sudo umount "$M"; trap - EXIT
 sudo fsck.hfsplus -fy "$IMG" | grep -v 'Illegal name' | tail -1 || true
 echo "== per-GiB SHA-256"; mkdir -p "$REPO/work/iosroot"
