@@ -376,13 +376,44 @@ Lessons (each cost a reboot):
 - One CSIPHY mapping per PHY (r17d/f set up the first PHY again for the second sensor: no packets).
 - The SMMU bank's CBAR does not go back to 0 when written: the last run's bank is taken again.
 
+Torch check (r17g): with the flash LED lit (`poke t 100 8000`) during `c 21 0 10` / `c 21 1 3`, the rear frames went
+from black (mean 64, the black level) to mean 883 (IMX363) and 237 (IMX481, the lit desk visible): the rear sensors see.
+Full-resolution modes also stream: IMX363 mode 0 4032x3024, IMX355 mode 0 3280x2464 (8 frames, no errors).
+
+**/dev/redwood-camera (0923, r18a-r18b): works.** Boot-arg `sweetcamdev=1` (with `sweetcam=2`). HackiOS's cam=5 device
+(header `phone/audio/redwood_camera.h`): a read gives a frame header and the RAW10 frame, writes give EXPOSURE (lines,
+linear gain 256 = 1x, frame lines), SENSOR (1 back IMX363, 2 front IMX355, 3 ultra-wide IMX481; HackiOS numbering),
+FOCUS (ignored: no lens motor driver yet). Sessions run from the first read to the last close on `stream_up()`, three
+places of GPU-pool memory below 4 GB, the next address given at each RDI 0 SOF, the exposure in the sensor's group hold.
+Mode: the most pixels at 4:3, <= 31 fps, <= 13 MP (IMX363 4032x3024, IMX355 3280x2464, IMX481 2328x1746);
+`sweetcam_sensor=` / `sweetcam_mode=` choose the first. r18a's write-combined places copied at ~120 MB/s; r18b's are
+cached and the frame's lines are invalidated first: 10 MB in ~3 ms, the front camera at its full 30 fps with HackiOS's
+AE/AWB in `camera_test` (`phone /var/local/bin/camera_test raw 60 sensor 2`; picture in
+/private/var/local/camera_test.nv12).
+
+**iOS camera code in RedwoodAudio.driver (phone/audio, r18a+).** HackiOS's `inject_media.c`, `camera_device.c`,
+`camera_isp.c` (MIT) are built into the HAL plug-in mediaserverd already loads (no injection). Adapted: the kernel's
+sensor numbers, `kern.sweet_torch` for the torch, tuning files `/private/var/local/fw/camera-<sensor>.isp` (none yet:
+identity colour matrix, no lens shading), front camera not turned; no iOS 16.5 address is trusted: methods are
+replaced by class and selector, the Metal device list and FigFlashlight's callers are left alone, and without
+`/dev/redwood-camera` nothing of the capture stack is touched. r18b: the plug-in loads, audio and haptics still work,
+all eight methods are replaced (16.7.x addresses logged: `+[BWFigCaptureDeviceVendor sharedCaptureDeviceVendor]` at
+0x1a1f40c84 unslid, etc.). The old plug-in is kept on the PC in `backup-audio/` (`*.before-camera`).
+
+**What stops it now:** AVFoundation (`camera_avtest`) blocks in `FigCaptureSourceRemoteCopyCaptureSources` ->
+`FigXPCRemoteClientCreate`, a synchronous XPC message to mediaserverd that is never answered, while mediaserverd sits idle:
+its capture-source server is never started, so the vendor (and camera_device.c) is never asked. That is the ADT
+camera capability (`/arm-io/isp`) and the MobileGestalt cache made from it, which r15a/r15b found to hang SpringBoard
+when no capture device existed; the device exists now.
+
 **Next for the cameras:**
-1. `/dev/redwood-camera`: HackiOS redwood_camera.c cam=5 (frames for a program, three places in turn, the
-   exposure between frames in the sensor's group hold) on top of `capture_sensor()`.
-2. HackiOS's camera_device.c + camera_isp.c (the FigCaptureDevice for BWFigCaptureDeviceVendor) in mediaserverd
-   via RedwoodAudio.driver; the colour tuning from the `com.qti.tuned.*` files (HackiOS camtuning.py).
-3. Then the ADT flags (`mkadt.py --camera --flash`) with a fresh MobileGestalt cache: Camera.app on the home
-   screen, and the flashlight through the stream's TorchLevel (-> `kern.sweet_torch`).
+1. Boot with `mkadt.py --camera` (and later `--flash`) plus a rebuilt MobileGestalt cache (the r15a copy
+   `MobileGestalt.plist.r15a-camera` was made for this), with this plug-in in place; then `camera_avtest`, mediaserverd's
+   `redwood: camera:` lines, and Camera.app. Way back: the plain ADT and the original cache.
+2. Colour tuning: the `com.qti.tuned.*` files of /vendor/lib64/camera (twrp-pull-camera takes only the sensor
+   modules now) -> `camera-<sensor>.isp` (HackiOS camtuning.py reads its phone's V3 files: a V2 reader as for the
+   tables).
+3. The IMX363's lens motor (actuator on CCI0) for FOCUS; the flashlight button through the stream's TorchLevel.
 
 ## Done so far
 
