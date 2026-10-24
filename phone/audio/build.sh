@@ -10,4 +10,8 @@ mkdir -p out/RedwoodAudio.driver
 	-o out/RedwoodAudio.driver/RedwoodAudio audio_plugin.c
 cp audio_plugin.plist out/RedwoodAudio.driver/Info.plist
 codesign -f -s - out/RedwoodAudio.driver/RedwoodAudio
-ls -la out/RedwoodAudio.driver
+# sound_test (HackiOS, MIT, unchanged): plays tones, system sounds and CoreHaptics patterns the way an app does
+../../work/userland/bin/ios-cc -O2 -Wall -Wno-unused-parameter -framework CoreFoundation -framework AudioToolbox \
+	-framework AVFoundation -lobjc -o out/sound_test sound_test.c
+codesign -f -s - out/sound_test
+ls -la out/RedwoodAudio.driver out/sound_test
