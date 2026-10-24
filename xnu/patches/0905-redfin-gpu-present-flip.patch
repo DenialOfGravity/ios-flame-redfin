@@ -1,4 +1,4 @@
-From 1b35615d37b0b251fa9da851e5752c56b0f1c237 Mon Sep 17 00:00:00 2001
+From 45eabbce598181c4b9f113935904219236497532 Mon Sep 17 00:00:00 2001
 From: Rory Axton <roryaxton@gmail.com>
 Date: Sat, 24 Oct 2026 11:34:41 +0200
 Subject: [PATCH 2/2] 0905 redfin: double-buffered GPU present (sweetfbflip=1)

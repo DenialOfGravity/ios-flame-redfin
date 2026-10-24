@@ -1,4 +1,4 @@
-From 0a64ce035fffd45acf9ee9519c80f4d02894c55e Mon Sep 17 00:00:00 2001
+From 2d2beed1b48bcf73eb99eee9d47f387fbae61fc8 Mon Sep 17 00:00:00 2001
 From: Rory Axton <roryaxton@gmail.com>
 Date: Sat, 24 Oct 2026 11:33:52 +0200
 Subject: [PATCH 1/2] 0904 redfin: Adreno 620 bring-up (A650-family GMU, HFI
@@ -40,14 +40,14 @@ Not run on the phone yet.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01GizUhEzkc6MoTcLnCZCfFa
 ---
- bsd/dev/sweet_a6xx.c                  | 332 ++++++++++++++++++++++++--
+ bsd/dev/sweet_a6xx.c                  | 339 ++++++++++++++++++++++++--
  bsd/dev/sweet_a6xx.h                  |  39 ++-
  bsd/dev/sweet_gpu.c                   |  17 +-
  iokit/Kernel/arm/SweetAccelerator.cpp |  14 +-
- 4 files changed, 368 insertions(+), 34 deletions(-)
+ 4 files changed, 374 insertions(+), 35 deletions(-)
 
 diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
-index 966ebb5..38adad5 100644
+index 966ebb5..f2c0f99 100644
 --- a/bsd/dev/sweet_a6xx.c
 +++ b/bsd/dev/sweet_a6xx.c
 @@ -92,10 +92,16 @@ static void zero_pa(uint64_t pa, uint64_t size)
@@ -98,7 +98,7 @@ index 966ebb5..38adad5 100644
  
  	uint64_t gdsc = GPUCC + GPUCC_CX_GDSCR;
  	wr32(gdsc, rd32(gdsc) & ~1u);
-@@ -271,14 +289,22 @@ static void smmu_bank(int smr, int cb, uint64_t ttbr0, uint32_t sid, uint32_t ma
+@@ -271,16 +289,29 @@ static void smmu_bank(int smr, int cb, uint64_t ttbr0, uint32_t sid, uint32_t ma
  	wr32(SMMU + 0x68, 0);					/* TLBIALLNSNH */
  	wr32(SMMU + 0x70, 0);					/* TLBGSYNC */
  	wait_bit(SMMU + 0x74, 1, 0, 10);
@@ -118,10 +118,18 @@ index 966ebb5..38adad5 100644
 +		a6_log("smmu: smr%d with mask %x reads %x; exact sid %u instead\n", smr, mask, rd32(SMR(smr)), sid);
 +		wr32(SMR(smr), (1u << 31) | sid);
 +	}
++#if A6_GPU_ID == 618
++	uint32_t impl6000 = rd32(SMMU + 0x6000);
++#else
++	uint32_t impl6000 = 0;	/* 0904: no reads of implementation-defined SMMU space under lito's hypervisor */
++#endif
  	a6_log("smmu: scr0 %x sgfsr %x s2cr%d %x impl6000 %x; smr0-4 %x %x %x %x %x\n", rd32(SMMU), rd32(SMMU + 0x48),
- 	    smr, rd32(S2CR(smr)), rd32(SMMU + 0x6000), rd32(SMR(0)), rd32(SMR(1)), rd32(SMR(2)), rd32(SMR(3)), rd32(SMR(4)));
+-	    smr, rd32(S2CR(smr)), rd32(SMMU + 0x6000), rd32(SMR(0)), rd32(SMR(1)), rd32(SMR(2)), rd32(SMR(3)), rd32(SMR(4)));
++	    smr, rd32(S2CR(smr)), impl6000, rd32(SMR(0)), rd32(SMR(1)), rd32(SMR(2)), rd32(SMR(3)), rd32(SMR(4)));
  	a6_log("smmu: smr%d %x -> cb%d cbar %x sctlr %x tcr %x tcr2 %x\n", smr, rd32(SMR(smr)), cb,
-@@ -289,7 +315,14 @@ static int smmu_pick(int32_t *smr_out, int32_t *cb_out, int cb_min)
+ 	       rd32(CBAR(cb)), rd32(c + CB_SCTLR), rd32(c + CB_TCR), rd32(c + CB_TCR2));
+ }
+@@ -289,7 +320,14 @@ static int smmu_pick(int32_t *smr_out, int32_t *cb_out, int cb_min)
  {
  	int smr = -1, cb = -1;
  	uint32_t used_cb = 0;
@@ -137,7 +145,7 @@ index 966ebb5..38adad5 100644
  		uint32_t m = rd32(SMR(i)), c = rd32(S2CR(i));
  		if ((m >> 31) && ((c >> 16) & 3) == 0)
  			used_cb |= 1u << (c & 0xff);
-@@ -342,6 +375,64 @@ int a6_clear_fault(const struct a6_gpu *g)
+@@ -342,6 +380,64 @@ int a6_clear_fault(const struct a6_gpu *g)
  
  /* ---- stage 2: GMU boot ---- */
  
@@ -202,7 +210,7 @@ index 966ebb5..38adad5 100644
  static int gmu_smmu(struct a6_gpu *g)
  {
  	if (smmu_pick(&g->gmu_smr, &g->gmu_cb, 0)) {
-@@ -353,14 +444,19 @@ static int gmu_smmu(struct a6_gpu *g)
+@@ -353,14 +449,19 @@ static int gmu_smmu(struct a6_gpu *g)
  	wr64(GMEM_L1(g) + 8, GMEM_L2_1(g) | 3);
  	wr64(GMEM_L2_0(g) + 0, GMEM_L3_LOW(g) | 3);
  	wr64(GMEM_L2_1(g) + 8 * ((VA_DUMMY >> 21) & 0x1ff), GMEM_L3_6(g) | 3);
@@ -224,7 +232,7 @@ index 966ebb5..38adad5 100644
  	int32_t smr4, cb_unused;
  	if (!smmu_pick(&smr4, &cb_unused, g->gmu_cb + 1)) {
  		wr32(S2CR(smr4), (uint32_t)g->gmu_cb);
-@@ -371,37 +467,78 @@ static int gmu_smmu(struct a6_gpu *g)
+@@ -371,37 +472,78 @@ static int gmu_smmu(struct a6_gpu *g)
  	return 0;
  }
  
@@ -315,7 +323,7 @@ index 966ebb5..38adad5 100644
  	/* kgsl hfi_init: HFI_QUEUE_MAX = 4 queues (the 4th, dispatch, disabled),
  	 * sizes in dwords (flame wrote bytes for 3 queues; the A640 fw tolerated it). */
  	const uint32_t nq = 4;
-@@ -423,6 +560,10 @@ static void hfi_table(struct a6_gpu *g)
+@@ -423,6 +565,10 @@ static void hfi_table(struct a6_gpu *g)
  #if A6_GPU_ID == 618
  		static const uint32_t legacy_idx[4] = { 0, 4, 5, 1 };	/* cmd, msg, dbg, dsp0 (HFI_*_IDX_LEGACY) */
  		wr32(h + 8, (10u << 8) | legacy_idx[q]);
@@ -326,7 +334,7 @@ index 966ebb5..38adad5 100644
  #else
  		wr32(h + 8, (10u << 8) | q);
  #endif
-@@ -436,7 +577,13 @@ static void hfi_table(struct a6_gpu *g)
+@@ -436,7 +582,13 @@ static void hfi_table(struct a6_gpu *g)
  static int fw_load(struct a6_gpu *g)
  {
  	uint32_t len;
@@ -340,7 +348,7 @@ index 966ebb5..38adad5 100644
  	if (!fw)
  		return -1;
  #if A6_GPU_ID == 618
-@@ -457,8 +604,18 @@ static int fw_load(struct a6_gpu *g)
+@@ -457,8 +609,18 @@ static int fw_load(struct a6_gpu *g)
  		memcpy(&size, p + 4, 4);
  		const uint8_t *data = p + 16;
  		uint64_t dst = 0;
@@ -359,7 +367,7 @@ index 966ebb5..38adad5 100644
  		else if (addr >= 0x40000 && addr < 0x44000)
  			dst = GMU_REG(GMU_DTCM) + (addr - 0x40000);
  		else if (addr >= VA_ICACHE && addr + size <= VA_ICACHE + CACHE_SIZE)
-@@ -483,6 +640,10 @@ static int gmu_boot(struct a6_gpu *g)
+@@ -483,6 +645,10 @@ static int gmu_boot(struct a6_gpu *g)
  	rpmh_init();
  	hfi_table(g);
  
@@ -370,7 +378,7 @@ index 966ebb5..38adad5 100644
  	wr32(GMU_REG(GMU_GENERAL_7), 1);
  	wr32(GMU_REG(GMU_RSCC_REQ), 1u << 1);
  	(void)wait_bit(GMU_REG(GMU_RSCC_ACK), 1u << 1, 1, 200);	/* never acks; harmless */
-@@ -557,6 +718,13 @@ static int gmu_boot(struct a6_gpu *g)
+@@ -557,6 +723,13 @@ static int gmu_boot(struct a6_gpu *g)
  static const uint32_t gpu_khz[] = { 0, 180000, 267000, 355000, 430000, 565000, 650000, 800000, 825000 };
  static const uint32_t gpu_lvl[] = { 0, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_SVS_L2, LVL_NOM, LVL_NOM_L1, LVL_TURBO,
      LVL_TURBO_L1 };
@@ -384,7 +392,7 @@ index 966ebb5..38adad5 100644
  #else
  static const uint32_t gpu_khz[] = { 0, 180000, 267000, 355000, 430000, 565000 };
  static const uint32_t gpu_lvl[] = { 0, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_SVS_L2, LVL_NOM };
-@@ -565,10 +733,26 @@ static const uint32_t gpu_lvl[] = { 0, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_SVS
+@@ -565,10 +738,26 @@ static const uint32_t gpu_lvl[] = { 0, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_SVS
  static const uint32_t gmu_khz[] = { 0, 200000 };
  static const uint32_t gmu_lvl[] = { 0, LVL_MIN_SVS };
  
@@ -413,7 +421,7 @@ index 966ebb5..38adad5 100644
  		return -1;
  	uint64_t data = db + 4 + 4 + 8 * 16 + 4 + 4;
  	for (uint32_t r = 0; r < 8; r++) {
-@@ -584,14 +768,29 @@ static int cmddb_aux(const char *id, uint64_t *aux, uint32_t *len)
+@@ -584,14 +773,29 @@ static int cmddb_aux(const char *id, uint64_t *aux, uint32_t *len)
  			if (strncmp(name, id, 8))
  				continue;
  			uint32_t w5 = rd32(ent + 20);
@@ -445,7 +453,7 @@ index 966ebb5..38adad5 100644
  static uint32_t aux16(uint64_t aux, uint32_t i)
  {
  	return (rd32(aux + 2 * (i & ~1u)) >> (16 * (i & 1))) & 0xffff;
-@@ -757,9 +956,9 @@ static int gmu_hfi(struct a6_gpu *g)
+@@ -757,9 +961,9 @@ static int gmu_hfi(struct a6_gpu *g)
  	    rd32(SMMU_CB(g->gmu_cb) + CB_FAR + 4), rd32(SMMU_CB(g->gmu_cb) + CB_FAR));
  #else
  	memset(msg, 0, sizeof(msg));
@@ -457,7 +465,7 @@ index 966ebb5..38adad5 100644
  		msg[3 + 3 * i] = gx[i];
  		msg[4 + 3 * i] = 0xffffffff;
  		msg[5 + 3 * i] = gpu_khz[i];
-@@ -779,6 +978,37 @@ static int gmu_hfi(struct a6_gpu *g)
+@@ -779,6 +983,37 @@ static int gmu_hfi(struct a6_gpu *g)
  	};
  	for (unsigned i = 0; i < sizeof(bw) / sizeof(bw[0]); i++)
  		msg[bw[i][0]] = bw[i][1];
@@ -495,7 +503,7 @@ index 966ebb5..38adad5 100644
  	rc |= hfi_send(g, 3, msg, 32 + 128);
  	msg[1] = 0;
  	rc |= hfi_send(g, 14, msg, 2);
-@@ -812,7 +1042,20 @@ static int gmu_hfi(struct a6_gpu *g)
+@@ -812,7 +1047,20 @@ static int gmu_hfi(struct a6_gpu *g)
  /* ---- zap shader through TrustZone PAS ---- */
  
  #define PAS_GPU		13
@@ -516,7 +524,7 @@ index 966ebb5..38adad5 100644
  #define ZAP_SIZE	0x2000u
  #define SCM_PIL(cmd)	(0x42000000ull | (2u << 8) | (cmd))
  
-@@ -829,7 +1072,7 @@ static int zap_load(struct a6_gpu *g)
+@@ -829,7 +1077,7 @@ static int zap_load(struct a6_gpu *g)
  {
  	uint64_t r1 = 0;
  	uint32_t mlen, slen;
@@ -525,7 +533,7 @@ index 966ebb5..38adad5 100644
  	if (!mdt || !b02 || slen > ZAP_SIZE)
  		return -1;
  	a6_write(a6_pool_pa(g, A6_OFF_ZAP_META), mdt, mlen);
-@@ -1207,7 +1450,7 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
+@@ -1207,7 +1455,7 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
  		/* UCHE: write range max, trap base, write-through base (trap 0x1fffffffff000) */
  		{ 0x0e05, 0xffffffc0 }, { 0x0e06, 0x1ffff }, { 0x0e09, 0xfffff000 }, { 0x0e0a, 0x1ffff },
  		{ 0x0e07, 0xfffff000 }, { 0x0e08, 0x1ffff },
@@ -534,7 +542,7 @@ index 966ebb5..38adad5 100644
  		{ 0x0e0b, 0x100000 }, { 0x0e0c, 0 }, { 0x0e0d, 0x17ffff }, { 0x0e0e, 0 },	/* GMEM range: 512 KB */
  #else
  		{ 0x0e0b, 0x100000 }, { 0x0e0c, 0 }, { 0x0e0d, 0x1fffff }, { 0x0e0e, 0 },	/* GMEM range */
-@@ -1220,18 +1463,37 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
+@@ -1220,18 +1468,37 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
  		{ 0x08c2, 0x02000140 }, { 0x08c1, 0x8040362c }, { 0x08c3, 128 },	/* ROQ, mem pool */
  #endif
  		{ 0x098d, 1 }, { 0x0500, 1 },		/* CP_AHB_CNTL, RBBM_PERFCTR_CNTL */
@@ -573,7 +581,7 @@ index 966ebb5..38adad5 100644
  #else
  		/* a6xx_set_ubwc_config: highest bank bit 15 (hbb_lo 2), AMSBC, UBWC 3 */
  		{ 0x8e08, (1u << 4) | (2u << 1) }, { 0xb604, 2u << 1 }, { 0xae02, 2u << 1 },
-@@ -1242,7 +1504,11 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
+@@ -1242,7 +1509,11 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
  		wr32(GREG(init[i][0]), init[i][1]);
  
  	uint32_t len;
@@ -585,7 +593,7 @@ index 966ebb5..38adad5 100644
  	if (!sqe || len < 8 || len > 0x10000)
  		return -1;
  	a6_write(a6_pool_pa(g, A6_OFF_SQE), sqe + 4, (len - 4 + 3) & ~3u);	/* minus the first dword */
-@@ -1251,6 +1517,10 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
+@@ -1251,6 +1522,10 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
  	wr32(GREG(CP_RB_BASE), (uint32_t)a6_pool_va(A6_OFF_RING));
  	wr32(GREG(CP_RB_BASE + 1), 0);
  	wr32(GREG(CP_RB_CNTL), 0x0800020c);	/* 32K ring, 32-byte blocks, no rptr update */
@@ -596,7 +604,7 @@ index 966ebb5..38adad5 100644
  	g->wptr = 0;
  	wr32(GREG(CP_SQE_CNTL), 1);
  
-@@ -1274,16 +1544,28 @@ int a6_power_up(struct a6_gpu *g)
+@@ -1274,16 +1549,28 @@ int a6_power_up(struct a6_gpu *g)
  
  /* The A640 state turnip writes before any work (tu6_init_hw + the device's magic registers). */
  static const uint32_t blit_init[][2] = {
