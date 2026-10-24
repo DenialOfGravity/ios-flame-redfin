@@ -16,7 +16,10 @@ frames, the write master stopped at the wanted one, "off"; all undone.
 "c 20" and "c 21" run on a thread of their own: a poke runs on the USB
 driver's command thread, which also sends the log, so r17a/r17b's c 20 went
 down with none of its lines out. The CCI pins are held as I2C lines for a
-whole session of writes and given back clock line first.
+whole session of writes and given back clock line first. "c 22 MS" sets
+the time before each stage (the UDP log drops what a poke's run prints;
+the ring, read with klog, has it). The SMMU is mapped whole: 0921 mapped
+128 KB and then read the context banks' SCTLRs at 512 KB and up.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01WuzsiVGCDDmN2GPRLJvX3w
@@ -185,7 +188,32 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	if (phy < 0 && (!bput(c, "CSID", CSID_TPG_VC_CFG0, 1u << 10 | vc, true) ||
  	    !bput(c, "CSID", CSID_TPG_VC_CFG1, 0x3ffu << 12 | 0x740, true) || !bput(c, "CSID", CSID_TPG_LFSR_SEED, 0x12345678, true) ||
  	    !bput(c, "CSID", CSID_TPG_DT0_CFG0, width << 16 | height, true) || !bput(c, "CSID", CSID_TPG_DT0_CFG1, RAW10_DT, true) ||
-@@ -1526,13 +1600,612 @@
+@@ -1395,11 +1469,14 @@
+  * r17a: "c 20" took the phone down with nothing in the log (the UDP log loses what a hang leaves
+  * unsent). Each stage now says what comes next and gives the log 300 ms to carry it out.
+  */
++static unsigned cam_step_ms = 300;     /* "c 22 MS" (r17c: the UDP log drops what is printed during a poke; the
++					 * ring, read with the phone agent's klog, has it, given the time to read it) */
++
+ static void
+ cstep(const char *what)
+ {
+ 	printf("SWEET CAM: next: %s\n", what);
+-	sleep_ms(300);
++	sleep_ms(cam_step_ms);
+ }
+ 
+ /* everything up to the clocks; false on a fault (cap_down() takes back what was done) */
+@@ -1411,7 +1488,7 @@
+ 		cap.camcc = ml_io_map_unmappable(CAMCC_PA, 0x10000, VM_WIMG_IO);
+ 		cap.csid = ml_io_map_unmappable(CSID_LITE_PA, 0x1000, VM_WIMG_IO);
+ 		cap.ife = ml_io_map_unmappable(IFE_LITE_PA, 0x4000, VM_WIMG_IO);
+-		cap.smmu = ml_io_map_unmappable(SMMU_PA, 0x20000, VM_WIMG_IO);  /* page 0 and GR1 (4 or 64 KB pages) */
++		cap.smmu = ml_io_map_unmappable(SMMU_PA, 0x100000, VM_WIMG_IO); /* all of it: cap_smmu_up() reads the banks' SCTLRs */
+ 	}
+ 	if (!cap.camcc || !cap.csid || !cap.ife || !cap.smmu) {
+ 		give_up("mappings");
+@@ -1526,13 +1603,617 @@
  	return result;
  }
  
@@ -778,6 +806,11 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  		printf("SWEET CAM: not ready (sweetcam=%u)\n", cm.mode);
  		return ENXIO;
  	}
++	if (what == 22) {
++		cam_step_ms = a > 30000 ? 30000 : (unsigned)a;
++		printf("SWEET CAM: %u ms before each stage\n", cam_step_ms);
++		return 0;
++	}
 +	if (what == 20 || what == 21) {
 +		if (job.busy) {
 +			return EBUSY;
@@ -799,7 +832,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	lck_mtx_lock(&sweet_cam_lock);
  	int err = 0;
  	if (what == 9) {
-@@ -1543,8 +2216,6 @@
+@@ -1543,8 +2224,6 @@
  		look_slg();
  	} else if (what == 12) {
  		look_camcc();
@@ -808,7 +841,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	} else if (what < sizeof(sensors) / sizeof(sensors[0])) {
  		err = probe(what);
  	} else {
-@@ -1554,6 +2225,12 @@
+@@ -1554,6 +2233,12 @@
  	return err;
  }
  
