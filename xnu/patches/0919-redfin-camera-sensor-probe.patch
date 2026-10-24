@@ -11,7 +11,10 @@ MCLK0-2 from camcc at the crystal's 19.2 MHz, titan top GDSC), the chip ID
 register 0x0016 read by hand on the CCI pins (17/18, 19/20, 27/28), powered
 down again. The SLG51000 gets Google's slg51000_config_tuning() first.
 sweetcam=1 looks, =2 probes on request (poke "c N", 9 = look), =3 probes all
-three at boot. sweet_haptic.c exports sweet_se9_xfer() for the PMIC.
+three at boot; "c 10" reads the PMIC GPIOs, "c 11" the SLG51000 (r16a reset
+during those reads at boot: now separate, each line given 300 ms to reach the
+log). The GCC camera XO clock (off here, critical in Linux) is switched on.
+sweet_haptic.c exports sweet_se9_xfer() for the PMIC.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01WuzsiVGCDDmN2GPRLJvX3w
@@ -125,10 +128,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 new file mode 100644
-index 0000000..8197c2d
+index 0000000..e1c3f5c
 --- /dev/null
 +++ b/bsd/dev/sweet_cam.c
-@@ -0,0 +1,818 @@
+@@ -0,0 +1,855 @@
 +/*
 + * redfin (Pixel 5) cameras, step 1: one sensor powered up as Android powers it, its chip ID read,
 + * powered down again. After HackiOS's redwood_camera.c (cam=1 / cam=2), with this phone's numbers.
@@ -167,7 +170,7 @@ index 0000000..8197c2d
 + *
 + * Boot-arg sweetcam=1: a look only (clocks, GDSC, pins, the PMIC GPIOs, the SLG51000 if it answers).
 + * sweetcam=2: and the probe on request: poke/command line "c N" (N = 0, 1, 2; 9 = the look again),
-+ * tools/flame-cmd.py 'c 0'. sweetcam=3: and all three probed once at boot.
++ * tools/flame-cmd.py 'c 0'; 10 = the PMIC GPIOs, 11 = the SLG51000's ID register. sweetcam=3: and all three probed once at boot.
 + * Any write that does not read back, a rail that does not come up or reports over-current, a byte
 + * nobody acknowledges on the PMIC's bus, and everything switched on so far is switched off again in
 + * the power-down order. Whatever was found on is left on.
@@ -558,11 +561,21 @@ index 0000000..8197c2d
 +static bool
 +titan_up(void)
 +{
++	/* r16a: AHB 0x80000003 (enabled, hardware gated: CLK_OFF while idle), XO 0x80000000 (off; Linux keeps it on) */
 +	uint32_t ahb = rd(cm.gcc, GCC_CAMERA_AHB), xo = rd(cm.gcc, GCC_CAMERA_XO);
-+	if ((ahb & CBCR_OFF) || (xo & CBCR_OFF)) {
-+		printf("SWEET CAM: GCC camera AHB %#x XO %#x: not running\n", ahb, xo);
-+		give_up("camcc's GCC clocks are off");
++	if (!(ahb & 1u)) {
++		printf("SWEET CAM: GCC camera AHB %#x not enabled\n", ahb);
++		give_up("camcc's AHB clock is off");
 +		return false;
++	}
++	if (!(xo & 1u)) {
++		wr(cm.gcc, GCC_CAMERA_XO, xo | 1u);
++		if (!wait_bits(cm.gcc, GCC_CAMERA_XO, CBCR_OFF, 0, 500)) {
++			printf("SWEET CAM: GCC camera XO %#x does not run\n", rd(cm.gcc, GCC_CAMERA_XO));
++			give_up("the camera XO clock");
++			return false;
++		}
++		printf("SWEET CAM: GCC camera XO on (%#x); left on, as Linux keeps it\n", rd(cm.gcc, GCC_CAMERA_XO));
 +	}
 +	uint32_t gclk = rd(cm.camcc, CAMCC_GDSC_CLK);
 +	if (!(gclk & 1u)) {
@@ -793,14 +806,37 @@ index 0000000..8197c2d
 +		show_pin(s->reset, "reset");
 +		show_pin(s->mclk_pin, "MCLK");
 +	}
-+	pgpio_show(4, "SLG51000 cs");
-+	pgpio_show(9, "SLG51000 enable 1");
-+	pgpio_show(10, "SLG51000 enable 0");
-+	pgpio_show(8, "camera_ldo (rear VAF)");
-+	pgpio_show(2, "front custom 1");
++}
++
++/*
++ * r16a: the phone reset right after the look's pin lines (the PMIC GPIO and SLG51000 reads followed, and
++ * the UDP log loses the last lines before a reset). Those reads are separate commands now, each line
++ * given 300 ms to reach the log: "c 10" the PMIC GPIOs, "c 11" the SLG51000's first register.
++ */
++static void
++look_pmic(void)
++{
++	static const struct { unsigned n; const char *what; } g[] = {
++		{ 4, "SLG51000 cs" }, { 9, "SLG51000 enable 1" }, { 10, "SLG51000 enable 0" }, { 8, "camera_ldo (rear VAF)" },
++		{ 2, "front custom 1" },
++	};
++	for (unsigned i = 0; i < sizeof(g) / sizeof(g[0]); i++) {
++		printf("SWEET CAM: reading PM8150L gpio%u ...\n", g[i].n);
++		sleep_ms(300);
++		pgpio_show(g[i].n, g[i].what);
++		sleep_ms(300);
++	}
++}
++
++static void
++look_slg(void)
++{
 +	uint8_t id = 0;
++	printf("SWEET CAM: reading the SLG51000 (SE9 0x75) ...\n");
++	sleep_ms(300);
 +	int err = slg_read(0x1105, &id);
-+	printf("SWEET CAM: SLG51000 at SE9 0x75: %s (id0 %#x)\n", err ? "no answer (not selected, or SE9 not up)" : "answers", id);
++	printf("SWEET CAM: SLG51000 at SE9 0x75: %s (err %d, id0 %#x)\n", err ? "no answer" : "answers", err, id);
++	sleep_ms(300);
 +}
 +
 +static void
@@ -896,6 +932,10 @@ index 0000000..8197c2d
 +	int err = 0;
 +	if (what == 9) {
 +		look();
++	} else if (what == 10) {
++		look_pmic();
++	} else if (what == 11) {
++		look_slg();
 +	} else if (what < sizeof(sensors) / sizeof(sensors[0])) {
 +		err = probe(what);
 +	} else {
