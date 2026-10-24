@@ -63,3 +63,6 @@
   DHCP) service + set and restarts configd (backup: logs/preferences.plist.bak-*).
 - Result: en0 192.168.2.30/24, router + DNS 192.168.2.1, primary interface en0;
   nettest: DNS apple.com OK, TCP OK, HTTPS 200.
+- Safari pages were black: WebKit's GPU process got no Metal device (only SpringBoard on /var/local/mtl2-clients)
+  and has no CPU fallback. Added com.apple.WebKit.GPU + MobileSafari (sunfish-metal2-install.sh too).
+  fast.com renders: 7.7 Mbps down, 8.9 Mbps up, 35 ms.
