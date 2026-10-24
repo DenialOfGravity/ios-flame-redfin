@@ -32,7 +32,7 @@
 
 #define CLIENT_ID	0x4b4e454c	/* ath10k's */
 #define MSA_PA		0x98d00000ull	/* sunfish wlan_msa_region (flame: 0x8bc00000) */
-#define MSA_SIZE	0x100000u	/* qcom,wlan-msa-memory */
+#define MSA_SIZE	0x200000u	/* sunfish DT wlan_msa_mem: 2 MB (1 MB left the fw heap's upper half unassigned) */
 #define BDF_PATH	"/var/local/fw/modem/bdwlan-sunfish.bin"
 #define BDF_PATH2	"/var/local/fw/modem/bdwlan-sunfish-EVT1.0.bin"
 
