@@ -1,0 +1,844 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sat, 24 Oct 2026 21:30:00 +0200
+Subject: [PATCH] 0922 redfin: camera capture path, step 2: a sensor's own frames
+
+"c 21 SENSOR MODE OPTIONS" (sweetcam=2): HackiOS redwood_camera.c cam=4 with
+redfin's sensors. camcc PLL2 (Zonda, 960 MHz, cam_cc_pll2_config) for the
+24 MHz MCLK (aux /2, M/N 1/20) the device tree and the sensors' tables ask
+for; the sensor powered up as for "c N", its chip ID, its "init" and "resM"
+tables from /private/var/local/fw/camera-<sensor>.tab (tools/redfin-camtab.py,
+out of the vendor's module file: on the phone only); CSID-lite 0 from the
+sensor's CSIPHY into RDI 0 and IFE-lite 0's write master; the CSIPHY
+(v1.2.2: the 1.2 tables, D-PHY, four lanes) with refgen on; "on", the
+frames, the write master stopped at the wanted one, "off"; all undone.
+
+"c 20" and "c 21" run on a thread of their own: a poke runs on the USB
+driver's command thread, which also sends the log, so r17a/r17b's c 20 went
+down with none of its lines out. The CCI pins are held as I2C lines for a
+whole session of writes and given back clock line first.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WuzsiVGCDDmN2GPRLJvX3w
+---
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -143,6 +143,8 @@
+ 	uint8_t ldo_on;                 /* bits we switched on */
+ 	uint32_t found_mclk_cfg, found_mclk_cbcr, found_mclk_pin, found_reset_cfg, found_reset_io;
+ 	bool mclk_on, reset_taken;
++	bool mclk24;                    /* 0922: MCLK at 24 MHz from camcc PLL2 (running), not the crystal's 19.2 */
++	uint32_t found_mclk_mnd[3];
+ 	const struct sensor *s;
+ } cm;
+ static LCK_GRP_DECLARE(sweet_cam_grp, "sweet_cam");
+@@ -541,12 +543,18 @@
+ 		wr(cm.mclk, s->mclk_cbcr, rd(cm.mclk, s->mclk_cbcr) & ~1u);
+ 		(void)wait_bits(cm.mclk, s->mclk_cbcr, CBCR_OFF, CBCR_OFF, 500);
+ 		wr(cm.mclk, s->mclk_rcg + 4, cm.found_mclk_cfg);
++		for (unsigned k = 0; k < 3; k++) {
++			wr(cm.mclk, s->mclk_rcg + 8 + 4 * k, cm.found_mclk_mnd[k]);
++		}
+ 		wr(cm.mclk, s->mclk_rcg, rd(cm.mclk, s->mclk_rcg) | 1u);
+ 		(void)wait_bits(cm.mclk, s->mclk_rcg, 1u, 0, 500);
+ 		cm.mclk_on = false;
+ 		return true;
+ 	}
+ 	cm.found_mclk_cfg = rd(cm.mclk, s->mclk_rcg + 4);
++	for (unsigned k = 0; k < 3; k++) {
++		cm.found_mclk_mnd[k] = rd(cm.mclk, s->mclk_rcg + 8 + 4 * k);
++	}
+ 	cm.found_mclk_cbcr = rd(cm.mclk, s->mclk_cbcr);
+ 	cm.found_mclk_pin = rd(cm.tlmm, GPIO_CFG(s->mclk_pin));
+ 	if (cm.found_mclk_cbcr & 1u) {
+@@ -554,9 +562,20 @@
+ 		return false;
+ 	}
+ 	cm.mclk_on = true;
+-	wr(cm.mclk, s->mclk_rcg + 4, (cm.found_mclk_cfg & ~0x371fu) | 1u);    /* XO, divider 1, no M/N */
++	/*
++	 * 19.2 MHz: XO, divider 1, no M/N. 24 MHz (0922, cm.mclk24, camcc PLL2 running): ftbl_cam_cc_mclk0_clk_src's
++	 * F(24000000, P_CAM_CC_PLL2_OUT_AUX, 1, 1, 20): source 5 (PLL2 aux, 480 MHz), divider 1, M/N 1/20 dual edge,
++	 * as __clk_rcg2_configure() writes them (M 1, N ~(20 - 1), D ~20, 8 bits each).
++	 */
++	uint32_t cfg = cm.mclk24 ? 5u << 8 | 2u << 12 | 1u : 1u;
++	if (cm.mclk24) {
++		wr(cm.mclk, s->mclk_rcg + 8, (cm.found_mclk_mnd[0] & ~0xffu) | 1u);
++		wr(cm.mclk, s->mclk_rcg + 12, (cm.found_mclk_mnd[1] & ~0xffu) | (~(20u - 1u) & 0xffu));
++		wr(cm.mclk, s->mclk_rcg + 16, (cm.found_mclk_mnd[2] & ~0xffu) | (~20u & 0xffu));
++	}
++	wr(cm.mclk, s->mclk_rcg + 4, (cm.found_mclk_cfg & ~0x10371fu) | cfg);
+ 	wr(cm.mclk, s->mclk_rcg, rd(cm.mclk, s->mclk_rcg) | 1u);
+-	if (!wait_bits(cm.mclk, s->mclk_rcg, 1u, 0, 500) || (rd(cm.mclk, s->mclk_rcg + 4) & 0x371fu) != 1u) {
++	if (!wait_bits(cm.mclk, s->mclk_rcg, 1u, 0, 500) || (rd(cm.mclk, s->mclk_rcg + 4) & 0x371fu) != cfg) {
+ 		printf("SWEET CAM: MCLK RCG cmd %#x cfg %#x\n", rd(cm.mclk, s->mclk_rcg), rd(cm.mclk, s->mclk_rcg + 4));
+ 		give_up("an RCG that does not update");
+ 		return false;
+@@ -652,17 +671,51 @@
+ 	half_bit();
+ }
+ 
++/*
++ * The CCI pins as I2C lines (pull-up, driven low by the output enable) for a transfer or, held (0922), for a
++ * whole session of writes; given back as they were found, the clock line first (the data line falling while the
++ * clock is high would be a start condition).
++ */
++static struct { bool held, taken; uint32_t cfg[2], io[2]; } bus;
++
++static void
++bus_take(void)
++{
++	const struct sensor *s = cm.s;
++	if (bus.taken) {
++		return;
++	}
++	bus.cfg[0] = rd(cm.tlmm, GPIO_CFG(s->sda));
++	bus.cfg[1] = rd(cm.tlmm, GPIO_CFG(s->scl));
++	bus.io[0] = rd(cm.tlmm, GPIO_IO(s->sda));
++	bus.io[1] = rd(cm.tlmm, GPIO_IO(s->scl));
++	bus.taken = true;
++	line(s->sda, true);
++	line(s->scl, true);
++	half_bit();
++}
++
++static void
++bus_give(void)
++{
++	const struct sensor *s = cm.s;
++	if (!bus.taken || bus.held) {
++		return;
++	}
++	wr(cm.tlmm, GPIO_IO(s->scl), bus.io[1] & 2u);
++	wr(cm.tlmm, GPIO_CFG(s->scl), bus.cfg[1]);
++	wr(cm.tlmm, GPIO_IO(s->sda), bus.io[0] & 2u);
++	wr(cm.tlmm, GPIO_CFG(s->sda), bus.cfg[0]);
++	bus.taken = false;
++}
++
+ /* a 16-bit register's two bytes; false if nobody answered */
+ static bool
+ sensor_read16(uint8_t slave, uint16_t reg, uint16_t *val, const char **why)
+ {
+ 	const struct sensor *s = cm.s;
+-	uint32_t cfg[2] = { rd(cm.tlmm, GPIO_CFG(s->sda)), rd(cm.tlmm, GPIO_CFG(s->scl)) };
+-	uint32_t io[2] = { rd(cm.tlmm, GPIO_IO(s->sda)), rd(cm.tlmm, GPIO_IO(s->scl)) };
+ 	bool ok = false;
+-	line(s->sda, true);
+-	line(s->scl, true);
+-	half_bit();
++	bus_take();
+ 	if (!level(s->sda) || !level(s->scl)) {
+ 		*why = "bus not at rest";
+ 	} else {
+@@ -688,10 +741,26 @@
+ 		}
+ 		i2c_stop(s->sda, s->scl);
+ 	}
+-	wr(cm.tlmm, GPIO_IO(s->sda), io[0] & 2u);
+-	wr(cm.tlmm, GPIO_IO(s->scl), io[1] & 2u);
+-	wr(cm.tlmm, GPIO_CFG(s->sda), cfg[0]);
+-	wr(cm.tlmm, GPIO_CFG(s->scl), cfg[1]);
++	bus_give();
++	return ok;
++}
++
++/* 0922: one register write (n bytes: the address's and the data's), every byte acknowledged */
++static bool
++sensor_write(uint8_t slave, const uint8_t *b, unsigned n)
++{
++	const struct sensor *s = cm.s;
++	bool ok = false;
++	bus_take();
++	if (level(s->sda) && level(s->scl)) {
++		i2c_start(s->sda, s->scl);
++		ok = i2c_byte(s->sda, s->scl, (uint8_t)(slave << 1));
++		for (unsigned i = 0; ok && i < n; i++) {
++			ok = i2c_byte(s->sda, s->scl, b[i]);
++		}
++		i2c_stop(s->sda, s->scl);
++	}
++	bus_give();
+ 	return ok;
+ }
+ 
+@@ -1219,9 +1288,11 @@
+ #define BUS_HW_VERSION          0x2000
+ #define BUS_CGC_OVD             0x200c
+ #define BUS_IRQ_MASK1           0x2048
++#define BUS_IRQ_CLEAR1          0x2054
+ #define BUS_IRQ_STATUS0         0x205c
+ #define BUS_IRQ_STATUS1         0x2060
+ #define BUS_IRQ_STATUS2         0x2064
++#define BUS_IRQ_GLOBAL_CLEAR    0x2068
+ #define BUS_COMP_ERROR          0x206c
+ #define BUS_ADDR_SYNC_FRAME_HDR 0x2080
+ #define BUS_ADDR_SYNC_NO_SYNC   0x2084
+@@ -1306,6 +1377,9 @@
+ 	    !bput(c, "CSID", CSID_RX_CFG1, 1u << 6 | 1u, true)) {
+ 		return false;
+ 	}
++	if (phy >= 0) {
++		wr(c, CSID_RX_IRQ_MASK, 0x0fffffffu);   /* 0922: the receiver's errors and events seen in show_paths() */
++	}
+ 	if (phy < 0 && (!bput(c, "CSID", CSID_TPG_VC_CFG0, 1u << 10 | vc, true) ||
+ 	    !bput(c, "CSID", CSID_TPG_VC_CFG1, 0x3ffu << 12 | 0x740, true) || !bput(c, "CSID", CSID_TPG_LFSR_SEED, 0x12345678, true) ||
+ 	    !bput(c, "CSID", CSID_TPG_DT0_CFG0, width << 16 | height, true) || !bput(c, "CSID", CSID_TPG_DT0_CFG1, RAW10_DT, true) ||
+@@ -1526,13 +1600,612 @@
+ 	return result;
+ }
+ 
++/* ==== 0922: the capture path, step 2: a sensor's own frames ("c 21 SENSOR MODE OPTIONS") ==== */
++
++/*
++ * HackiOS redwood_camera.c's cam=4 with redfin's sensors. The sequence is Android's (cam_sensor, cam_csiphy,
++ * cam_ife_csid, cam_vfe): the capture clocks and the SMMU as for "c 20"; camcc's PLL2 for the 24 MHz MCLK the
++ * device tree asks for (cam-sensor clock-rates 24000000; the module files' tables start with EXCK_FREQ 0x136 =
++ * 24.00 MHz); the sensor powered up as for "c N", its chip ID, its tables "init" and "resM"; CSID-lite 0 from the
++ * sensor's PHY and RDI 0, IFE-lite 0's write master into the frame memory; the sensor's CSIPHY; the sensor's
++ * "on", frames until the wanted one is written, the write master stopped at that frame's end, "off"; everything
++ * down again.
++ *
++ * The tables: tools/redfin-camtab.py makes /private/var/local/fw/camera-<sensor>.tab out of the sensor's module
++ * file (the vendor's: on the phone only, never in git), read at run time (redwood_adsp_fw_file(), sweet_adsp.c).
++ *   SENSOR   0 rear IMX363 (CSIPHY 0), 1 rear ultra-wide IMX481 (CSIPHY 1), 2 front IMX355 (CSIPHY 2)
++ *   MODE     the module file's mode (redfin-camtab.py lists them); one past the last: the one with the fewest pixels
++ *   OPTIONS  [3:0] 0 the picture, N the sensor's test pattern table tpgN (tpg2: colour bars); [15:8] the CSIPHY
++ *            settle count (0: the module file's, in periods of the 300 MHz timer); [31:16] the exposure in lines
++ *            (0: the tables'); [47:32] the analog gain code (0x0204, 0: the tables'); [55:48] frames to wait for
++ *            (0: 8, the last kept)
++ *
++ * The CSIPHY ("qcom,csiphy-v1.2.2": cam_csiphy_soc.c gives it the 1.2 tables of cam_csiphy_1_2_hwreg.h):
++ * csiphy_reset_reg_1_2, csiphy_common_reg_1_2 with the lanes to enable, csiphy_2ph_v1_2_reg for each lane position
++ * in use (data lane 0, the clock lane, data lanes 1, 2, 3) with the settle count, csiphy_irq_reg_1_2. Its supplies
++ * are the titan top GDSC, refgen (0xff1000, qcom,refgen-kona-regulator: PWRDWN_CTRL5 bit 0) and PM8150 L5 (the UFS
++ * and DSI PHYs' too, so on).
++ */
++extern const uint8_t *redwood_adsp_fw_file(const char *name, uint64_t *size);
++extern void redwood_adsp_fw_free(const uint8_t *data, uint64_t size);
++
++#define REFGEN_PA               0x00ff1000u
++#define REFGEN_PWRDWN_CTRL5     0x080u
++
++struct tab_mode { uint32_t width, height, x, y, lanes, cphy, settle, pixel_clock, line_length, frame_length, fps_milli, dt, cfa, table; };
++struct tab_entry { uint16_t address, data; uint8_t address_bytes, data_bytes, operation, pad; uint32_t delay_us; };
++
++static const struct { const char *file; unsigned phy; } sensor_capture[] = {
++	{ "camera-imx363.tab", 0 }, { "camera-imx481.tab", 1 }, { "camera-imx355.tab", 2 },
++};
++
++static struct {
++	const uint8_t *data;
++	uint64_t size;
++	uint32_t slave, lane_assign, modes, tables;
++	const struct tab_mode *mode;
++	vm_offset_t csiphy, refgen;
++	bool pll2_on, csiphy_on, refgen_switched;
++} sc;
++
++static void
++tab_free(void)
++{
++	if (sc.data) {
++		redwood_adsp_fw_free(sc.data, sc.size);
++		sc.data = NULL;
++	}
++}
++
++static bool
++tab_load(const char *name)
++{
++	sc.data = redwood_adsp_fw_file(name, &sc.size);
++	if (sc.data == NULL) {
++		printf("SWEET CAM: no /private/var/local/fw/%s (tools/redfin-camtab.py makes it)\n", name);
++		return false;
++	}
++	const uint32_t *h = (const uint32_t *)(const void *)(sc.data + 8);
++	if (sc.size < 24 || memcmp(sc.data, "RFCTAB01", 8) != 0 || h[2] == 0 || h[2] > 32 ||
++	    24 + (uint64_t)h[2] * sizeof(struct tab_mode) > sc.size) {
++		printf("SWEET CAM: %s: not a table file of the kind known here\n", name);
++		tab_free();
++		return false;
++	}
++	sc.slave = h[0];
++	sc.lane_assign = h[1];
++	sc.modes = h[2];
++	sc.tables = h[3];
++	sc.mode = (const struct tab_mode *)(const void *)(sc.data + 24);
++	return true;
++}
++
++static const struct tab_entry *
++tab_find(const char *name, uint32_t *count)
++{
++	uint64_t at = 24 + (uint64_t)sc.modes * sizeof(struct tab_mode);
++	for (uint32_t t = 0; t < sc.tables && at + 12 <= sc.size; t++) {
++		uint32_t n = *(const uint32_t *)(const void *)(sc.data + at + 8);
++		if (at + 12 + (uint64_t)n * sizeof(struct tab_entry) > sc.size) {
++			break;
++		}
++		bool same = true;
++		for (unsigned k = 0; k < 8 && same; k++) {
++			same = sc.data[at + k] == (uint8_t)name[k];
++			if (name[k] == 0) {
++				break;
++			}
++		}
++		if (same) {
++			*count = n;
++			return (const struct tab_entry *)(const void *)(sc.data + at + 12);
++		}
++		at += 12 + (uint64_t)n * sizeof(struct tab_entry);
++	}
++	*count = 0;
++	return NULL;
++}
++
++/* one register of the sensor's: 1 or 2 bytes of address, 1 or 2 of data */
++static bool
++sensor_put(uint16_t address, unsigned address_bytes, uint16_t data, unsigned data_bytes)
++{
++	uint8_t b[4];
++	unsigned n = 0;
++	if (address_bytes == 2) {
++		b[n++] = (uint8_t)(address >> 8);
++	}
++	b[n++] = (uint8_t)address;
++	if (data_bytes == 2) {
++		b[n++] = (uint8_t)(data >> 8);
++	}
++	b[n++] = (uint8_t)data;
++	return sensor_write((uint8_t)sc.slave, b, n);
++}
++
++/* one of the sensor's tables in order, as cam_sensor writes it (the writes are not read back) */
++static bool
++sensor_table(const char *name)
++{
++	uint32_t count;
++	const struct tab_entry *e = tab_find(name, &count);
++	if (e == NULL) {
++		printf("SWEET CAM: the table file has no \"%s\"\n", name);
++		give_up("a sensor table missing");
++		return false;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		if (e[i].operation != 0 || e[i].address_bytes < 1 || e[i].address_bytes > 2 || e[i].data_bytes < 1 ||
++		    e[i].data_bytes > 2) {
++			printf("SWEET CAM: \"%s\" %u: operation %u, %u/%u bytes: not known here\n", name, i, e[i].operation,
++			    e[i].address_bytes, e[i].data_bytes);
++			give_up("a sensor table not understood");
++			return false;
++		}
++		if (!sensor_put(e[i].address, e[i].address_bytes, e[i].data, e[i].data_bytes)) {
++			printf("SWEET CAM: \"%s\" %u: %#x <- %#x not acknowledged\n", name, i, e[i].address, e[i].data);
++			give_up("a sensor write nobody acknowledged");
++			return false;
++		}
++		if (e[i].delay_us >= 1000) {
++			sleep_ms(e[i].delay_us > 100000 ? 100 : e[i].delay_us / 1000);
++		} else if (e[i].delay_us) {
++			delay(e[i].delay_us);
++		}
++	}
++	printf("SWEET CAM: the sensor's \"%s\": %u writes\n", name, count);
++	return true;
++}
++
++/* ---- camcc's PLL2 (Zonda) for the 24 MHz MCLK: cam_cc_pll2_config, clk_zonda_pll_configure() + _enable() ---- */
++
++#define PLL2                    0x2000u
++#define Z_MODE                  (PLL2 + 0x00)   /* [0] outputs, [1] bypass off, [2] out of reset, [20] FSM vote, [29] freq lock, [31] lock */
++#define Z_L                     (PLL2 + 0x04)
++#define Z_USER                  (PLL2 + 0x0c)   /* [3:0] the outputs, [9:8] the post-divider (1: /2) */
++#define Z_CONFIG                (PLL2 + 0x10)
++#define Z_CONFIG_U              (PLL2 + 0x14)
++#define Z_TEST                  (PLL2 + 0x1c)   /* [16] stays in CFA: then the frequency lock is what to wait for */
++#define Z_OPMODE                (PLL2 + 0x28)
++
++static bool
++pll2_up(void)
++{
++	uint32_t mode = crd(Z_MODE);
++	if (mode & (1u | 1u << 20)) {
++		printf("SWEET CAM: camcc PLL2 mode %#x: running or voted (somebody else's)\n", mode);
++		give_up("PLL2 in use");
++		return false;
++	}
++	/* L 0x32: 960 MHz; the aux output /2: 480 MHz, MCLK's source 5 */
++	if (!cwr(Z_L, 0x32, ~0u) || !cwr(Z_CONFIG, 0x08200920, ~0u) || !cwr(Z_CONFIG_U, 0x15008001, ~0u) ||
++	    !cwr(Z_USER, 0xe0000101, ~0u) || !cwr(Z_TEST, 0x00010000, ~0u)) {
++		return false;
++	}
++	sc.pll2_on = true;
++	if (!cwr(Z_MODE, crd(Z_MODE) & ~2u, 2u) || !cwr(Z_MODE, crd(Z_MODE) & ~1u, 1u) || !cwr(Z_OPMODE, 0, 1u) ||
++	    !cwr(Z_MODE, crd(Z_MODE) | 4u, 4u)) {
++		return false;
++	}
++	if (!cwr(Z_MODE, crd(Z_MODE) | 2u, 2u)) {
++		return false;
++	}
++	delay(1);
++	if (!cwr(Z_MODE, crd(Z_MODE) | 4u, 4u) || !cwr(Z_OPMODE, 1, 1u)) {
++		return false;
++	}
++	uint32_t lock = (crd(Z_TEST) & (1u << 16)) ? 1u << 29 : 1u << 31;
++	if (!wait_bits(cap.camcc, Z_MODE, lock, lock, 2000)) {
++		printf("SWEET CAM: camcc PLL2 does not lock (mode %#x)\n", crd(Z_MODE));
++		give_up("a PLL that does not lock");
++		return false;
++	}
++	if (!cwr(Z_USER, crd(Z_USER) | 0xfu, 0xfu) || !cwr(Z_MODE, crd(Z_MODE) | 1u, 1u)) {
++		return false;
++	}
++	printf("SWEET CAM: camcc PLL2 locked at 960 MHz (mode %#x user %#x)\n", crd(Z_MODE), crd(Z_USER));
++	return true;
++}
++
++static void
++pll2_down(void)
++{
++	if (!sc.pll2_on) {
++		return;
++	}
++	wr(cap.camcc, Z_MODE, crd(Z_MODE) & ~1u);
++	wr(cap.camcc, Z_USER, crd(Z_USER) & ~0xfu);
++	wr(cap.camcc, Z_MODE, crd(Z_MODE) & ~6u);
++	wr(cap.camcc, Z_OPMODE, 0);
++	sc.pll2_on = false;
++	printf("SWEET CAM: camcc PLL2 off (mode %#x)\n", crd(Z_MODE));
++}
++
++/* ---- the CSIPHY ---- */
++
++static bool
++refgen_on(void)
++{
++	if (!sc.refgen) {
++		sc.refgen = ml_io_map_unmappable(REFGEN_PA, 0x1000, VM_WIMG_IO);
++	}
++	if (!sc.refgen) {
++		give_up("mappings");
++		return false;
++	}
++	uint32_t v = rd(sc.refgen, REFGEN_PWRDWN_CTRL5);
++	printf("SWEET CAM: refgen PWRDWN_CTRL5 %#x (%s)\n", v, (v & 1u) ? "on: the display's" : "off: switching it on");
++	if (!(v & 1u)) {
++		wr(sc.refgen, REFGEN_PWRDWN_CTRL5, v | 1u);
++		sc.refgen_switched = true;
++		delay(5);
++	}
++	return true;
++}
++
++static void
++refgen_restore(void)
++{
++	if (sc.refgen_switched) {
++		wr(sc.refgen, REFGEN_PWRDWN_CTRL5, rd(sc.refgen, REFGEN_PWRDWN_CTRL5) & ~1u);
++		sc.refgen_switched = false;
++	}
++}
++
++static void
++csiphy_reset(void)
++{
++	vm_offset_t p = sc.csiphy;
++	wr(p, 0x814, 0x00);
++	sleep_ms(5);
++	wr(p, 0x818, 0x00);
++	wr(p, 0x81c, 0x00);
++	wr(p, 0x800, 0x01);
++	sleep_ms(1);
++	wr(p, 0x800, 0x00);
++}
++
++/* lanes: data lanes in use; lane_assign: the physical data lane of each, 4 bits apiece */
++static bool
++csiphy_up(unsigned phy, unsigned lanes, uint32_t lane_assign, unsigned settle)
++{
++	static const uint8_t pos_of_lane[4] = { 0, 2, 3, 4 };           /* lane positions: data 0, clock, data 1, 2, 3 */
++	static const uint16_t pos_base[5] = { 0x000, 0x700, 0x200, 0x400, 0x600 };
++	static const uint8_t irq_mask[11] = { 0xff, 0xff, 0xfb, 0xff, 0x7f, 0xff, 0xff, 0xef, 0xff, 0xff, 0xff };
++	uint32_t pos_mask = 1u << 1, lane_enable = 0x80;                /* the clock lane */
++	for (unsigned l = 0; l < lanes; l++, lane_assign >>= 4) {
++		unsigned n = lane_assign & 0xf;
++		if (n > 3) {
++			give_up("a lane assignment not known here");
++			return false;
++		}
++		pos_mask |= 1u << pos_of_lane[n];
++		lane_enable |= 1u << (2 * n);
++	}
++	if (!sc.csiphy) {
++		sc.csiphy = ml_io_map_unmappable(CSIPHY_PA(phy), 0x1000, VM_WIMG_IO);
++	}
++	if (!sc.csiphy) {
++		give_up("mappings");
++		return false;
++	}
++	vm_offset_t p = sc.csiphy;
++	csiphy_reset();
++	sc.csiphy_on = true;
++	/* csiphy_common_reg_1_2 */
++	wr(p, 0x814, lane_enable);
++	wr(p, 0x818, 0x01);
++	wr(p, 0x81c, 0x5a);
++	wr(p, 0x800, 0x03);
++	sleep_ms(1);
++	wr(p, 0x800, 0x02);
++	wr(p, 0x884, 0x01);
++	wr(p, 0x824, 0x72);
++	/* csiphy_2ph_v1_2_reg, each position in use */
++	for (unsigned pos = 0; pos < 5; pos++) {
++		if (!(pos_mask & (1u << pos))) {
++			continue;
++		}
++		uint32_t b = pos_base[pos];
++		bool clock = pos == 1;
++		wr(p, b + 0x30, 0x00);
++		wr(p, b + 0x2c, 0x01);
++		wr(p, b + 0x34, 0x0f);
++		wr(p, b + 0x10, 0x52);
++		wr(p, b + 0x1c, 0x0a);
++		wr(p, b + 0x14, 0x60);
++		if (clock) {
++			wr(p, b + 0x28, 0x04);
++		}
++		wr(p, b + 0x3c, 0xb8);
++		wr(p, b + 0x00, clock ? 0x80 : 0x91);
++		wr(p, b + 0x04, 0x0c);
++		wr(p, b + 0x20, 0x00);
++		wr(p, b + 0x24, 0x00);
++		wr(p, b + 0x08, settle & 0xff);
++		if (clock) {
++			wr(p, b + 0x0c, 0xff);
++			wr(p, b + 0x38, 0x1f);
++		} else {
++			wr(p, b + 0x38, 0xfe);
++			wr(p, b + 0x5c, 0xc0);
++			wr(p, b + 0x60, 0x0d);
++		}
++	}
++	for (unsigned i = 0; i < 11; i++) {
++		wr(p, 0x82c + 4 * i, irq_mask[i]);
++		wr(p, 0x858 + 4 * i, 0xff);
++	}
++	wr(p, 0x828, 0x1);
++	wr(p, 0x828, 0x0);
++	printf("SWEET CAM: CSIPHY %u: %u D-PHY lanes (positions %#x, enable %#x), settle count %u\n", phy, lanes, pos_mask,
++	    lane_enable, settle);
++	return true;
++}
++
++static void
++show_csiphy(const char *when)
++{
++	if (!sc.csiphy) {
++		return;
++	}
++	printf("SWEET CAM: CSIPHY %s: status %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", when,
++	    rd(sc.csiphy, 0x8b0) & 0xff, rd(sc.csiphy, 0x8b4) & 0xff, rd(sc.csiphy, 0x8b8) & 0xff, rd(sc.csiphy, 0x8bc) & 0xff,
++	    rd(sc.csiphy, 0x8c0) & 0xff, rd(sc.csiphy, 0x8c4) & 0xff, rd(sc.csiphy, 0x8c8) & 0xff, rd(sc.csiphy, 0x8cc) & 0xff,
++	    rd(sc.csiphy, 0x8d0) & 0xff, rd(sc.csiphy, 0x8d4) & 0xff, rd(sc.csiphy, 0x8d8) & 0xff);
++}
++
++static void
++csiphy_down(void)
++{
++	if (!sc.csiphy_on) {
++		return;
++	}
++	for (unsigned i = 0; i < 11; i++) {
++		wr(sc.csiphy, 0x82c + 4 * i, 0);
++	}
++	csiphy_reset();
++	sc.csiphy_on = false;
++}
++
++/* the sensor's exposure (SMIA: 0x0202 coarse integration in lines, 0x0204 analog gain), in its group hold */
++static bool
++sensor_exposure(uint32_t lines, uint32_t gain)
++{
++	if (lines == 0 && gain == 0) {
++		return true;
++	}
++	bool ok = sensor_put(0x0104, 2, 1, 1);
++	if (ok && lines) {
++		ok = sensor_put(0x0202, 2, (uint16_t)lines, 2);
++	}
++	if (ok && gain) {
++		ok = sensor_put(0x0204, 2, (uint16_t)gain, 2);
++	}
++	ok = sensor_put(0x0104, 2, 0, 1) && ok;
++	printf("SWEET CAM: exposure %u lines, analog gain code %#x: %s\n", lines, gain, ok ? "written" : "NOT acknowledged");
++	return ok;
++}
++
++static void
++sensor_down(void)
++{
++	const struct sensor *s = cm.s;
++	bool was = cm.broken;
++	cm.broken = false;
++	bus.held = false;
++	bus_give();
++	run_steps(s->down, false);
++	mclk_set(false);
++	if (cm.ldo_on) {
++		for (unsigned n = 1; n <= 7; n++) {
++			(void)ldo_set(n, 0, false);
++		}
++	}
++	if (cm.reset_taken) {
++		wr(cm.tlmm, GPIO_IO(s->reset), cm.found_reset_io & 2u);
++		wr(cm.tlmm, GPIO_CFG(s->reset), cm.found_reset_cfg);
++		cm.reset_taken = false;
++	}
++	cm.broken = was;
++}
++
++static int
++capture_sensor(unsigned si, unsigned mode_n, uint64_t options)
++{
++	unsigned pattern = options & 0xf, settle = (options >> 8) & 0xff, wanted = (options >> 48) & 0xff;
++	uint32_t lines = (options >> 16) & 0xffff, gain = (options >> 32) & 0xffff;
++	int result = EIO;
++	if (si >= sizeof(sensor_capture) / sizeof(sensor_capture[0])) {
++		return EINVAL;
++	}
++	const struct sensor *s = &sensors[si];
++	unsigned phy = sensor_capture[si].phy;
++	if (!tab_load(sensor_capture[si].file)) {
++		return ENOENT;
++	}
++	if (mode_n >= sc.modes) {
++		mode_n = 0;
++		for (unsigned m = 1; m < sc.modes; m++) {
++			if ((uint64_t)sc.mode[m].width * sc.mode[m].height < (uint64_t)sc.mode[mode_n].width * sc.mode[mode_n].height) {
++				mode_n = m;
++			}
++		}
++	}
++	const struct tab_mode *m = &sc.mode[mode_n];
++	uint32_t width = m->width, height = m->height, bytes = width * height / 4 * 5;
++	settle = settle ? settle : m->settle;
++	wanted = wanted ? wanted : 8;
++	if (sc.slave != s->slave || m->lanes < 1 || m->lanes > 4 || m->cphy || m->dt != RAW10_DT || width % 4 || bytes > CAP_POOL_BYTES) {
++		printf("SWEET CAM: %s mode %u: slave %#x, %u lanes%s, data type %#x, %ux%u: not what this is written for\n", s->name,
++		    mode_n, sc.slave, m->lanes, m->cphy ? " (C-PHY)" : "", m->dt, width, height);
++		tab_free();
++		return EINVAL;
++	}
++	printf("SWEET CAM: %s mode %u: %ux%u RAW10, %u lanes, %u.%03u frames/s, line %u, frame %u lines; settle %u; %s\n", s->name,
++	    mode_n, width, height, m->lanes, m->fps_milli / 1000, m->fps_milli % 1000, m->line_length, m->frame_length, settle,
++	    pattern ? "the sensor's test pattern" : "the picture");
++	cm.s = s;
++	cm.broken = false;
++	cm.reset_taken = false;
++	bool powered = false;
++	if (cap_up(phy)) {
++		bool ok = true;
++		cstep("PLL2 (24 MHz MCLK)");
++		ok = pll2_up();
++		cm.mclk24 = ok;
++		if (ok) {
++			cstep("refgen");
++			ok = refgen_on();
++		}
++		if (ok) {
++			cstep("the sensor's power");
++			powered = true;
++			reset_set(false);
++			sleep_ms(1);
++			ok = slg_up();
++			if (ok) {
++				run_steps(s->up, true);
++				ok = !cm.broken;
++			}
++		}
++		if (ok) {
++			uint16_t id = 0;
++			const char *why = "";
++			bus_take();
++			bus.held = true;
++			ok = sensor_read16(s->slave, 0x0016, &id, &why) && id == s->id;
++			printf("SWEET CAM: %s: chip ID %#06x%s%s\n", s->name, id, ok ? "" : " -- ", ok ? "" : (*why ? why : "not the one"));
++		}
++		char res[8];
++		snprintf(res, sizeof(res), "res%u", mode_n);
++		char tpg[8];
++		snprintf(tpg, sizeof(tpg), "tpg%u", pattern);
++		if (ok) {
++			cstep("the sensor's tables");
++			ok = sensor_table("init") && sensor_table(res) && sensor_exposure(lines, gain) && (!pattern || sensor_table(tpg));
++		}
++		if (ok) {
++			cstep("marking the frame memory");
++			frames_mark(bytes);
++			cstep("CSID reset");
++			ok = csid_reset();
++		}
++		if (ok) {
++			cstep("CSID configuration");
++			ok = csid_config((int)phy, m->lanes, sc.lane_assign & ((1u << (4 * m->lanes)) - 1), 0, width, height);
++		}
++		if (ok) {
++			cstep("IFE configuration");
++			ok = ife_config((uint32_t)cap.frames_pa, 0);        /* each frame into the same place */
++		}
++		if (ok) {
++			cstep("CSIPHY");
++			ok = csiphy_up(phy, m->lanes, sc.lane_assign, settle);
++		}
++		if (ok) {
++			show_paths("configured");
++			cstep("streaming");
++			ok = sensor_table("on");
++		}
++		if (ok) {
++			unsigned done = 0, ms = 0;
++			for (; ms < 4000 && done < wanted; ms++) {
++				delay(1000);
++				if (!(rd(cap.ife, BUS_IRQ_STATUS1) & 1u)) {
++					continue;
++				}
++				done++;
++				if (done == wanted) {
++					/* stop the write master at this frame's end: the register update takes at the next frame's start */
++					wr(cap.ife, WM0_CFG, 0);
++					wr(cap.ife, IFE_REG_UPDATE, 0x2);
++				}
++				wr(cap.ife, BUS_IRQ_CLEAR1, 1);
++				wr(cap.ife, BUS_IRQ_GLOBAL_CLEAR, 1);
++				if (done <= 2 || done == wanted) {
++					printf("SWEET CAM: frame %u written, %u ms after the sensor was started\n", done, ms + 1);
++				}
++			}
++			show_paths(done ? "after the frames" : "no frame");
++			show_csiphy(done ? "after the frames" : "no frame");
++			(void)sensor_table("off");
++			sleep_ms(40);
++			result = done == wanted ? 0 : done ? EAGAIN : ETIMEDOUT;
++		}
++	}
++	cstep("taking it all down");
++	cap_smmu_faults();
++	paths_down();
++	csiphy_down();
++	if (powered) {
++		sensor_down();
++	}
++	cm.mclk24 = false;
++	pll2_down();
++	refgen_restore();
++	cap_down();
++	if (cap.frames_va && result != EINVAL) {
++		frames_look(bytes);
++		printf("SWEET CAM: %s mode %u frame: files read /dev/pmem %llu %u (%ux%u RAW10 packed, %u bytes a line, %s first)\n",
++		    s->name, mode_n, (unsigned long long)cap.frames_pa, bytes, width, height, width / 4 * 5,
++		    m->cfa == 0 ? "BGGR" : m->cfa == 1 ? "GBRG" : m->cfa == 2 ? "GRBG" : m->cfa == 3 ? "RGGB" : "mono");
++	}
++	tab_free();
++	return result;
++}
++
++/*
++ * r17b: "c 20" took the phone down again with not one of its lines in the log, the stages' 300 ms apart
++ * notwithstanding: a poke runs on the USB driver's command thread (sweet_usb.c), the thread that also sends the
++ * log, so nothing a command prints goes out before it returns. The capture runs on a thread of its own now; the
++ * command only starts it.
++ */
++static struct { volatile bool busy; unsigned what; uint64_t a, b, c; } job;
++
++static void
++cam_job(void *arg __unused, wait_result_t w __unused)
++{
++	lck_mtx_lock(&sweet_cam_lock);
++	int err = EINVAL;
++	if (job.what == 20) {
++		err = capture_tpg();
++	} else if (job.what == 21) {
++		err = capture_sensor((unsigned)job.a, (unsigned)job.b, job.c);
++	}
++	printf("SWEET CAM: job %u done: %d\n", job.what, err);
++	job.busy = false;
++	lck_mtx_unlock(&sweet_cam_lock);
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* "c N [A B C]" (sweet_poke.c): 20 the CSID's test pattern, 21 SENSOR MODE OPTIONS a sensor's frames, on a thread */
+ int
+-sweet_cam_cmd(unsigned what)
++sweet_cam_cmd_args(unsigned what, uint64_t a, uint64_t b, uint64_t c)
+ {
+ 	if (cm.mode < 2 || !cm.tlmm) {
+ 		printf("SWEET CAM: not ready (sweetcam=%u)\n", cm.mode);
+ 		return ENXIO;
+ 	}
++	if (what == 20 || what == 21) {
++		if (job.busy) {
++			return EBUSY;
++		}
++		job.busy = true;
++		job.what = what;
++		job.a = a;
++		job.b = b;
++		job.c = c;
++		thread_t t;
++		if (kernel_thread_start(cam_job, NULL, &t) != KERN_SUCCESS) {
++			job.busy = false;
++			return ENOMEM;
++		}
++		thread_deallocate(t);
++		printf("SWEET CAM: job %u started on its own thread\n", what);
++		return 0;
++	}
+ 	lck_mtx_lock(&sweet_cam_lock);
+ 	int err = 0;
+ 	if (what == 9) {
+@@ -1543,8 +2216,6 @@
+ 		look_slg();
+ 	} else if (what == 12) {
+ 		look_camcc();
+-	} else if (what == 20) {
+-		err = capture_tpg();
+ 	} else if (what < sizeof(sensors) / sizeof(sensors[0])) {
+ 		err = probe(what);
+ 	} else {
+@@ -1554,6 +2225,12 @@
+ 	return err;
+ }
+ 
++int
++sweet_cam_cmd(unsigned what)
++{
++	return sweet_cam_cmd_args(what, 0, 0, 0);
++}
++
+ static void
+ cam_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+diff --git a/bsd/dev/sweet_poke.c b/bsd/dev/sweet_poke.c
+--- a/bsd/dev/sweet_poke.c
++++ b/bsd/dev/sweet_poke.c
+@@ -167,9 +167,12 @@
+ 		break;
+ 	}
+ 	case 'c': {
+-		/* redfin (0919): c N powers camera sensor N up, reads its chip ID, powers it down (9: look) */
+-		extern int sweet_cam_cmd(unsigned what);
+-		printf("POKE: c %llu -> %d\n", a, sweet_cam_cmd((unsigned)a));
++		/*
++		 * redfin (0919): c N powers camera sensor N up, reads its chip ID, powers it down (9: look);
++		 * 0922: c 20 the CSID's test pattern, c 21 SENSOR MODE OPTIONS a sensor's frames (sweet_cam.c)
++		 */
++		extern int sweet_cam_cmd_args(unsigned what, uint64_t a, uint64_t b, uint64_t c);
++		printf("POKE: c %llu -> %d\n", a, sweet_cam_cmd_args((unsigned)a, b, c, d));
+ 		break;
+ 	}
+ 	case 'r': {
+-- 
+2.43.0

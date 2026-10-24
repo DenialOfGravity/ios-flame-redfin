@@ -172,3 +172,7 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
 - 0921 camera capture, step 1 ("poke c 20", sweetcam=2): camcc PLL0 + Titan RCGs/branches, GCC camera AXI, mx.lvl
   vote, apps-SMMU bypass context bank for the IFE streams, CSID-lite test pattern -> IFE-lite RDI0 -> write master 0
   into a GPU-pool buffer (1600x1200 RAW10). HackiOS redwood_camera.c's sequence with lito's clocks; all undone after.
+- 0922 camera capture, step 2 ("poke c 21 SENSOR MODE OPTIONS"): camcc PLL2 for the 24 MHz MCLK, the sensor's tables
+  from /private/var/local/fw/camera-<sensor>.tab (tools/redfin-camtab.py; vendor data, phone only), CSIPHY v1.2.2
+  D-PHY, CSID-lite RX -> RDI0 -> IFE-lite WM0. c 20/21 run on their own thread (pokes run on the thread that sends
+  the log: r17a/r17b's c 20 went down with nothing logged).
