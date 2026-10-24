@@ -550,7 +550,8 @@ static uint32_t wmi_rf_chains;
 /*
  * Test hook: /var/local/wlan-steps.conf, a hex mask of ath10k station steps we used to skip (default all on):
  * bit 0 keepalive off, bit 1 sta ps params, bit 2 rts threshold, bit 3 vdev start in HT20 mode;
- * bits 4-6 (ours, before vdev start): sta ps mode off, pdev tx power limits, vdev wmm.
+ * bits 4-6 (ours, before vdev start): sta ps mode off, pdev tx power limits, vdev wmm;
+ * probes: bit 7 vdev start on 2437 MHz instead of a scan, bit 8 no HTT setup.
  */
 static uint32_t w_steps = 0x7f;
 static int w_steps_read;
@@ -569,6 +570,7 @@ static uint32_t steps(void)
 	return w_steps;
 }
 static int w_pdev_param(uint32_t param, uint32_t value);
+static int w_vdev_start(uint32_t freq, uint32_t bcn, uint32_t dtim);
 
 /* ath10k WMI_SERVICE_IS_ENABLED: 4 service bits per 32-bit word (sizeof(u32)) */
 static int wmi_svc(uint32_t bit)
@@ -914,6 +916,12 @@ static void scan_start(void)
 		put32(q, 0xffffffffu);
 		LOG("vdev: rts threshold %s", wmi_send(0x5008, m, sizeof(m)) ? "FAILED" : "ok");
 	}
+	if (steps() & 0x80) {			/* probe: vdev start on 2437 MHz, no scan at all */
+		fflush(stdout);
+		LOG("probe: vdev start 2437 MHz without a scan: %s", w_vdev_start(2437, 100, 1) ? "FAILED" : "sent");
+		fflush(stdout);
+		return;
+	}
 	scanning = !scan_send_start();
 	LOG("scan: channel list (%u) %s, vdev %s, passive scan %s", NFREQ, a ? "FAILED" : "ok", b ? "FAILED" : "ok",
 	    scanning ? "requested" : "FAILED");
@@ -1185,6 +1193,12 @@ static void htt_start(void)
 
 	if (htt_state != 0)
 		return;
+	if (steps() & 0x100) {			/* probe: no HTT setup at all */
+		LOG("probe: HTT setup skipped");
+		htt_state = 2;
+		scan_start();
+		return;
+	}
 	if (!(pa = pool_alloc(ring + bank + (uint64_t)HTT_RING_SIZE * HTT_BUF_SIZE))) {
 		LOG("htt: no memory, scanning without it");
 		scan_start();
@@ -1843,6 +1857,7 @@ static void sta_wmi_event(uint32_t id, const uint8_t *t, uint32_t len)
 	if (id == EV_VDEV_START_RESP && l >= 16) {	/* {vdev, req, type, status} */
 		s_start_status = (int32_t)v[3];
 		s_start_resp = 1;
+		LOG("vdev start resp: status %d", s_start_status);
 	} else if (id == EV_PEER_STA_KICKOUT && s_state == S_UP) {
 		w_link_lost("peer kickout");
 	} else if (id == EV_ROAM && l >= 12) {
