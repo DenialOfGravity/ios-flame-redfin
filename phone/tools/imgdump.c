@@ -6,6 +6,7 @@
  *   imgdump text IMAGE OUT       the __TEXT,__text section of the loaded image whose path ends in IMAGE into OUT,
  *                                and its unslid address (llvm-objdump -D -b binary -m aarch64 --adjust-vma=ADDR)
  *   imgdump read ADDR LEN OUT    LEN bytes at the unslid shared-cache address ADDR into OUT
+ *   imgdump grep TEXT [LIB...]   where TEXT is in the __TEXT sections of the loaded images (after loading LIBs too)
  *
  * Addresses are unslid (the shared cache's own, as pstack/a2s print them once the slide is taken off) so that
  * they are the same in every process and boot.
@@ -111,6 +112,48 @@ main(int argc, char **argv)
 
 		return write_out(argv[4], (const void *)a, n);
 	}
-	fprintf(stderr, "usage: imgdump sym NAME... | text IMAGE OUT | read ADDR LEN OUT\n");
+	if (argc >= 3 && strcmp(argv[1], "grep") == 0) {
+		size_t m = strlen(argv[2]);
+
+		for (int i = 3; i < argc; i++) {
+			if (dlopen(argv[i], RTLD_LAZY) == NULL) {
+				printf("%s: %s\n", argv[i], dlerror());
+			}
+		}
+		for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+			const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
+			const struct load_command *lc = (const struct load_command *)(h + 1);
+
+			for (uint32_t c = 0; c < h->ncmds; c++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize)) {
+				if (lc->cmd != LC_SEGMENT_64) {
+					continue;
+				}
+				const struct segment_command_64 *seg = (const void *)lc;
+				const struct section_64 *sect = (const void *)(seg + 1);
+
+				for (uint32_t k = 0; k < seg->nsects; k++) {
+					if (strcmp(sect[k].segname, "__TEXT") != 0 || strcmp(sect[k].sectname, "__text") == 0) {
+						continue;
+					}
+					const char *p = (const char *)(sect[k].addr + _dyld_get_image_vmaddr_slide(i)), *end = p + sect[k].size;
+
+					for (const char *q = p; q && q + m <= end; q++) {
+						q = memmem(q, (size_t)(end - q), argv[2], m);
+						if (q == NULL) {
+							break;
+						}
+						const char *b = q;
+						while (b > p && b[-1] != 0) {
+							b--;
+						}
+						printf("%s %s: %#lx \"%.120s\"\n", _dyld_get_image_name(i), sect[k].sectname, (uintptr_t)b - s, b);
+						q = b + strlen(b);
+					}
+				}
+			}
+		}
+		return 0;
+	}
+	fprintf(stderr, "usage: imgdump sym NAME... | text IMAGE OUT | read ADDR LEN OUT | grep TEXT [LIB...]\n");
 	return 2;
 }
