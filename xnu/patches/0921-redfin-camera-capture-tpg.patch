@@ -8,8 +8,9 @@ CSID-lite and IFE-lite register files are the same in both kernels (Titan
 17x: cam_ife_csid_lite17x.h, cam_vfe_lite17x.h + vfe bus ver2). lito's:
 camcc PLL0 (Lucid, 1200 MHz, cam_cc_pll0_config), RCGs at the DT's lowest
 levels (slow_ahb 80, camnoc_axi 150, cphy_rx/csiNphytimer/ife_lite_csid 300,
-ife_lite 400 MHz) and their branches, GCC camera hf/sf AXI, mx.lvl at
-SVS_L1 (cx.lvl is wland's, at its top); frame memory from the GPU pool
+ife_lite 400 MHz) and their branches, GCC camera hf/sf AXI, no RPMh vote
+(cx.lvl is wland's, at its top; r17a's mx.lvl vote took the phone down);
+each stage logged 300 ms before it runs; frame memory from the GPU pool
 (below 4 GB: the write master's addresses are 32-bit); the IFE streams
 (0x800/0x5e0) through an apps-SMMU context bank with translation off, as
 phone/wifi/radio.c does for the WLAN. One 1600x1200 RAW10 colour-bar frame
@@ -29,7 +30,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  extern kern_return_t thread_terminate(thread_t);
-@@ -849,6 +850,708 @@
+@@ -849,6 +850,682 @@
  	return result;
  }
  
@@ -44,9 +45,10 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 + *            device tree's lowest levels: slow_ahb 80 (PLL0 odd /5), camnoc_axi 150 (even /4), cphy_rx 300 (even
 + *            /2), csiNphytimer 300, ife_lite_csid 300, ife_lite 400 (odd /1); the branches cpas_ahb, camnoc_axi,
 + *            csiphyN, csiNphytimer, ife_lite_csid, ife_lite_cphy_rx, ife_lite; GCC camera_hf_axi and _sf_axi
-+ *   rails    camcc's vdd_mx at SVS_L1 for PLL0 (mx.lvl through bsd/dev/sweet_rpmh.c); vdd_cx is not asked: wland
-+ *            holds cx.lvl at its top level on the same RSC (phone/wifi/wland.c boot_modem()), and a vote of ours
-+ *            would replace it
++ *   rails    none asked for: wland holds cx.lvl at its top level on the apps RSC (phone/wifi/wland.c
++ *            boot_modem()), and MX stays at or above CX. (r17a voted mx.lvl to SVS_L1 and back to 0, which
++ *            replaces the apps RSC's vote the boot loader left, and the phone went down at the first "c 20":
++ *            the vote is gone, and the stages say what comes next, 300 ms apart, so a hang shows where.)
 + *   memory   the GPU's pool (sweet_gpu_pool_alloc(): RAM below 4 GB that XNU never maps), because the write
 + *            master takes 32-bit addresses
 + *   SMMU     the apps SMMU (0x15000000) sends the IFEs' streams (live DT msm_cam_smmu_ife: 0x820..0xd40, mask
@@ -57,15 +59,12 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 + */
 +extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 +extern int sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa);
-+extern int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
 +
 +#define CAMCC_PA                0x0ad00000u
 +#define CSID_LITE_PA            0x0acc8000u
 +#define IFE_LITE_PA             0x0acc4000u
 +#define CSIPHY_PA(n)            (0x0ace0000u + 0x2000u * (n))
 +#define SMMU_PA                 0x15000000u
-+#define CMDDB_PA                0x80860000u
-+#define CMDDB_SIZE              0x20000u
 +#define GCC_CAMERA_HF_AXI       0x028u  /* GCC 0xb028 (in the GCC page mapped above) */
 +#define GCC_CAMERA_SF_AXI       0x02cu
 +
@@ -77,7 +76,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 +	vm_offset_t camcc, csid, ife, smmu, smmu_gr1, smmu_cb, frames_va;
 +	uint64_t frames_pa;
 +	uint32_t smr_n, cb_n, smr_old, s2cr_old, cbar_old;
-+	bool pll0_on, mx_voted, smmu_set, csid_on, ife_on, tpg_on;
++	bool pll0_on, smmu_set, csid_on, ife_on, tpg_on;
 +} cap = { .smr_n = ~0u, .cb_n = ~0u };
 +
 +static uint32_t
@@ -96,65 +95,6 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 +		return false;
 +	}
 +	return true;
-+}
-+
-+/* ---- the MX rail: the first level of mx.lvl at or above SVS_L1 (192), from cmd-db's list (sweet_adsp.c's way) ---- */
-+
-+struct cdb_slave { uint16_t id, header_offset, data_offset, count, version, reserved[3]; };
-+struct cdb_header { uint32_t version; uint8_t magic[4]; struct cdb_slave slave[8]; uint32_t checksum, reserved; uint8_t data[]; };
-+struct cdb_entry { char id[8]; uint32_t priority[2]; uint32_t address; uint16_t length, offset; };
-+
-+static int
-+mx_position(uint32_t level)
-+{
-+	static const struct cdb_header *db;
-+	if (db == NULL) {
-+		db = (const struct cdb_header *)ml_io_map_unmappable(CMDDB_PA, CMDDB_SIZE, VM_WIMG_WCOMB);
-+	}
-+	if (!db || !(db->magic[0] == 0xdb && db->magic[1] == 0x30 && db->magic[2] == 0x03 && db->magic[3] == 0x0c)) {
-+		return -1;
-+	}
-+	for (unsigned s = 0; s < 8; s++) {
-+		const struct cdb_slave *sl = &db->slave[s];
-+		const struct cdb_entry *e = (const struct cdb_entry *)(db->data + sl->header_offset);
-+		if (sl->id == 0 || sl->count > 512) {
-+			continue;
-+		}
-+		for (unsigned i = 0; i < sl->count; i++) {
-+			if (memcmp(e[i].id, "mx.lvl\0\0", 8) != 0) {
-+				continue;
-+			}
-+			const uint8_t *d = db->data + sl->data_offset + e[i].offset;
-+			for (unsigned l = 0; l < e[i].length / 2u && l < 16; l++) {
-+				if ((uint32_t)(d[2 * l] | d[2 * l + 1] << 8) >= level) {
-+					return (int)l;
-+				}
-+			}
-+			return -1;
-+		}
-+	}
-+	return -1;
-+}
-+
-+static bool
-+mx_vote(bool on)
-+{
-+	int pos = on ? mx_position(192) : 0;
-+	if (pos < 0) {
-+		printf("SWEET CAM: no mx.lvl position for SVS_L1 in cmd-db\n");
-+		return false;
-+	}
-+	uint32_t off = 0, val = (uint32_t)pos;
-+	int err = EBUSY;
-+	for (unsigned k = 0; k < 50 && err == EBUSY; k++) {
-+		err = sweet_rpmh_write("mx.lvl", 1, &off, &val);
-+		if (err == EBUSY) {
-+			sleep_ms(2);
-+		}
-+	}
-+	printf("SWEET CAM: RPMh mx.lvl -> position %u%s: %d\n", val, on ? "" : " (given back)", err);
-+	cap.mx_voted = on && err == 0;
-+	return err == 0;
 +}
 +
 +/* ---- camcc's PLL0 (Lucid): clk_lucid_pll_configure() + alpha_pll_lucid_enable() with cam_cc_pll0_config ---- */
@@ -635,10 +575,22 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 +	}
 +}
 +
++/*
++ * r17a: "c 20" took the phone down with nothing in the log (the UDP log loses what a hang leaves
++ * unsent). Each stage now says what comes next and gives the log 300 ms to carry it out.
++ */
++static void
++cstep(const char *what)
++{
++	printf("SWEET CAM: next: %s\n", what);
++	sleep_ms(300);
++}
++
 +/* everything up to the clocks; false on a fault (cap_down() takes back what was done) */
 +static bool
 +cap_up(unsigned phy)
 +{
++	cstep("mappings");
 +	if (!cap.camcc) {
 +		cap.camcc = ml_io_map_unmappable(CAMCC_PA, 0x10000, VM_WIMG_IO);
 +		cap.csid = ml_io_map_unmappable(CSID_LITE_PA, 0x1000, VM_WIMG_IO);
@@ -649,6 +601,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 +		give_up("mappings");
 +		return false;
 +	}
++	cstep("frame memory");
 +	if (!cap.frames_pa) {
 +		if (sweet_gpu_pool_alloc(CAP_POOL_BYTES, &cap.frames_pa) != 0 || cap.frames_pa + CAP_POOL_BYTES > 0x100000000ull) {
 +			cap.frames_pa = 0;
@@ -659,7 +612,20 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 +		printf("SWEET CAM: %u MB for frames at %#llx (GPU pool)\n", CAP_POOL_BYTES >> 20, (unsigned long long)cap.frames_pa);
 +	}
 +	cm.broken = false;
-+	return titan_up() && mx_vote(true) && pll0_up() && cap_clocks_up(phy) && cap_smmu_up();
++	cstep("titan");
++	if (!titan_up()) {
++		return false;
++	}
++	cstep("PLL0");
++	if (!pll0_up()) {
++		return false;
++	}
++	cstep("clocks");
++	if (!cap_clocks_up(phy)) {
++		return false;
++	}
++	cstep("SMMU");
++	return cap_smmu_up();
 +}
 +
 +static void
@@ -670,9 +636,6 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 +	cap_smmu_down();
 +	cap_clocks_down();
 +	pll0_down();
-+	if (cap.mx_voted) {
-+		(void)mx_vote(false);
-+	}
 +	titan_down();
 +	cm.broken = was;
 +}
@@ -708,10 +671,21 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 +	int result = EIO;
 +	cm.s = &sensors[2];     /* (any: titan_up() wants none of it) */
 +	if (cap_up(2)) {
++		cstep("marking the frame memory");
 +		frames_mark(bytes);
-+		if (csid_reset() && csid_config(-1, 4, 0x3210, TPG_VC, width, height) &&
-+		    ife_config((uint32_t)cap.frames_pa, bytes)) {
++		cstep("CSID reset");
++		bool ok = csid_reset();
++		if (ok) {
++			cstep("CSID configuration");
++			ok = csid_config(-1, 4, 0x3210, TPG_VC, width, height);
++		}
++		if (ok) {
++			cstep("IFE configuration");
++			ok = ife_config((uint32_t)cap.frames_pa, bytes);
++		}
++		if (ok) {
 +			show_paths("configured");
++			cstep("test pattern on");
 +			if (bput(cap.csid, "CSID", CSID_TPG_CTRL, 4u << 20 | 0x80u << 8 | 3u << 4 | 7u, true)) {
 +				cap.tpg_on = true;
 +				for (unsigned ms = 0; ms < 2000; ms += 50) {
@@ -726,6 +700,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 +			}
 +		}
 +	}
++	cstep("taking it all down");
 +	cap_smmu_faults();
 +	cap_down();
 +	if (cap.frames_va) {
@@ -738,7 +713,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  int
  sweet_cam_cmd(unsigned what)
  {
-@@ -866,6 +1569,8 @@
+@@ -866,6 +1543,8 @@
  		look_slg();
  	} else if (what == 12) {
  		look_camcc();
