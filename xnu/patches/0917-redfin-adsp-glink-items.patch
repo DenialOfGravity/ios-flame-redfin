@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Rory Axton <roryaxton@gmail.com>
-Date: Sat, 24 Oct 2026 16:46:28 +0200
+Date: Sat, 24 Oct 2026 16:49:35 +0200
 Subject: [PATCH] 0917 redfin: make GLINK's descriptor and our queue before the DSP starts
 
 r14b: the DSP came up (slave-kernel 0x2 after 37 ms, its own power
@@ -11,17 +11,20 @@ Linux's qcom_glink_smem_register(), our side allocates 478 (32 bytes) and
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01GizUhEzkc6MoTcLnCZCfFa
 ---
-  bsd/dev/sweet_adsp.c | 50 ++++++++++++++++++++++++++++++++++++++------
+  bsd/dev/sweet_adsp.c | 53 +++++++++++++++++++++++++++++++++++++++-----
 
 diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
-index a2be90a..0327f72 100644
+index a2be90a..c219cd8 100644
 --- a/bsd/dev/sweet_adsp.c
 +++ b/bsd/dev/sweet_adsp.c
-@@ -1509,24 +1509,25 @@ step_image(void)
+@@ -1509,24 +1509,28 @@ step_image(void)
  
  /* ---- step 6: our SMP2P item ------------------------------------------------------------------------ */
  
 +static bool glink_items_make(void);
++#define ITEM_GLINK_DESCRIPTOR   478
++#define ITEM_GLINK_OUR_QUEUE    479
++#define ITEM_GLINK_THEIR_QUEUE  480
  static struct block smem_lock = { "shared memory's lock", 0x01f43000, 0x1000 };
  #define LOCK_OWNER              0x000
  #define LOCK_US                 1u
@@ -46,7 +49,7 @@ index a2be90a..0327f72 100644
  	snprintf(last_write, sizeof(last_write), "step %u took the shared memory's lock", step);
  	for (uint32_t ms = 0; ms <= 1000; ms++) {
  		wr(smem_lock.base + LOCK_OWNER, LOCK_US);
-@@ -1547,7 +1548,7 @@ our_item_make(uint32_t partition)
+@@ -1547,7 +1551,7 @@ our_item_make(uint32_t partition)
  		goto out;
  	}
  	for (at = sizeof(header); at < header.free_uncached;) {
@@ -55,7 +58,7 @@ index a2be90a..0327f72 100644
  		    entry.size > header.size) {
  			break;
  		}
-@@ -1562,9 +1563,9 @@ our_item_make(uint32_t partition)
+@@ -1562,9 +1566,9 @@ our_item_make(uint32_t partition)
  		printf("adsp: %u: no room: %u bytes wanted, %u free: nothing is written\n", step, need_bytes, header.free_cached - at);
  		goto out;
  	}
@@ -67,7 +70,7 @@ index a2be90a..0327f72 100644
  	smem_poke(partition + at + 12, 0);
  	settle();
  	smem_poke(partition + __offsetof(struct smem_partition, free_uncached), at + need_bytes);
-@@ -1577,6 +1578,37 @@ out:
+@@ -1577,6 +1581,37 @@ out:
  	return made;
  }
  
@@ -105,7 +108,7 @@ index a2be90a..0327f72 100644
  static void glink_reset(void);
  
  static bool
-@@ -1632,6 +1664,9 @@ step_our_item(void)
+@@ -1632,6 +1667,9 @@ step_our_item(void)
  		return false;
  	}
  	show_words("our item reads back", &ours);
@@ -115,7 +118,7 @@ index a2be90a..0327f72 100644
  	glink_reset();
  	return true;
  }
-@@ -2955,6 +2990,9 @@ step_queues(void)
+@@ -2955,6 +2993,9 @@ step_queues(void)
  	uint32_t head, tail;
  
  	announce("find GLINK's descriptor and the two queues, and read what the audio DSP has put into its own");
