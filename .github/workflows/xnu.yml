@@ -187,7 +187,7 @@ jobs:
           P=$RUNNER_TEMP/publish
           rm -rf "$P" && mkdir -p "$P" && cd "$P"
           git init -q -b builds-xnu
-          for f in "$GITHUB_WORKSPACE"/out/kernel.*; do gzip -9 -c "$f" > "$(basename "$f").gz"; done
+          for f in "$GITHUB_WORKSPACE"/out/kernel.*; do [ -f "$f" ] && gzip -9 -c "$f" > "$(basename "$f").gz"; done  # not the .link dirs
           cp "$GITHUB_WORKSPACE/out/SHA256SUMS" .
           printf 'source %s\nref %s\nrun %s\n' "$GITHUB_SHA" "$GITHUB_REF_NAME" "$GITHUB_RUN_ID" > BUILD.txt
           git add -A
