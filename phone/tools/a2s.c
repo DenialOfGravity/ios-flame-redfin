@@ -22,6 +22,13 @@ static const char *const libs[] = {
 	"/System/Library/PrivateFrameworks/GPUSupport.framework/GPUSupport",
 	"/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",
 	"/usr/lib/libobjc.A.dylib",
+	/* (the capture stack's, for camera work) */
+	"/System/Library/Frameworks/AVFoundation.framework/AVFoundation",
+	"/System/Library/Frameworks/CoreMedia.framework/CoreMedia",
+	"/System/Library/Frameworks/MediaToolbox.framework/MediaToolbox",
+	"/System/Library/PrivateFrameworks/CMCapture.framework/CMCapture",
+	"/System/Library/PrivateFrameworks/Celestial.framework/Celestial",
+	"/System/Library/PrivateFrameworks/TCC.framework/TCC",
 };
 
 static void one(const char *s)
