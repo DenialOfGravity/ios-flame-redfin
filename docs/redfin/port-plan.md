@@ -288,6 +288,73 @@ ADSP's sensor core (SSC, QMI), like audio. APPS-reachable extras: the PM8150L fl
 - Tooling: tools-claude/phone-agent.sh (WSL helper: boots, file server, SSH to the phone, logs); dropbear on
   the phone (key ~/.ssh/redfin-claude); builds published to branches builds-xnu / builds-userland.
 
+## Flash, cameras, sensors (2026-10-24 evening, r15a-r16)
+
+**Flash LED (0918, `sweettorch=2`): works.** PM8150L qpnp-flash-led-v2 (SPMI SID 5, 0xd300, APID 286, owned by
+the APPS EE), channels 0+1 together (the rear LED, `led:switch_2`). At start the driver writes what
+`qpnp_flash_led_init_settings()` writes for this DT (headroom auto mode off: it was 0x07; ISC/warm-up delays, ramp
+rates, VPH droop), then torch mode with software strobe and no safety timer. Poke `t MA [MS]`
+(`tools/flame-cmd.py 't 100 10000'`), sysctl `kern.sweet_torch` 0..1000. r16c: 100 mA per channel held for the
+full 10 s, off on its timer. Limits: `sweettorch_ma` (100, cap 200; Android's torch is 300), `sweettorch_secs`
+(120, cap 600), PM8150L temperature alarm (SID 4 0x2400) any stage = off.
+- Learned the hard way: LED_STATUS2 bits 2:0 (OTST) are derating bands, not faults (r15a), and single-check
+  LED-fault / open-short flags come and go while lit (Linux only logs them); only flags that persist for three
+  checks (300 ms) count. Switching off is always allowed, even after the driver stopped (r15a's off writes were
+  refused; the LED stayed lit at 50 mA until raw SPMI writes switched it off).
+
+**Camera icon and flashlight button: not yet.** HackiOS shows Camera.app with `/arm-io/isp` (camera-rear/-front)
+and Control Center's flashlight with `/product/camera` `flash` (`tools/mkadt.py --camera --flash` now writes both).
+On this iOS 16.7.16 root either one, with the MobileGestalt cache rebuilt, leaves SpringBoard at the boot logo
+(r15a both, r15b flash only, 5+ min; backboardd never presents). r15c (plain ADT, original cache) boots. iOS then
+waits on mediaserverd's capture device, which does not exist: the flags have to come together with the
+capture-device shim (HackiOS `camera_device.c` / `inject_media.c`; RedwoodAudio.driver already runs code in
+mediaserverd and is the natural place). MobileGestalt caches: the r15a/r15b caches are kept next to the original as
+`MobileGestalt.plist.r15a-camera` / `.r15b-flash` in
+/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches.
+
+**Camera sensors (0919, `sweetcam=2`, needs `sweethaptic=1`): all three answer (r16g).** `tools/flame-cmd.py 'c N'`
+powers sensor N up in its module file's order, reads the chip ID, powers it down: IMX355 0x0355, IMX481 0x0481,
+IMX363 0x0363; every SLG51000 LDO reports VOUT_OK within 1 ms. From the live DT and Android's module files
+(phone agent `twrp-pull-camera` -> recon/camera, decoded with `tools/redfin-camsensor.py`):
+
+| # | Sensor | Bus (pins) | Slave (8-bit) | ID @0x0016 | Reset | MCLK | Power-up (module file) |
+|---|---|---|---|---|---|---|---|
+| 0 | rear IMX363 | CCI0 m0 (17/18) | 0x20 | 0x0363 | GPIO23 | MCLK0 GPIO13 | VIO LDO7 1.8, VANA LDO3 2.85, VAF (PM8150L GPIO8), VDIG LDO1 2.85, LDO4 1.8, LDO6 1.1, reset, MCLK 24 MHz +10 ms |
+| 1 | rear ultra-wide IMX481 | CCI0 m1 (19/20) | 0x34 | 0x0481 | GPIO25 | MCLK1 GPIO14 | VIO, VANA LDO2 2.85, VDIG LDO5 1.1, MCLK, reset |
+| 2 | front IMX355 | CCI1 m0 (27/28) | 0x34 | 0x0355 | GPIO21 | MCLK2 GPIO15 | VIO, PM8150L GPIO2, MCLK, reset +12 ms |
+
+Rails: Dialog SLG51000 at I2C 0x75 on SE9 (the DRV2624's bus; cs PM8150L GPIO4, enables GPIO9/10 low, Google's
+`slg51000_config_tuning()`); LDO n enable = MATRIX_CONF_A (0x110d) bit n-1, VSEL = (uV - base)/step within
+MINV..MAXV, STATUS +0xc1 bit1 VOUT_OK / bit0 ILIM. MCLK from camcc RCG 0x5004/0x5024/0x5044 (branches
+0x501c/0x503c/0x505c), XO 19.2 MHz for the probe (24 MHz needs camcc PLL2). camcc needs GCC camera AHB (0xb008,
+enabled + HW-gated) and XO (0xb03c, found **off**; Linux keeps both on). Titan top GDSC camcc 0xc1c4, its clock 0xc1a0.
+Chip ID read by bit-banged I2C on the CCI pins (HackiOS's way; no CCI block needed).
+- **0920: XNU's I/O map was full.** r16a-r16e reset ~8 s after the camera driver's thread mapped ~600 KB with
+  `ml_io_map()` (even with no register access at all, r16e); r16c without it ran on. The I/O submap is 8 MiB,
+  KMA_NOFAIL, and SWEET drivers never unmap. 0920 makes it 32 MiB; 0919 maps only the pages it uses.
+
+**Sensors (accel/gyro, light/proximity): behind the audio DSP.** /vendor/etc/sensors/config (recon/fw-adsp):
+LSM6DSR accel+gyro on SSC I3C bus 1 (I2C 0x6a / I3C 0x0a, IRQ 113), TCS3701 light+proximity on SSC I2C 5 (0x39,
+IRQ 111), LIS2MDL magnetometer SSC I2C 6 (0x1e), BMP380 pressure SSC I2C 5 (0x76). The SSC QUPs sit in LPASS:
+an APPS access to an LPASS register is an external abort (HackiOS redwood_adsp.c), so there is no direct route.
+Order of work: (1) keep the DSP's sensor PD alive: a FastRPC host file service (hexagonrpcd's apps_std/adsp_listener:
+sensors/config, the registry, sns_reg.conf) over the `fastrpcglink-apps-dsp` channel, with buffers in the DSP's
+SMMU context; (2) a QMI client for SNS (service 400) over our QRTR, SEE protobuf (postmarketOS libssc is the
+reference); (3) iOS side: HID event services for accelerometer/gyro/ALS/proximity that backboardd/CoreMotion
+accept (iPhone X normally gets them from the AOP/SPU). (1) is also what audio needs (the PD crash takes the whole
+DSP down), so it comes first.
+
+**Next for the cameras** (HackiOS redwood_camera.c cam=3/4/5 and its userland are the template):
+1. MCLK at 24 MHz from camcc PLL2 (the module files' rate; the register tables' PLL settings assume it).
+2. The sensor's init + mode tables (in the module files: regSetting arrays, see HackiOS camsensor.py) over the
+   bit-banged bus, then CSIPHY (v1.2.2 at 0xace0000 + 0x2000 n: rear 0, ultra-wide 1, front 2) -> CSID-lite 0
+   (0xacc8000, csid-lite175) RDI 0 -> IFE-lite 0 (0xacc4000, vfe-lite175) write master into memory through the
+   camera SMMU context (msm_cam_smmu_ife). First with the CSID's test pattern, then the sensor's frames.
+3. `/dev/redwood-camera` with RAW10 frames, HackiOS's camera_device.c + camera_isp.c (the FigCaptureDevice that
+   BWFigCaptureDeviceVendor gets in mediaserverd) loaded into mediaserverd (RedwoodAudio.driver already runs
+   there), then the ADT flags (`mkadt.py --camera --flash`) with a fresh MobileGestalt cache: Camera.app on the
+   home screen, and the flashlight through the camera stream's TorchLevel (-> `kern.sweet_torch`).
+
 ## Done so far
 
 **Shim** (boots in place of iBoot)

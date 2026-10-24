@@ -3,6 +3,8 @@ From: Rory Axton <roryaxton@gmail.com>
 Date: Sat, 24 Oct 2026 19:00:00 +0200
 Subject: [PATCH] 0919 redfin: camera sensors powered up, chip IDs read (sweetcam)
 
+r16g: all three answer (IMX355 0x0355, IMX481 0x0481, IMX363 0x0363).
+
 New bsd/dev/sweet_cam.c, after HackiOS redwood_camera.c (cam=1/2): the rear
 IMX363, the rear ultra-wide IMX481 and the front IMX355 powered up in their
 Android module files' order (SLG51000 LDOs over SE9 I2C at 0x75, PM8150L GPIO
@@ -136,10 +138,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 new file mode 100644
-index 0000000..72bc9bf
+index 0000000..b34fa8b
 --- /dev/null
 +++ b/bsd/dev/sweet_cam.c
-@@ -0,0 +1,923 @@
+@@ -0,0 +1,925 @@
 +/*
 + * redfin (Pixel 5) cameras, step 1: one sensor powered up as Android powers it, its chip ID read,
 + * powered down again. After HackiOS's redwood_camera.c (cam=1 / cam=2), with this phone's numbers.
@@ -175,6 +177,9 @@ index 0000000..72bc9bf
 + *
 + * The sensor's I2C is done by hand on its CCI pins (GPIO function 0, pull-up, open drain by the
 + * output enable), at most 100 kHz, the pins given back as they were found: no CCI block, no CCI clock.
++ *
++ * r16g (2026-10-24): all three answer -- IMX355 0x0355, IMX481 0x0481, IMX363 0x0363 -- each powered up in its
++ * module file's order (LDOs ready within 1 ms) and down again.
 + *
 + * Boot-arg sweetcam=1: a look only (clocks, GDSC, pins, the PMIC GPIOs, the SLG51000 if it answers).
 + * sweetcam=2: and the probe on request: poke/command line "c N" (N = 0, 1, 2; 9 = the look again),
@@ -600,7 +605,7 @@ index 0000000..72bc9bf
 +/*
 + * GCC's camera clocks, which camcc needs to be read at all: AHB (enabled, hardware gated, so CLK_OFF while
 + * idle: r16a 0x80000003) and XO (r16a: 0x80000000, off; gcc-lito.c marks both critical, so Linux keeps them on).
-+ * r16a/r16b reset a few seconds after the first camcc reads with XO off; r16c (no camcc reads) did not.
++ * (The resets of r16a-r16e were the full I/O map, not these: 0920.)
 + */
 +static bool
 +camera_xo_on(void)
@@ -1030,8 +1035,7 @@ index 0000000..72bc9bf
 +		goto out;
 +	}
 +	/*
-+	 * r16a, r16b, r16d reset about 8 s after this boot-time look (r16d: GCC and pin reads only); r16c, the
-+	 * same kernel without sweetcam, ran on. So sweetcam=2 now does nothing at boot: "c 9" is the look.
++	 * sweetcam=2 does nothing at boot ("c 9" is the look); the look at boot is sweetcam=1 or 3.
 +	 */
 +	if (cm.mode == 1 || cm.mode >= 3) {
 +		lck_mtx_lock(&sweet_cam_lock);
