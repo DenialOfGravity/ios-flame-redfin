@@ -1,0 +1,743 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sat, 24 Oct 2026 20:45:00 +0200
+Subject: [PATCH] 0921 redfin: camera capture path, step 1: the CSID test pattern into memory
+
+"c 20" (sweetcam=2): HackiOS redwood_camera.c cam=3 with lito's numbers. The
+CSID-lite and IFE-lite register files are the same in both kernels (Titan
+17x: cam_ife_csid_lite17x.h, cam_vfe_lite17x.h + vfe bus ver2). lito's:
+camcc PLL0 (Lucid, 1200 MHz, cam_cc_pll0_config), RCGs at the DT's lowest
+levels (slow_ahb 80, camnoc_axi 150, cphy_rx/csiNphytimer/ife_lite_csid 300,
+ife_lite 400 MHz) and their branches, GCC camera hf/sf AXI, mx.lvl at
+SVS_L1 (cx.lvl is wland's, at its top); frame memory from the GPU pool
+(below 4 GB: the write master's addresses are 32-bit); the IFE streams
+(0x800/0x5e0) through an apps-SMMU context bank with translation off, as
+phone/wifi/radio.c does for the WLAN. One 1600x1200 RAW10 colour-bar frame
+through RDI 0 and write master 0 in frame mode; everything taken back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WuzsiVGCDDmN2GPRLJvX3w
+---
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -849,6 +849,708 @@
+ 	return result;
+ }
+ 
++/* ==== 0921: the capture path. Step 1: the CSID's test pattern through IFE-lite 0 into memory ("c 20") ==== */
++
++/*
++ * HackiOS redwood_camera.c's cam=3 (Titan 165, yupik), with lito's (Titan 175) numbers. The CSID-lite and
++ * IFE-lite register layouts are the same files in both kernels (cam_ife_csid_lite17x.h, cam_vfe_lite17x.h with
++ * cam_vfe_bus_ver2.c), and so are the base addresses: CSID-lite 0 at 0xacc8000, IFE-lite 0 at 0xacc4000.
++ * Different here:
++ *   clocks   camcc-lito.c: PLL0 (Lucid) at 1200 MHz (L 0x3e, alpha 0x8000; even /2 600, odd /3 400), then at the
++ *            device tree's lowest levels: slow_ahb 80 (PLL0 odd /5), camnoc_axi 150 (even /4), cphy_rx 300 (even
++ *            /2), csiNphytimer 300, ife_lite_csid 300, ife_lite 400 (odd /1); the branches cpas_ahb, camnoc_axi,
++ *            csiphyN, csiNphytimer, ife_lite_csid, ife_lite_cphy_rx, ife_lite; GCC camera_hf_axi and _sf_axi
++ *   rails    camcc's vdd_mx at SVS_L1 for PLL0 (mx.lvl through bsd/dev/sweet_rpmh.c); vdd_cx is not asked: wland
++ *            holds cx.lvl at its top level on the same RSC (phone/wifi/wland.c boot_modem()), and a vote of ours
++ *            would replace it
++ *   memory   the GPU's pool (sweet_gpu_pool_alloc(): RAM below 4 GB that XNU never maps), because the write
++ *            master takes 32-bit addresses
++ *   SMMU     the apps SMMU (0x15000000) sends the IFEs' streams (live DT msm_cam_smmu_ife: 0x820..0xd40, mask
++ *            0x5e0: one match register 0x800/0x5e0 takes them all) to a context bank with translation off, as
++ *            phone/wifi/radio.c does for the WLAN: the IFE's addresses are physical
++ * The frames stay in the pool after the run; tools/flame-files.py read /dev/pmem PA LEN fetches them
++ * (tools/redfin-camraw.py makes a picture). Everything else is taken back in the reverse order.
++ */
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern int sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa);
++extern int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
++
++#define CAMCC_PA                0x0ad00000u
++#define CSID_LITE_PA            0x0acc8000u
++#define IFE_LITE_PA             0x0acc4000u
++#define CSIPHY_PA(n)            (0x0ace0000u + 0x2000u * (n))
++#define SMMU_PA                 0x15000000u
++#define CMDDB_PA                0x80860000u
++#define CMDDB_SIZE              0x20000u
++#define GCC_CAMERA_HF_AXI       0x028u  /* GCC 0xb028 (in the GCC page mapped above) */
++#define GCC_CAMERA_SF_AXI       0x02cu
++
++#define CAP_POOL_BYTES          (32u << 20)     /* two of the largest frames (IMX363 4032x3024 RAW10: 15.3 MB) */
++#define IFE_STREAM              0x800u
++#define IFE_STREAM_MASK         0x5e0u
++
++static struct {
++	vm_offset_t camcc, csid, ife, smmu, smmu_gr1, smmu_cb, frames_va;
++	uint64_t frames_pa;
++	uint32_t smr_n, cb_n, smr_old, s2cr_old, cbar_old;
++	bool pll0_on, mx_voted, smmu_set, csid_on, ife_on, tpg_on;
++} cap = { .smr_n = ~0u, .cb_n = ~0u };
++
++static uint32_t
++crd(uint32_t off)
++{
++	return rd(cap.camcc, off);
++}
++
++static bool
++cwr(uint32_t off, uint32_t value, uint32_t check)
++{
++	wr(cap.camcc, off, value);
++	if ((rd(cap.camcc, off) & check) != (value & check)) {
++		printf("SWEET CAM: camcc %#x <- %#x reads %#x\n", off, value, rd(cap.camcc, off));
++		give_up("a camcc register that did not read back");
++		return false;
++	}
++	return true;
++}
++
++/* ---- the MX rail: the first level of mx.lvl at or above SVS_L1 (192), from cmd-db's list (sweet_adsp.c's way) ---- */
++
++struct cdb_slave { uint16_t id, header_offset, data_offset, count, version, reserved[3]; };
++struct cdb_header { uint32_t version; uint8_t magic[4]; struct cdb_slave slave[8]; uint32_t checksum, reserved; uint8_t data[]; };
++struct cdb_entry { char id[8]; uint32_t priority[2]; uint32_t address; uint16_t length, offset; };
++
++static int
++mx_position(uint32_t level)
++{
++	static const struct cdb_header *db;
++	if (db == NULL) {
++		db = (const struct cdb_header *)ml_io_map_unmappable(CMDDB_PA, CMDDB_SIZE, VM_WIMG_WCOMB);
++	}
++	if (!db || !(db->magic[0] == 0xdb && db->magic[1] == 0x30 && db->magic[2] == 0x03 && db->magic[3] == 0x0c)) {
++		return -1;
++	}
++	for (unsigned s = 0; s < 8; s++) {
++		const struct cdb_slave *sl = &db->slave[s];
++		const struct cdb_entry *e = (const struct cdb_entry *)(db->data + sl->header_offset);
++		if (sl->id == 0 || sl->count > 512) {
++			continue;
++		}
++		for (unsigned i = 0; i < sl->count; i++) {
++			if (memcmp(e[i].id, "mx.lvl\0\0", 8) != 0) {
++				continue;
++			}
++			const uint8_t *d = db->data + sl->data_offset + e[i].offset;
++			for (unsigned l = 0; l < e[i].length / 2u && l < 16; l++) {
++				if ((uint32_t)(d[2 * l] | d[2 * l + 1] << 8) >= level) {
++					return (int)l;
++				}
++			}
++			return -1;
++		}
++	}
++	return -1;
++}
++
++static bool
++mx_vote(bool on)
++{
++	int pos = on ? mx_position(192) : 0;
++	if (pos < 0) {
++		printf("SWEET CAM: no mx.lvl position for SVS_L1 in cmd-db\n");
++		return false;
++	}
++	uint32_t off = 0, val = (uint32_t)pos;
++	int err = EBUSY;
++	for (unsigned k = 0; k < 50 && err == EBUSY; k++) {
++		err = sweet_rpmh_write("mx.lvl", 1, &off, &val);
++		if (err == EBUSY) {
++			sleep_ms(2);
++		}
++	}
++	printf("SWEET CAM: RPMh mx.lvl -> position %u%s: %d\n", val, on ? "" : " (given back)", err);
++	cap.mx_voted = on && err == 0;
++	return err == 0;
++}
++
++/* ---- camcc's PLL0 (Lucid): clk_lucid_pll_configure() + alpha_pll_lucid_enable() with cam_cc_pll0_config ---- */
++
++#define PLL_MODE        0x00            /* [0] outputs, [1] bypass off, [2] out of reset, [20] FSM vote, [23] update bypass, [31] lock */
++#define PLL_L           0x04
++#define PLL_CAL_L       0x08
++#define PLL_USER        0x0c
++#define PLL_USER_U      0x10
++#define PLL_USER_U1     0x14
++#define PLL_CONFIG      0x18
++#define PLL_CONFIG_U    0x1c
++#define PLL_CONFIG_U1   0x20
++#define PLL_TEST_U1     0x2c
++#define PLL_OPMODE      0x38
++#define PLL_ALPHA       0x40
++
++static bool
++pll0_up(void)
++{
++	uint32_t mode = crd(PLL_MODE);
++	if (mode & (1u | 1u << 20)) {
++		printf("SWEET CAM: camcc PLL0 mode %#x: running or voted (somebody else's)\n", mode);
++		give_up("PLL0 in use");
++		return false;
++	}
++	static const struct { uint32_t off, val; } cfg[] = {
++		{ PLL_L, 0x3e }, { PLL_CAL_L, 0x44 }, { PLL_ALPHA, 0x8000 }, { PLL_CONFIG, 0x20485699 },
++		{ PLL_CONFIG_U, 0x00002261 }, { PLL_CONFIG_U1, 0x329a699c },
++		{ PLL_USER, 0x00003101 },       /* main on; even /2 ([11:8] 1), odd /3 ([15:12] 3): the post-dividers' tables */
++		{ PLL_USER_U, 0x00000805 }, { PLL_TEST_U1, 0x01800000 },
++	};
++	for (unsigned i = 0; i < sizeof(cfg) / sizeof(cfg[0]); i++) {
++		if (!cwr(cfg[i].off, cfg[i].val, ~0u)) {
++			return false;
++		}
++	}
++	cap.pll0_on = true;
++	if (!cwr(PLL_MODE, crd(PLL_MODE) | 1u << 23, 1u << 23) || !cwr(PLL_MODE, crd(PLL_MODE) & ~1u, 1) ||
++	    !cwr(PLL_OPMODE, 0, 1) || !cwr(PLL_MODE, crd(PLL_MODE) | 1u << 2, 1u << 2) || !cwr(PLL_OPMODE, 1, 1)) {
++		return false;
++	}
++	if (!wait_bits(cap.camcc, PLL_MODE, 1u << 31, 1u << 31, 2000)) {
++		printf("SWEET CAM: camcc PLL0 does not lock (mode %#x)\n", crd(PLL_MODE));
++		give_up("a PLL that does not lock");
++		return false;
++	}
++	if (!cwr(PLL_USER, crd(PLL_USER) | 7u, 7u) || !cwr(PLL_MODE, crd(PLL_MODE) | 1u, 1u)) {
++		return false;
++	}
++	printf("SWEET CAM: camcc PLL0 locked at 1200 MHz (mode %#x user %#x)\n", crd(PLL_MODE), crd(PLL_USER));
++	return true;
++}
++
++static void
++pll0_down(void)
++{
++	if (!cap.pll0_on) {
++		return;
++	}
++	wr(cap.camcc, PLL_MODE, crd(PLL_MODE) & ~1u);
++	wr(cap.camcc, PLL_USER, crd(PLL_USER) & ~7u);
++	wr(cap.camcc, PLL_OPMODE, 0);
++	wr(cap.camcc, PLL_MODE, crd(PLL_MODE) & ~(1u << 2));
++	cap.pll0_on = false;
++	printf("SWEET CAM: camcc PLL0 off (mode %#x)\n", crd(PLL_MODE));
++}
++
++/* ---- RCGs and branches ---- */
++
++struct cap_rcg { const char *name; uint32_t cmd, src, div; uint32_t found; bool set; };
++static struct cap_rcg cap_rcgs[] = {
++	{ "slow_ahb 80", 0x7058, 3, 9 },                /* PLL0 odd 400 / 5 (field 2n - 1) */
++	{ "camnoc_axi 150", 0xc12c, 2, 7 },             /* PLL0 even 600 / 4 */
++	{ "cphy_rx 300", 0xa064, 2, 3 },                /* even / 2 */
++	{ "csiNphytimer 300", 0, 2, 3 },                /* even / 2: the sensor's PHY (0x6004 + 0x24 n) */
++	{ "ife_lite_csid 300", 0xc020, 2, 3 },          /* even / 2 */
++	{ "ife_lite 400", 0xc004, 3, 1 },               /* odd / 1 */
++};
++struct cap_branch { const char *name; bool gcc; uint32_t cbcr; bool set; };
++static struct cap_branch cap_branches[] = {
++	{ "gcc camera_hf_axi", true, GCC_CAMERA_HF_AXI }, { "gcc camera_sf_axi", true, GCC_CAMERA_SF_AXI },
++	{ "cpas_ahb", false, 0xc124 }, { "camnoc_axi", false, 0xc148 }, { "csiphyN", false, 0 }, { "csiNphytimer", false, 0 },
++	{ "ife_lite_csid", false, 0xc038 }, { "ife_lite_cphy_rx", false, 0xc040 }, { "ife_lite", false, 0xc01c },
++};
++
++static bool
++cap_clocks_up(unsigned phy)
++{
++	cap_rcgs[3].cmd = 0x6004u + 0x24u * phy;
++	cap_branches[4].cbcr = 0x6020u + 0x24u * phy;   /* csiphyN */
++	cap_branches[5].cbcr = 0x601cu + 0x24u * phy;   /* csiNphytimer */
++	for (unsigned i = 0; i < sizeof(cap_rcgs) / sizeof(cap_rcgs[0]); i++) {
++		struct cap_rcg *r = &cap_rcgs[i];
++		r->found = crd(r->cmd + 4);
++		if (!cwr(r->cmd + 4, (r->found & ~0x371fu) | r->src << 8 | r->div, 0x371f)) {
++			return false;
++		}
++		r->set = true;
++		wr(cap.camcc, r->cmd, crd(r->cmd) | 1u);
++		if (!wait_bits(cap.camcc, r->cmd, 1u, 0, 500)) {
++			printf("SWEET CAM: RCG %s cmd %#x does not update\n", r->name, crd(r->cmd));
++			give_up("an RCG that does not update");
++			return false;
++		}
++	}
++	for (unsigned i = 0; i < sizeof(cap_branches) / sizeof(cap_branches[0]); i++) {
++		struct cap_branch *b = &cap_branches[i];
++		vm_offset_t base = b->gcc ? cm.gcc : cap.camcc;
++		if (rd(base, b->cbcr) & 1u) {
++			continue;
++		}
++		wr(base, b->cbcr, rd(base, b->cbcr) | 1u);
++		b->set = true;
++		if (!wait_bits(base, b->cbcr, CBCR_OFF, 0, 500)) {
++			printf("SWEET CAM: branch %s %#x does not run\n", b->name, rd(base, b->cbcr));
++			give_up("a branch that does not come on");
++			return false;
++		}
++	}
++	printf("SWEET CAM: capture clocks on (PHY %u)\n", phy);
++	return true;
++}
++
++static void
++cap_clocks_down(void)
++{
++	for (int i = (int)(sizeof(cap_branches) / sizeof(cap_branches[0])) - 1; i >= 0; i--) {
++		struct cap_branch *b = &cap_branches[i];
++		if (b->set) {
++			vm_offset_t base = b->gcc ? cm.gcc : cap.camcc;
++			wr(base, b->cbcr, rd(base, b->cbcr) & ~1u);
++			b->set = false;
++		}
++	}
++	for (int i = (int)(sizeof(cap_rcgs) / sizeof(cap_rcgs[0])) - 1; i >= 0; i--) {
++		struct cap_rcg *r = &cap_rcgs[i];
++		if (r->set) {
++			wr(cap.camcc, r->cmd + 4, r->found);
++			wr(cap.camcc, r->cmd, crd(r->cmd) | 1u);
++			(void)wait_bits(cap.camcc, r->cmd, 1u, 0, 500);
++			r->set = false;
++		}
++	}
++}
++
++/* ---- the apps SMMU: the IFEs' streams through a context bank with translation off (phone/wifi/radio.c) ---- */
++
++static bool
++cap_smmu_up(void)
++{
++	uint32_t id0 = rd(cap.smmu, 0x20), id1 = rd(cap.smmu, 0x24);
++	uint32_t nsmr = id0 & 0xff, ncb = id1 & 0xff, psize = (id1 >> 31) ? 0x10000 : 0x1000, npage = 1u << (((id1 >> 28) & 7) + 1);
++	uint64_t used[4] = { 0 };
++	uint32_t free_smr = ~0u;
++	if ((uint64_t)npage * psize * 2 != 0x100000) {
++		printf("SWEET CAM: SMMU ID1 %#x: a layout not known here\n", id1);
++		return false;
++	}
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		uint32_t smr = rd(cap.smmu, 0x800 + 4 * i), s2cr = rd(cap.smmu, 0xc00 + 4 * i);
++		if (!(smr >> 31)) {
++			if (free_smr == ~0u) {
++				free_smr = i;
++			}
++			continue;
++		}
++		if (((s2cr >> 16) & 3) == 0) {
++			used[(s2cr & 0xff) / 64] |= 1ull << ((s2cr & 0xff) % 64);
++		}
++		uint32_t id = smr & 0x7fff, m = (smr >> 16) & 0x7fff;
++		if (((id ^ IFE_STREAM) & ~(m | IFE_STREAM_MASK) & 0x7fff) == 0) {
++			printf("SWEET CAM: SMR%u %#x (S2CR %#x) already takes the IFE streams: left alone\n", i, smr, s2cr);
++			give_up("the IFE streams are somebody's");
++			return false;
++		}
++	}
++	uint32_t cb = ~0u;
++	for (uint32_t c = 0; c < ncb && c < 256; c++) {
++		if (!(used[c / 64] & (1ull << (c % 64))) && !(rd(cap.smmu, (npage + c) * psize) & 1u) && rd(cap.smmu, psize + 4 * c) == 0) {
++			cb = c;
++			break;
++		}
++	}
++	if (free_smr == ~0u || cb == ~0u) {
++		printf("SWEET CAM: SMMU: no free match register (%d) or context bank (%d)\n", (int)free_smr, (int)cb);
++		give_up("no room in the SMMU");
++		return false;
++	}
++	cap.smmu_cb = ml_io_map_unmappable(SMMU_PA + (npage + cb) * psize, 0x1000, VM_WIMG_IO);
++	if (!cap.smmu_cb) {
++		return false;
++	}
++	cap.smr_n = free_smr;
++	cap.cb_n = cb;
++	cap.smr_old = rd(cap.smmu, 0x800 + 4 * free_smr);
++	cap.s2cr_old = rd(cap.smmu, 0xc00 + 4 * free_smr);
++	cap.cbar_old = rd(cap.smmu, psize + 4 * cb);
++	cap.smmu_gr1 = psize;
++	wr(cap.smmu_cb, 0x58, 0xffffffffu);     /* FSR */
++	wr(cap.smmu_cb, 0x20, 0);
++	wr(cap.smmu_cb, 0x24, 0);
++	wr(cap.smmu_cb, 0x30, 0);
++	wr(cap.smmu_cb, 0x10, 0);
++	wr(cap.smmu_cb, 0x38, 0);
++	wr(cap.smmu_cb, 0x3c, 0);
++	wr(cap.smmu, psize + 0x800 + 4 * cb, 1);        /* CBA2R: AArch64 */
++	wr(cap.smmu, psize + 4 * cb, 0x1f000);          /* CBAR: S1, S2 bypass, as ABL's banks */
++	wr(cap.smmu_cb, 0, 0xe0);                       /* SCTLR: fault config, M = 0 (no translation) */
++	wr(cap.smmu, 0xc00 + 4 * free_smr, cb);         /* S2CR: translate through it */
++	wr(cap.smmu, 0x800 + 4 * free_smr, 1u << 31 | IFE_STREAM_MASK << 16 | IFE_STREAM);
++	wr(cap.smmu, 0x70, 0);                          /* sTLBGSYNC */
++	for (int i = 0; i < 1000 && (rd(cap.smmu, 0x74) & 1u); i++) {
++		delay(10);
++	}
++	cap.smmu_set = true;
++	printf("SWEET CAM: SMMU: IFE streams %#x/%#x -> CB%u (translation off) via SMR%u: SMR %#x S2CR %#x\n", IFE_STREAM,
++	    IFE_STREAM_MASK, cb, free_smr, rd(cap.smmu, 0x800 + 4 * free_smr), rd(cap.smmu, 0xc00 + 4 * free_smr));
++	return true;
++}
++
++static void
++cap_smmu_faults(void)
++{
++	if (!cap.smmu_set) {
++		return;
++	}
++	uint32_t fsr = rd(cap.smmu_cb, 0x58), gfsr = rd(cap.smmu, 0x48);
++	printf("SWEET CAM: SMMU CB%u FSR %#x FAR %#x%08x FSYNR0 %#x; global FSR %#x FSYNR1 %#x\n", cap.cb_n, fsr,
++	    rd(cap.smmu_cb, 0x64), rd(cap.smmu_cb, 0x60), rd(cap.smmu_cb, 0x68), gfsr, rd(cap.smmu, 0x54));
++}
++
++static void
++cap_smmu_down(void)
++{
++	if (!cap.smmu_set) {
++		return;
++	}
++	cap_smmu_faults();
++	wr(cap.smmu, 0x800 + 4 * cap.smr_n, cap.smr_old);
++	wr(cap.smmu, 0xc00 + 4 * cap.smr_n, cap.s2cr_old);
++	wr(cap.smmu_cb, 0, 0);
++	wr(cap.smmu, cap.smmu_gr1 + 4 * cap.cb_n, cap.cbar_old);
++	wr(cap.smmu, 0x70, 0);
++	for (int i = 0; i < 1000 && (rd(cap.smmu, 0x74) & 1u); i++) {
++		delay(10);
++	}
++	cap.smmu_set = false;
++}
++
++/* ---- CSID-lite 0 and IFE-lite 0 (HackiOS's code, the same register files) ---- */
++
++#define CSID_HW_VERSION         0x000
++#define CSID_RST_STROBES        0x010
++#define CSID_RX_IRQ_STATUS      0x020
++#define CSID_RX_IRQ_MASK        0x024
++#define CSID_RX_IRQ_CLEAR       0x028
++#define CSID_RDI0_IRQ_STATUS    0x030
++#define CSID_RDI0_IRQ_MASK      0x034
++#define CSID_RDI0_IRQ_CLEAR     0x038
++#define CSID_TOP_IRQ_STATUS     0x070
++#define CSID_TOP_IRQ_MASK       0x074
++#define CSID_TOP_IRQ_CLEAR      0x078
++#define CSID_IRQ_CMD            0x080
++#define CSID_RX_CFG0            0x100
++#define CSID_RX_CFG1            0x104
++#define CSID_RX_PKTS            0x160
++#define CSID_RX_ECC             0x164
++#define CSID_RX_CRC             0x168
++#define CSID_RDI0_CFG0          0x200
++#define CSID_RDI0_CFG1          0x204
++#define CSID_RDI0_CTRL          0x208
++#define CSID_RDI0_FRM_DROP_PAT  0x20c
++#define CSID_RDI0_FRM_DROP_PER  0x210
++#define CSID_RDI0_IRQ_SUB_PAT   0x214
++#define CSID_RDI0_IRQ_SUB_PER   0x218
++#define CSID_RDI0_PIX_DROP_PAT  0x224
++#define CSID_RDI0_PIX_DROP_PER  0x228
++#define CSID_RDI0_LINE_DROP_PAT 0x22c
++#define CSID_RDI0_LINE_DROP_PER 0x230
++#define CSID_RDI0_STATUS        0x250
++#define CSID_RDI0_BYTES_PING    0x2e0
++#define CSID_RDI0_BYTES_PONG    0x2e4
++#define CSID_TPG_CTRL           0x600
++#define CSID_TPG_VC_CFG0        0x604
++#define CSID_TPG_VC_CFG1        0x608
++#define CSID_TPG_LFSR_SEED      0x60c
++#define CSID_TPG_DT0_CFG0       0x610
++#define CSID_TPG_DT0_CFG1       0x614
++#define CSID_TPG_DT0_CFG2       0x618
++#define CSID_TPG_COLOR_BARS     0x640
++#define CSID_TPG_COMMON_GEN     0x648
++#define TPG_VC                  0xa
++#define RAW10_DT                0x2b
++
++#define IFE_HW_VERSION          0x0000
++#define IFE_GLOBAL_RESET        0x0018
++#define IFE_IRQ_MASK0           0x005c
++#define IFE_IRQ_CLEAR0          0x0064
++#define IFE_IRQ_CLEAR1          0x0068
++#define IFE_IRQ_STATUS0         0x006c
++#define IFE_IRQ_STATUS1         0x0070
++#define IFE_IRQ_GLOBAL_CLEAR    0x0058
++#define IFE_VIOLATION_STATUS    0x007c
++#define IFE_REG_UPDATE          0x04ac
++#define BUS_HW_VERSION          0x2000
++#define BUS_CGC_OVD             0x200c
++#define BUS_IRQ_MASK1           0x2048
++#define BUS_IRQ_STATUS0         0x205c
++#define BUS_IRQ_STATUS1         0x2060
++#define BUS_IRQ_STATUS2         0x2064
++#define BUS_COMP_ERROR          0x206c
++#define BUS_ADDR_SYNC_FRAME_HDR 0x2080
++#define BUS_ADDR_SYNC_NO_SYNC   0x2084
++#define BUS_TEST_CTRL           0x211c
++#define WM0_STATUS0             0x2200
++#define WM0_STATUS1             0x2204
++#define WM0_CFG                 0x2208
++#define WM0_IMAGE_ADDR          0x2214
++#define WM0_WIDTH               0x221c
++#define WM0_HEIGHT              0x2220
++#define WM0_PACKER              0x2224
++#define WM0_STRIDE              0x2228
++#define WM0_IRQ_SUB_PERIOD      0x2248
++#define WM0_IRQ_SUB_PATTERN     0x224c
++#define WM0_FRAMEDROP_PERIOD    0x2250
++#define WM0_FRAMEDROP_PATTERN   0x2254
++#define WM0_FRAME_INC           0x2258
++#define WM0_BURST_LIMIT         0x225c
++
++static bool
++bput(vm_offset_t base, const char *what, uint32_t off, uint32_t val, bool check)
++{
++	wr(base, off, val);
++	if (check && rd(base, off) != val) {
++		printf("SWEET CAM: %s %#x <- %#x reads %#x\n", what, off, val, rd(base, off));
++		give_up("a camera register that did not read back");
++		return false;
++	}
++	return true;
++}
++
++static bool
++csid_reset(void)
++{
++	vm_offset_t c = cap.csid;
++	wr(c, CSID_RX_IRQ_MASK, 0);
++	for (unsigned r = 0; r < 4; r++) {
++		wr(c, CSID_RDI0_IRQ_MASK + 0x10 * r, 0);
++	}
++	wr(c, CSID_TOP_IRQ_CLEAR, 1);
++	wr(c, CSID_RX_IRQ_CLEAR, 0xfffffff);
++	for (unsigned r = 0; r < 4; r++) {
++		wr(c, CSID_RDI0_IRQ_CLEAR + 0x10 * r, 0x7fff);
++	}
++	wr(c, CSID_IRQ_CMD, 1);
++	wr(c, CSID_RX_CFG1, 0x80);
++	for (unsigned r = 0; r < 4; r++) {
++		wr(c, CSID_RDI0_CFG0 + 0x100 * r, 2);
++	}
++	for (unsigned hw = 0; hw < 2; hw++) {
++		wr(c, CSID_TOP_IRQ_CLEAR, 1);
++		wr(c, CSID_IRQ_CMD, 1);
++		if (hw) {
++			wr(c, CSID_TOP_IRQ_MASK, 1);
++			wr(c, CSID_IRQ_CMD, 1);
++		}
++		wr(c, CSID_RST_STROBES, hw ? 0x1e : 0x1);
++		if (!hw) {
++			wr(c, CSID_TOP_IRQ_MASK, 1);
++			wr(c, CSID_IRQ_CMD, 1);
++		}
++		if (!wait_bits(c, CSID_TOP_IRQ_STATUS, 1, 1, 100000)) {
++			printf("SWEET CAM: CSID %s reset does not finish (top irq %#x)\n", hw ? "hardware" : "register",
++			    rd(c, CSID_TOP_IRQ_STATUS));
++			give_up("a CSID that does not reset");
++			return false;
++		}
++		wr(c, CSID_TOP_IRQ_CLEAR, 1);
++		wr(c, CSID_IRQ_CMD, 1);
++	}
++	printf("SWEET CAM: CSID-lite 0 reset (version %#x)\n", rd(c, CSID_HW_VERSION));
++	return true;
++}
++
++/* RX from PHY `phy' (-1: the test pattern), RDI 0 for RAW10 of vc, written packed as it comes */
++static bool
++csid_config(int phy, unsigned lanes, uint32_t lane_cfg, uint32_t vc, uint32_t width, uint32_t height)
++{
++	vm_offset_t c = cap.csid;
++	uint32_t cfg0 = vc << 22 | RAW10_DT << 16 | 0xfu << 12 | 1u << 2 | 3u;
++	if (!bput(c, "CSID", CSID_RX_CFG0, (lanes - 1) | lane_cfg << 4 | (uint32_t)(phy < 0 ? 0 : phy & 3) << 20, true) ||
++	    !bput(c, "CSID", CSID_RX_CFG1, 1u << 6 | 1u, true)) {
++		return false;
++	}
++	if (phy < 0 && (!bput(c, "CSID", CSID_TPG_VC_CFG0, 1u << 10 | vc, true) ||
++	    !bput(c, "CSID", CSID_TPG_VC_CFG1, 0x3ffu << 12 | 0x740, true) || !bput(c, "CSID", CSID_TPG_LFSR_SEED, 0x12345678, true) ||
++	    !bput(c, "CSID", CSID_TPG_DT0_CFG0, width << 16 | height, true) || !bput(c, "CSID", CSID_TPG_DT0_CFG1, RAW10_DT, true) ||
++	    !bput(c, "CSID", CSID_TPG_DT0_CFG2, (3u - 1) << 16 | 0x8, true) || !bput(c, "CSID", CSID_TPG_COLOR_BARS, 1u << 5, true) ||
++	    !bput(c, "CSID", CSID_TPG_COMMON_GEN, 0, true))) {
++		return false;
++	}
++	if (!bput(c, "CSID", CSID_RDI0_CFG0, cfg0, true) || !bput(c, "CSID", CSID_RDI0_CFG1, 2, true) ||
++	    !bput(c, "CSID", CSID_RDI0_FRM_DROP_PER, 1, true) || !bput(c, "CSID", CSID_RDI0_FRM_DROP_PAT, 0, true) ||
++	    !bput(c, "CSID", CSID_RDI0_IRQ_SUB_PER, 1, true) || !bput(c, "CSID", CSID_RDI0_IRQ_SUB_PAT, 0, true) ||
++	    !bput(c, "CSID", CSID_RDI0_PIX_DROP_PAT, 0, true) || !bput(c, "CSID", CSID_RDI0_PIX_DROP_PER, 1, true) ||
++	    !bput(c, "CSID", CSID_RDI0_LINE_DROP_PAT, 0, true) || !bput(c, "CSID", CSID_RDI0_LINE_DROP_PER, 1, true) ||
++	    !bput(c, "CSID", CSID_RDI0_CTRL, 0, true) || !bput(c, "CSID", CSID_RDI0_CFG0, cfg0 | 1u << 31, true)) {
++		return false;
++	}
++	cap.csid_on = true;
++	return bput(c, "CSID", CSID_RDI0_CTRL, 1, true) &&
++	       bput(c, "CSID", CSID_RDI0_IRQ_MASK, 1u << 1 | 1u << 2 | 1u << 3 | 1u << 4 | 1u << 5 | 1u << 6, true);
++}
++
++/* cam_vfe_top_reset(), cam_vfe_bus_init_hw(), start_wm() and update_wm() for RDI 0 in frame mode */
++static bool
++ife_config(uint32_t address, uint32_t frame_inc)
++{
++	vm_offset_t f = cap.ife;
++	wr(f, IFE_IRQ_MASK0, 1u << 31);
++	wr(f, IFE_GLOBAL_RESET, 0x3f9f);
++	if (!wait_bits(f, IFE_IRQ_STATUS0, 1u << 31, 1u << 31, 100000)) {
++		printf("SWEET CAM: IFE-lite does not reset (irq %#x)\n", rd(f, IFE_IRQ_STATUS0));
++		give_up("an IFE that does not reset");
++		return false;
++	}
++	wr(f, IFE_IRQ_CLEAR0, 0xffffffffu);
++	wr(f, IFE_IRQ_CLEAR1, 0xffffffffu);
++	wr(f, IFE_IRQ_GLOBAL_CLEAR, 1);
++	printf("SWEET CAM: IFE-lite 0 reset (version %#x, bus %#x)\n", rd(f, IFE_HW_VERSION), rd(f, BUS_HW_VERSION));
++	if (!bput(f, "IFE", BUS_ADDR_SYNC_FRAME_HDR, 0, true) || !bput(f, "IFE", BUS_CGC_OVD, 0xfffff, false) ||
++	    !bput(f, "IFE", BUS_TEST_CTRL, 0, false) || !bput(f, "IFE", BUS_ADDR_SYNC_NO_SYNC, 0xffffff, false) ||
++	    !bput(f, "IFE", WM0_BURST_LIMIT, 0xf, true) || !bput(f, "IFE", WM0_WIDTH, 0xff01, true) ||
++	    !bput(f, "IFE", WM0_HEIGHT, 0, true) || !bput(f, "IFE", WM0_PACKER, 0, true) ||
++	    !bput(f, "IFE", WM0_STRIDE, 0xff01, true) || !bput(f, "IFE", WM0_FRAMEDROP_PERIOD, 0, true) ||
++	    !bput(f, "IFE", WM0_FRAMEDROP_PATTERN, 1, true) || !bput(f, "IFE", WM0_IRQ_SUB_PERIOD, 0, true) ||
++	    !bput(f, "IFE", WM0_IRQ_SUB_PATTERN, 1, true) || !bput(f, "IFE", BUS_IRQ_MASK1, 1, false) ||
++	    !bput(f, "IFE", WM0_IMAGE_ADDR, address, false) || !bput(f, "IFE", WM0_FRAME_INC, frame_inc, true) ||
++	    !bput(f, "IFE", WM0_CFG, 3, true)) {
++		return false;
++	}
++	cap.ife_on = true;
++	return bput(f, "IFE", IFE_REG_UPDATE, 0x2, false);
++}
++
++static void
++show_paths(const char *when)
++{
++	vm_offset_t c = cap.csid, f = cap.ife;
++	printf("SWEET CAM: %s: CSID rx irq %#x pkts %u ecc %#x crc %u; RDI0 irq %#x status %#x bytes %u/%u; IFE irq %#x %#x "
++	    "violation %#x; bus irq %#x %#x %#x comp err %#x; WM0 status %#x %#x\n", when, rd(c, CSID_RX_IRQ_STATUS),
++	    rd(c, CSID_RX_PKTS), rd(c, CSID_RX_ECC), rd(c, CSID_RX_CRC), rd(c, CSID_RDI0_IRQ_STATUS), rd(c, CSID_RDI0_STATUS),
++	    rd(c, CSID_RDI0_BYTES_PING), rd(c, CSID_RDI0_BYTES_PONG), rd(f, IFE_IRQ_STATUS0), rd(f, IFE_IRQ_STATUS1),
++	    rd(f, IFE_VIOLATION_STATUS), rd(f, BUS_IRQ_STATUS0), rd(f, BUS_IRQ_STATUS1), rd(f, BUS_IRQ_STATUS2),
++	    rd(f, BUS_COMP_ERROR), rd(f, WM0_STATUS0), rd(f, WM0_STATUS1));
++}
++
++static void
++paths_down(void)
++{
++	if (cap.tpg_on) {
++		wr(cap.csid, CSID_TPG_CTRL, 0);
++		cap.tpg_on = false;
++	}
++	if (cap.csid_on) {
++		wr(cap.csid, CSID_RDI0_IRQ_MASK, 0);
++		wr(cap.csid, CSID_RDI0_CTRL, (rd(cap.csid, CSID_RDI0_CTRL) & ~3u) | 2u);
++		wr(cap.csid, CSID_RDI0_CFG0, rd(cap.csid, CSID_RDI0_CFG0) & ~(1u << 31));
++		wr(cap.csid, CSID_RX_CFG0, 0);
++		cap.csid_on = false;
++	}
++	if (cap.ife_on) {
++		wr(cap.ife, WM0_CFG, 0);
++		wr(cap.ife, IFE_REG_UPDATE, 0x2);
++		delay(1000);
++		cap.ife_on = false;
++	}
++}
++
++/* everything up to the clocks; false on a fault (cap_down() takes back what was done) */
++static bool
++cap_up(unsigned phy)
++{
++	if (!cap.camcc) {
++		cap.camcc = ml_io_map_unmappable(CAMCC_PA, 0x10000, VM_WIMG_IO);
++		cap.csid = ml_io_map_unmappable(CSID_LITE_PA, 0x1000, VM_WIMG_IO);
++		cap.ife = ml_io_map_unmappable(IFE_LITE_PA, 0x4000, VM_WIMG_IO);
++		cap.smmu = ml_io_map_unmappable(SMMU_PA, 0x20000, VM_WIMG_IO);  /* page 0 and GR1 (4 or 64 KB pages) */
++	}
++	if (!cap.camcc || !cap.csid || !cap.ife || !cap.smmu) {
++		give_up("mappings");
++		return false;
++	}
++	if (!cap.frames_pa) {
++		if (sweet_gpu_pool_alloc(CAP_POOL_BYTES, &cap.frames_pa) != 0 || cap.frames_pa + CAP_POOL_BYTES > 0x100000000ull) {
++			cap.frames_pa = 0;
++			give_up("no frame memory below 4 GB (GPU pool)");
++			return false;
++		}
++		cap.frames_va = ml_io_map_unmappable(cap.frames_pa, CAP_POOL_BYTES, VM_WIMG_WCOMB);
++		printf("SWEET CAM: %u MB for frames at %#llx (GPU pool)\n", CAP_POOL_BYTES >> 20, (unsigned long long)cap.frames_pa);
++	}
++	cm.broken = false;
++	return titan_up() && mx_vote(true) && pll0_up() && cap_clocks_up(phy) && cap_smmu_up();
++}
++
++static void
++cap_down(void)
++{
++	bool was = cm.broken;
++	paths_down();
++	cap_smmu_down();
++	cap_clocks_down();
++	pll0_down();
++	if (cap.mx_voted) {
++		(void)mx_vote(false);
++	}
++	titan_down();
++	cm.broken = was;
++}
++
++/* the frame memory: a marker pattern before, and a look at what is there after */
++static void
++frames_mark(uint32_t bytes)
++{
++	volatile uint32_t *w = (volatile uint32_t *)cap.frames_va;
++	for (uint32_t i = 0; i < bytes / 4; i++) {
++		w[i] = 0x5a5a5a5au;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++frames_look(uint32_t bytes)
++{
++	volatile uint32_t *w = (volatile uint32_t *)cap.frames_va;
++	uint32_t untouched = 0;
++	for (uint32_t i = 0; i < bytes / 4; i += 64) {
++		untouched += w[i] == 0x5a5a5a5au;
++	}
++	printf("SWEET CAM: frame at %#llx: first words %08x %08x %08x %08x, middle %08x, last %08x; %u of %u samples untouched\n",
++	    (unsigned long long)cap.frames_pa, w[0], w[1], w[2], w[3], w[bytes / 8], w[bytes / 4 - 1], untouched, bytes / 256);
++}
++
++/* "c 20": the CSID's test pattern, 1600 x 1200 RAW10 colour bars, one frame */
++static int
++capture_tpg(void)
++{
++	const uint32_t width = 1600, height = 1200, stride = width * 10 / 8, bytes = stride * height;
++	int result = EIO;
++	cm.s = &sensors[2];     /* (any: titan_up() wants none of it) */
++	if (cap_up(2)) {
++		frames_mark(bytes);
++		if (csid_reset() && csid_config(-1, 4, 0x3210, TPG_VC, width, height) &&
++		    ife_config((uint32_t)cap.frames_pa, bytes)) {
++			show_paths("configured");
++			if (bput(cap.csid, "CSID", CSID_TPG_CTRL, 4u << 20 | 0x80u << 8 | 3u << 4 | 7u, true)) {
++				cap.tpg_on = true;
++				for (unsigned ms = 0; ms < 2000; ms += 50) {
++					sleep_ms(50);
++					if (rd(cap.ife, BUS_IRQ_STATUS1) & 1u) {
++						printf("SWEET CAM: write master 0 done after %u ms\n", ms + 50);
++						result = 0;
++						break;
++					}
++				}
++				show_paths(result ? "no frame done" : "frame done");
++			}
++		}
++	}
++	cap_smmu_faults();
++	cap_down();
++	if (cap.frames_va) {
++		frames_look(bytes);
++		printf("SWEET CAM: TPG frame: files read /dev/pmem %llu %u (1600x1200 RAW10, stride %u)\n", (unsigned long long)cap.frames_pa, bytes, stride);
++	}
++	return result;
++}
++
+ int
+ sweet_cam_cmd(unsigned what)
+ {
+@@ -866,6 +1568,8 @@
+ 		look_slg();
+ 	} else if (what == 12) {
+ 		look_camcc();
++	} else if (what == 20) {
++		err = capture_tpg();
+ 	} else if (what < sizeof(sensors) / sizeof(sensors[0])) {
+ 		err = probe(what);
+ 	} else {
+-- 
+2.43.0
