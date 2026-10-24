@@ -132,3 +132,6 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   0xa2200000 in the splash region, sent from its own thread between autorefresh frames (topaz 0104/0107);
   CoreBrightness via IOMFBBrightnessLevel, plus AppleARMBacklight with `sweetbl=1` (digital dimming then
   runs too: opt-in while CA renders on the CPU). `sweetbl_dcs=0` disables it.
+- 0907 DRV2624 vibration motor (`sweethaptic=1`; `=2` buzzes once when ready): I2C 0x5a on GENI SE9
+  (0x98c000, sweet_touch.c's FIFO code), enable line PM7250B GPIO1 via the APPS SPMI channel, SE9 clocks
+  and pins gpio46/47. `tools/flame-cmd.py 'v 200'` buzzes 200 ms. Not hooked to iOS yet.
