@@ -267,6 +267,27 @@ ADSP's sensor core (SSC, QMI), like audio. APPS-reachable extras: the PM8150L fl
 - MakrSas/ios-topaz (Redmi Note 12, A610): GPU-pool patches, audio, 4K pages. zeroninefourfour/ios-extra:
   A618 GMU experiments. tutpyhoon/ios-coral (Pixel 4 XL, A640): flame tree on coral, no new GPU work.
 
+## Haptics, audio DSP (2026-10-24, r11-r14c)
+
+- **Touch on its interrupt** (0911): TLMM gpio9 -> summary SPI 208 (INTID 240), events every ~5 ms.
+- **Network** (0913): WebKit networking, nsurlsessiond, trustd and mDNSResponder were denied socket delegation;
+  granted to platform binaries. Wi-Fi joins in about 75 s after the idle-cache fix (0910).
+- **Haptics work** (r13c): iOS plays them as waveforms on the iPhone X's "Actuator" audio device. Needed:
+  /product/haptics closed-loop in the ADT (mkadt.py), HackiOS's RedwoodAudio.driver HAL plug-in (phone/audio),
+  `/dev/redwood-haptic` -> DRV2624 level follower (0914), VirtualAudio.plugin moved back from
+  /Library/Audio/Plug-Ins/HAL.disabled, and the MobileGestalt cache rebuilt (CacheVersion made stale once).
+- **Audio DSP boots** (0915-0917, r14c, `adsp=1`): HackiOS's redwood_adsp.c with lito's DSP memory
+  (0x89200000, 40 MB); TrustZone authenticates Android's /vendor/firmware/adsp.* (in /private/var/local/fw),
+  up in 38 ms, GLINK (IPCRTR, apr_audio_svc), QRTR node 5 with 11 services, APR audio services up.
+  Our side must make GLINK items 478/479 itself (0917).
+- **Blocker:** ~10 s later the DSP's sensor_process fails (`sar.cc: chre_utils fatal`) and takes the whole DSP
+  down. Other Qualcomm ports: the sensor PD reads its config and registry through a FastRPC file service on
+  the host (hexagonrpcd: /vendor/etc/sensors/config, /mnt/vendor/persist/sensors/registry). Next: a minimal
+  FastRPC host (channel fastrpcglink-apps-dsp, adsp_listener + apps_std) serving those files, then the speaker
+  path: QUIN_TDM_RX_0 (2 ch, S32_LE, 48 kHz) to two CS35L41 at 0x40/0x41 on SE9 (mixer_paths_noextcodec_snd.xml).
+- Tooling: tools-claude/phone-agent.sh (WSL helper: boots, file server, SSH to the phone, logs); dropbear on
+  the phone (key ~/.ssh/redfin-claude); builds published to branches builds-xnu / builds-userland.
+
 ## Done so far
 
 **Shim** (boots in place of iBoot)
