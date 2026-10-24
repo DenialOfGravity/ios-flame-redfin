@@ -17,7 +17,9 @@ sweetcam_mode= its mode; else the most pixels at 4:3, <= 31 fps, <= 13 MP).
 Gain is linear for the program (256 = 1x; IMX363 up to 8x, the others 16x),
 the Sony code (512 - 512/g, 1024 - 1024/g) for the sensor. No lens motor
 yet: FOCUS is taken and ignored. "c 20/21" are refused while it streams;
-the stage names of "c 22" are off unless asked for.
+the stage names of "c 22" are off unless asked for. r18a: camera_test
+reads frames with AE; the places are cached now (uncached they copied at
+~120 MB/s), the frame's lines forgotten before each copy.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01WuzsiVGCDDmN2GPRLJvX3w
@@ -318,7 +320,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	if (cap.frames_va && result != EINVAL) {
  		frames_look(bytes);
  		printf("SWEET CAM: %s mode %u frame: files read /dev/pmem %llu %u (%ux%u RAW10 packed, lines %u bytes apart, %s first)\n",
-@@ -2187,6 +2233,569 @@
+@@ -2187,6 +2233,580 @@
  	return result;
  }
  
@@ -456,7 +458,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 +		ring_pa = 0;
 +		return false;
 +	}
-+	ring_va = ml_io_map_unmappable(ring_pa, want, VM_WIMG_WCOMB);
++	ring_va = ml_io_map_unmappable(ring_pa, want, VM_WIMG_DEFAULT);     /* (cached: see camdev_read()) */
 +	if (!ring_va) {
 +		sweet_gpu_pool_free(ring_pa, want);
 +		ring_pa = 0;
@@ -814,12 +816,23 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 +	error = uiomove((caddr_t)&f, (int)MIN(sizeof(f), (size_t)uio_resid(uio)), uio);
 +	if (error == 0 && uio_resid(uio) > 0) {
 +		uint32_t n = (uint32_t)MIN((uint64_t)frame_bytes, (uint64_t)uio_resid(uio));
-+		uint64_t t0 = mach_absolute_time(), t1, ns;
-+		error = uiomove((caddr_t)at, (int)n, uio);
++		uint64_t t0 = mach_absolute_time(), t1, t2, ns1, ns2;
++		/*
++		 * r18a: write-combined (uncached) places read at ~120 MB/s (a 15 MB frame in 120 ms): they are cached now,
++		 * and what the IFE wrote past the caches is made visible by forgetting the frame's lines first (HackiOS's way)
++		 */
++		for (vm_offset_t line = at & ~63ul; line < at + n; line += 64) {
++			__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
 +		t1 = mach_absolute_time();
++		error = uiomove((caddr_t)at, (int)n, uio);
++		t2 = mach_absolute_time();
 +		if (f.sequence <= 3 || f.sequence % 300 == 0) {
-+			absolutetime_to_nanoseconds(t1 - t0, &ns);
-+			printf("SWEET CAM: /dev/redwood-camera: frame %llu read: %u bytes in %llu us\n", f.sequence, n, ns / 1000);
++			absolutetime_to_nanoseconds(t1 - t0, &ns1);
++			absolutetime_to_nanoseconds(t2 - t1, &ns2);
++			printf("SWEET CAM: /dev/redwood-camera: frame %llu read: %u bytes, caches %llu us, copy %llu us\n", f.sequence, n,
++			    ns1 / 1000, ns2 / 1000);
 +		}
 +	}
 +	lck_mtx_lock(&ios_lock);
@@ -888,7 +901,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  /*
   * r17b: "c 20" took the phone down again with not one of its lines in the log, the stages' 300 ms apart
   * notwithstanding: a poke runs on the USB driver's command thread (sweet_usb.c), the thread that also sends the
-@@ -2225,6 +2834,10 @@
+@@ -2225,6 +2845,10 @@
  		printf("SWEET CAM: %u ms before each stage\n", cam_step_ms);
  		return 0;
  	}
@@ -899,7 +912,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	if (what == 20 || what == 21) {
  		if (job.busy) {
  			return EBUSY;
-@@ -2268,9 +2881,14 @@
+@@ -2268,9 +2892,14 @@
  	return sweet_cam_cmd_args(what, 0, 0, 0);
  }
  
@@ -914,7 +927,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	sleep_ms(12000);        /* after the haptic driver has SE9 up (8 s) */
  	cm.gcc = ml_io_map(GCC_CAM_PA, 0x40);
  	cm.camcc = ml_io_map(CAMCC_TOP_PA, 0x200);
-@@ -2291,6 +2909,12 @@
+@@ -2291,6 +2920,12 @@
  		look();
  		lck_mtx_unlock(&sweet_cam_lock);
  	}
@@ -927,7 +940,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	if (cm.mode >= 3) {
  		for (unsigned i = 0; i < sizeof(sensors) / sizeof(sensors[0]); i++) {
  			(void)sweet_cam_cmd(i);
-@@ -2307,6 +2931,7 @@
+@@ -2307,6 +2942,7 @@
  sweet_cam_init(void)
  {
  	PE_parse_boot_argn("sweetcam", &cm.mode, sizeof(cm.mode));
