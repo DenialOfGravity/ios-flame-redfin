@@ -155,3 +155,8 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   /product/haptics closed-loop (tools/mkadt.py now copies it from the D22 tree); each write's peak drives
   the DRV2624 (`sweet_haptic_drive`). Speaker frames are dropped until the ADSP path exists. Install the
   plug-in with tools/redfin-install-audio.sh; SweetHaptics.dylib (`sweetui=1`) is no longer needed.
+  Works (r13c): the root also needs /Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin back (sweet's image
+  moved it to HAL.disabled; without a device it crashed mediaserverd) and a fresh MobileGestalt cache
+  (it keeps "no haptics" from the first boot).
+- 0915 the audio DSP (`adsp=1`, `adsp_step=N`): HackiOS's redwood_adsp.c with lito's DSP memory
+  (0x89200000, 40 MB); firmware in /private/var/local/fw (Android's /vendor/firmware/adsp.*).

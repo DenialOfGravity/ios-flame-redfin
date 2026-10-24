@@ -15,7 +15,9 @@ what you need to fetch yourself.
 - **HackiOS** (OOSEX GANG, <https://github.com/oosexgang/hackios-xnu-userland>, MIT): `phone/audio/`
   (RedwoodAudio.driver, the CoreAudio HAL plug-in) is its `userland/src/audio_plugin.c`, unchanged; licence
   in `phone/audio/LICENSE.HackiOS`. Patch 0914 implements its `/dev/redwood-audio` and `/dev/redwood-haptic`
-  interfaces for this phone.
+  interfaces for this phone. Patch 0915 (`bsd/dev/sweet_adsp.c`, `bsd/sys/redwood_audio.h`) is HackiOS's kernel
+  `redwood_adsp.c` and `sys/redwood_audio.h` (<https://github.com/oosexgang/hackios-xnu-kernel>, APSL 2.0) with the
+  Pixel 5's numbers; the commit message lists what changed.
 
 - **ios-sweet** (dipa-studio, <https://github.com/dipa-studio/ios-sweet>, MIT): the XNU port to the Redmi
   Note 10 Pro this is forked from. Patches 0001-0081, the shim and most of `tools/` started there.
