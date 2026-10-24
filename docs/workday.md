@@ -66,3 +66,22 @@
 - Safari pages were black: WebKit's GPU process got no Metal device (only SpringBoard on /var/local/mtl2-clients)
   and has no CPU fallback. Added com.apple.WebKit.GPU + MobileSafari (sunfish-metal2-install.sh too).
   fast.com renders: 7.7 Mbps down, 8.9 Mbps up, 35 ms.
+
+## [22:35] GPU stability — what actually freezes/blacks the screen
+- **Black screens during app stress were Photos/Notes/Weather stuck at launch** (Photos waits on assetsd /
+  PhotosFileProvider, which crash every launch). A hung frontmost app also blocks openapp switches.
+  Not a GPU problem; test with Safari/Settings/Calculator.
+- **The "zoom + freeze" and the later respring = GPU pool exhaustion in backboardd.** Pool 940/944 MB →
+  backboardd's next Turnip command-stream BO refused → Turnip writes through cs->cur == NULL
+  (libvulkan_freedreno+0x57b68, called from the bridge's RenderCommandEncoder::end_encoding) → backboardd
+  SIGSEGV → the new backboardd gets OutOfMemory → no acceleration / black.
+- **backboardd leaks pool memory on app switches**: 0154/0155 census — small (<256K) BOs only grow
+  (≈340 per switch, ~7 MB), plus 10 MB render targets churn (alloc+bzero each time). 5 Safari page loads
+  ≈ +280 small; 6 switches between the same two apps ≈ +2000 (linear: a leak, not a cache).
+  Frontend telemetry: commits == completions (no command-buffer leak), 100 pipelines (stable).
+  Critical memory pressure (tools: memwarn) frees only ~33 MB.
+- Other fixes today: 0152 (hang = no CP progress for 2 s; GBIF-halt reset retry; recovery from an
+  SMMU fault now works), 0153 (full ring waits in kernel; v2 error log), 0154/0155 census.
+- A real GPU hang also happened once at 565 MHz (k70); none at 430 MHz (sweetgpufreq=4) so far.
+- Next: find the small-BO owner (bridge runtime vs Turnip) — per-BO alloc call-site tagging; cap the
+  render-target churn (reuse instead of alloc+bzero); then smoothness (CP_WAIT_FOR_IDLE, async waits).
