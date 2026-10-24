@@ -20,7 +20,8 @@ r16d (GCC + pin reads only) still reset ~8 s later: sweetcam=2 no longer
 looks at boot ("c 9" does). r16e (nothing at boot but the mappings) reset
 too: XNU's 8 MiB I/O map ran out (0920). The driver maps only the pages it uses
 now (GCC 0xb000, camcc 0x5000 and 0xc000, TLMM EAST GPIO 13-28) and keeps its
-SPMI channel mappings.
+SPMI channel mappings. PMIC GPIO supplies are set only where Android's DT
+sets them (GPIO 8, 10: power-source 1).
 sweet_haptic.c exports sweet_se9_xfer() for the PMIC.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -135,10 +136,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 new file mode 100644
-index 0000000..ca9691a
+index 0000000..72bc9bf
 --- /dev/null
 +++ b/bsd/dev/sweet_cam.c
-@@ -0,0 +1,917 @@
+@@ -0,0 +1,923 @@
 +/*
 + * redfin (Pixel 5) cameras, step 1: one sensor powered up as Android powers it, its chip ID read,
 + * powered down again. After HackiOS's redwood_camera.c (cam=1 / cam=2), with this phone's numbers.
@@ -437,9 +438,15 @@ index 0000000..ca9691a
 +		give_up("a PMIC GPIO that is not one");
 +		return false;
 +	}
++	/*
++	 * The supply (DIG_VIN_CTL) only where Android's DT sets one: power-source 1 for GPIO 8 (camera_rear_vcm_en)
++	 * and 10 (en_rwcam). GPIO 2, 4 and 9 have no pinctrl state there and keep what they have (r16f: VIN0 for
++	 * 2 and 4, VIN1 for 9).
++	 */
++	bool set_vin = n == 8 || n == 10;
 +	static const uint8_t regs[4] = { 0x41, 0x44, 0x40, 0x46 };
-+	uint8_t vals[4] = { 0x01, (uint8_t)(high ? 0x80 : 0x00), 0x01, 0x80 };      /* VIN1 (power-source 1), level, output, on */
-+	for (unsigned i = 0; i < 4; i++) {
++	uint8_t vals[4] = { 0x01, (uint8_t)(high ? 0x80 : 0x00), 0x01, 0x80 };      /* VIN1, level, output, on */
++	for (unsigned i = set_vin ? 0 : 1; i < 4; i++) {
 +		uint8_t v = vals[i], back = 0;
 +		if (spmi(PGPIO_SID, base + regs[i], true, &v) || spmi(PGPIO_SID, base + regs[i], false, &back) ||
 +		    (back & 0x87) != (vals[i] & 0x87)) {
