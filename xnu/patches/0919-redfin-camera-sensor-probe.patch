@@ -16,6 +16,8 @@ during those reads at boot: now separate, each line given 300 ms to reach the
 log). r16b still reset ~8 s after the boot look; r16c (no camera driver)
 did not. The boot look now reads only GCC and pins; camcc ("c 12") and the
 probe switch the GCC camera XO clock on first (off here; critical in Linux).
+r16d (GCC + pin reads only) still reset ~8 s later: sweetcam=2 no longer
+looks at boot ("c 9" does).
 sweet_haptic.c exports sweet_se9_xfer() for the PMIC.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -130,10 +132,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 new file mode 100644
-index 0000000..b6d1d40
+index 0000000..1ce5e4a
 --- /dev/null
 +++ b/bsd/dev/sweet_cam.c
-@@ -0,0 +1,886 @@
+@@ -0,0 +1,892 @@
 +/*
 + * redfin (Pixel 5) cameras, step 1: one sensor powered up as Android powers it, its chip ID read,
 + * powered down again. After HackiOS's redwood_camera.c (cam=1 / cam=2), with this phone's numbers.
@@ -992,9 +994,15 @@ index 0000000..b6d1d40
 +		cm.tlmm = 0;
 +		goto out;
 +	}
-+	lck_mtx_lock(&sweet_cam_lock);
-+	look();
-+	lck_mtx_unlock(&sweet_cam_lock);
++	/*
++	 * r16a, r16b, r16d reset about 8 s after this boot-time look (r16d: GCC and pin reads only); r16c, the
++	 * same kernel without sweetcam, ran on. So sweetcam=2 now does nothing at boot: "c 9" is the look.
++	 */
++	if (cm.mode == 1 || cm.mode >= 3) {
++		lck_mtx_lock(&sweet_cam_lock);
++		look();
++		lck_mtx_unlock(&sweet_cam_lock);
++	}
 +	if (cm.mode >= 3) {
 +		for (unsigned i = 0; i < sizeof(sensors) / sizeof(sensors[0]); i++) {
 +			(void)sweet_cam_cmd(i);
