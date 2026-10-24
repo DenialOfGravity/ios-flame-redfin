@@ -20,6 +20,10 @@ whole session of writes and given back clock line first. "c 22 MS" sets
 the time before each stage (the UDP log drops what a poke's run prints;
 the ring, read with klog, has it). The SMMU is mapped whole: 0921 mapped
 128 KB and then read the context banks' SCTLRs at 512 KB and up.
+r17d: the CSID test pattern into memory (1600x1200 colour bars), the
+IMX355's own colour bars (tpg2) and its first picture (mode 2, 1640x924).
+The write master's lines are 16-byte aligned (2050 bytes every 2064), and
+it wants each next frame's address before writing it.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01WuzsiVGCDDmN2GPRLJvX3w
@@ -166,7 +170,23 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	return ok;
  }
  
-@@ -1219,9 +1288,11 @@
+@@ -1154,10 +1223,15 @@
+ 	wr(cap.smmu, 0xc00 + 4 * cap.smr_n, cap.s2cr_old);
+ 	wr(cap.smmu_cb, 0, 0);
+ 	wr(cap.smmu, cap.smmu_gr1 + 4 * cap.cb_n, cap.cbar_old);
++	wr(cap.smmu, cap.smmu_gr1 + 0x800 + 4 * cap.cb_n, 0);
+ 	wr(cap.smmu, 0x70, 0);
+ 	for (int i = 0; i < 1000 && (rd(cap.smmu, 0x74) & 1u); i++) {
+ 		delay(10);
+ 	}
++	/* r17d: each run took the next bank (CB6, 7, 8): the reads of the given-back one, to see why */
++	printf("SWEET CAM: SMMU CB%u given back: CBAR %#x CBA2R %#x SCTLR %#x; SMR%u %#x S2CR %#x\n", cap.cb_n,
++	    rd(cap.smmu, cap.smmu_gr1 + 4 * cap.cb_n), rd(cap.smmu, cap.smmu_gr1 + 0x800 + 4 * cap.cb_n), rd(cap.smmu_cb, 0),
++	    cap.smr_n, rd(cap.smmu, 0x800 + 4 * cap.smr_n), rd(cap.smmu, 0xc00 + 4 * cap.smr_n));
+ 	cap.smmu_set = false;
+ }
+ 
+@@ -1219,9 +1293,11 @@
  #define BUS_HW_VERSION          0x2000
  #define BUS_CGC_OVD             0x200c
  #define BUS_IRQ_MASK1           0x2048
@@ -178,7 +198,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  #define BUS_COMP_ERROR          0x206c
  #define BUS_ADDR_SYNC_FRAME_HDR 0x2080
  #define BUS_ADDR_SYNC_NO_SYNC   0x2084
-@@ -1306,6 +1377,9 @@
+@@ -1306,6 +1382,9 @@
  	    !bput(c, "CSID", CSID_RX_CFG1, 1u << 6 | 1u, true)) {
  		return false;
  	}
@@ -188,7 +208,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	if (phy < 0 && (!bput(c, "CSID", CSID_TPG_VC_CFG0, 1u << 10 | vc, true) ||
  	    !bput(c, "CSID", CSID_TPG_VC_CFG1, 0x3ffu << 12 | 0x740, true) || !bput(c, "CSID", CSID_TPG_LFSR_SEED, 0x12345678, true) ||
  	    !bput(c, "CSID", CSID_TPG_DT0_CFG0, width << 16 | height, true) || !bput(c, "CSID", CSID_TPG_DT0_CFG1, RAW10_DT, true) ||
-@@ -1395,11 +1469,14 @@
+@@ -1395,11 +1474,14 @@
   * r17a: "c 20" took the phone down with nothing in the log (the UDP log loses what a hang leaves
   * unsent). Each stage now says what comes next and gives the log 300 ms to carry it out.
   */
@@ -204,7 +224,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  }
  
  /* everything up to the clocks; false on a fault (cap_down() takes back what was done) */
-@@ -1411,7 +1488,7 @@
+@@ -1411,7 +1493,7 @@
  		cap.camcc = ml_io_map_unmappable(CAMCC_PA, 0x10000, VM_WIMG_IO);
  		cap.csid = ml_io_map_unmappable(CSID_LITE_PA, 0x1000, VM_WIMG_IO);
  		cap.ife = ml_io_map_unmappable(IFE_LITE_PA, 0x4000, VM_WIMG_IO);
@@ -213,7 +233,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	}
  	if (!cap.camcc || !cap.csid || !cap.ife || !cap.smmu) {
  		give_up("mappings");
-@@ -1526,13 +1603,617 @@
+@@ -1526,13 +1608,621 @@
  	return result;
  }
  
@@ -650,7 +670,8 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 +		}
 +	}
 +	const struct tab_mode *m = &sc.mode[mode_n];
-+	uint32_t width = m->width, height = m->height, bytes = width * height / 4 * 5;
++	/* the write master puts each line at a 16-byte boundary (r17d: 1640 pixels, 2050 bytes, every 2064) */
++	uint32_t width = m->width, height = m->height, stride = (width / 4 * 5 + 15) & ~15u, bytes = stride * height;
 +	settle = settle ? settle : m->settle;
 +	wanted = wanted ? wanted : 8;
 +	if (sc.slave != s->slave || m->lanes < 1 || m->lanes > 4 || m->cphy || m->dt != RAW10_DT || width % 4 || bytes > CAP_POOL_BYTES) {
@@ -733,13 +754,16 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 +					continue;
 +				}
 +				done++;
++				wr(cap.ife, BUS_IRQ_CLEAR1, 1);
++				wr(cap.ife, BUS_IRQ_GLOBAL_CLEAR, 1);
 +				if (done == wanted) {
 +					/* stop the write master at this frame's end: the register update takes at the next frame's start */
 +					wr(cap.ife, WM0_CFG, 0);
-+					wr(cap.ife, IFE_REG_UPDATE, 0x2);
++				} else {
++					/* the next frame's address (the same place): r17d wrote only the first frame without it */
++					wr(cap.ife, WM0_IMAGE_ADDR, (uint32_t)cap.frames_pa);
 +				}
-+				wr(cap.ife, BUS_IRQ_CLEAR1, 1);
-+				wr(cap.ife, BUS_IRQ_GLOBAL_CLEAR, 1);
++				wr(cap.ife, IFE_REG_UPDATE, 0x2);
 +				if (done <= 2 || done == wanted) {
 +					printf("SWEET CAM: frame %u written, %u ms after the sensor was started\n", done, ms + 1);
 +				}
@@ -764,8 +788,8 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 +	cap_down();
 +	if (cap.frames_va && result != EINVAL) {
 +		frames_look(bytes);
-+		printf("SWEET CAM: %s mode %u frame: files read /dev/pmem %llu %u (%ux%u RAW10 packed, %u bytes a line, %s first)\n",
-+		    s->name, mode_n, (unsigned long long)cap.frames_pa, bytes, width, height, width / 4 * 5,
++		printf("SWEET CAM: %s mode %u frame: files read /dev/pmem %llu %u (%ux%u RAW10 packed, lines %u bytes apart, %s first)\n",
++		    s->name, mode_n, (unsigned long long)cap.frames_pa, bytes, width, height, stride,
 +		    m->cfa == 0 ? "BGGR" : m->cfa == 1 ? "GBRG" : m->cfa == 2 ? "GRBG" : m->cfa == 3 ? "RGGB" : "mono");
 +	}
 +	tab_free();
@@ -832,7 +856,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	lck_mtx_lock(&sweet_cam_lock);
  	int err = 0;
  	if (what == 9) {
-@@ -1543,8 +2224,6 @@
+@@ -1543,8 +2233,6 @@
  		look_slg();
  	} else if (what == 12) {
  		look_camcc();
@@ -841,7 +865,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	} else if (what < sizeof(sensors) / sizeof(sensors[0])) {
  		err = probe(what);
  	} else {
-@@ -1554,6 +2233,12 @@
+@@ -1554,6 +2242,12 @@
  	return err;
  }
  
