@@ -23,7 +23,10 @@ the ring, read with klog, has it). The SMMU is mapped whole: 0921 mapped
 r17d: the CSID test pattern into memory (1600x1200 colour bars), the
 IMX355's own colour bars (tpg2) and its first picture (mode 2, 1640x924).
 The write master's lines are 16-byte aligned (2050 bytes every 2064), and
-it wants each next frame's address before writing it.
+it wants each next frame's address before writing it. r17f: the rear
+IMX363 too (mode 10, 2016x1136); each PHY has its own mapping (r17d/f kept
+the first PHY's for all, so a second sensor's PHY was never set up), and
+the SMMU bank of the last run is taken again (its CBAR stays 0x1f000).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01WuzsiVGCDDmN2GPRLJvX3w
@@ -170,7 +173,42 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	return ok;
  }
  
-@@ -1154,10 +1223,15 @@
+@@ -892,6 +961,7 @@
+ 	vm_offset_t camcc, csid, ife, smmu, smmu_gr1, smmu_cb, frames_va;
+ 	uint64_t frames_pa;
+ 	uint32_t smr_n, cb_n, smr_old, s2cr_old, cbar_old;
++	uint32_t cb_last;       /* + 1: the bank of the last run, taken again (r17d/f: its CBAR does not go back to 0) */
+ 	bool pll0_on, smmu_set, csid_on, ife_on, tpg_on;
+ } cap = { .smr_n = ~0u, .cb_n = ~0u };
+ 
+@@ -1089,10 +1159,16 @@
+ 		}
+ 	}
+ 	uint32_t cb = ~0u;
+-	for (uint32_t c = 0; c < ncb && c < 256; c++) {
++	if (cap.cb_last) {
++		uint32_t c = cap.cb_last - 1;
++		if (!(used[c / 64] & (1ull << (c % 64))) && !(rd(cap.smmu, (npage + c) * psize) & 1u) &&
++		    rd(cap.smmu, psize + 4 * c) == 0x1f000) {
++			cb = c;
++		}
++	}
++	for (uint32_t c = 0; cb == ~0u && c < ncb && c < 256; c++) {
+ 		if (!(used[c / 64] & (1ull << (c % 64))) && !(rd(cap.smmu, (npage + c) * psize) & 1u) && rd(cap.smmu, psize + 4 * c) == 0) {
+ 			cb = c;
+-			break;
+ 		}
+ 	}
+ 	if (free_smr == ~0u || cb == ~0u) {
+@@ -1106,6 +1182,7 @@
+ 	}
+ 	cap.smr_n = free_smr;
+ 	cap.cb_n = cb;
++	cap.cb_last = cb + 1;
+ 	cap.smr_old = rd(cap.smmu, 0x800 + 4 * free_smr);
+ 	cap.s2cr_old = rd(cap.smmu, 0xc00 + 4 * free_smr);
+ 	cap.cbar_old = rd(cap.smmu, psize + 4 * cb);
+@@ -1154,10 +1231,15 @@
  	wr(cap.smmu, 0xc00 + 4 * cap.smr_n, cap.s2cr_old);
  	wr(cap.smmu_cb, 0, 0);
  	wr(cap.smmu, cap.smmu_gr1 + 4 * cap.cb_n, cap.cbar_old);
@@ -186,7 +224,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	cap.smmu_set = false;
  }
  
-@@ -1219,9 +1293,11 @@
+@@ -1219,9 +1301,11 @@
  #define BUS_HW_VERSION          0x2000
  #define BUS_CGC_OVD             0x200c
  #define BUS_IRQ_MASK1           0x2048
@@ -198,7 +236,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  #define BUS_COMP_ERROR          0x206c
  #define BUS_ADDR_SYNC_FRAME_HDR 0x2080
  #define BUS_ADDR_SYNC_NO_SYNC   0x2084
-@@ -1306,6 +1382,9 @@
+@@ -1306,6 +1390,9 @@
  	    !bput(c, "CSID", CSID_RX_CFG1, 1u << 6 | 1u, true)) {
  		return false;
  	}
@@ -208,7 +246,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	if (phy < 0 && (!bput(c, "CSID", CSID_TPG_VC_CFG0, 1u << 10 | vc, true) ||
  	    !bput(c, "CSID", CSID_TPG_VC_CFG1, 0x3ffu << 12 | 0x740, true) || !bput(c, "CSID", CSID_TPG_LFSR_SEED, 0x12345678, true) ||
  	    !bput(c, "CSID", CSID_TPG_DT0_CFG0, width << 16 | height, true) || !bput(c, "CSID", CSID_TPG_DT0_CFG1, RAW10_DT, true) ||
-@@ -1395,11 +1474,14 @@
+@@ -1395,11 +1482,14 @@
   * r17a: "c 20" took the phone down with nothing in the log (the UDP log loses what a hang leaves
   * unsent). Each stage now says what comes next and gives the log 300 ms to carry it out.
   */
@@ -224,7 +262,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  }
  
  /* everything up to the clocks; false on a fault (cap_down() takes back what was done) */
-@@ -1411,7 +1493,7 @@
+@@ -1411,7 +1501,7 @@
  		cap.camcc = ml_io_map_unmappable(CAMCC_PA, 0x10000, VM_WIMG_IO);
  		cap.csid = ml_io_map_unmappable(CSID_LITE_PA, 0x1000, VM_WIMG_IO);
  		cap.ife = ml_io_map_unmappable(IFE_LITE_PA, 0x4000, VM_WIMG_IO);
@@ -233,7 +271,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	}
  	if (!cap.camcc || !cap.csid || !cap.ife || !cap.smmu) {
  		give_up("mappings");
-@@ -1526,13 +1608,632 @@
+@@ -1526,13 +1616,633 @@
  	return result;
  }
  
@@ -281,7 +319,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 +	uint64_t size;
 +	uint32_t slave, lane_assign, modes, tables;
 +	const struct tab_mode *mode;
-+	vm_offset_t csiphy, refgen;
++	vm_offset_t csiphy, refgen, csiphy_map[4];    /* csiphy: the one in use (r17f: one mapping kept for all, the first PHY's) */
 +	bool pll2_on, csiphy_on, refgen_switched;
 +} sc;
 +
@@ -519,9 +557,10 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 +		pos_mask |= 1u << pos_of_lane[n];
 +		lane_enable |= 1u << (2 * n);
 +	}
-+	if (!sc.csiphy) {
-+		sc.csiphy = ml_io_map_unmappable(CSIPHY_PA(phy), 0x1000, VM_WIMG_IO);
++	if (!sc.csiphy_map[phy & 3]) {
++		sc.csiphy_map[phy & 3] = ml_io_map_unmappable(CSIPHY_PA(phy & 3), 0x1000, VM_WIMG_IO);
 +	}
++	sc.csiphy = sc.csiphy_map[phy & 3];
 +	if (!sc.csiphy) {
 +		give_up("mappings");
 +		return false;
@@ -867,7 +906,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	lck_mtx_lock(&sweet_cam_lock);
  	int err = 0;
  	if (what == 9) {
-@@ -1543,8 +2244,6 @@
+@@ -1543,8 +2253,6 @@
  		look_slg();
  	} else if (what == 12) {
  		look_camcc();
@@ -876,7 +915,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	} else if (what < sizeof(sensors) / sizeof(sensors[0])) {
  		err = probe(what);
  	} else {
-@@ -1554,6 +2253,12 @@
+@@ -1554,6 +2262,12 @@
  	return err;
  }
  
