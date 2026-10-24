@@ -119,3 +119,15 @@ Bench (tools/sunfish-fpsbench.sh, BENCH_TIGHT=1, Settings swipes, 30 s):
   Also CA's 16/32-byte row pitches are refused for explicit DRM-linear layouts (turnip 0103 logs them).
 - Fixes: xnu 0159 (kernel35) rounds single-plane IOSurface rows to 64 bytes (sweetsurfalign=0 off) — alone
   no change; turnip 0104: host-allocation images not dedicated (testing).
+- Results (kernel35 + turnip 0104 + bridge 0102): the copy-out is gone and most copy-ins are gone.
+  dr23 frame GPU 9.4 -> 6.4 ms, dr14 7.4 -> 4.4 ms. Remaining: ~3 ms/frame of small A8/RGBA8 buffer
+  textures with 32-byte pitches (Turnip needs 64 for explicit linear).
+- fps barely moved (17-19 panel updates/s): the GPU is only 35-60% busy, and backboardd is idle ~45%
+  of the time (pstack samples + phone/tools/a2s; shared-cache symbols are redacted, but most CPU is
+  in QuartzCore, little in the bridge). The limit is now pacing/latency, not GPU work.
+- Matrix on kernel35 (tools/sunfish-cfgbench.sh): sweetfb_thread=0 vs 1 is the same (~17 panel/s).
+- backboardd never calls IOMFB sel 72 (vsync notification enable) on this boot. Check how CA gets
+  vsync now (0121 relied on it). This is the next lead for pacing.
+- Idle 10 Hz full redraws = the Clock icon's second hand (normal).
+- Next: (1) trace CA's vsync source / swap pacing; (2) Turnip: allow 16/32-byte linear pitch for
+  sampled-only images (removes the last copies); (3) charger config (the phone loses about 0.5 A while benching).
