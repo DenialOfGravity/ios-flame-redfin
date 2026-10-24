@@ -20,7 +20,7 @@
 
 #define RMTFS_DIR	"/var/local/fw/rmtfs"
 #define RMTFS_PA	0xE1000000ull	/* below 4 GB: see rmtfs_init */
-#define BUF_SIZE	0x200000u
+#define BUF_SIZE	0x280000u	/* redfin: modem asks 2621440 (DT rmtfs_sharedmem 0x280000); sunfish 2 MB */
 #define SECTOR		512
 
 enum { RMTFS_OPEN = 1, RMTFS_CLOSE, RMTFS_RW_IOVEC, RMTFS_ALLOC_BUFF, RMTFS_GET_DEV_ERROR, RMTFS_FORCE_SYNC_IND };
@@ -163,7 +163,8 @@ void rmtfs_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	case RMTFS_ALLOC_BUFF: {
 		uint32_t size = 0;
 		qmi_get_u32(&m, 2, &size);
-		printf("rmtfs: alloc %u bytes for %u -> %llx\n", size, caller, (unsigned long long)buf_pa);
+		printf("rmtfs: alloc %u bytes for %u -> %s %llx (buffer %u)\n", size, caller,
+		       size <= BUF_SIZE ? "granted" : "REFUSED", (unsigned long long)buf_pa, BUF_SIZE);
 		if (size <= BUF_SIZE) {
 			qmi_tlv_result(&q, 0, 0);
 			qmi_tlv_u64(&q, 0x10, buf_pa);

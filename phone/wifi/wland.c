@@ -316,6 +316,22 @@ static void smp2p_service(void)
 	if (smp2p_in_value("slave-kernel", &v) == 0 && v != modem_state) {
 		printf("[%6llu] smp2p: modem state %x%s%s%s%s\n", (unsigned long long)link_ms(), v, v & 1 ? " ERR-FATAL" : "", v & 2 ? " ready" : "",
 		       v & 4 ? " handover" : "", v & 8 ? " stop-ack" : "");
+		/* modem crash reason (Linux qcom_q6v5 SMEM_SSR_REASON_MSS0, global item 421), once */
+		static int reason_shown;
+		uint64_t rp;
+		uint32_t rsz;
+		if ((v & 1) && !reason_shown && smem_get(SMEM_HOST_GLOBAL, 421, &rp, &rsz) == 0 && rsz) {
+			char r[256];
+			uint32_t n = rsz < sizeof(r) - 1 ? rsz : sizeof(r) - 1;
+			for (uint32_t i = 0; i < n; i++) {
+				char c = (char)(rd32(rp + (i & ~3u)) >> (8 * (i & 3)));
+				r[i] = (c >= 32 && c < 127) ? c : (c ? '.' : 0);
+				if (!c) { n = i; break; }
+			}
+			r[n] = 0;
+			printf("modem crash reason: \"%s\"\n", r);
+			reason_shown = 1;
+		}
 		modem_state = v;
 	}
 }
