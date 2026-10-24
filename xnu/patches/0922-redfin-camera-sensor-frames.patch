@@ -233,7 +233,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	}
  	if (!cap.camcc || !cap.csid || !cap.ife || !cap.smmu) {
  		give_up("mappings");
-@@ -1526,13 +1608,621 @@
+@@ -1526,13 +1608,632 @@
  	return result;
  }
  
@@ -747,6 +747,17 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 +			ok = sensor_table("on");
 +		}
 +		if (ok) {
++			/* r17d: the rear sensors sent nothing at all: the sensor's own word on it (SMIA 0x0005 frame count, 0x0100 mode) */
++			uint16_t fc0 = 0, fc1 = 0, md = 0;
++			const char *why = "";
++			sleep_ms(100);
++			bool r0 = sensor_read16(s->slave, 0x0004, &fc0, &why);
++			sleep_ms(100);
++			bool r1 = sensor_read16(s->slave, 0x0004, &fc1, &why) && sensor_read16(s->slave, 0x0100, &md, &why);
++			printf("SWEET CAM: %s streaming? frame count %u then %u (100 ms apart), mode select %#x%s%s\n", s->name, fc0 & 0xff,
++			    fc1 & 0xff, md >> 8, r0 && r1 ? "" : " -- read failed: ", r0 && r1 ? "" : why);
++		}
++		if (ok) {
 +			unsigned done = 0, ms = 0;
 +			for (; ms < 4000 && done < wanted; ms++) {
 +				delay(1000);
@@ -856,7 +867,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	lck_mtx_lock(&sweet_cam_lock);
  	int err = 0;
  	if (what == 9) {
-@@ -1543,8 +2233,6 @@
+@@ -1543,8 +2244,6 @@
  		look_slg();
  	} else if (what == 12) {
  		look_camcc();
@@ -865,7 +876,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	} else if (what < sizeof(sensors) / sizeof(sensors[0])) {
  		err = probe(what);
  	} else {
-@@ -1554,6 +2242,12 @@
+@@ -1554,6 +2253,12 @@
  	return err;
  }
  
