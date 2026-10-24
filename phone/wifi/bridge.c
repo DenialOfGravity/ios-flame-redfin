@@ -5,6 +5,9 @@
  * device (an older kernel, or boot-arg sweetwifid=0) wland keeps its own utun.
  */
 #include <errno.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <sys/sysctl.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
@@ -131,6 +134,60 @@ static void on_join(const struct fw_join *j)
 	join_deadline = link_ms() + 35000;
 }
 
+/*
+ * configd writes its default network configuration only when it starts without preferences.plist,
+ * and it starts long before the first scan makes en0: that default has no network services, so
+ * iOS never runs DHCP on en0 (frames come in, none go out). Once en0 exists: if preferences.plist
+ * has no NetworkServices, move it aside and restart configd (launchd starts it again), which then
+ * creates the Wi-Fi service for en0. Once per wland run; the new file persists across boots.
+ * (flame 2026-10-22 did this by hand; redfin 2026-10-24.)
+ */
+#define SC_PREFS	"/private/var/preferences/SystemConfiguration/preferences.plist"
+static uint64_t sc_check_at;
+
+static int sc_has_services(void)
+{
+	FILE *f = fopen(SC_PREFS, "rb");
+	if (!f)
+		return -1;
+	static char b[65536];
+	size_t n = fread(b, 1, sizeof(b), f);
+	fclose(f);
+	for (size_t i = 0; i + 15 <= n; i++)		/* binary or XML plist: the key is stored as text */
+		if (!memcmp(b + i, "NetworkServices", 15))
+			return 1;
+	return 0;
+}
+
+static void sc_fix(void)
+{
+	int has = sc_has_services();
+	if (has != 0) {
+		printf("[%6llu] bridge: configd preferences %s\n", (unsigned long long)link_ms(),
+		       has > 0 ? "have network services" : "absent (configd writes them)");
+		return;
+	}
+	if (rename(SC_PREFS, SC_PREFS ".pre-wifi")) {
+		printf("bridge: configd preferences: rename failed (%s)\n", strerror(errno));
+		return;
+	}
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+	size_t len = 0;
+	int killed = 0;
+	if (sysctl(mib, 3, NULL, &len, NULL, 0) == 0 && len) {
+		len += 16 * sizeof(struct kinfo_proc);
+		struct kinfo_proc *kp = malloc(len);
+		if (kp && sysctl(mib, 3, kp, &len, NULL, 0) == 0) {
+			for (size_t i = 0; i < len / sizeof(*kp); i++)
+				if (!strcmp(kp[i].kp_proc.p_comm, "configd") && kill(kp[i].kp_proc.p_pid, SIGTERM) == 0)
+					killed++;
+		}
+		free(kp);
+	}
+	printf("[%6llu] bridge: configd preferences had no network services: moved to .pre-wifi, "
+	       "configd restarted (%d)\n", (unsigned long long)link_ms(), killed);
+}
+
 /* from wland's idle loop */
 void bridge_poll(void)
 {
@@ -143,6 +200,11 @@ void bridge_poll(void)
 		bridge_send(FW_HELLO, &h, sizeof(h));
 		hello_sent = 1;
 		printf("[%6llu] bridge: hello: the kernel makes en0\n", (unsigned long long)link_ms());
+		sc_check_at = link_ms() + 5000;
+	}
+	if (sc_check_at && link_ms() >= sc_check_at) {
+		sc_check_at = 0;
+		sc_fix();
 	}
 	for (int n = 0; n < 32; n++) {
 		ssize_t r = read(bfd, m, sizeof(m));
