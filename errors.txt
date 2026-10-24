@@ -1,0 +1,10 @@
+2442:/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2356:3: error: call to undeclared function 'ml_io_unmap'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+2513:64 warnings and 1 error generated.
+2514:make[7]: *** [sweet_cam.o] Error 1
+2516:make[6]: *** [build_all] Error 2
+2517:make[5]: *** [do_all] Error 2
+2519:make[4]: *** [build_all] Error 2
+2520:make[3]: *** [build_all_recurse_into_conf] Error 2
+2522:make[2]: *** [build_all_recurse_into_bsd] Error 2
+2524:make[1]: *** [build_all_bootstrap_DEVELOPMENT^ARM64^SWEET] Error 2
+2526:make: *** [install] Error 2

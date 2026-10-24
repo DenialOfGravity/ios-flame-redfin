@@ -1,0 +1,16 @@
+2439-/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2149:23: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+2440-        const struct sensor *s = &sensors[si];
+2441-                             ^
+2442:/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2356:3: error: call to undeclared function 'ml_io_unmap'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+2443-                ml_io_unmap(ring_va, ring_bytes);
+2444-                ^
+2445-/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2356:3: note: did you mean 'ml_io_map'?
+2446-/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:60:20: note: 'ml_io_map' declared here
+2447-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+2448-                   ^
+2449-/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2402:25: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+2450-        const struct tab_mode *m = &sc.mode[mode_n];
+2451-                               ^
+2452-/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2501:12: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+2453-                uint64_t now = ios_ms();
+2454-                         ^

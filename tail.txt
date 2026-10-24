@@ -1,0 +1,300 @@
+/bin/mkdir -p /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/prng/
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/SETUP/replacecontents/replacecontents kpincmidir/.UNIFDEF_FLAGS /Applications/Xcode_15.0.1.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/unifdef -DXNU_PLATFORM_MacOSX  -UXNU_PLATFORM_DriverKit -UXNU_PLATFORM_iPhoneSimulator -UXNU_PLATFORM_iPhoneNanoSimulator -UXNU_PLATFORM_tvSimulator -UXNU_PLATFORM_AppleTVSimulator -UXNU_PLATFORM_WatchSimulator -UXNU_PLATFORM_iPhoneOS -UXNU_PLATFORM_iPhoneOSNano -UXNU_PLATFORM_tvOS -UXNU_PLATFORM_AppleTVOS -UXNU_PLATFORM_WatchOS -UXNU_PLATFORM_BridgeOS  -UMACH_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE -UIOKIT_KERNEL_PRIVATE -ULIBKERN_KERNEL_PRIVATE -ULIBSA_KERNEL_PRIVATE -UPEXPERT_KERNEL_PRIVATE -UXNU_KERNEL_PRIVATE  -DKERNEL_PRIVATE -DKERNEL -DPRIVATE -UDRIVERKIT -U_OPEN_SOURCE_ -U__OPEN_SOURCE__
+/bin/mkdir -p ./incmidir
+/bin/mkdir -p ./incmigendir
+/bin/mkdir -p /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//usr/include/sys/
+make -C "/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/osfmk" -f /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/osfmk/Makefile CURRENT_KERNEL_CONFIG=DEVELOPMENT CURRENT_ARCH_CONFIG=ARM64 CURRENT_MACHINE_CONFIG=SWEET CURRENT_BUILD_CONFIG=DEVELOPMENT^ARM64^SWEET SOURCE=/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/osfmk/ RELATIVE_SOURCE_PATH=./osfmk TARGET=/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/osfmk/ OBJPATH=/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET do_installhdrs_mi;
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/SETUP/replacecontents/replacecontents .SFLAGS /Applications/Xcode_15.0.1.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -D__ASSEMBLER__ -DASSEMBLER  -DARM64_BOARD_CONFIG_SWEET                -mcpu=cortex-a55+crypto -arch arm64 -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=0xfffffe0007004000 -DARM_LARGE_MEMORY=1 -momit-leaf-frame-pointer -fno-strict-aliasing -D__API__=v4 -mkernel   -mmacosx-version-min=14.0 -DXNU_TARGET_OS_OSX -DXNU_PLATFORM_MacOSX -DAPPLE -DKERNEL -DKERNEL_PRIVATE -DXNU_KERNEL_PRIVATE -DPRIVATE -D__MACHO__=1 -Dvolatile=__volatile -DXNU_KERN_EVENT_DATA_IS_VLA -DCURRENT_MACHINE_CONFIG_LC=sweet -DMACH -DAH_ALL_CRYPTO -DTRAFFIC_MGT -DMULTICAST -DIFNET_INPUT_SANITY_CHK -DPSYNCH -DFLOW_DIVERT -DNECP -DCONTENT_FILTER -DPACKET_MANGLER -DCONFIG_MBUF_JUMBO -DMOCKFS -DSWEET_HFS -DNULLFS -DBINDFS -DNAMEDSTREAMS -DCONFIG_APPLEDOUBLE -DCONFIG_VOLFS -DCONFIG_IMGSRC_ACCESS -DCONFIG_SEARCHFS -DCONFIG_MNT_SUID -DCONFIG_MNT_ROOTSNAP -DCONFIG_ROSV_STARTUP -DCONFIG_FIRMLINKS -DCONFIG_MOUNT_VM -DCONFIG_MOUNT_PREBOOTRECOVERY -DCONFIG_DATALESS_FILES -DCONFIG_BASESYSTEMROOT -DCONFIG_UNION_MOUNTS -DCONFIG_FILE_LEASES -DCONFIG_IOCOUNT_TRACE -DNFSSERVER -DCONFIG_NETBOOT -DIPSEC -DIPSEC_ESP -DCRYPTO_SHA2 -DENCRYPTED_SWAP -DCONFIG_IMG4 -DCONFIG_KN_HASHSIZE="64" -DCONFIG_VNODES="263168" -DCONFIG_NC_HASH="4096" -DCONFIG_VFS_NAMES="4096" -DCONFIG_MAX_CLUSTERS="8" -DCONFIG_MIN_NBUF="256" -DCONFIG_MIN_NIOBUF="128" -DCONFIG_NMBCLUSTERS="((1024 * 512) / MCLBYTES)" -DCONFIG_TCBHASHSIZE="4096" -DCONFIG_AIO_MAX="90" -DCONFIG_AIO_PROCESS_MAX="16" -DCONFIG_AIO_THREAD_COUNT="4" -DCONFIG_MAXVIFS="32" -DCONFIG_MFCTBLSIZ="256" -DCONFIG_MSG_BSIZE_REL="131072" -DCONFIG_MSG_BSIZE_DEV="131072" -DCONFIG_MSG_BSIZE="CONFIG_MSG_BSIZE_DEV" -DCONFIG_IPC_TABLE_ENTRIES_SIZE_MAX="7340032" -DCONFIG_IPC_TABLE_REQUEST_SIZE_MAX="2097152" -DCONFIG_IPC_KERNEL_MAP_SIZE="64" -DCONFIG_PMAP_PPL -DNOS_ARM_ASM -DNOS_ARM_PMAP -DCONFIG_DYNAMIC_CODE_SIGNING -DCONFIG_SECOND_STATIC_TRUST_CACHE -DCONFIG_SUPPLEMENTAL_SIGNATURES -DCONFIG_CODE_DECRYPTION -DCONFIG_PROTECT -DCONFIG_MEMORYSTATUS -DCONFIG_DEFERRED_RECLAIM -DCONFIG_PHYS_WRITE_ACCT -DVM_PRESSURE_EVENTS -DCONFIG_LEDGER_INTERVAL_MAX -DCONFIG_IOSCHED -DCONFIG_IO_ACCOUNTING -DIMPORTANCE_TRACE -DCONFIG_TELEMETRY -DCONFIG_PROC_UUID_POLICY -DCONFIG_COREDUMP -DCONFIG_VNGUARD -DIOKITCPP -DIOKITSTATS -DIOTRACKING -DCONFIG_SLEEP -DCONFIG_MAX_THREADS="500" -DNO_KERNEL_HID -DLIBKERNCPP -DCONFIG_BLOCKS -DCONFIG_KEC_FIPS -DCONFIG_PERSONAS -DCONFIG_MACF_SOCKET_SUBSET -DCONFIG_ARCADE -DCONFIG_SETUID -DCONFIG_SECURE_BSD_ROOT -DCONFIG_KAS_INFO -DCONFIG_PROC_RESOURCE_LIMITS -DCONFIG_ZLEAKS -DCONFIG_VOUCHER_DEPRECATED -DLOCK_STATS -DKPERF -DKPC -DCONFIG_PERVASIVE_ENERGY -DCONFIG_IOTRACE -DPGO -DDEVELOPMENT -DMACH_BSD -DIOKIT -DCONFIG_THREAD_MAX="2560" -DCONFIG_TASK_MAX="1024" -DCONFIG_ZONE_MAP_MIN="120586240" -DCONFIG_VC_PROGRESS_WHITE -DCONFIG_SCHED_TRADITIONAL -DCONFIG_SCHED_MULTIQ -DCONFIG_SCHED_TIMESHARE_CORE -DCONFIG_CLUTCH -DCONFIG_SCHED_AUTO_JOIN -DCONFIG_SCHED_SFI -DCONFIG_PROB_GZALLOC -DCONFIG_SCHED_DEFERRED_AST -DCONFIG_PREADOPT_TG -DMACH_KDP -DCONFIG_SERIAL_KDP -DCONFIG_KDP_INTERACTIVE_DEBUGGING -DCONFIG_KDP_COREDUMP_ENCRYPTION -DCONFIG_TASKWATCH -DCONFIG_USER_NOTIFICATION -DCONFIG_XNUPOST -DPROC_REF_DEBUG -DCONFIG_ATM -DCONFIG_COALITIONS -DCONFIG_SYSDIAGNOSE -DCONFIG_CSR -DCONFIG_CSR_FROM_DT -DSERIAL_CONSOLE -DVIDEO_CONSOLE -DCONFIG_REQUIRES_U32_MUNGING -DCONFIG_MACH_BRIDGE_RECV_TIME -DCONFIG_QUIESCE_COUNTER -DCONFIG_ARM_PFZ -DCONFIG_DARKBOOT -DCONFIG_SERVICE_PORT_INFO -DCONFIG_DELAY_IDLE_SLEEP -DCONFIG_PROC_UDATA_STORAGE -DSCHED_HYGIENE_DEBUG -DCONFIG_DEBUG_SYSCALL_REJECTION -DALTERNATE_DEBUGGER -DCONFIG_MACH_APPROXIMATE_TIME -DCONFIG_KERNEL_INTEGRITY -DCONFIG_MACF_LAZY_VNODE_LABELS -DCONFIG_HYPERVISOR_PUBLIC -DCONFIG_RESLIDE_SHARED_CACHE  -include meta_features.h -I. -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/bsd  -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/osfmk  -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/libkern  -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/iokit  -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/pexpert  -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/libsa  -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/security  -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/san -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/EXTERNAL_HEADERS  -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot/usr/local/include/kernel -I/Applications/Xcode_15.0.1.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.0.sdk//System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform
+/bin/mkdir -p /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//usr/include/sys/
+/bin/mkdir -p ./mmincmidir
+/bin/mkdir -p ./kincmidir
+make -C "/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/bsd/skywalk" -f /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/skywalk/Makefile CURRENT_KERNEL_CONFIG=DEVELOPMENT CURRENT_ARCH_CONFIG=ARM64 CURRENT_MACHINE_CONFIG=SWEET CURRENT_BUILD_CONFIG=DEVELOPMENT^ARM64^SWEET SOURCE=/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/skywalk/ RELATIVE_SOURCE_PATH=./bsd/skywalk TARGET=/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/bsd/skywalk/ OBJPATH=/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET do_installhdrs_mi;
+[[1marm64      sweet[m] [1;34m         CC[m sweet_cam.o[m
+/Applications/bin/mkdir -p /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//usr/include//
+/Xcode_15.0.1.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -c -g -nostdinc -ferror-limit=10000 -fno-builtin -fno-common -ftrivial-auto-var-init=zero -fsigned-bitfields -fmerge-all-constants -fno-c++-static-destructors -DARM64_BOARD_CONFIG_SWEET -mcpu=cortex-a55+crypto -arch arm64 -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=0xfffffe0007004000 -DARM_LARGE_MEMORY=1 -momit-leaf-frame-pointer -fno-strict-aliasing -D__API__=v4 -mkernel -O2 -mmacosx-version-min=14.0 -DXNU_TARGET_OS_OSX -DXNU_PLATFORM_MacOSX -DAPPLE -DKERNEL -DKERNEL_PRIVATE -DXNU_KERNEL_PRIVATE -DPRIVATE -D__MACHO__=1 -Dvolatile=__volatile -DXNU_KERN_EVENT_DATA_IS_VLA -DCURRENT_MACHINE_CONFIG_LC=sweet -DMACH -DAH_ALL_CRYPTO -DTRAFFIC_MGT -DMULTICAST -DIFNET_INPUT_SANITY_CHK -DPSYNCH -DFLOW_DIVERT -DNECP -DCONTENT_FILTER -DPACKET_MANGLER -DCONFIG_MBUF_JUMBO -DMOCKFS -DSWEET_HFS -DNULLFS -DBINDFS -DNAMEDSTREAMS -DCONFIG_APPLEDOUBLE -DCONFIG_VOLFS -DCONFIG_IMGSRC_ACCESS -DCONFIG_SEARCHFS -DCONFIG_MNT_SUID -DCONFIG_MNT_ROOTSNAP -DCONFIG_ROSV_STARTUP -DCONFIG_FIRMLINKS -DCONFIG_MOUNT_VM -DCONFIG_MOUNT_PREBOOTRECOVERY -DCONFIG_DATALESS_FILES -DCONFIG_BASESYSTEMROOT -DCONFIG_UNION_MOUNTS -DCONFIG_FILE_LEASES -DCONFIG_IOCOUNT_TRACE -DNFSSERVER -DCONFIG_NETBOOT -DIPSEC -DIPSEC_ESP -DCRYPTO_SHA2 -DENCRYPTED_SWAP -DCONFIG_IMG4 -DCONFIG_KN_HASHSIZE="64" -DCONFIG_VNODES="263168" -DCONFIG_NC_HASH="4096" -DCONFIG_VFS_NAMES="4096" -DCONFIG_MAX_CLUSTERS="8" -DCONFIG_MIN_NBUF="256" -DCONFIG_MIN_NIOBUF="128" -DCONFIG_NMBCLUSTERS="((1024 * 512) / MCLBYTES)" -DCONFIG_TCBHASHSIZE="4096" -DCONFIG_AIO_MAX="90" -DCONFIG_AIO_PROCESS_MAX="16" -DCONFIG_AIO_THREAD_COUNT="4" -DCONFIG_MAXVIFS="32" -DCONFIG_MFCTBLSIZ="256" -DCONFIG_MSG_BSIZE_REL="131072" -DCONFIG_MSG_BSIZE_DEV="131072" -DCONFIG_MSG_BSIZE="CONFIG_MSG_BSIZE_DEV" -DCONFIG_IPC_TABLE_ENTRIES_SIZE_MAX="7340032" -DCONFIG_IPC_TABLE_REQUEST_SIZE_MAX="2097152" -DCONFIG_IPC_KERNEL_MAP_SIZE="64" -DCONFIG_PMAP_PPL -DNOS_ARM_ASM -DNOS_ARM_PMAP -DCONFIG_DYNAMIC_CODE_SIGNING -DCONFIG_SECOND_STATIC_TRUST_CACHE -DCONFIG_SUPPLEMENTAL_SIGNATURES -DCONFIG_CODE_DECRYPTION -DCONFIG_PROTECT -DCONFIG_MEMORYSTATUS -DCONFIG_DEFERRED_RECLAIM -DCONFIG_PHYS_WRITE_ACCT -DVM_PRESSURE_EVENTS -DCONFIG_LEDGER_INTERVAL_MAX -DCONFIG_IOSCHED -DCONFIG_IO_ACCOUNTING -DIMPORTANCE_TRACE -DCONFIG_TELEMETRY -DCONFIG_PROC_UUID_POLICY -DCONFIG_COREDUMP -DCONFIG_VNGUARD -DIOKITCPP -DIOKITSTATS -DIOTRACKING -DCONFIG_SLEEP -DCONFIG_MAX_THREADS="500" -DNO_KERNEL_HID -DLIBKERNCPP -DCONFIG_BLOCKS -DCONFIG_KEC_FIPS -DCONFIG_PERSONAS -DCONFIG_MACF_SOCKET_SUBSET -DCONFIG_ARCADE -DCONFIG_SETUID -DCONFIG_SECURE_BSD_ROOT -DCONFIG_KAS_INFO -DCONFIG_PROC_RESOURCE_LIMITS -DCONFIG_ZLEAKS -DCONFIG_VOUCHER_DEPRECATED -DLOCK_STATS -DKPERF -DKPC -DCONFIG_PERVASIVE_ENERGY -DCONFIG_IOTRACE -DPGO -DDEVELOPMENT -DMACH_BSD -DIOKIT -DCONFIG_THREAD_MAX="2560" -DCONFIG_TASK_MAX="1024" -DCONFIG_ZONE_MAP_MIN="120586240" -DCONFIG_VC_PROGRESS_WHITE -DCONFIG_SCHED_TRADITIONAL -DCONFIG_SCHED_MULTIQ -DCONFIG_SCHED_TIMESHARE_CORE -DCONFIG_CLUTCH -DCONFIG_SCHED_AUTO_JOIN -DCONFIG_SCHED_SFI -DCONFIG_PROB_GZALLOC -DCONFIG_SCHED_DEFERRED_AST -DCONFIG_PREADOPT_TG -DMACH_KDP -DCONFIG_SERIAL_KDP -DCONFIG_KDP_INTERACTIVE_DEBUGGING -DCONFIG_KDP_COREDUMP_ENCRYPTION -DCONFIG_TASKWATCH -DCONFIG_USER_NOTIFICATION -DCONFIG_XNUPOST -DPROC_REF_DEBUG -DCONFIG_ATM -DCONFIG_COALITIONS -DCONFIG_SYSDIAGNOSE -DCONFIG_CSR -DCONFIG_CSR_FROM_DT -DSERIAL_CONSOLE -DVIDEO_CONSOLE -DCONFIG_REQUIRES_U32_MUNGING -DCONFIG_MACH_BRIDGE_RECV_TIME -DCONFIG_QUIESCE_COUNTER -DCONFIG_ARM_PFZ -DCONFIG_DARKBOOT -DCONFIG_SERVICE_PORT_INFO -DCONFIG_DELAY_IDLE_SLEEP -DCONFIG_PROC_UDATA_STORAGE -DSCHED_HYGIENE_DEBUG -DCONFIG_DEBUG_SYSCALL_REJECTION -DALTERNATE_DEBUGGER -DCONFIG_MACH_APPROXIMATE_TIME -DCONFIG_KERNEL_INTEGRITY -DCONFIG_MACF_LAZY_VNODE_LABELS -DCONFIG_HYPERVISOR_PUBLIC -DCONFIG_RESLIDE_SHARED_CACHE -include meta_features.h -DDRIVER_PRIVATE -D_KERNEL_BUILD -DKERNEL_BUILD -DMACH_KERNEL -DBSD_BUILD -DBSD_KERNEL_PRIVATE -DLP64_DEBUG=0 -Warray-bounds-pointer-arithmetic -Weverything -Wundef-prefix=TARGET_OS_ -Wundef-prefix=LCK_GRP_USE_ARG -Wno-pedantic -Wno-bad-function-cast -Wno-bitwise-instead-of-logical -Wno-c++-compat -Wno-c++98-compat -Wno-conditional-uninitialized -Wno-covered-switch-default -Wno-disabled-macro-expansion -Wno-documentation-unknown-command -Wno-extra-semi-stmt -Wno-format-non-iso -Wno-language-extension-token -Wno-missing-variable-declarations -Wno-packed -Wno-padded -Wno-partial-availability -Wno-reserved-id-macro -Wno-shift-sign-overflow -Wno-switch-enum -Wno-unaligned-access -Wno-undef -Wno-unused-macros -Wno-used-but-marked-unused -Wno-variadic-macros -Wno-vla -Wno-zero-length-array -Wno-unknown-warning-option -Wno-anon-enum-enum-conversion -Wno-error=enum-enum-conversion -Wno-error=c99-designator -Wno-error=reorder-init-list -Wno-error=declaration-after-statement -Wno-sign-compare -Wno-sign-conversion -Wpointer-arith -Wxnu-typed-allocators -MD -MF sweet_cam.d -MP   -I. -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/bsd  -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/osfmk  -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/libkern  -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/iokit  -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/pexpert  -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/libsa  -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/security  -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/san -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/EXTERNAL_HEADERS  -I/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot/usr/local/include/kernel -I/Applications/Xcode_15.0.1.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.0.sdk//System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform  /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c
+/bin/mkdir -p /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/Kernel.framework/Versions/A/Headers/sys/
+/bin/mkdir -p ./kincmigendir
+/bin/mkdir -p ./pincmidir
+/bin/mkdir -p /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/Kernel.framework/Versions/A/Headers/sys/
+/bin/mkdir -p /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//usr/local/include/sys/
+/bin/mkdir -p ./spincmidir
+/bin/mkdir -p ./spincmigendir
+/bin/mkdir -p /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/System.framework/Versions/B/PrivateHeaders/sys/
+/bin/mkdir -p /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/System.framework/Versions/B/PrivateHeaders/sys/
+/bin/mkdir -p ./kpincmidir
+/bin/mkdir -p ./kpincmigendir
+/bin/mkdir -p /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/sys/
+/bin/mkdir -p /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/sys/
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/SETUP/replacecontents/replacecontents incmidir/.UNIFDEF_FLAGS /Applications/Xcode_15.0.1.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/unifdef -DXNU_PLATFORM_MacOSX  -UXNU_PLATFORM_DriverKit -UXNU_PLATFORM_iPhoneSimulator -UXNU_PLATFORM_iPhoneNanoSimulator -UXNU_PLATFORM_tvSimulator -UXNU_PLATFORM_AppleTVSimulator -UXNU_PLATFORM_WatchSimulator -UXNU_PLATFORM_iPhoneOS -UXNU_PLATFORM_iPhoneOSNano -UXNU_PLATFORM_tvOS -UXNU_PLATFORM_AppleTVOS -UXNU_PLATFORM_WatchOS -UXNU_PLATFORM_BridgeOS  -UMACH_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE -UIOKIT_KERNEL_PRIVATE -ULIBKERN_KERNEL_PRIVATE -ULIBSA_KERNEL_PRIVATE -UPEXPERT_KERNEL_PRIVATE -UXNU_KERNEL_PRIVATE  -UKERNEL_PRIVATE -UKERNEL -UPRIVATE -UDRIVERKIT -D_OPEN_SOURCE_ -D__OPEN_SOURCE__ 
+/bin/mkdir -p ./spincmidir
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/SETUP/replacecontents/replacecontents incmigendir/.UNIFDEF_FLAGS /Applications/Xcode_15.0.1.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/unifdef -DXNU_PLATFORM_MacOSX  -UXNU_PLATFORM_DriverKit -UXNU_PLATFORM_iPhoneSimulator -UXNU_PLATFORM_iPhoneNanoSimulator -UXNU_PLATFORM_tvSimulator -UXNU_PLATFORM_AppleTVSimulator -UXNU_PLATFORM_WatchSimulator -UXNU_PLATFORM_iPhoneOS -UXNU_PLATFORM_iPhoneOSNano -UXNU_PLATFORM_tvOS -UXNU_PLATFORM_AppleTVOS -UXNU_PLATFORM_WatchOS -UXNU_PLATFORM_BridgeOS  -UMACH_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE -UIOKIT_KERNEL_PRIVATE -ULIBKERN_KERNEL_PRIVATE -ULIBSA_KERNEL_PRIVATE -UPEXPERT_KERNEL_PRIVATE -UXNU_KERNEL_PRIVATE  -UKERNEL_PRIVATE -UKERNEL -UPRIVATE -UDRIVERKIT -D_OPEN_SOURCE_ -D__OPEN_SOURCE__ 
+/bin/mkdir -p ./kpincmidir
+/bin/mkdir -p /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/System.framework/Versions/B/PrivateHeaders/skywalk/
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/SETUP/replacecontents/replacecontents mmincmidir/.UNIFDEF_FLAGS /Applications/Xcode_15.0.1.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/unifdef -t -DXNU_PLATFORM_MacOSX  -UXNU_PLATFORM_DriverKit -UXNU_PLATFORM_iPhoneSimulator -UXNU_PLATFORM_iPhoneNanoSimulator -UXNU_PLATFORM_tvSimulator -UXNU_PLATFORM_AppleTVSimulator -UXNU_PLATFORM_WatchSimulator -UXNU_PLATFORM_iPhoneOS -UXNU_PLATFORM_iPhoneOSNano -UXNU_PLATFORM_tvOS -UXNU_PLATFORM_AppleTVOS -UXNU_PLATFORM_WatchOS -UXNU_PLATFORM_BridgeOS  -UMACH_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE -UIOKIT_KERNEL_PRIVATE -ULIBKERN_KERNEL_PRIVATE -ULIBSA_KERNEL_PRIVATE -UPEXPERT_KERNEL_PRIVATE -UXNU_KERNEL_PRIVATE  -UPRIVATE -D_OPEN_SOURCE_ -D__OPEN_SOURCE__
+/bin/mkdir -p /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/skywalk/
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/SETUP/replacecontents/replacecontents kincmidir/.UNIFDEF_FLAGS /Applications/Xcode_15.0.1.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/unifdef -DXNU_PLATFORM_MacOSX  -UXNU_PLATFORM_DriverKit -UXNU_PLATFORM_iPhoneSimulator -UXNU_PLATFORM_iPhoneNanoSimulator -UXNU_PLATFORM_tvSimulator -UXNU_PLATFORM_AppleTVSimulator -UXNU_PLATFORM_WatchSimulator -UXNU_PLATFORM_iPhoneOS -UXNU_PLATFORM_iPhoneOSNano -UXNU_PLATFORM_tvOS -UXNU_PLATFORM_AppleTVOS -UXNU_PLATFORM_WatchOS -UXNU_PLATFORM_BridgeOS  -UMACH_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE -UIOKIT_KERNEL_PRIVATE -ULIBKERN_KERNEL_PRIVATE -ULIBSA_KERNEL_PRIVATE -UPEXPERT_KERNEL_PRIVATE -UXNU_KERNEL_PRIVATE  -UKERNEL_PRIVATE -DKERNEL -UPRIVATE -UDRIVERKIT -D_OPEN_SOURCE_ -D__OPEN_SOURCE__
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/SETUP/replacecontents/replacecontents spincmidir/.UNIFDEF_FLAGS /Applications/Xcode_15.0.1.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/unifdef -DXNU_PLATFORM_MacOSX  -UXNU_PLATFORM_DriverKit -UXNU_PLATFORM_iPhoneSimulator -UXNU_PLATFORM_iPhoneNanoSimulator -UXNU_PLATFORM_tvSimulator -UXNU_PLATFORM_AppleTVSimulator -UXNU_PLATFORM_WatchSimulator -UXNU_PLATFORM_iPhoneOS -UXNU_PLATFORM_iPhoneOSNano -UXNU_PLATFORM_tvOS -UXNU_PLATFORM_AppleTVOS -UXNU_PLATFORM_WatchOS -UXNU_PLATFORM_BridgeOS  -UMACH_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE -UIOKIT_KERNEL_PRIVATE -ULIBKERN_KERNEL_PRIVATE -ULIBSA_KERNEL_PRIVATE -UPEXPERT_KERNEL_PRIVATE -UXNU_KERNEL_PRIVATE  -UKERNEL_PRIVATE -UKERNEL -DPRIVATE -UDRIVERKIT -U_OPEN_SOURCE_ -U__OPEN_SOURCE__ 
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/SETUP/replacecontents/replacecontents kincmigendir/.UNIFDEF_FLAGS /Applications/Xcode_15.0.1.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/unifdef -DXNU_PLATFORM_MacOSX  -UXNU_PLATFORM_DriverKit -UXNU_PLATFORM_iPhoneSimulator -UXNU_PLATFORM_iPhoneNanoSimulator -UXNU_PLATFORM_tvSimulator -UXNU_PLATFORM_AppleTVSimulator -UXNU_PLATFORM_WatchSimulator -UXNU_PLATFORM_iPhoneOS -UXNU_PLATFORM_iPhoneOSNano -UXNU_PLATFORM_tvOS -UXNU_PLATFORM_AppleTVOS -UXNU_PLATFORM_WatchOS -UXNU_PLATFORM_BridgeOS  -UMACH_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE -UIOKIT_KERNEL_PRIVATE -ULIBKERN_KERNEL_PRIVATE -ULIBSA_KERNEL_PRIVATE -UPEXPERT_KERNEL_PRIVATE -UXNU_KERNEL_PRIVATE  -UKERNEL_PRIVATE -DKERNEL -UPRIVATE -UDRIVERKIT -D_OPEN_SOURCE_ -D__OPEN_SOURCE__
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/SETUP/replacecontents/replacecontents kpincmidir/.UNIFDEF_FLAGS /Applications/Xcode_15.0.1.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/unifdef -DXNU_PLATFORM_MacOSX  -UXNU_PLATFORM_DriverKit -UXNU_PLATFORM_iPhoneSimulator -UXNU_PLATFORM_iPhoneNanoSimulator -UXNU_PLATFORM_tvSimulator -UXNU_PLATFORM_AppleTVSimulator -UXNU_PLATFORM_WatchSimulator -UXNU_PLATFORM_iPhoneOS -UXNU_PLATFORM_iPhoneOSNano -UXNU_PLATFORM_tvOS -UXNU_PLATFORM_AppleTVOS -UXNU_PLATFORM_WatchOS -UXNU_PLATFORM_BridgeOS  -UMACH_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE -UIOKIT_KERNEL_PRIVATE -ULIBKERN_KERNEL_PRIVATE -ULIBSA_KERNEL_PRIVATE -UPEXPERT_KERNEL_PRIVATE -UXNU_KERNEL_PRIVATE  -DKERNEL_PRIVATE -DKERNEL -DPRIVATE -UDRIVERKIT -U_OPEN_SOURCE_ -U__OPEN_SOURCE__
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/SETUP/replacecontents/replacecontents pincmidir/.UNIFDEF_FLAGS /Applications/Xcode_15.0.1.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/unifdef -DXNU_PLATFORM_MacOSX  -UXNU_PLATFORM_DriverKit -UXNU_PLATFORM_iPhoneSimulator -UXNU_PLATFORM_iPhoneNanoSimulator -UXNU_PLATFORM_tvSimulator -UXNU_PLATFORM_AppleTVSimulator -UXNU_PLATFORM_WatchSimulator -UXNU_PLATFORM_iPhoneOS -UXNU_PLATFORM_iPhoneOSNano -UXNU_PLATFORM_tvOS -UXNU_PLATFORM_AppleTVOS -UXNU_PLATFORM_WatchOS -UXNU_PLATFORM_BridgeOS  -UMACH_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE -UIOKIT_KERNEL_PRIVATE -ULIBKERN_KERNEL_PRIVATE -ULIBSA_KERNEL_PRIVATE -UPEXPERT_KERNEL_PRIVATE -UXNU_KERNEL_PRIVATE  -UKERNEL_PRIVATE -UKERNEL -DPRIVATE -UDRIVERKIT -U_OPEN_SOURCE_ -U__OPEN_SOURCE__ 
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/SETUP/replacecontents/replacecontents spincmidir/.UNIFDEF_FLAGS /Applications/Xcode_15.0.1.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/unifdef -DXNU_PLATFORM_MacOSX  -UXNU_PLATFORM_DriverKit -UXNU_PLATFORM_iPhoneSimulator -UXNU_PLATFORM_iPhoneNanoSimulator -UXNU_PLATFORM_tvSimulator -UXNU_PLATFORM_AppleTVSimulator -UXNU_PLATFORM_WatchSimulator -UXNU_PLATFORM_iPhoneOS -UXNU_PLATFORM_iPhoneOSNano -UXNU_PLATFORM_tvOS -UXNU_PLATFORM_AppleTVOS -UXNU_PLATFORM_WatchOS -UXNU_PLATFORM_BridgeOS  -UMACH_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE -UIOKIT_KERNEL_PRIVATE -ULIBKERN_KERNEL_PRIVATE -ULIBSA_KERNEL_PRIVATE -UPEXPERT_KERNEL_PRIVATE -UXNU_KERNEL_PRIVATE  -UKERNEL_PRIVATE -UKERNEL -DPRIVATE -UDRIVERKIT -U_OPEN_SOURCE_ -U__OPEN_SOURCE__ 
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/SETUP/replacecontents/replacecontents spincmigendir/.UNIFDEF_FLAGS /Applications/Xcode_15.0.1.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/unifdef -DXNU_PLATFORM_MacOSX  -UXNU_PLATFORM_DriverKit -UXNU_PLATFORM_iPhoneSimulator -UXNU_PLATFORM_iPhoneNanoSimulator -UXNU_PLATFORM_tvSimulator -UXNU_PLATFORM_AppleTVSimulator -UXNU_PLATFORM_WatchSimulator -UXNU_PLATFORM_iPhoneOS -UXNU_PLATFORM_iPhoneOSNano -UXNU_PLATFORM_tvOS -UXNU_PLATFORM_AppleTVOS -UXNU_PLATFORM_WatchOS -UXNU_PLATFORM_BridgeOS  -UMACH_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE -UIOKIT_KERNEL_PRIVATE -ULIBKERN_KERNEL_PRIVATE -ULIBSA_KERNEL_PRIVATE -UPEXPERT_KERNEL_PRIVATE -UXNU_KERNEL_PRIVATE  -UKERNEL_PRIVATE -UKERNEL -DPRIVATE -UDRIVERKIT -U_OPEN_SOURCE_ -U__OPEN_SOURCE__ 
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/SETUP/replacecontents/replacecontents kpincmidir/.UNIFDEF_FLAGS /Applications/Xcode_15.0.1.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/unifdef -DXNU_PLATFORM_MacOSX  -UXNU_PLATFORM_DriverKit -UXNU_PLATFORM_iPhoneSimulator -UXNU_PLATFORM_iPhoneNanoSimulator -UXNU_PLATFORM_tvSimulator -UXNU_PLATFORM_AppleTVSimulator -UXNU_PLATFORM_WatchSimulator -UXNU_PLATFORM_iPhoneOS -UXNU_PLATFORM_iPhoneOSNano -UXNU_PLATFORM_tvOS -UXNU_PLATFORM_AppleTVOS -UXNU_PLATFORM_WatchOS -UXNU_PLATFORM_BridgeOS  -UMACH_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE -UIOKIT_KERNEL_PRIVATE -ULIBKERN_KERNEL_PRIVATE -ULIBSA_KERNEL_PRIVATE -UPEXPERT_KERNEL_PRIVATE -UXNU_KERNEL_PRIVATE  -DKERNEL_PRIVATE -DKERNEL -DPRIVATE -UDRIVERKIT -U_OPEN_SOURCE_ -U__OPEN_SOURCE__
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/SETUP/replacecontents/replacecontents kpincmigendir/.UNIFDEF_FLAGS /Applications/Xcode_15.0.1.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/unifdef -DXNU_PLATFORM_MacOSX  -UXNU_PLATFORM_DriverKit -UXNU_PLATFORM_iPhoneSimulator -UXNU_PLATFORM_iPhoneNanoSimulator -UXNU_PLATFORM_tvSimulator -UXNU_PLATFORM_AppleTVSimulator -UXNU_PLATFORM_WatchSimulator -UXNU_PLATFORM_iPhoneOS -UXNU_PLATFORM_iPhoneOSNano -UXNU_PLATFORM_tvOS -UXNU_PLATFORM_AppleTVOS -UXNU_PLATFORM_WatchOS -UXNU_PLATFORM_BridgeOS  -UMACH_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE -UIOKIT_KERNEL_PRIVATE -ULIBKERN_KERNEL_PRIVATE -ULIBSA_KERNEL_PRIVATE -UPEXPERT_KERNEL_PRIVATE -UXNU_KERNEL_PRIVATE  -DKERNEL_PRIVATE -DKERNEL -DPRIVATE -UDRIVERKIT -U_OPEN_SOURCE_ -U__OPEN_SOURCE__
+make -C "/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/bsd" -f /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/Makefile CURRENT_KERNEL_CONFIG=DEVELOPMENT CURRENT_ARCH_CONFIG=ARM64 CURRENT_MACHINE_CONFIG=SWEET CURRENT_BUILD_CONFIG=DEVELOPMENT^ARM64^SWEET SOURCE=/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/ RELATIVE_SOURCE_PATH=./bsd TARGET=/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/bsd/ OBJPATH=/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET do_installhdrs_mi;
+make -C "/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET" -f /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/Makefile CURRENT_KERNEL_CONFIG=DEVELOPMENT CURRENT_ARCH_CONFIG=ARM64 CURRENT_MACHINE_CONFIG=SWEET CURRENT_BUILD_CONFIG=DEVELOPMENT^ARM64^SWEET SOURCE=/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/ RELATIVE_SOURCE_PATH=. TARGET=/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/ OBJPATH=/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET do_installhdrs_mi;
+In file included from /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:49:
+In file included from /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/sys/param.h:116:
+In file included from /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/sys/ucred.h:82:
+In file included from /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/sys/queue.h:63:
+In file included from /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/osfmk/kern/debug.h:32:
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/osfmk/kern/kcdata.h:1612:11: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        uint32_t maxlen = kcdata_iter_size(iter) - offset;
+                 ^
+/bin/mkdir -p /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/Kernel.framework
+/bin/mkdir -p /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders
+/bin/mkdir -p /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/Kernel.framework/Versions/A/Resources
+/bin/rm -f /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/Kernel.framework/Versions/Current
+/bin/ln -fs A /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/Kernel.framework/Versions/Current
+/bin/rm -f /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/Kernel.framework/Headers
+/bin/ln -fs Versions/Current/Headers			\
+		   /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/Kernel.framework/Headers
+/bin/rm -f /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/Kernel.framework/PrivateHeaders
+/bin/ln -fs Versions/Current/PrivateHeaders		\
+		   /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/Kernel.framework/PrivateHeaders
+/bin/rm -f /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/Kernel.framework/Resources
+/bin/ln -fs Versions/Current/Resources			\
+		   /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/fakeroot//System/Library/Frameworks/Kernel.framework/Resources
+In file included from /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:50:
+In file included from /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/sys/systm.h:105:
+In file included from /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/sys/malloc.h:80:
+In file included from /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/osfmk/kern/kalloc.h:65:
+In file included from /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/osfmk/kern/zalloc.h:72:
+In file included from /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/osfmk/kern/kern_types.h:36:
+In file included from /Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/osfmk/mach/mach_types.h:115:
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/build/xnu.obj/EXPORT_HDRS/osfmk/mach/vm_param.h:607:14: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        vm_offset_t ptr = params.vmpp_base +
+                    ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:176:11: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        uint64_t deadline;
+                 ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:216:12: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+                unsigned o = rd(cm.sp_cnfg, 0x700u + 4u * i) & 7u;
+                         ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:257:12: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+                uint32_t st = 0;
+                         ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:310:7: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        bool set_vin = n == 8 || n == 10;
+             ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:355:10: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        uint8_t id[3] = { 0 };
+                ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:407:10: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        uint8_t bit = (uint8_t)(1u << (n - 1));
+                ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:495:11: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        uint32_t gclk = rd(cm.camcc, CAMCC_GDSC_CLK);
+                 ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:570:11: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        uint32_t cfg = cm.mclk24 ? 5u << 8 | 2u << 12 | 1u : 1u;
+                 ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:637:7: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        bool in = level(sda);
+             ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:835:6: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        int err = slg_read(0x1105, &id);
+            ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:884:6: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        int result = EIO;
+            ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1010:15: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        static const struct { uint32_t off, val; } cfg[] = {
+                     ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1056:32: warning: missing field 'found' initializer [-Wmissing-field-initializers]
+        { "slow_ahb 80", 0x7058, 3, 9 },                /* PLL0 odd 400 / 5 (field 2n - 1) */
+                                      ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1057:35: warning: missing field 'found' initializer [-Wmissing-field-initializers]
+        { "camnoc_axi 150", 0xc12c, 2, 7 },             /* PLL0 even 600 / 4 */
+                                         ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1058:32: warning: missing field 'found' initializer [-Wmissing-field-initializers]
+        { "cphy_rx 300", 0xa064, 2, 3 },                /* even / 2 */
+                                      ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1059:32: warning: missing field 'found' initializer [-Wmissing-field-initializers]
+        { "csiNphytimer 300", 0, 2, 3 },                /* even / 2: the sensor's PHY (0x6004 + 0x24 n) */
+                                      ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1060:38: warning: missing field 'found' initializer [-Wmissing-field-initializers]
+        { "ife_lite_csid 300", 0xc020, 2, 3 },          /* even / 2 */
+                                            ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1061:33: warning: missing field 'found' initializer [-Wmissing-field-initializers]
+        { "ife_lite 400", 0xc004, 3, 1 },               /* odd / 1 */
+                                       ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1065:49: warning: missing field 'set' initializer [-Wmissing-field-initializers]
+        { "gcc camera_hf_axi", true, GCC_CAMERA_HF_AXI }, { "gcc camera_sf_axi", true, GCC_CAMERA_SF_AXI },
+                                                       ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1065:99: warning: missing field 'set' initializer [-Wmissing-field-initializers]
+        { "gcc camera_hf_axi", true, GCC_CAMERA_HF_AXI }, { "gcc camera_sf_axi", true, GCC_CAMERA_SF_AXI },
+                                                                                                         ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1066:30: warning: missing field 'set' initializer [-Wmissing-field-initializers]
+        { "cpas_ahb", false, 0xc124 }, { "camnoc_axi", false, 0xc148 }, { "csiphyN", false, 0 }, { "csiNphytimer", false, 0 },
+                                    ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1066:63: warning: missing field 'set' initializer [-Wmissing-field-initializers]
+        { "cpas_ahb", false, 0xc124 }, { "camnoc_axi", false, 0xc148 }, { "csiphyN", false, 0 }, { "csiNphytimer", false, 0 },
+                                                                     ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1066:88: warning: missing field 'set' initializer [-Wmissing-field-initializers]
+        { "cpas_ahb", false, 0xc124 }, { "camnoc_axi", false, 0xc148 }, { "csiphyN", false, 0 }, { "csiNphytimer", false, 0 },
+                                                                                              ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1066:118: warning: missing field 'set' initializer [-Wmissing-field-initializers]
+        { "cpas_ahb", false, 0xc124 }, { "camnoc_axi", false, 0xc148 }, { "csiphyN", false, 0 }, { "csiNphytimer", false, 0 },
+                                                                                                                            ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1067:35: warning: missing field 'set' initializer [-Wmissing-field-initializers]
+        { "ife_lite_csid", false, 0xc038 }, { "ife_lite_cphy_rx", false, 0xc040 }, { "ife_lite", false, 0xc01c },
+                                         ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1067:74: warning: missing field 'set' initializer [-Wmissing-field-initializers]
+        { "ife_lite_csid", false, 0xc038 }, { "ife_lite_cphy_rx", false, 0xc040 }, { "ife_lite", false, 0xc01c },
+                                                                                ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1067:105: warning: missing field 'set' initializer [-Wmissing-field-initializers]
+        { "ife_lite_csid", false, 0xc038 }, { "ife_lite_cphy_rx", false, 0xc040 }, { "ife_lite", false, 0xc01c },
+                                                                                                               ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1154:12: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+                uint32_t id = smr & 0x7fff, m = (smr >> 16) & 0x7fff;
+                         ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1161:11: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        uint32_t cb = ~0u;
+                 ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1218:11: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        uint32_t fsr = rd(cap.smmu_cb, 0x58), gfsr = rd(cap.smmu, 0x48);
+                 ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1233:28: warning: implicit conversion loses integer precision: 'vm_offset_t' (aka 'unsigned long') to 'uint32_t' (aka 'unsigned int') [-Wshorten-64-to-32]
+        wr(cap.smmu, cap.smmu_gr1 + 4 * cap.cb_n, cap.cbar_old);
+        ~~           ~~~~~~~~~~~~~^~~~~~~~~~~~~~
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1234:36: warning: implicit conversion loses integer precision: 'vm_offset_t' (aka 'unsigned long') to 'uint32_t' (aka 'unsigned int') [-Wshorten-64-to-32]
+        wr(cap.smmu, cap.smmu_gr1 + 0x800 + 4 * cap.cb_n, 0);
+        ~~           ~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1241:83: warning: implicit conversion loses integer precision: 'vm_offset_t' (aka 'unsigned long') to 'uint32_t' (aka 'unsigned int') [-Wshorten-64-to-32]
+            rd(cap.smmu, cap.smmu_gr1 + 4 * cap.cb_n), rd(cap.smmu, cap.smmu_gr1 + 0x800 + 4 * cap.cb_n), rd(cap.smmu_cb, 0),
+                                                       ~~           ~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1241:32: warning: implicit conversion loses integer precision: 'vm_offset_t' (aka 'unsigned long') to 'uint32_t' (aka 'unsigned int') [-Wshorten-64-to-32]
+            rd(cap.smmu, cap.smmu_gr1 + 4 * cap.cb_n), rd(cap.smmu, cap.smmu_gr1 + 0x800 + 4 * cap.cb_n), rd(cap.smmu_cb, 0),
+            ~~           ~~~~~~~~~~~~~^~~~~~~~~~~~~~
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1596:8: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+                bool ok = csid_reset();
+                     ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1697:18: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        const uint32_t *h = (const uint32_t *)(const void *)(sc.data + 8);
+                        ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1721:8: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+                bool same = true;
+                     ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1826:11: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        uint32_t lock = (crd(Z_TEST) & (1u << 16)) ? 1u << 29 : 1u << 31;
+                 ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1865:11: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        uint32_t v = rd(sc.refgen, REFGEN_PWRDWN_CTRL5);
+                 ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1939:12: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+                uint32_t b = pos_base[pos];
+                         ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:1922:14: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        vm_offset_t p = sc.csiphy;
+                    ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2008:7: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        bool ok = sensor_put(0x0104, 2, 1, 1);
+             ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2070:7: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        bool ok = pll2_up();
+             ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2190:9: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+                        bool r0 = sensor_read16(s->slave, 0x0004, &fc0, &why);
+                             ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2184:8: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+                bool ok = sensor_table("on");
+                     ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2149:23: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        const struct sensor *s = &sensors[si];
+                             ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2356:3: error: call to undeclared function 'ml_io_unmap'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+                ml_io_unmap(ring_va, ring_bytes);
+                ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2356:3: note: did you mean 'ml_io_map'?
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:60:20: note: 'ml_io_map' declared here
+extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+                   ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2402:25: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        const struct tab_mode *m = &sc.mode[mode_n];
+                               ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2501:12: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+                uint64_t now = ios_ms();
+                         ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2466:7: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        bool ok = stream_up(ios_sensor, ios_mode_n, 0, 0, lines, gain_code(gain), frame_lines, (uint32_t)ring_pa, &powered);
+             ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2609:17: warning: passing 'volatile bool *' to parameter of type 'void *' discards qualifiers [-Wincompatible-pointer-types-discards-qualifiers]
+                        (void)msleep(&ios_open, &ios_lock, PZERO, "redwood-camera-idle", NULL);
+                                     ^~~~~~~~~
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/sys/proc.h:257:30: note: passing argument to parameter 'chan' here
+extern int      msleep(void *chan, lck_mtx_t *mtx, int pri, const char *__unsafe_indexable wmesg, struct timespec * ts );
+                             ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2622:9: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+                        bool ok = ios_select(to - 1, ios_switch_mode);
+                             ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2611:12: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+                unsigned to = ios_switch_to;
+                         ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2653:9: warning: passing 'volatile bool *' to parameter of type 'void *' discards qualifiers [-Wincompatible-pointer-types-discards-qualifiers]
+        wakeup(&ios_open);
+               ^~~~~~~~~
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/sys/proc.h:259:30: note: passing argument to parameter 'chan' here
+extern void     wakeup(void *chan);
+                             ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2686:11: warning: passing 'volatile bool *' to parameter of type 'void *' discards qualifiers [-Wincompatible-pointer-types-discards-qualifiers]
+                        wakeup(&ios_open);
+                               ^~~~~~~~~
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/sys/proc.h:259:30: note: passing argument to parameter 'chan' here
+extern void     wakeup(void *chan);
+                             ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2688:19: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+                struct timespec ts = { 0, 100 * NSEC_PER_MSEC };
+                                ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2720:14: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        vm_offset_t at = ring_va + (uint64_t)b * place_bytes;
+                    ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2772:10: warning: passing 'volatile bool *' to parameter of type 'void *' discards qualifiers [-Wincompatible-pointer-types-discards-qualifiers]
+                wakeup(&ios_open);
+                       ^~~~~~~~~
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/sys/proc.h:259:30: note: passing argument to parameter 'chan' here
+extern void     wakeup(void *chan);
+                             ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2810:6: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        int err = EINVAL;
+            ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2849:12: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+                thread_t t;
+                         ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2859:6: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        int err = 0;
+            ^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2825:1: warning: no previous prototype for function 'sweet_cam_cmd_args' [-Wmissing-prototypes]
+sweet_cam_cmd_args(unsigned what, uint64_t a, uint64_t b, uint64_t c)
+^
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2824:1: note: declare 'static' if the function is not intended to be used outside of this translation unit
+int
+^
+static 
+/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_cam.c:2937:11: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+        thread_t t;
+                 ^
+64 warnings and 1 error generated.
+make[7]: *** [sweet_cam.o] Error 1
+make[7]: Target `do_build_all' not remade because of errors.
+make[6]: *** [build_all] Error 2
+make[5]: *** [do_all] Error 2
+make[5]: Target `do_build_all' not remade because of errors.
+make[4]: *** [build_all] Error 2
+make[3]: *** [build_all_recurse_into_conf] Error 2
+make[3]: Target `build_all' not remade because of errors.
+make[2]: *** [build_all_recurse_into_bsd] Error 2
+make[2]: Target `build_all' not remade because of errors.
+make[1]: *** [build_all_bootstrap_DEVELOPMENT^ARM64^SWEET] Error 2
+make[1]: Target `install' not remade because of errors.
+make: *** [install] Error 2
