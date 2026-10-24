@@ -7,6 +7,9 @@
  *                                and its unslid address (llvm-objdump -D -b binary -m aarch64 --adjust-vma=ADDR)
  *   imgdump read ADDR LEN OUT    LEN bytes at the unslid shared-cache address ADDR into OUT
  *   imgdump grep TEXT [LIB...]   where TEXT is in the __TEXT sections of the loaded images (after loading LIBs too)
+ *   imgdump imp ADDR...          the Objective-C method whose code holds each unslid ADDR (the nearest
+ *                                implementation at or below it in the same image; the runtime's own names, where
+ *                                a2s's dladdr only has "<redacted>")
  *
  * Addresses are unslid (the shared cache's own, as pstack/a2s print them once the slide is taken off) so that
  * they are the same in every process and boot.
@@ -15,6 +18,8 @@
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
+#include <objc/runtime.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +56,47 @@ write_out(const char *path, const void *p, size_t n)
 	}
 	close(fd);
 	return 0;
+}
+
+/* the method whose implementation is nearest at or below a (slid), among the classes of the image holding a */
+static void
+imp_lookup(uintptr_t a, uintptr_t s)
+{
+	Dl_info di;
+	const char *best_class = NULL, *best_sel = NULL;
+	uintptr_t best = 0;
+	bool best_meta = false;
+	unsigned n = 0;
+
+	if (!dladdr((const void *)a, &di) || di.dli_fname == NULL) {
+		printf("%#lx: in no loaded image\n", a - s);
+		return;
+	}
+	const char **names = objc_copyClassNamesForImage(di.dli_fname, &n);
+	for (unsigned i = 0; names != NULL && i < n; i++) {
+		Class c = objc_getClass(names[i]);
+		for (int meta = 0; c != NULL && meta < 2; meta++) {
+			Class k = meta ? object_getClass((id)c) : c;
+			unsigned m = 0;
+			Method *ms = class_copyMethodList(k, &m);
+			for (unsigned j = 0; j < m; j++) {
+				uintptr_t imp = (uintptr_t)method_getImplementation(ms[j]);
+				if (imp <= a && imp > best) {
+					best = imp;
+					best_class = names[i];
+					best_sel = sel_getName(method_getName(ms[j]));
+					best_meta = meta;
+				}
+			}
+			free(ms);
+		}
+	}
+	if (best_class != NULL) {
+		printf("%#lx: %c[%s %s]+%#lx (%s)\n", a - s, best_meta ? '+' : '-', best_class, best_sel, a - best, di.dli_fname);
+	} else {
+		printf("%#lx: no method (%s)\n", a - s, di.dli_fname);
+	}
+	free(names);
 }
 
 int
@@ -112,6 +158,12 @@ main(int argc, char **argv)
 
 		return write_out(argv[4], (const void *)a, n);
 	}
+	if (argc >= 3 && strcmp(argv[1], "imp") == 0) {
+		for (int i = 2; i < argc; i++) {
+			imp_lookup(strtoul(argv[i], NULL, 16) + s, s);
+		}
+		return 0;
+	}
 	if (argc >= 3 && strcmp(argv[1], "grep") == 0) {
 		size_t m = strlen(argv[2]);
 
@@ -154,6 +206,6 @@ main(int argc, char **argv)
 		}
 		return 0;
 	}
-	fprintf(stderr, "usage: imgdump sym NAME... | text IMAGE OUT | read ADDR LEN OUT | grep TEXT [LIB...]\n");
+	fprintf(stderr, "usage: imgdump sym NAME... | text IMAGE OUT | read ADDR LEN OUT | grep TEXT [LIB...] | imp ADDR...\n");
 	return 2;
 }

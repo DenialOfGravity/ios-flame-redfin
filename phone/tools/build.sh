@@ -31,5 +31,5 @@ build netsvc netsvc.m -fobjc-arc -framework Foundation -framework SystemConfigur
 build memwarn memwarn.c
 build pmem pmem.c
 build a2s a2s.c
-build imgdump imgdump.c
+build imgdump imgdump.c -lobjc
 ls -l out
