@@ -1,0 +1,951 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sat, 24 Oct 2026 19:00:00 +0200
+Subject: [PATCH] 0919 redfin: camera sensors powered up, chip IDs read (sweetcam)
+
+New bsd/dev/sweet_cam.c, after HackiOS redwood_camera.c (cam=1/2): the rear
+IMX363, the rear ultra-wide IMX481 and the front IMX355 powered up in their
+Android module files' order (SLG51000 LDOs over SE9 I2C at 0x75, PM8150L GPIO
+2/8 for the front custom rail and the rear VAF regulator, reset GPIO 23/25/21,
+MCLK0-2 from camcc at the crystal's 19.2 MHz, titan top GDSC), the chip ID
+register 0x0016 read by hand on the CCI pins (17/18, 19/20, 27/28), powered
+down again. The SLG51000 gets Google's slg51000_config_tuning() first.
+sweetcam=1 looks, =2 probes on request (poke "c N", 9 = look), =3 probes all
+three at boot. sweet_haptic.c exports sweet_se9_xfer() for the PMIC.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WuzsiVGCDDmN2GPRLJvX3w
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/sweet_sects.c			standard
+ bsd/dev/sweet_haptic.c			standard
+ bsd/dev/sweet_torch.c			standard
++bsd/dev/sweet_cam.c			standard
+ bsd/dev/sweet_audio.c			standard
+ bsd/dev/sweet_adsp.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+diff --git a/bsd/dev/sweet_haptic.c b/bsd/dev/sweet_haptic.c
+--- a/bsd/dev/sweet_haptic.c
++++ b/bsd/dev/sweet_haptic.c
+@@ -358,7 +358,7 @@
+ 
+ /* One FIFO message: TX at most 8 bytes or RX at most 8 bytes (sweet_touch.c touch_msg_run). */
+ static int
+-hap_msg(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
++hap_msg_to(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
+ {
+ 	if (hp.dead || nt > 8 || nr > 8 || (nt && nr) || (!nt && !nr)) {
+ 		return EIO;
+@@ -371,7 +371,7 @@
+ 	hap_wr(hp.se, SE_IRQ_CLR, 0xffffffffu);
+ 	hap_wr(hp.se, SE_TX_WM, nt ? 1u : 0u);
+ 	hap_wr(hp.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
+-	hap_wr(hp.se, SE_CMD, ((nr ? 2u : 1u) << 27) | ((uint32_t)HAP_ADDR << 9) | (stretch ? 4u : 0u));
++	hap_wr(hp.se, SE_CMD, ((nr ? 2u : 1u) << 27) | ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
+ 	int err = ETIMEDOUT;
+ 	for (unsigned i = 0; i < 20000; ++i) {
+ 		uint32_t irq = hp.irq_last = hap_rd(hp.se, SE_IRQ);
+@@ -425,6 +425,12 @@
+ }
+ 
+ static int
++hap_msg(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
++{
++	return hap_msg_to(HAP_ADDR, tx, nt, rx, nr, stretch);
++}
++
++static int
+ drv_read(uint8_t reg, uint8_t *val)
+ {
+ 	int err = hap_msg(&reg, 1, NULL, 0, true);
+@@ -619,6 +625,26 @@
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * 0919: another device on SE9 (the SLG51000 camera PMIC at 0x75, bsd/dev/sweet_cam.c): write nt bytes,
++ * then (with a repeated start) read nr bytes, under the motor's lock. Only once the bus is up.
++ */
++int sweet_se9_xfer(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr);
++int
++sweet_se9_xfer(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr)
++{
++	if (!hp.ready || hp.dead || addr == HAP_ADDR || nt == 0 || nt > 8 || nr > 8) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&sweet_haptic_lock);
++	int err = hap_msg_to(addr, tx, nt, NULL, 0, nr != 0);
++	if (!err && nr) {
++		err = hap_msg_to(addr, NULL, 0, rx, nr, false);
++	}
++	lck_mtx_unlock(&sweet_haptic_lock);
++	return err;
++}
++
+ /* The motor on at strength (1..127) for at least ms more, from the driver's thread; newest wins. */
+ int
+ sweet_haptic_drive(unsigned ms, unsigned strength)
+diff --git a/bsd/dev/sweet_poke.c b/bsd/dev/sweet_poke.c
+--- a/bsd/dev/sweet_poke.c
++++ b/bsd/dev/sweet_poke.c
+@@ -166,6 +166,12 @@
+ 		    sweet_torch_set((unsigned)a, hb ? (unsigned)b : 1000));
+ 		break;
+ 	}
++	case 'c': {
++		/* redfin (0919): c N powers camera sensor N up, reads its chip ID, powers it down (9: look) */
++		extern int sweet_cam_cmd(unsigned what);
++		printf("POKE: c %llu -> %d\n", a, sweet_cam_cmd((unsigned)a));
++		break;
++	}
+ 	case 'r': {
+ 		uint64_t n = hb ? b : 1;
+ 		for (uint64_t i = 0; i < n && i < 256; i += 4) {
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -56,6 +56,7 @@
+ extern void sweet_sects_init(void);
+ extern void sweet_haptic_init(void);
+ extern void sweet_torch_init(void);
++extern void sweet_cam_init(void);
+ extern void sweet_audio_init(void);
+ extern void redwood_adsp_init(void);
+ extern void sweet_cpufreq_init(void);
+@@ -677,6 +678,7 @@
+ 	sweet_sects_init();	/* redfin sec_ts (sectouch=1) */
+ 	sweet_haptic_init();	/* redfin DRV2624 (sweethaptic=1) */
+ 	sweet_torch_init();	/* redfin flash LED (sweettorch=2): bsd/dev/sweet_torch.c */
++	sweet_cam_init();	/* redfin camera sensors (sweetcam=1/2): bsd/dev/sweet_cam.c */
+ 	sweet_audio_init();	/* /dev/redwood-audio, /dev/redwood-haptic: bsd/dev/sweet_audio.c */
+ 	redwood_adsp_init();	/* the audio DSP (adsp=1): bsd/dev/sweet_adsp.c */
+ 	sweet_usb_probe();
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+new file mode 100644
+index 0000000..8197c2d
+--- /dev/null
++++ b/bsd/dev/sweet_cam.c
+@@ -0,0 +1,818 @@
++/*
++ * redfin (Pixel 5) cameras, step 1: one sensor powered up as Android powers it, its chip ID read,
++ * powered down again. After HackiOS's redwood_camera.c (cam=1 / cam=2), with this phone's numbers.
++ *
++ * The three sensors (live DT cam-sensor@0..2 and Android's module files
++ * /vendor/lib64/camera/com.qti.sensormodule.*_lito2.bin, read as data):
++ *
++ *   0  rear, Sony IMX363 (metric_imx363): CCI 0 master 0 (GPIO 17 data, 18 clock), slave 0x20 (8-bit),
++ *      chip ID 0x0363 in the 16-bit register 0x0016; reset GPIO 23; MCLK0 (camcc RCG 0x5004, branch
++ *      0x501c, GPIO 13, 4 mA). Power-up: VIO (SLG51000 LDO7 1.8 V), VANA (LDO3 2.85 V), VAF (camera_ldo,
++ *      a fixed 2.85 V regulator switched by PM8150L GPIO 8), VDIG (LDO1 2.85 V), custom1 (LDO4 1.8 V),
++ *      custom2 (LDO6 1.1 V), 1 ms each; reset high, 1 ms; MCLK, 10 ms.
++ *   1  rear ultra-wide, Sony IMX481 (metric_imx481): CCI 0 master 1 (GPIO 19/20), slave 0x34, ID 0x0481;
++ *      reset GPIO 25; MCLK1 (0x5024/0x503c, GPIO 14, 4 mA). VIO (LDO7 1.8 V), VANA (LDO2 2.85 V), VDIG (LDO5
++ *      1.1 V), MCLK, reset; 1 ms each.
++ *   2  front, Sony IMX355 (primax_imx355): CCI 1 master 0 (GPIO 27/28), slave 0x34, ID 0x0355; reset GPIO
++ *      21; MCLK2 (0x5044/0x505c, GPIO 15, 2 mA). VIO (LDO7 1.8 V), custom GPIO 1 (PM8150L GPIO 2) high,
++ *      1 ms; MCLK, 1 ms; reset, 12 ms.
++ *   Power-down: the module files' own order (the reverse, VAF given 20 ms).
++ *
++ * The SLG51000 (Dialog, I2C 0x75 on GENI SE9 -- the DRV2624's bus, bsd/dev/sweet_haptic.c, so
++ * sweethaptic=1 is needed -- 16-bit registers): chip select PM8150L GPIO 4 high, its two enable
++ * lines PM8150L GPIO 9/10 low, 10 ms, then Google's tuning (slg51000_config_tuning(): software test
++ * mode, LDO3_CONF1 0x28, LDO5_VSEL 0x9f, MUXARRAY_INPUT_SEL_39 0x34, LUT_VAL_3 0xea, startup current
++ * limit [7:5] 0, test mode off), as drivers/regulator/slg51000-regulator.c does at every boot.
++ * An LDO: VSEL (0x2000/2200/2300/2500/2700/2900/3100) = (uV - base) / step, kept within its own
++ * MINV..MAXV, then its bit in MATRIX_CONF_A (0x110d); its STATUS (+0xc1) must show VOUT_OK and no
++ * ILIM within 10 ms. Only the device tree's voltages are ever set.
++ *
++ * MCLK here is the crystal's 19.2 MHz (RCG source 0, divider 1; Sony sensors take 6-27 MHz), not the
++ * module files' 24 MHz (camcc PLL2): enough to answer on I2C. Before it: camcc's GDSC clock
++ * (0xc1a0, critical in camcc-lito.c) and the titan top GDSC (0xc1c4), as the sensor's cam_clk supply.
++ *
++ * The sensor's I2C is done by hand on its CCI pins (GPIO function 0, pull-up, open drain by the
++ * output enable), at most 100 kHz, the pins given back as they were found: no CCI block, no CCI clock.
++ *
++ * Boot-arg sweetcam=1: a look only (clocks, GDSC, pins, the PMIC GPIOs, the SLG51000 if it answers).
++ * sweetcam=2: and the probe on request: poke/command line "c N" (N = 0, 1, 2; 9 = the look again),
++ * tools/flame-cmd.py 'c 0'. sweetcam=3: and all three probed once at boot.
++ * Any write that does not read back, a rail that does not come up or reports over-current, a byte
++ * nobody acknowledges on the PMIC's bus, and everything switched on so far is switched off again in
++ * the power-down order. Whatever was found on is left on.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int sweet_se9_xfer(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr);
++void sweet_cam_init(void);
++int sweet_cam_cmd(unsigned what);
++
++#define GCC_PA          0x00100000u
++#define CAMCC_PA        0x0ad00000u
++#define TLMM_EAST_PA    0x0f900000u     /* TLMM 0x0f000000 + EAST tile: GPIO 13..28 */
++#define SP_CORE_PA      0x0c440000u
++#define SP_CHNLS_PA     0x0c600000u
++#define SP_OBS_PA       0x0e600000u
++#define SP_CNFG_PA      0x0c40a000u
++
++#define GCC_CAMERA_AHB  0xb008u         /* critical in gcc-lito.c */
++#define GCC_CAMERA_XO   0xb03cu
++#define CAMCC_GDSC_CLK  0xc1a0u
++#define TITAN_GDSCR     0xc1c4u         /* [0] collapse, [31] on */
++#define CBCR_OFF        (1u << 31)
++
++#define GPIO_CFG(n)     (0x1000u * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
++#define GPIO_IO(n)      (0x1000u * (n) + 4u)    /* [0] in, [1] out */
++#define CFG_PULL_UP     3u
++#define CFG_OUTPUT      (1u << 9)
++#define CFG_FUNC(f)     ((uint32_t)(f) << 2)
++#define CFG_MA(ma)      ((uint32_t)((ma) / 2 - 1) << 6)
++
++#define SLG_ADDR        0x75
++#define PGPIO_SID       4u              /* PM8150L */
++#define PGPIO(n)        (0xc0u + (n) - 1u)      /* GPIO n's peripheral */
++
++enum { ST_END, ST_LDO, ST_PGPIO, ST_RESET, ST_MCLK };
++struct step {
++	uint8_t kind, n;                /* LDO number / PMIC GPIO number */
++	uint16_t mv;
++	uint16_t ms;                    /* the delay after the step */
++};
++struct sensor {
++	const char *name;
++	unsigned sda, scl, reset, mclk_pin, mclk_ma;
++	uint32_t mclk_rcg, mclk_cbcr;
++	uint8_t slave;                  /* 7-bit */
++	uint16_t id;
++	struct step up[10], down[10];
++};
++static const struct sensor sensors[] = {
++	{ "rear IMX363", 17, 18, 23, 13, 4, 0x5004, 0x501c, 0x10, 0x0363,
++	  { { ST_LDO, 7, 1800, 1 }, { ST_LDO, 3, 2850, 1 }, { ST_PGPIO, 8, 0, 0 }, { ST_LDO, 1, 2850, 1 },
++	    { ST_LDO, 4, 1800, 1 }, { ST_LDO, 6, 1100, 1 }, { ST_RESET, 0, 0, 1 }, { ST_MCLK, 0, 0, 10 }, { ST_END, 0, 0, 0 } },
++	  { { ST_MCLK, 0, 0, 1 }, { ST_RESET, 0, 0, 1 }, { ST_LDO, 6, 0, 1 }, { ST_LDO, 4, 0, 1 }, { ST_LDO, 1, 0, 1 },
++	    { ST_PGPIO, 8, 0, 20 }, { ST_LDO, 3, 0, 1 }, { ST_LDO, 7, 0, 1 }, { ST_END, 0, 0, 0 } } },
++	{ "rear ultra-wide IMX481", 19, 20, 25, 14, 4, 0x5024, 0x503c, 0x1a, 0x0481,
++	  { { ST_LDO, 7, 1800, 1 }, { ST_LDO, 2, 2850, 1 }, { ST_LDO, 5, 1100, 1 }, { ST_MCLK, 0, 0, 1 },
++	    { ST_RESET, 0, 0, 1 }, { ST_END, 0, 0, 0 } },
++	  { { ST_RESET, 0, 0, 1 }, { ST_MCLK, 0, 0, 1 }, { ST_LDO, 5, 0, 1 }, { ST_LDO, 2, 0, 1 }, { ST_LDO, 7, 0, 1 },
++	    { ST_END, 0, 0, 0 } } },
++	{ "front IMX355", 27, 28, 21, 15, 2, 0x5044, 0x505c, 0x1a, 0x0355,
++	  { { ST_LDO, 7, 1800, 0 }, { ST_PGPIO, 2, 0, 1 }, { ST_MCLK, 0, 0, 1 }, { ST_RESET, 0, 0, 12 }, { ST_END, 0, 0, 0 } },
++	  { { ST_RESET, 0, 0, 0 }, { ST_MCLK, 0, 0, 1 }, { ST_PGPIO, 2, 0, 1 }, { ST_LDO, 7, 0, 1 }, { ST_END, 0, 0, 0 } } },
++};
++
++/* SLG51000 LDOs: VSEL register, base uV, step uV (slg51000-regulator.c regls_desc) */
++static const struct { uint16_t vsel; uint32_t base, step; } ldos[8] = {
++	{ 0, 0, 0 }, { 0x2000, 2200000, 5000 }, { 0x2200, 2200000, 5000 }, { 0x2300, 1200000, 10000 },
++	{ 0x2500, 1200000, 10000 }, { 0x2700, 400000, 5000 }, { 0x2900, 400000, 5000 }, { 0x3100, 1200000, 10000 },
++};
++#define SLG_MATRIX_CONF_A       0x110d
++#define SLG_SYSCTL_STATUS       0x1117
++#define SLG_FAULT_LOG1          0x1115
++
++static struct {
++	vm_offset_t gcc, camcc, tlmm, sp_core, sp_cnfg;
++	unsigned mode;
++	bool broken, slg_up, slg_cs_raised, gdsc_switched, gdsc_clk_switched;
++	uint8_t ldo_on;                 /* bits we switched on */
++	uint32_t found_mclk_cfg, found_mclk_cbcr, found_mclk_pin, found_reset_cfg, found_reset_io;
++	bool mclk_on, reset_taken;
++	const struct sensor *s;
++} cm;
++static LCK_GRP_DECLARE(sweet_cam_grp, "sweet_cam");
++static LCK_MTX_DECLARE(sweet_cam_lock, &sweet_cam_grp);
++static int cam_sleep_chan;
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++sleep_ms(unsigned ms)
++{
++	if (ms == 0) {
++		return;
++	}
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&cam_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++wait_bits(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned us)
++{
++	for (unsigned t = 0; t <= us; t += 10) {
++		if ((rd(base, off) & mask) == want) {
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++static void
++give_up(const char *why)
++{
++	if (!cm.broken) {
++		printf("SWEET CAM: giving up: %s\n", why);
++	}
++	cm.broken = true;
++}
++
++/* ---- PM8150L GPIOs through the APPS EE's arbiter channels (as sweet_haptic.c / sweet_torch.c) ---- */
++
++static bool
++spmi_channel(unsigned sid, unsigned periph, bool write, vm_offset_t *ch)
++{
++	unsigned ppid = (sid << 8) | periph, n = rd(cm.sp_core, 4) & 0x7ffu, apid = 0xffff, own = 7;
++	for (unsigned i = 0; i < n && i < 512; i++) {
++		uint32_t map = rd(cm.sp_core, 0x900u + 4u * i);
++		if (!map || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		unsigned o = rd(cm.sp_cnfg, 0x700u + 4u * i) & 7u;
++		if (apid == 0xffff || o == 0) {
++			apid = i;
++			own = o;
++		}
++	}
++	if (apid == 0xffff || (write && own != 0)) {
++		printf("SWEET CAM: spmi %x:%x %s refused (apid %#x owner %u)\n", sid, periph << 8, write ? "write" : "read", apid, own);
++		return false;
++	}
++	*ch = ml_io_map(write ? SP_CHNLS_PA + 0x10000u * apid : SP_OBS_PA + 0x80u * apid, 0x1000);
++	return *ch != 0;
++}
++
++static int
++spmi(unsigned sid, unsigned addr, bool write, uint8_t *val)
++{
++	vm_offset_t ch;
++	if (!spmi_channel(sid, (addr >> 8) & 0xffu, write, &ch)) {
++		return -1;
++	}
++	for (unsigned attempt = 0; attempt < 3; attempt++) {
++		if (write) {
++			wr(ch, 0x10, *val);
++		}
++		wr(ch, 0x00, ((write ? 0u : 1u) << 27) | ((addr & 0xffu) << 4));
++		uint32_t st = 0;
++		unsigned i;
++		for (i = 0; i < 1000 && !((st = rd(ch, 0x08)) & 1u); i++) {
++			delay(1);
++		}
++		if (i == 1000) {
++			printf("SWEET CAM: spmi %x:%x timeout\n", sid, addr);
++			return -1;
++		}
++		if (st & 0x8u) {
++			continue;
++		}
++		if (st & 0x6u) {
++			printf("SWEET CAM: spmi %x:%x status %#x\n", sid, addr, st);
++			return -1;
++		}
++		if (!write) {
++			*val = (uint8_t)rd(ch, 0x18);
++		}
++		return 0;
++	}
++	return -1;
++}
++
++/* GPIO n: MODE_CTL 0x40, DIG_VIN_CTL 0x41, OUT_SOURCE_CTL 0x44 ([7] level), EN_CTL 0x46 */
++static void
++pgpio_show(unsigned n, const char *what)
++{
++	uint8_t r[8] = { 0 };
++	unsigned base = PGPIO(n) << 8;
++	bool ok = !spmi(PGPIO_SID, base + 0x04, false, &r[0]) && !spmi(PGPIO_SID, base + 0x05, false, &r[1]) &&
++	    !spmi(PGPIO_SID, base + 0x08, false, &r[2]) && !spmi(PGPIO_SID, base + 0x40, false, &r[3]) &&
++	    !spmi(PGPIO_SID, base + 0x41, false, &r[4]) && !spmi(PGPIO_SID, base + 0x44, false, &r[5]) &&
++	    !spmi(PGPIO_SID, base + 0x46, false, &r[6]) && !spmi(PGPIO_SID, base + 0x10, false, &r[7]);
++	printf("SWEET CAM: PM8150L gpio%u (%s): %s type %#x sub %#x status %#x mode %#x vin %#x out %#x en %#x rt %#x\n",
++	    n, what, ok ? "" : "(read failed)", r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
++}
++
++static bool
++pgpio_set(unsigned n, bool high)
++{
++	unsigned base = PGPIO(n) << 8;
++	uint8_t type = 0;
++	if (spmi(PGPIO_SID, base + 0x04, false, &type) || type != 0x10) {
++		printf("SWEET CAM: PM8150L gpio%u: type %#x, not a GPIO\n", n, type);
++		give_up("a PMIC GPIO that is not one");
++		return false;
++	}
++	static const uint8_t regs[4] = { 0x41, 0x44, 0x40, 0x46 };
++	uint8_t vals[4] = { 0x01, (uint8_t)(high ? 0x80 : 0x00), 0x01, 0x80 };      /* VIN1 (power-source 1), level, output, on */
++	for (unsigned i = 0; i < 4; i++) {
++		uint8_t v = vals[i], back = 0;
++		if (spmi(PGPIO_SID, base + regs[i], true, &v) || spmi(PGPIO_SID, base + regs[i], false, &back) ||
++		    (back & 0x87) != (vals[i] & 0x87)) {
++			printf("SWEET CAM: PM8150L gpio%u reg %#x <- %#x reads %#x\n", n, regs[i], vals[i], back);
++			give_up("a PMIC GPIO write that did not read back");
++			return false;
++		}
++	}
++	return true;
++}
++
++/* ---- the SLG51000 ---- */
++
++static int
++slg_read(uint16_t reg, uint8_t *val)
++{
++	uint8_t a[2] = { (uint8_t)(reg >> 8), (uint8_t)reg };
++	return sweet_se9_xfer(SLG_ADDR, a, 2, val, 1);
++}
++
++static int
++slg_write(uint16_t reg, uint8_t val, bool check)
++{
++	uint8_t a[3] = { (uint8_t)(reg >> 8), (uint8_t)reg, val }, back = 0;
++	int err = sweet_se9_xfer(SLG_ADDR, a, 3, NULL, 0);
++	if (!err && check && (err = slg_read(reg, &back)) == 0 && back != val) {
++		printf("SWEET CAM: SLG51000 %#x <- %#x reads %#x\n", reg, val, back);
++		err = EIO;
++	}
++	if (err) {
++		give_up("an SLG51000 write");
++	}
++	return err;
++}
++
++static bool
++slg_up(void)
++{
++	if (cm.slg_up) {
++		return true;
++	}
++	uint8_t id[3] = { 0 };
++	if (slg_read(0x1105, &id[0]) != 0) {
++		/* not selected yet: as slg51000_i2c_probe(): cs high, both enable lines low, 10 ms */
++		if (!pgpio_set(9, false) || !pgpio_set(10, false) || !pgpio_set(4, true)) {
++			return false;
++		}
++		cm.slg_cs_raised = true;
++		sleep_ms(10);
++	}
++	if (slg_read(0x1105, &id[0]) || slg_read(0x1106, &id[1]) || slg_read(0x1107, &id[2])) {
++		give_up("no SLG51000 at SE9 0x75");
++		return false;
++	}
++	uint8_t fault = 0, status = 0, matrix = 0;
++	(void)slg_read(SLG_FAULT_LOG1, &fault);
++	(void)slg_read(SLG_SYSCTL_STATUS, &status);
++	(void)slg_read(SLG_MATRIX_CONF_A, &matrix);
++	printf("SWEET CAM: SLG51000 id %02x %02x %02x, fault log %#x, status %#x, LDOs on %#x\n", id[0], id[1], id[2],
++	    fault, status, matrix);
++	/* slg51000_config_tuning() */
++	static const uint8_t test_on[4] = { 0x45, 0x53, 0x54, 0x4d };
++	for (unsigned i = 0; i < 4; i++) {
++		if (slg_write((uint16_t)(0x111a + i), test_on[i], false)) {
++			return false;
++		}
++	}
++	uint8_t ilim = 0;
++	int err = slg_write(0x2364, 0x28, false);               /* LDO3_CONF1 */
++	err |= slg_write(0x2700, 0x9f, false);                  /* LDO5_VSEL */
++	err |= slg_write(0x1727, 0x34, false);                  /* MUXARRAY_INPUT_SEL_39 */
++	err |= slg_write(0x1603, 0xea, false);                  /* LUTARRAY_LUT_VAL_3 */
++	err |= slg_read(0x1133, &ilim);
++	err |= slg_write(0x1133, (uint8_t)(ilim & 0x1f), false);        /* LDO_HP_STARTUP_ILIM [7:5] = 0 */
++	for (unsigned i = 0; i < 4; i++) {
++		err |= slg_write((uint16_t)(0x111a + i), 0, false);
++	}
++	if (err) {
++		give_up("the SLG51000's tuning");
++		return false;
++	}
++	cm.slg_up = true;
++	return true;
++}
++
++static bool
++ldo_set(unsigned n, unsigned mv, bool on)
++{
++	uint8_t matrix = 0;
++	if (n < 1 || n > 7 || slg_read(SLG_MATRIX_CONF_A, &matrix)) {
++		give_up("the SLG51000's enable register");
++		return false;
++	}
++	uint8_t bit = (uint8_t)(1u << (n - 1));
++	if (!on) {
++		if (!(cm.ldo_on & bit)) {
++			return true;    /* found on, or never ours */
++		}
++		(void)slg_write(SLG_MATRIX_CONF_A, (uint8_t)(matrix & ~bit), false);
++		cm.ldo_on &= (uint8_t)~bit;
++		return true;
++	}
++	if (matrix & bit) {
++		printf("SWEET CAM: SLG51000 LDO%u was on already: left as it is\n", n);
++		return true;
++	}
++	uint8_t minv = 0, maxv = 0, trim2 = 0;
++	uint16_t vsel = ldos[n].vsel;
++	if (slg_read(vsel + 0x60, &minv) || slg_read(vsel + 0x61, &maxv) || slg_read(vsel + 0x63, &trim2)) {
++		give_up("an SLG51000 LDO's range");
++		return false;
++	}
++	uint32_t sel = (mv * 1000u - ldos[n].base) / ldos[n].step;
++	if ((n == 5 || n == 6) && (trim2 & 1u)) {
++		printf("SWEET CAM: SLG51000 LDO%u is in bypass mode (trim2 %#x)\n", n, trim2);
++		give_up("an LDO in bypass mode");
++		return false;
++	}
++	if (mv * 1000u < ldos[n].base || sel < minv || sel > maxv) {
++		printf("SWEET CAM: SLG51000 LDO%u: %u mV is selector %u, outside %u..%u\n", n, mv, sel, minv, maxv);
++		give_up("a voltage the LDO does not have");
++		return false;
++	}
++	if (slg_write(vsel, (uint8_t)sel, true) || slg_write(SLG_MATRIX_CONF_A, (uint8_t)(matrix | bit), true)) {
++		return false;
++	}
++	cm.ldo_on |= bit;
++	uint8_t st = 0;
++	for (unsigned t = 0; t < 10; t++) {
++		sleep_ms(1);
++		if (slg_read(vsel + 0xc1, &st)) {
++			break;
++		}
++		if (st & 1u) {
++			printf("SWEET CAM: SLG51000 LDO%u over current (status %#x)\n", n, st);
++			give_up("an LDO over current");
++			return false;
++		}
++		if (st & 2u) {
++			printf("SWEET CAM: SLG51000 LDO%u at %u mV (selector %u) after %u ms\n", n, mv, sel, t + 1);
++			return true;
++		}
++	}
++	printf("SWEET CAM: SLG51000 LDO%u not ready (status %#x)\n", n, st);
++	give_up("an LDO that does not come up");
++	return false;
++}
++
++/* ---- clocks ---- */
++
++static bool
++titan_up(void)
++{
++	uint32_t ahb = rd(cm.gcc, GCC_CAMERA_AHB), xo = rd(cm.gcc, GCC_CAMERA_XO);
++	if ((ahb & CBCR_OFF) || (xo & CBCR_OFF)) {
++		printf("SWEET CAM: GCC camera AHB %#x XO %#x: not running\n", ahb, xo);
++		give_up("camcc's GCC clocks are off");
++		return false;
++	}
++	uint32_t gclk = rd(cm.camcc, CAMCC_GDSC_CLK);
++	if (!(gclk & 1u)) {
++		wr(cm.camcc, CAMCC_GDSC_CLK, gclk | 1u);
++		cm.gdsc_clk_switched = true;
++		if (!wait_bits(cm.camcc, CAMCC_GDSC_CLK, CBCR_OFF, 0, 500)) {
++			give_up("camcc's GDSC clock does not run");
++			return false;
++		}
++	}
++	uint32_t g = rd(cm.camcc, TITAN_GDSCR);
++	if (!(g & 1u) && (g & (1u << 31))) {
++		return true;
++	}
++	wr(cm.camcc, TITAN_GDSCR, g & ~1u);
++	cm.gdsc_switched = true;
++	if (!wait_bits(cm.camcc, TITAN_GDSCR, 1u << 31, 1u << 31, 1000)) {
++		printf("SWEET CAM: titan top GDSC %#x does not come on\n", rd(cm.camcc, TITAN_GDSCR));
++		give_up("a power domain that does not come on");
++		return false;
++	}
++	printf("SWEET CAM: titan top GDSC on (%#x)\n", rd(cm.camcc, TITAN_GDSCR));
++	return true;
++}
++
++static void
++titan_down(void)
++{
++	if (cm.gdsc_switched) {
++		wr(cm.camcc, TITAN_GDSCR, rd(cm.camcc, TITAN_GDSCR) | 1u);
++		(void)wait_bits(cm.camcc, TITAN_GDSCR, 1u << 31, 0, 1000);
++		printf("SWEET CAM: titan top GDSC off (%#x)\n", rd(cm.camcc, TITAN_GDSCR));
++		cm.gdsc_switched = false;
++	}
++	if (cm.gdsc_clk_switched) {
++		wr(cm.camcc, CAMCC_GDSC_CLK, rd(cm.camcc, CAMCC_GDSC_CLK) & ~1u);
++		cm.gdsc_clk_switched = false;
++	}
++}
++
++static bool
++mclk_set(bool on)
++{
++	const struct sensor *s = cm.s;
++	if (!on) {
++		if (!cm.mclk_on) {
++			return true;
++		}
++		wr(cm.tlmm, GPIO_CFG(s->mclk_pin), cm.found_mclk_pin);
++		wr(cm.camcc, s->mclk_cbcr, rd(cm.camcc, s->mclk_cbcr) & ~1u);
++		(void)wait_bits(cm.camcc, s->mclk_cbcr, CBCR_OFF, CBCR_OFF, 500);
++		wr(cm.camcc, s->mclk_rcg + 4, cm.found_mclk_cfg);
++		wr(cm.camcc, s->mclk_rcg, rd(cm.camcc, s->mclk_rcg) | 1u);
++		(void)wait_bits(cm.camcc, s->mclk_rcg, 1u, 0, 500);
++		cm.mclk_on = false;
++		return true;
++	}
++	cm.found_mclk_cfg = rd(cm.camcc, s->mclk_rcg + 4);
++	cm.found_mclk_cbcr = rd(cm.camcc, s->mclk_cbcr);
++	cm.found_mclk_pin = rd(cm.tlmm, GPIO_CFG(s->mclk_pin));
++	if (cm.found_mclk_cbcr & 1u) {
++		give_up("MCLK on already (somebody else's)");
++		return false;
++	}
++	cm.mclk_on = true;
++	wr(cm.camcc, s->mclk_rcg + 4, (cm.found_mclk_cfg & ~0x371fu) | 1u);    /* XO, divider 1, no M/N */
++	wr(cm.camcc, s->mclk_rcg, rd(cm.camcc, s->mclk_rcg) | 1u);
++	if (!wait_bits(cm.camcc, s->mclk_rcg, 1u, 0, 500) || (rd(cm.camcc, s->mclk_rcg + 4) & 0x371fu) != 1u) {
++		printf("SWEET CAM: MCLK RCG cmd %#x cfg %#x\n", rd(cm.camcc, s->mclk_rcg), rd(cm.camcc, s->mclk_rcg + 4));
++		give_up("an RCG that does not update");
++		return false;
++	}
++	wr(cm.camcc, s->mclk_cbcr, cm.found_mclk_cbcr | 1u);
++	if (!wait_bits(cm.camcc, s->mclk_cbcr, CBCR_OFF, 0, 500)) {
++		printf("SWEET CAM: MCLK branch %#x\n", rd(cm.camcc, s->mclk_cbcr));
++		give_up("an MCLK branch that does not run");
++		return false;
++	}
++	wr(cm.tlmm, GPIO_CFG(s->mclk_pin), CFG_FUNC(1) | CFG_MA(s->mclk_ma));
++	return true;
++}
++
++static void
++reset_set(bool high)
++{
++	const struct sensor *s = cm.s;
++	if (!cm.reset_taken) {
++		cm.found_reset_cfg = rd(cm.tlmm, GPIO_CFG(s->reset));
++		cm.found_reset_io = rd(cm.tlmm, GPIO_IO(s->reset));
++		cm.reset_taken = true;
++	}
++	wr(cm.tlmm, GPIO_IO(s->reset), high ? 2u : 0u);
++	wr(cm.tlmm, GPIO_CFG(s->reset), CFG_OUTPUT | CFG_MA(2));
++}
++
++/* ---- the sensor's I2C by hand (HackiOS redwood_camera.c) ---- */
++
++static void
++half_bit(void)
++{
++	delay(5);
++}
++
++static void
++line(unsigned pin, bool high)
++{
++	wr(cm.tlmm, GPIO_IO(pin), 0);
++	wr(cm.tlmm, GPIO_CFG(pin), CFG_PULL_UP | CFG_MA(2) | (high ? 0 : CFG_OUTPUT));
++}
++
++static bool
++level(unsigned pin)
++{
++	return rd(cm.tlmm, GPIO_IO(pin)) & 1u;
++}
++
++static bool
++i2c_bit(unsigned sda, unsigned scl, bool out)
++{
++	line(sda, out);
++	half_bit();
++	line(scl, true);
++	for (unsigned stretched = 0; !level(scl) && stretched < 100; stretched++) {
++		half_bit();
++	}
++	half_bit();
++	bool in = level(sda);
++	line(scl, false);
++	return in;
++}
++
++static bool
++i2c_byte(unsigned sda, unsigned scl, uint8_t b)
++{
++	for (int i = 7; i >= 0; i--) {
++		(void)i2c_bit(sda, scl, (b >> i) & 1u);
++	}
++	return !i2c_bit(sda, scl, true);
++}
++
++static void
++i2c_start(unsigned sda, unsigned scl)
++{
++	line(sda, true);
++	line(scl, true);
++	half_bit();
++	line(sda, false);
++	half_bit();
++	line(scl, false);
++	half_bit();
++}
++
++static void
++i2c_stop(unsigned sda, unsigned scl)
++{
++	line(sda, false);
++	half_bit();
++	line(scl, true);
++	half_bit();
++	line(sda, true);
++	half_bit();
++}
++
++/* a 16-bit register's two bytes; false if nobody answered */
++static bool
++sensor_read16(uint8_t slave, uint16_t reg, uint16_t *val, const char **why)
++{
++	const struct sensor *s = cm.s;
++	uint32_t cfg[2] = { rd(cm.tlmm, GPIO_CFG(s->sda)), rd(cm.tlmm, GPIO_CFG(s->scl)) };
++	uint32_t io[2] = { rd(cm.tlmm, GPIO_IO(s->sda)), rd(cm.tlmm, GPIO_IO(s->scl)) };
++	bool ok = false;
++	line(s->sda, true);
++	line(s->scl, true);
++	half_bit();
++	if (!level(s->sda) || !level(s->scl)) {
++		*why = "bus not at rest";
++	} else {
++		i2c_start(s->sda, s->scl);
++		ok = i2c_byte(s->sda, s->scl, (uint8_t)(slave << 1)) && i2c_byte(s->sda, s->scl, (uint8_t)(reg >> 8)) &&
++		    i2c_byte(s->sda, s->scl, (uint8_t)reg);
++		*why = ok ? "" : "no acknowledgement";
++		if (ok) {
++			i2c_start(s->sda, s->scl);
++			ok = i2c_byte(s->sda, s->scl, (uint8_t)(slave << 1 | 1));
++			if (ok) {
++				uint8_t b[2] = { 0, 0 };
++				for (unsigned k = 0; k < 2; k++) {
++					for (int i = 7; i >= 0; i--) {
++						b[k] = (uint8_t)(b[k] << 1 | i2c_bit(s->sda, s->scl, true));
++					}
++					(void)i2c_bit(s->sda, s->scl, k == 1);  /* ACK the first, NACK the last */
++				}
++				*val = (uint16_t)(b[0] << 8 | b[1]);
++			} else {
++				*why = "no acknowledgement of the read";
++			}
++		}
++		i2c_stop(s->sda, s->scl);
++	}
++	wr(cm.tlmm, GPIO_IO(s->sda), io[0] & 2u);
++	wr(cm.tlmm, GPIO_IO(s->scl), io[1] & 2u);
++	wr(cm.tlmm, GPIO_CFG(s->sda), cfg[0]);
++	wr(cm.tlmm, GPIO_CFG(s->scl), cfg[1]);
++	return ok;
++}
++
++/* ---- the look, the probe ---- */
++
++static void
++show_pin(unsigned pin, const char *what)
++{
++	uint32_t cfg = rd(cm.tlmm, GPIO_CFG(pin)), io = rd(cm.tlmm, GPIO_IO(pin));
++	printf("SWEET CAM: gpio%u (%s): function %u pull %u %u mA %s, reads %u\n", pin, what, (cfg >> 2) & 15u, cfg & 3u,
++	    (((cfg >> 6) & 7u) + 1u) * 2u, (cfg & CFG_OUTPUT) ? ((io & 2u) ? "drives high" : "drives low") : "input", io & 1u);
++}
++
++static void
++look(void)
++{
++	printf("SWEET CAM: GCC camera AHB %#x XO %#x; camcc GDSC clock %#x, titan top GDSC %#x\n",
++	    rd(cm.gcc, GCC_CAMERA_AHB), rd(cm.gcc, GCC_CAMERA_XO), rd(cm.camcc, CAMCC_GDSC_CLK), rd(cm.camcc, TITAN_GDSCR));
++	for (unsigned i = 0; i < sizeof(sensors) / sizeof(sensors[0]); i++) {
++		const struct sensor *s = &sensors[i];
++		printf("SWEET CAM: %u %s: MCLK RCG cmd %#x cfg %#x branch %#x\n", i, s->name, rd(cm.camcc, s->mclk_rcg),
++		    rd(cm.camcc, s->mclk_rcg + 4), rd(cm.camcc, s->mclk_cbcr));
++		show_pin(s->sda, "CCI data");
++		show_pin(s->scl, "CCI clock");
++		show_pin(s->reset, "reset");
++		show_pin(s->mclk_pin, "MCLK");
++	}
++	pgpio_show(4, "SLG51000 cs");
++	pgpio_show(9, "SLG51000 enable 1");
++	pgpio_show(10, "SLG51000 enable 0");
++	pgpio_show(8, "camera_ldo (rear VAF)");
++	pgpio_show(2, "front custom 1");
++	uint8_t id = 0;
++	int err = slg_read(0x1105, &id);
++	printf("SWEET CAM: SLG51000 at SE9 0x75: %s (id0 %#x)\n", err ? "no answer (not selected, or SE9 not up)" : "answers", id);
++}
++
++static void
++run_steps(const struct step *st, bool up)
++{
++	for (; st->kind != ST_END; st++) {
++		if (up && cm.broken) {
++			return;
++		}
++		switch (st->kind) {
++		case ST_LDO:
++			if (!ldo_set(st->n, st->mv, up) && up) {
++				return;
++			}
++			break;
++		case ST_PGPIO:
++			if (!pgpio_set(st->n, up) && up) {
++				return;
++			}
++			break;
++		case ST_RESET:
++			reset_set(up);
++			break;
++		case ST_MCLK:
++			if (!mclk_set(up) && up) {
++				return;
++			}
++			break;
++		}
++		sleep_ms(st->ms);
++	}
++}
++
++static int
++probe(unsigned i)
++{
++	const struct sensor *s = &sensors[i];
++	cm.s = s;
++	cm.broken = false;
++	cm.reset_taken = false;
++	printf("SWEET CAM: %u %s: powering up\n", i, s->name);
++	reset_set(false);
++	sleep_ms(1);
++	if (titan_up() && slg_up()) {
++		run_steps(s->up, true);
++	}
++	int result = EIO;
++	if (!cm.broken) {
++		uint16_t id = 0, alt = 0;
++		const char *why = "", *why2 = "";
++		bool ok = sensor_read16(s->slave, 0x0016, &id, &why);
++		if (ok) {
++			printf("SWEET CAM: %u %s: chip ID %#06x at 0x%02x (8-bit 0x%02x) %s\n", i, s->name, id, s->slave, s->slave << 1,
++			    id == s->id ? "-- as expected" : "-- NOT the expected one");
++			result = id == s->id ? 0 : ENODEV;
++		} else {
++			/* the other usual Sony address, in case the module answers there */
++			uint8_t other = s->slave == 0x1a ? 0x10 : 0x1a;
++			bool ok2 = sensor_read16(other, 0x0016, &alt, &why2);
++			printf("SWEET CAM: %u %s: nothing at 0x%02x (%s); at 0x%02x: %s %#06x\n", i, s->name, s->slave, why, other,
++			    ok2 ? "answers" : why2, alt);
++			result = ENODEV;
++		}
++	}
++	printf("SWEET CAM: %u %s: powering down\n", i, s->name);
++	bool was_broken = cm.broken;
++	cm.broken = false;
++	run_steps(s->down, false);
++	mclk_set(false);
++	if (cm.ldo_on) {
++		/* anything a failed power-up left on */
++		for (unsigned n = 1; n <= 7; n++) {
++			(void)ldo_set(n, 0, false);
++		}
++	}
++	if (cm.reset_taken) {
++		wr(cm.tlmm, GPIO_IO(s->reset), cm.found_reset_io & 2u);
++		wr(cm.tlmm, GPIO_CFG(s->reset), cm.found_reset_cfg);
++	}
++	titan_down();
++	cm.broken = was_broken;
++	return result;
++}
++
++int
++sweet_cam_cmd(unsigned what)
++{
++	if (cm.mode < 2 || !cm.tlmm) {
++		printf("SWEET CAM: not ready (sweetcam=%u)\n", cm.mode);
++		return ENXIO;
++	}
++	lck_mtx_lock(&sweet_cam_lock);
++	int err = 0;
++	if (what == 9) {
++		look();
++	} else if (what < sizeof(sensors) / sizeof(sensors[0])) {
++		err = probe(what);
++	} else {
++		err = EINVAL;
++	}
++	lck_mtx_unlock(&sweet_cam_lock);
++	return err;
++}
++
++static void
++cam_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	sleep_ms(12000);        /* after the haptic driver has SE9 up (8 s) */
++	cm.gcc = ml_io_map(GCC_PA, 0x60000);
++	cm.camcc = ml_io_map(CAMCC_PA, 0x10000);
++	cm.tlmm = ml_io_map(TLMM_EAST_PA, 0x20000);
++	cm.sp_core = ml_io_map(SP_CORE_PA, 0x2000);
++	cm.sp_cnfg = ml_io_map(SP_CNFG_PA, 0x1000);
++	if (!cm.gcc || !cm.camcc || !cm.tlmm || !cm.sp_core || !cm.sp_cnfg) {
++		printf("SWEET CAM: mapping failed\n");
++		cm.tlmm = 0;
++		goto out;
++	}
++	lck_mtx_lock(&sweet_cam_lock);
++	look();
++	lck_mtx_unlock(&sweet_cam_lock);
++	if (cm.mode >= 3) {
++		for (unsigned i = 0; i < sizeof(sensors) / sizeof(sensors[0]); i++) {
++			(void)sweet_cam_cmd(i);
++			sleep_ms(200);
++		}
++	}
++	printf("SWEET CAM: %s (sweetcam=%u)\n", cm.mode >= 2 ? "ready: 'c N' probes sensor N" : "look only", cm.mode);
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_cam_init(void)
++{
++	PE_parse_boot_argn("sweetcam", &cm.mode, sizeof(cm.mode));
++	if (!cm.mode) {
++		return;
++	}
++	thread_t t;
++	if (kernel_thread_start(cam_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.43.0

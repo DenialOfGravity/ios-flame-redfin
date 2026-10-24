@@ -15,9 +15,6 @@ first: every boot, what broke and why. Paths under `work/`, `logs/`, `backup/`, 
 3. The shim sets the PM8150 PON reason to bootloader, so a reset lands in fastboot.
 4. `fastboot boot downloads/twrp/twrp-3.7.1_12-0-flame.img`, then
    `tools/flame-log-pull.sh shim logs/X.txt` (and `xnu` for the XNU ring).
-- 0918 flash LED as a flashlight (`sweettorch=1` look, `=2` usable, `=3` blink at 5 mA when ready): PM8150L
-  qpnp-flash-led-v2 (SPMI SID 5, 0xd300) channels 0+1, torch mode as leds-qpnp-flash-v2.c; poke `t MA [MS]`,
-  sysctl `kern.sweet_torch` 0..1000; <= `sweettorch_ma` (100, cap 200) per channel, <= `sweettorch_secs` (120).
 - `boot_a` holds TWRP (flashed 2026-10-19) so any reset without the PON reason boots TWRP
   (adb root), not Android. `boot_b` is stock. Restore everything with `images/.../flash-all.sh`.
 - macOS asks "Allow accessory to connect?" the first time a new USB identity appears; until
@@ -163,3 +160,10 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   (it keeps "no haptics" from the first boot).
 - 0915 the audio DSP (`adsp=1`, `adsp_step=N`): HackiOS's redwood_adsp.c with lito's DSP memory
   (0x89200000, 40 MB); firmware in /private/var/local/fw (Android's /vendor/firmware/adsp.*).
+- 0918 flash LED as a flashlight (`sweettorch=1` look, `=2` usable, `=3` blink at 5 mA when ready): PM8150L
+  qpnp-flash-led-v2 (SPMI SID 5, 0xd300) channels 0+1, torch mode as leds-qpnp-flash-v2.c; poke `t MA [MS]`,
+  sysctl `kern.sweet_torch` 0..1000; <= `sweettorch_ma` (100, cap 200) per channel, <= `sweettorch_secs` (120).
+- 0919 camera sensors (`sweetcam=1` look, `=2` poke `c N` probes sensor N, `=3` all three at boot): rear IMX363
+  (CCI0 m0, 0x20), ultra-wide IMX481 (CCI0 m1, 0x34), front IMX355 (CCI1 m0, 0x34) powered up in their module files'
+  order (SLG51000 LDOs over SE9 at 0x75 with Google's tuning, PM8150L GPIO 2/8, reset GPIO 23/25/21, MCLK from camcc
+  at 19.2 MHz, titan top GDSC), chip ID register 0x0016 read by bit-banged I2C on the CCI pins. Needs sweethaptic=1.
