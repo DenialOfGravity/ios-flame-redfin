@@ -344,16 +344,45 @@ reference); (3) iOS side: HID event services for accelerometer/gyro/ALS/proximit
 accept (iPhone X normally gets them from the AOP/SPU). (1) is also what audio needs (the PD crash takes the whole
 DSP down), so it comes first.
 
-**Next for the cameras** (HackiOS redwood_camera.c cam=3/4/5 and its userland are the template):
-1. MCLK at 24 MHz from camcc PLL2 (the module files' rate; the register tables' PLL settings assume it).
-2. The sensor's init + mode tables (in the module files: regSetting arrays, see HackiOS camsensor.py) over the
-   bit-banged bus, then CSIPHY (v1.2.2 at 0xace0000 + 0x2000 n: rear 0, ultra-wide 1, front 2) -> CSID-lite 0
-   (0xacc8000, csid-lite175) RDI 0 -> IFE-lite 0 (0xacc4000, vfe-lite175) write master into memory through the
-   camera SMMU context (msm_cam_smmu_ife). First with the CSID's test pattern, then the sensor's frames.
-3. `/dev/redwood-camera` with RAW10 frames, HackiOS's camera_device.c + camera_isp.c (the FigCaptureDevice that
-   BWFigCaptureDeviceVendor gets in mediaserverd) loaded into mediaserverd (RedwoodAudio.driver already runs
-   there), then the ADT flags (`mkadt.py --camera --flash`) with a fresh MobileGestalt cache: Camera.app on the
-   home screen, and the flashlight through the camera stream's TorchLevel (-> `kern.sweet_torch`).
+**Camera frames into memory (0921-0922, r17d-r17g): all three sensors.** HackiOS redwood_camera.c cam=3/4 with
+lito's numbers, in `bsd/dev/sweet_cam.c`. Commands (sweetcam=2), each run on its own thread:
+- `poke c 20`: the CSID-lite's test pattern, 1600x1200 RAW10 colour bars, one frame (r17d: correct bars).
+- `poke c 21 SENSOR MODE OPTIONS`: the sensor's own frames. SENSOR 0 IMX363 / 1 IMX481 / 2 IMX355; MODE as
+  `tools/redfin-camtab.py` lists them; OPTIONS hex: [3:0] sensor test pattern (2 = colour bars), [15:8] CSIPHY
+  settle (0: module file's 14), [31:16] exposure lines, [47:32] analog gain code (0x0204), [55:48] frames.
+  Working examples: `c 21 2 2 0x3c00a280000` (front, 1640x924), `c 21 0 10 0x1c00960_0000` (rear, 2016x1136),
+  `c 21 1 3 0x3000708_0000` (ultra-wide, 2328x1310).
+- `poke c 22 MS`: time before each stage (default 300), so a hang shows its stage in the ring.
+- The run prints `files read /dev/pmem PA LEN`; fetch with the phone agent, decode with
+  `tools/redfin-camraw.py FRAME W H OUT.png --cfa BGGR --stride S` (S = W*10/8 rounded up to 16).
+- Tables: `tools/redfin-camtab.py MODULE.bin camera-<sensor>.tab` (vendor data, phone only) ->
+  `/private/var/local/fw/camera-<sensor>.tab` (`files put`); read at run time.
+
+The sequence: titan GDSC, camcc PLL0 (Lucid 1200 MHz) and the capture RCGs/branches at the DT's lowest levels,
+GCC camera hf/sf AXI, an apps-SMMU match register (stream 0x800 mask 0x5e0) to a context bank with translation
+off; camcc PLL2 (Zonda 960 MHz, aux /2) -> MCLK 24 MHz (M/N 1/20); refgen (0xff1080 bit 0, found off); the sensor
+powered as for `c N`; tables init + resM (+ exposure, + tpgN); CSID-lite 0 RX from the PHY -> RDI 0; IFE-lite 0
+WM0 frame mode; CSIPHY v1.2.2 = the 1.2 tables (D-PHY, 4 lanes, lane enable 0xd5, settle 14); stream on; frames;
+WM stopped at the last; stream off; all back. Results: front IMX355 colour bars and a picture of the room; rear
+IMX363 and IMX481 8 frames each at 30/60 fps (dark: the phone lay on its back), no ECC/CRC errors.
+
+Lessons (each cost a reboot):
+- r17a/b/c: the phone reset at `c 20` with nothing logged: 0921 mapped 128 KB of the SMMU and then read the context
+  banks' SCTLRs at 512 KB and up. The whole 1 MB is mapped now.
+- The UDP live log does not carry what a poke's run prints; the ring does: read it with `klog 0x101d0e710`
+  (0922 kernels) while the run's stages wait (`c 22 MS`).
+- No RPMh vote of ours: r17a's mx.lvl vote (SVS_L1, then 0 at the end) replaced the apps RSC's vote.
+- The write master puts lines at 16-byte boundaries and wants the next frame's address each frame.
+- One CSIPHY mapping per PHY (r17d/f set up the first PHY again for the second sensor: no packets).
+- The SMMU bank's CBAR does not go back to 0 when written: the last run's bank is taken again.
+
+**Next for the cameras:**
+1. `/dev/redwood-camera`: HackiOS redwood_camera.c cam=5 (frames for a program, three places in turn, the
+   exposure between frames in the sensor's group hold) on top of `capture_sensor()`.
+2. HackiOS's camera_device.c + camera_isp.c (the FigCaptureDevice for BWFigCaptureDeviceVendor) in mediaserverd
+   via RedwoodAudio.driver; the colour tuning from the `com.qti.tuned.*` files (HackiOS camtuning.py).
+3. Then the ADT flags (`mkadt.py --camera --flash`) with a fresh MobileGestalt cache: Camera.app on the home
+   screen, and the flashlight through the stream's TorchLevel (-> `kern.sweet_torch`).
 
 ## Done so far
 
