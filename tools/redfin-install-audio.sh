@@ -16,4 +16,8 @@ $F mkdir $H 755 || true
 $F mkdir $H/RedwoodAudio.driver 755 || true
 $F put "$D/Info.plist" $H/RedwoodAudio.driver/Info.plist 644
 $F put "$D/RedwoodAudio" $H/RedwoodAudio.driver/RedwoodAudio 755
+if [ -f "$D/_CodeSignature/CodeResources" ]; then
+	$F mkdir $H/RedwoodAudio.driver/_CodeSignature 755 || true
+	$F put "$D/_CodeSignature/CodeResources" $H/RedwoodAudio.driver/_CodeSignature/CodeResources 644
+fi
 echo "installed $H/RedwoodAudio.driver: reboot the phone into the new image"
