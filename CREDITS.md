@@ -12,6 +12,11 @@ what you need to fetch yourself.
 
 ## Projects this builds on
 
+- **HackiOS** (OOSEX GANG, <https://github.com/oosexgang/hackios-xnu-userland>, MIT): `phone/audio/`
+  (RedwoodAudio.driver, the CoreAudio HAL plug-in) is its `userland/src/audio_plugin.c`, unchanged; licence
+  in `phone/audio/LICENSE.HackiOS`. Patch 0914 implements its `/dev/redwood-audio` and `/dev/redwood-haptic`
+  interfaces for this phone.
+
 - **ios-sweet** (dipa-studio, <https://github.com/dipa-studio/ios-sweet>, MIT): the XNU port to the Redmi
   Note 10 Pro this is forked from. Patches 0001-0081, the shim and most of `tools/` started there.
 - **XNU** (Apple, APSL 2.0): xnu-8796.141.3.

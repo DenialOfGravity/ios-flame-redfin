@@ -150,3 +150,8 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   NECP, global proc info) for the kernel, platform binaries and entitled processes. r11 showed WebKit
   networking, nsurlsessiond, trustd and mDNSResponder denied PRIV_NET_PRIVILEGED_SOCKET_DELEGATE, which
   makes necp_client_add refuse every connection they open for an app.
+- 0914 `/dev/redwood-audio` + `/dev/redwood-haptic`, the kernel ends of HackiOS's RedwoodAudio.driver
+  (phone/audio, MIT): iOS plays its haptics as waveforms on the Actuator audio device once the ADT has
+  /product/haptics closed-loop (tools/mkadt.py now copies it from the D22 tree); each write's peak drives
+  the DRV2624 (`sweet_haptic_drive`). Speaker frames are dropped until the ADSP path exists. Install the
+  plug-in with tools/redfin-install-audio.sh; SweetHaptics.dylib (`sweetui=1`) is no longer needed.

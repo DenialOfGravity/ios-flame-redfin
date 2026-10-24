@@ -62,6 +62,22 @@ def d22ap_product(path=D22AP_ADT):
             return [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
     raise SystemExit(f'{path}: no /product node')
 
+
+def d22ap_product_child(child, path=D22AP_ADT):
+    """Properties of /product/CHILD of the real D22AP tree (None if missing). /product/haptics
+    ("closed-loop", MobileGestalt's DeviceSupportsClosedLoopHaptics) makes iOS play its haptics as
+    waveforms on the Actuator audio device (HackiOS mkidentity.py); without it UIKit plays none."""
+    if not os.path.exists(path):
+        return None
+    root, _ = adt.parse(open(path, 'rb').read())
+    for c in root.children:
+        if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
+            for g in c.children:
+                d = dict((k, v) for k, f, v in g.props)
+                if d.get('name') == cstr(child):
+                    return [(k, v) for k, f, v in g.props if not f and k not in ('name', 'AAPL,phandle')]
+    return None
+
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
 u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
@@ -244,7 +260,9 @@ def build(seed=None, qemu=False, highmem=False):
     ])
 
     product_props = d22ap_product()
-    product = [node('product', [ph()] + product_props)] if product_props else []
+    haptics = d22ap_product_child('haptics')
+    product = [node('product', [ph()] + product_props,
+                    [node('haptics', [ph()] + haptics)] if haptics else [])] if product_props else []
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product

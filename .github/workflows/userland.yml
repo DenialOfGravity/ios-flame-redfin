@@ -93,6 +93,7 @@ jobs:
           cp phone/wifi/out/wland ../out/
           bash phone/tools/build.sh || echo "::warning::some phone tools failed"
           sh phone/haptics/build.sh && cp phone/haptics/out/SweetHaptics.dylib ../out/ || echo "::warning::SweetHaptics.dylib failed"
+          sh phone/audio/build.sh && cp -R phone/audio/out/RedwoodAudio.driver ../out/ || echo "::warning::RedwoodAudio.driver failed"
           for t in psx pstack netsvc nettest oslog prefs openapp lsreg memwarn pmem a2s; do
             [ -f phone/tools/out/$t ] && cp phone/tools/out/$t ../out/ || true
           done
@@ -100,14 +101,14 @@ jobs:
       - name: Check and sign
         run: |
           cd out
-          for b in *; do
+          for b in $(find . -maxdepth 1 -type f | sed "s|^./||"); do
             if nm -m "$b" | grep -q "weak external"; then
               echo "::warning::$b has weak imports:"; nm -m "$b" | grep "weak external"
             fi
             case $b in dash|dropbearmulti|toybox) codesign -f -s - "$b";; esac  # others keep their entitlements
             file "$b"
           done
-          shasum -a 256 * > SHA256SUMS
+          find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 > SHA256SUMS
 
       - uses: actions/upload-artifact@v4
         with:
