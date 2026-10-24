@@ -128,3 +128,7 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
 - 0905 double-buffered GPU present (`sweetfbflip=1`, off by default): blit into the buffer not on screen
   (second one at 0xa0a00000 in the splash region), flip VIG0+VIG1 once the fence lands, never write the
   old buffer before the flip latched (as ios-sailfish 0164).
+- 0906 panel brightness: DCS 0x51 (10-bit, 0x4..0x3ff) through DSI0's command DMA (0x0ae94000), packet at
+  0xa2200000 in the splash region, sent from its own thread between autorefresh frames (topaz 0104/0107);
+  CoreBrightness via IOMFBBrightnessLevel, plus AppleARMBacklight with `sweetbl=1` (digital dimming then
+  runs too: opt-in while CA renders on the CPU). `sweetbl_dcs=0` disables it.

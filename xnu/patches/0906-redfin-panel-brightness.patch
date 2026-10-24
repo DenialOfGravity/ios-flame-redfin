@@ -1,0 +1,313 @@
+From fdbb4b866b588cf8aba4deb6c2737db48d90f735 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sat, 24 Oct 2026 12:26:43 +0200
+Subject: [PATCH] 0906 redfin: panel brightness by DCS 0x51 over DSI0
+ (CoreBrightness)
+
+The S6E3HC2's 10-bit level (0x4..0x3ff, MSB first) as one DCS long write
+through DSI0's command DMA (DSI ctrl v2.4 at 0x0ae94000), as topaz 0104
+does on SM6225; the packet sits in the top MB of the splash region
+(0xa2200000), which the display engine already reads in ABL's mapping,
+and the DMA is triggered when the MDP stream is idle between autorefresh
+frames. A thread sends it, at most one command a frame, so CoreBrightness
+never waits on the DSI (topaz 0107). Three missing CMD_DMA_DONEs turn it
+off for the boot; sweetbl_dcs=0 leaves it out.
+CoreBrightness drives it through IOMFBBrightnessLevel (nits 16.16, 500
+nits = 0x3ff) and, with sweetbl=1, an AppleARMBacklight service
+(backlight-control, IODisplayParameters 0..1023, ios-sailfish 0168);
+opt-in because that also turns on CoreBrightness's digital dimming,
+which the CPU renderer cannot afford (topaz 0110).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GizUhEzkc6MoTcLnCZCfFa
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 259 ++++++++++++++++++++++++++
+ 1 file changed, 259 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2d1e0f4..48ad805 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -150,6 +150,19 @@ public:
+ 	void present(const uint8_t *rec);
+ 	bool presentGPU(const uint8_t *rec);
+ 	bool fPresentBusy;	/* 0158: the last present was put off (GPU busy): show fPending on the next tick */
++	/* 0906: panel brightness (DCS 0x51 over DSI0), on its own thread: a DSI command waits for a gap
++	 * between the frames autorefresh sends, and CoreBrightness must not stall on it (as topaz 0107) */
++	volatile uint8_t  *fDsi;
++	volatile uint32_t *fBlPkt;
++	IOLock        *fBlLock;
++	uint32_t       fBlWant, fBlHave;        /* panel DBV; fBlHave 0 = not sent yet */
++	uint32_t       fBlFails;
++	bool           fBlReq;
++	bool           blStart(void);
++	bool           dsiDcs(const uint8_t *payload, uint32_t len);
++	void           blSet(uint32_t level);
++	static void    blLoop(void *arg);
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	void copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n);
+ 	static void presentLoop(void *arg);
+ };
+@@ -179,6 +192,239 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * ---- 0906: panel brightness (redfin: Samsung S6E3HC2, command mode) ----
++ *
++ * The panel's DCS 0x51 takes a 10-bit level, MSB first (dsi-panel-s6e3hc2-dvt-dsc-1080p-cmd.dtsi:
++ * bl_ctrl_dcs, min 0x4, max 0x3ff, high byte offset 8). It goes out as one DCS long write through
++ * DSI0's command DMA (DSI ctrl v2.4 at 0x0ae94000, as topaz 0104 on SM6225): the packet sits in the
++ * last MB of the cont_splash_region (0xa2200000), memory the display engine already reads through
++ * ABL's mapping. The DMA is triggered once the MDP stream is idle between two autorefresh frames.
++ * Three failures in a row (no CMD_DMA_DONE) turn it off for the boot. Boot-arg sweetbl_dcs=0: off.
++ *
++ * CoreBrightness sets IOMFBBrightnessLevel (nits, 16.16) on the framebuffer, and with an
++ * AppleARMBacklight service (backlight-control) also "brightness" in IODisplayParameters units
++ * (0..1023 here). The service is opt-in (sweetbl=1): with it CoreBrightness also runs digital dimming
++ * over every frame, which the CPU renderer could not afford on topaz (<1 fps); with the GPU it is fine.
++ */
++#define SWEET_BL_DSI0_PA        0x0ae94000ULL
++#define SWEET_BL_PKT_PA         0xa2200000ULL
++#define SWEET_BL_MIN            0x4u
++#define SWEET_BL_MAX            0x3ffu
++#define SWEET_BL_MAX_NITS       500u    /* IOMFBBrightnessLevel that maps to SWEET_BL_MAX */
++
++#define DSI_CTRL                0x004
++#define DSI_STATUS0             0x008   /* bit 2: CMD_MODE_MDP_BUSY */
++#define DSI_CMD_DMA_CTRL        0x03c   /* bit 26: low power */
++#define DSI_DMA_CMD_OFFSET      0x048
++#define DSI_DMA_CMD_LENGTH      0x04c
++#define DSI_TRIG_CTRL           0x084   /* bits 2:0: DMA trigger, 4 = software */
++#define DSI_DMA_SW_TRIGGER      0x090
++#define DSI_INT_CTRL            0x110   /* bit 0: CMD_DMA_DONE (write 1 clears) */
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++static inline uint32_t
++dsi_rd(volatile uint8_t *b, uint32_t o)
++{
++	return *(volatile uint32_t *)(b + o);
++}
++
++static inline void
++dsi_wr(volatile uint8_t *b, uint32_t o, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(b + o) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++bool
++AppleCLCD::dsiDcs(const uint8_t *payload, uint32_t len)
++{
++	if (fDsi == NULL || fBlPkt == NULL || len == 0 || len > 28) {
++		return false;
++	}
++	/* DCS long write (0x39): word count, type, flags last | long; payload padded with 0xff */
++	uint8_t pkt[32];
++	memset(pkt, 0xff, sizeof(pkt));
++	pkt[0] = (uint8_t)len;
++	pkt[1] = 0;
++	pkt[2] = 0x39;
++	pkt[3] = 0xc0;
++	memcpy(pkt + 4, payload, len);
++	uint32_t size = (4 + len + 3) & ~3u;
++	for (uint32_t i = 0; i < size / 4; i++) {
++		uint32_t w;
++		memcpy(&w, pkt + 4 * i, 4);
++		fBlPkt[i] = w;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint32_t ctrl = dsi_rd(fDsi, DSI_CTRL), trig = dsi_rd(fDsi, DSI_TRIG_CTRL), dma = dsi_rd(fDsi, DSI_CMD_DMA_CTRL);
++	if ((trig & 7) != 4) {
++		dsi_wr(fDsi, DSI_TRIG_CTRL, (trig & ~7u) | 4);
++	}
++	dsi_wr(fDsi, DSI_CTRL, ctrl | 4 | 1);                   /* CMD_MODE_EN | DSI_EN (both on already) */
++	dsi_wr(fDsi, DSI_INT_CTRL, dsi_rd(fDsi, DSI_INT_CTRL) | 1);
++	dsi_wr(fDsi, DSI_DMA_CMD_OFFSET, (uint32_t)SWEET_BL_PKT_PA);
++	dsi_wr(fDsi, DSI_DMA_CMD_LENGTH, size);
++	dsi_wr(fDsi, DSI_CMD_DMA_CTRL, dma & ~(1u << 26));      /* high speed */
++	for (int i = 0; i < 200 && (dsi_rd(fDsi, DSI_STATUS0) & 4); i++) {
++		IODelay(100);                                   /* between two frames */
++	}
++	dsi_wr(fDsi, DSI_DMA_SW_TRIGGER, 1);
++	bool done = false;
++	for (int i = 0; i < 50 && !done; i++) {
++		done = (dsi_rd(fDsi, DSI_INT_CTRL) & 1) != 0;
++		if (!done) {
++			IODelay(1000);
++		}
++	}
++	dsi_wr(fDsi, DSI_INT_CTRL, dsi_rd(fDsi, DSI_INT_CTRL) | 1);
++	dsi_wr(fDsi, DSI_CMD_DMA_CTRL, dma);
++	dsi_wr(fDsi, DSI_CTRL, ctrl);
++	if ((trig & 7) != 4) {
++		dsi_wr(fDsi, DSI_TRIG_CTRL, trig);
++	}
++	return done;
++}
++
++void
++AppleCLCD::blLoop(void *arg)
++{
++	AppleCLCD *fb = (AppleCLCD *)arg;
++	for (;;) {
++		IOLockLock(fb->fBlLock);
++		while (!fb->fBlReq) {
++			IOLockSleep(fb->fBlLock, &fb->fBlReq, THREAD_UNINT);
++		}
++		fb->fBlReq = false;
++		uint32_t want = fb->fBlWant;
++		IOLockUnlock(fb->fBlLock);
++		if (want == fb->fBlHave || fb->fBlFails >= 3) {
++			continue;
++		}
++		uint8_t cmd[3] = { 0x51, (uint8_t)(want >> 8), (uint8_t)want };
++		bool ok = fb->dsiDcs(cmd, sizeof(cmd));
++		static uint32_t logs;
++		if (logs++ < 12 || !ok) {
++			IOLog("SWEET BL: panel level %#x %s (dsi ctrl %#x status %#x)\n", want, ok ? "set" : "NO DMA DONE",
++			    dsi_rd(fb->fDsi, DSI_CTRL), dsi_rd(fb->fDsi, DSI_STATUS0));
++		}
++		if (ok) {
++			fb->fBlHave = want;
++			fb->fBlFails = 0;
++		} else if (++fb->fBlFails >= 3) {
++			IOLog("SWEET BL: three DSI commands without CMD_DMA_DONE: brightness off for this boot\n");
++		}
++		IODelay(16000);         /* at most one command a frame; later requests coalesce */
++	}
++}
++
++void
++AppleCLCD::blSet(uint32_t level)
++{
++	if (fBlLock == NULL) {
++		return;
++	}
++	level = level < SWEET_BL_MIN ? SWEET_BL_MIN : level > SWEET_BL_MAX ? SWEET_BL_MAX : level;
++	IOLockLock(fBlLock);
++	fBlWant = level;
++	fBlReq = true;
++	IOLockWakeup(fBlLock, &fBlReq, false);
++	IOLockUnlock(fBlLock);
++}
++
++bool
++AppleCLCD::blStart(void)
++{
++	uint32_t on = 1;
++	PE_parse_boot_argn("sweetbl_dcs", &on, sizeof(on));
++	if (!on) {
++		return false;
++	}
++	fDsi = (volatile uint8_t *)ml_io_map(SWEET_BL_DSI0_PA, 0x1000);
++	fBlPkt = (volatile uint32_t *)ml_io_map(SWEET_BL_PKT_PA, 0x1000);
++	fBlLock = IOLockAlloc();
++	if (fDsi == NULL || fBlPkt == NULL || fBlLock == NULL || IOCreateThread(&AppleCLCD::blLoop, this) == NULL) {
++		IOLog("SWEET BL: setup failed\n");
++		fBlLock = NULL;
++		return false;
++	}
++	IOLog("SWEET BL: DSI0 ctrl %#x status %#x trig %#x: brightness via DCS 0x51\n", dsi_rd(fDsi, DSI_CTRL),
++	    dsi_rd(fDsi, DSI_STATUS0), dsi_rd(fDsi, DSI_TRIG_CTRL));
++	setProperty("IOMFBBrightnessLevel", (unsigned long long)(250u << 16), 32);
++	return true;
++}
++
++/* CoreBrightness: IOMFBBrightnessLevel, nits as 16.16 */
++IOReturn
++AppleCLCD::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("IOMFBBrightnessLevel")) : NULL;
++	if (n == NULL || fBlLock == NULL) {
++		return kIOReturnUnsupported;
++	}
++	uint64_t v = n->unsigned64BitValue();
++	setProperty("IOMFBBrightnessLevel", v, 32);
++	static uint32_t logs;
++	if (logs++ < 8) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET BL: %s sets IOMFBBrightnessLevel %llu.%02llu nits\n", name, v >> 16, ((v & 0xffff) * 100) >> 16);
++	}
++	blSet(SWEET_BL_MIN + (uint32_t)((v * (SWEET_BL_MAX - SWEET_BL_MIN)) / ((uint64_t)SWEET_BL_MAX_NITS << 16)));
++	return kIOReturnSuccess;
++}
++
++/* For CoreBrightness: the service with backlight-control = true (ios-sailfish 0168, topaz 0105). sweetbl=1. */
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++
++public:
++	AppleCLCD *fFB;
++	void publish(uint32_t level);
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++void
++AppleARMBacklight::publish(uint32_t level)
++{
++	OSDictionary *b = OSDictionary::withCapacity(3);
++	OSDictionary *p = OSDictionary::withCapacity(1);
++	if (b != NULL && p != NULL) {
++		OSNumber *n;
++		n = OSNumber::withNumber(0ULL, 32); b->setObject("min", n); OSSafeReleaseNULL(n);
++		n = OSNumber::withNumber(SWEET_BL_MAX, 32); b->setObject("max", n); OSSafeReleaseNULL(n);
++		n = OSNumber::withNumber(level, 32); b->setObject("value", n); OSSafeReleaseNULL(n);
++		p->setObject("brightness", b);
++		setProperty("IODisplayParameters", p);
++	}
++	OSSafeReleaseNULL(b);
++	OSSafeReleaseNULL(p);
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	OSNumber *b = d ? OSDynamicCast(OSNumber, d->getObject("brightness")) : NULL;
++	if (b == NULL) {
++		return d ? kIOReturnSuccess : kIOReturnBadArgument;
++	}
++	int32_t v = (int32_t)b->unsigned32BitValue();
++	uint32_t level = v < 0 ? 0 : (uint32_t)v > SWEET_BL_MAX ? SWEET_BL_MAX : (uint32_t)v;
++	static uint32_t logs;
++	if (logs++ < 8) {
++		IOLog("SWEET BL: backlight brightness %u\n", level);
++	}
++	fFB->blSet(level);
++	publish(level);
++	return kIOReturnSuccess;
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -262,6 +508,19 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	if (blStart()) {
++		uint32_t blOn = 0;
++		PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
++		AppleARMBacklight *bl = blOn ? OSTypeAlloc(AppleARMBacklight) : NULL;
++		if (bl != NULL && bl->init() && bl->attach(this)) {
++			bl->fFB = this;
++			bl->setProperty("backlight-control", true);
++			bl->publish(SWEET_BL_MAX / 2);
++			bl->registerService();
++			IOLog("SWEET BL: AppleARMBacklight published (sweetbl=1)\n");
++		}
++		OSSafeReleaseNULL(bl);
++	}
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+-- 
+2.43.0
+
