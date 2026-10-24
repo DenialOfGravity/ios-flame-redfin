@@ -1,0 +1,73 @@
+From 1183e1e26f817b9a8c36cc358ee454a3d11cad1e Mon Sep 17 00:00:00 2001
+From: Yofuness <compiledchickennuggets@gmail.com>
+Date: Fri, 23 Oct 2026 22:09:16 -0400
+Subject: [PATCH] 0154 sunfish: v2 client census (allocs/frees/imports, live
+ pool buffers by size) on the holds line
+
+---
+ iokit/Kernel/arm/SweetAccelerator.cpp | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index 35c15ef..37651da 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -149,6 +149,7 @@ class SweetAcceleratorUserClient : public IOUserClient {
+ 	uint64_t *fPageBuf;
+ 	uint64_t fEpoch, fFaults;       /* GPU resets seen; those that lost this client's work */
+ 	uint64_t fPoolBytes, fPoolPeak; /* GPU pool memory this client holds */
++	uint32_t fAllocs, fFrees, fImports, fImportFrees;	/* 0154: census for the holds line */
+ 	char fName[32];
+ 	bool fSystem;                   /* backboardd / SpringBoard: no pool cap, and the reserve is theirs */
+ 	bool fCapLogged;
+@@ -630,9 +631,11 @@ SweetAcceleratorUserClient::v2Release(SweetV2BO *bo)
+ 		sweet_gpu_unmap_at(bo->iova, bo->bytes);
+ 	}
+ 	if (bo->imported) {
++		fImportFrees++;
+ 		bo->md->complete();
+ 		bo->md->release();
+ 	} else {
++		fFrees++;
+ 		fPoolBytes -= bo->md->getLength();
+ 		sweet_pool_release(bo->md, bo->pool_pa);
+ 	}
+@@ -720,8 +723,24 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 			if (fPoolBytes > fPoolPeak) {
+ 				fPoolPeak = fPoolBytes;
+ 			}
++			fAllocs++;
+ 			if ((fPoolBytes >> 25) != ((fPoolBytes - len) >> 25)) {
+-				IOLog("SWEET MTL: v2 %s holds %llu MB of GPU pool (%llu MB buffer)\n", fName, fPoolBytes >> 20, len >> 20);
++				/* 0154: live pool buffers by size: <256K, <1M, <8M, 8M, >8M (count/MB) */
++				uint32_t n[5] = { 0 };
++				uint64_t mb[5] = { 0 };
++				for (uint32_t i = 0; i < fBOCap; i++) {
++					if (fBO[i].md == NULL || fBO[i].imported) {
++						continue;
++					}
++					uint64_t b = fBO[i].md->getLength();
++					unsigned k = b < (256u << 10) ? 0 : b < (1u << 20) ? 1 : b < (8u << 20) ? 2 : b == (8u << 20) ? 3 : 4;
++					n[k]++;
++					mb[k] += b;
++				}
++				IOLog("SWEET MTL: v2 %s holds %llu MB of GPU pool (%llu MB buffer); allocs %u frees %u imports %u/%u; "
++				    "live <256K %u/%lluM <1M %u/%lluM <8M %u/%lluM 8M %u/%lluM >8M %u/%lluM\n", fName, fPoolBytes >> 20,
++				    len >> 20, fAllocs, fFrees, fImports, fImportFrees, n[0], mb[0] >> 20, n[1], mb[1] >> 20, n[2], mb[2] >> 20,
++				    n[3], mb[3] >> 20, n[4], mb[4] >> 20);
+ 			}
+ 		}
+ 		IOLockUnlock(fLock);
+@@ -755,6 +774,9 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 		IOLockLock(fLock);
+ 		uint64_t h = 0;
+ 		IOReturn r = v2NewSlot(md, rq->bytes, true, &h);
++		if (r == kIOReturnSuccess) {
++			fImports++;
++		}
+ 		IOLockUnlock(fLock);
+ 		if (r != kIOReturnSuccess) {
+ 			md->complete();
+-- 
+2.56.0
+

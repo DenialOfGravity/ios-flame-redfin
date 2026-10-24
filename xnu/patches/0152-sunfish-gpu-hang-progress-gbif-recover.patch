@@ -1,0 +1,79 @@
+From b82066add29ee7f38e37449c286add7173c3f86b Mon Sep 17 00:00:00 2001
+From: Yofuness <compiledchickennuggets@gmail.com>
+Date: Fri, 23 Oct 2026 21:14:22 -0400
+Subject: [PATCH] 0152 sunfish: GPU hang = no CP progress for 2 s (not just no
+ fence); GBIF-halt reset retry
+
+A long WebKit IB tripped present's 500 ms no-fence hang check while the CP was
+still executing (ib1 rem 1980, rbbm busy); the soft reset then failed ME_INIT
+and the screen froze on the CPU fallback. Ring rptr / IB1 base / IB1+IB2 dwords
+left now count as progress, the floor is sweetgpuhang (2000 ms), and a failed
+recovery retries with kgsl's GBIF halt before the reset.
+---
+ bsd/dev/sweet_a6xx.c | 19 +++++++++++++++++++
+ bsd/dev/sweet_gpu.c  | 15 ++++++++++++++-
+ 2 files changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 0ef61c5..f4aa958 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -1159,6 +1159,25 @@ int a6_recover(struct a6_gpu *g)
+ 	(void)a6_clear_fault(g);
+ 	int rc = gpu_cp_init(g, true);
+ 	a6_log("recover: soft reset + CP init -> %d\n", rc);
++	if (rc == 0)
++		return 0;
++	/*
++	 * 0152: kgsl a6xx_halt_gbif before a reset: stop new GBIF transactions (GBIF_HALT, ack in GBIF_HALT_ACK),
++	 * then the RBBM side, so the reset does not land mid-transaction; then reset and CP init again (it
++	 * clears both halts).
++	 */
++	wr32(GREG(0x3c45), 0x3);		/* GBIF_HALT: client + arbiter */
++	(void)wait_bit(GREG(0x3c46), 0x3, 1, 100);
++	wr32(GREG(0x16), 1);			/* RBBM_GBIF_HALT */
++	(void)wait_bit(GREG(0x17), 1, 1, 100);	/* RBBM_GBIF_HALT_ACK */
++	wr32(GREG(0x43), 1);
++	(void)rd32(GREG(0x43));
++	a6_delay_us(100);
++	wr32(GREG(0x43), 0);
++	a6_delay_ms(10);
++	(void)a6_clear_fault(g);
++	rc = gpu_cp_init(g, true);
++	a6_log("recover: GBIF halt + soft reset + CP init -> %d\n", rc);
+ 	return rc;
+ }
+ 
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 56c8556..00936f0 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -455,11 +455,24 @@ gpu_note_submit_locked(void)
+ static bool
+ gpu_hung_locked(uint32_t hang_ms)
+ {
++	/*
++	 * 0152: a hang is no progress at all, not just no fence: a long client IB (WebKit) keeps the CP moving
++	 * (ring rptr, IB1 base and dwords left, IB2 left change) with the fence still behind. Those count as
++	 * progress; and never less than sweetgpuhang ms (default 2000).
++	 */
++	static uint32_t sig[4];
++	static uint32_t min_ms;
++	if (!min_ms && !PE_parse_boot_argn("sweetgpuhang", &min_ms, sizeof(min_ms)))
++		min_ms = 2000;
++	if (hang_ms < min_ms)
++		hang_ms = min_ms;
++	uint32_t now_sig[4] = { a6_rd(A6_GREG(0x806)), a6_rd(A6_GREG(0x928)), a6_rd(A6_GREG(0x92a)), a6_rd(A6_GREG(0x92d)) };
+ 	uint32_t done = a6_fence_read(&gpu);
+ 	uint64_t now = mach_absolute_time(), ns;
+-	if (done != progress_fence || (int32_t)(gpu.fence - done) <= 0) {
++	if (done != progress_fence || (int32_t)(gpu.fence - done) <= 0 || memcmp(sig, now_sig, sizeof(sig))) {
+ 		progress_fence = done;
+ 		progress_abs = now;
++		memcpy(sig, now_sig, sizeof(sig));
+ 		return false;
+ 	}
+ 	absolutetime_to_nanoseconds(now - progress_abs, &ns);
+-- 
+2.56.0
+

@@ -144,6 +144,15 @@ static bool listed(void)
 			sm2_log("not listed (/var/local/mtl2-clients): no Metal device");
 			return;
 		}
+		/* Turnip's per-name BO census (TU_DEBUG=bos, every 300 submits: phone/turnip/patches/0101) into
+		 * /var/local/tubos/NAME-PID.log while /var/local/tubos exists (mode 777) */
+		if (access("/var/local/tubos", W_OK) == 0) {
+			char log[256];
+			snprintf(log, sizeof(log), "/var/local/tubos/%s-%d.log", getprogname(), getpid());
+			setenv("TU_DEBUG", "bos", 1);
+			setenv("MESA_LOG_FILE", log, 1);
+			sm2_log("BO census -> %s", log);
+		}
 		NSString *bundle = [[NSBundle bundleForClass:[SweetMTL2Device class]] bundlePath];
 		NSString *turnip = [bundle stringByAppendingPathComponent:@"libvulkan_freedreno.dylib"];
 		char cache[256];

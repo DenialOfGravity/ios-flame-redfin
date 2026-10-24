@@ -1,0 +1,25 @@
+From 751160acb88dacb6f9e76351b7f905b330f4f5af Mon Sep 17 00:00:00 2001
+From: Yofuness <compiledchickennuggets@gmail.com>
+Date: Fri, 23 Oct 2026 22:16:50 -0400
+Subject: [PATCH] 0154b: census also every 500 allocations
+
+---
+ iokit/Kernel/arm/SweetAccelerator.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index 37651da..c16025b 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -724,7 +724,7 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 				fPoolPeak = fPoolBytes;
+ 			}
+ 			fAllocs++;
+-			if ((fPoolBytes >> 25) != ((fPoolBytes - len) >> 25)) {
++			if ((fPoolBytes >> 25) != ((fPoolBytes - len) >> 25) || fAllocs % 500 == 0) {
+ 				/* 0154: live pool buffers by size: <256K, <1M, <8M, 8M, >8M (count/MB) */
+ 				uint32_t n[5] = { 0 };
+ 				uint64_t mb[5] = { 0 };
+-- 
+2.56.0
+

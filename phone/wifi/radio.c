@@ -549,9 +549,11 @@ static uint8_t wmi_mac[6];
 static uint32_t wmi_rf_chains;
 /*
  * Test hook: /var/local/wlan-steps.conf, a hex mask of ath10k station steps we used to skip (default all on):
- * bit 0 keepalive off, bit 1 sta ps params, bit 2 rts threshold, bit 3 vdev start in HT20 mode.
+ * bit 0 keepalive off, bit 1 sta ps params, bit 2 rts threshold, bit 3 vdev start in HT20 mode;
+ * bits 4-6 (ours, before vdev start): sta ps mode off, pdev tx power limits, vdev wmm;
+ * probes: bit 7 vdev start on 2437 MHz instead of a scan, bit 8 no HTT setup.
  */
-static uint32_t w_steps = 0xf;
+static uint32_t w_steps = 0x7f;
 static int w_steps_read;
 static uint32_t steps(void)
 {
@@ -568,6 +570,7 @@ static uint32_t steps(void)
 	return w_steps;
 }
 static int w_pdev_param(uint32_t param, uint32_t value);
+static int w_vdev_start(uint32_t freq, uint32_t bcn, uint32_t dtim);
 
 /* ath10k WMI_SERVICE_IS_ENABLED: 4 service bits per 32-bit word (sizeof(u32)) */
 static int wmi_svc(uint32_t bit)
@@ -816,6 +819,10 @@ static void scan_start(void)
 	if (scan_started)
 		return;
 	scan_started = 1;
+	if (steps() & 0x200) {			/* probe: no regdomain, pdev params, dbglog or channel list */
+		LOG("probe: regdomain/pdev/dbglog/chan list skipped");
+		goto vdev_create;
+	}
 	/*
 	 * sunfish: WMI_PDEV_SET_REGDOMAIN first (ath10k_regd_update; tag 0x51, cmd 0x4001), with the
 	 * firmware's own eeprom code, FCC conformance limits. The HL3.2.2 firmware asserted in vdev
@@ -868,6 +875,10 @@ static void scan_start(void)
 		p = put32(c, 40u << 8);
 	}
 	int a = wmi_send(CMD_SCAN_CHAN_LIST, m, (uint32_t)(p - m));
+	if (0) {
+vdev_create:
+		a = 0;
+	}
 	uint8_t v[4 + 20] = { 0 };
 	c = put_tlv(v, TAG_VDEV_CREATE_CMD, 20);
 	c = put32(c, 0);				/* vdev 0 */
@@ -912,6 +923,12 @@ static void scan_start(void)
 		q = put32(q, 1);
 		put32(q, 0xffffffffu);
 		LOG("vdev: rts threshold %s", wmi_send(0x5008, m, sizeof(m)) ? "FAILED" : "ok");
+	}
+	if (steps() & 0x80) {			/* probe: vdev start on 2437 MHz, no scan at all */
+		fflush(stdout);
+		LOG("probe: vdev start 2437 MHz without a scan: %s", w_vdev_start(2437, 100, 1) ? "FAILED" : "sent");
+		fflush(stdout);
+		return;
 	}
 	scanning = !scan_send_start();
 	LOG("scan: channel list (%u) %s, vdev %s, passive scan %s", NFREQ, a ? "FAILED" : "ok", b ? "FAILED" : "ok",
@@ -1184,6 +1201,12 @@ static void htt_start(void)
 
 	if (htt_state != 0)
 		return;
+	if (steps() & 0x100) {			/* probe: no HTT setup at all */
+		LOG("probe: HTT setup skipped");
+		htt_state = 2;
+		scan_start();
+		return;
+	}
 	if (!(pa = pool_alloc(ring + bank + (uint64_t)HTT_RING_SIZE * HTT_BUF_SIZE))) {
 		LOG("htt: no memory, scanning without it");
 		scan_start();
@@ -1761,8 +1784,16 @@ static void w_join_begin(void)
 	s_start_resp = 0;
 	LOG("join: '%.*s' %02x:%02x:%02x:**:**:** %u MHz %d dBm %s", (int)s_ssid_len, s_ssid, s_bssid[0], s_bssid[1],
 	    s_bssid[2], s_freq, bss[best].rssi, s_rsn ? "WPA2" : "open");
-	w_ps_off();
-	int t2 = w_pdev_param(3, 40), t5 = w_pdev_param(4, 40), wm = w_vdev_wmm();
+	/* steps bits 4-6: our own pre-start commands (ath10k does not send these before vdev start) */
+	if (steps() & 0x10)
+		w_ps_off();
+	int t2 = 0, t5 = 0, wm = 0;
+	if (steps() & 0x20) {
+		t2 = w_pdev_param(3, 40);
+		t5 = w_pdev_param(4, 40);
+	}
+	if (steps() & 0x40)
+		wm = w_vdev_wmm();
 	LOG("join: tx power limit 2G/5G 20 dBm %s, vdev wmm %s", t2 || t5 ? "FAILED" : "ok", wm ? "FAILED" : "ok");
 	fflush(stdout);
 	if (w_vdev_start(s_freq, bcn, dtim)) {
@@ -1834,6 +1865,7 @@ static void sta_wmi_event(uint32_t id, const uint8_t *t, uint32_t len)
 	if (id == EV_VDEV_START_RESP && l >= 16) {	/* {vdev, req, type, status} */
 		s_start_status = (int32_t)v[3];
 		s_start_resp = 1;
+		LOG("vdev start resp: status %d", s_start_status);
 	} else if (id == EV_PEER_STA_KICKOUT && s_state == S_UP) {
 		w_link_lost("peer kickout");
 	} else if (id == EV_ROAM && l >= 12) {

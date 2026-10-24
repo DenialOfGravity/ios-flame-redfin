@@ -1,0 +1,152 @@
+From e908cc2289522b586bbcc727098024185f13771f Mon Sep 17 00:00:00 2001
+From: Yofuness <compiledchickennuggets@gmail.com>
+Date: Fri, 23 Oct 2026 22:31:43 -0400
+Subject: [PATCH] 0156 sunfish: per-client reuse of freed >= 1 MB pool buffers
+ (no new range, no bzero)
+
+CoreAnimation allocates and frees full-screen intermediates constantly; each
+BoAlloc took a pool range and zeroed 10 MB of WC memory. Up to 64 MB of a
+client's freed buffers are kept for its own next same-size allocation (never
+another client's), drained on pool shortage and on close.
+---
+ iokit/Kernel/arm/SweetAccelerator.cpp | 86 ++++++++++++++++++++++-----
+ 1 file changed, 71 insertions(+), 15 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index c16025b..cb50f91 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -160,6 +160,12 @@ class SweetAcceleratorUserClient : public IOUserClient {
+ 	SweetV2BO *v2Find(uint64_t handle);
+ 	IOReturn v2NewSlot(IOMemoryDescriptor *md, uint64_t bytes, bool imported, uint64_t *handle);
+ 	void v2Release(SweetV2BO *bo);
++	/* 0156: freed pool buffers >= 1 MB kept for this client's next allocation of the same size (no new pool
++	 * range, no 10 MB bzero per CoreAnimation intermediate); never shared across clients */
++	struct { IOMemoryDescriptor *md; uint64_t pa, len; } fReuse[16];
++	uint64_t fReuseBytes;
++	uint32_t fReuseHits;
++	void v2ReuseDrain(void);
+ 
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+@@ -259,6 +265,7 @@ SweetAcceleratorUserClient::free(void)
+ 		for (uint32_t i = 0; i < fBOCap; i++) {
+ 			v2Release(&fBO[i]);
+ 		}
++		v2ReuseDrain();
+ 		IODelete(fBO, SweetV2BO, fBOCap);
+ 		fBO = NULL;
+ 	}
+@@ -621,6 +628,18 @@ sweet_pool_release(IOMemoryDescriptor *md, uint64_t pa)
+ }
+ 
+ /* Unmap from the GPU, unwire, drop (pool memory: once no task maps it any more) */
++void
++SweetAcceleratorUserClient::v2ReuseDrain(void)
++{
++	for (unsigned i = 0; i < 16; i++) {
++		if (fReuse[i].md != NULL) {
++			sweet_pool_release(fReuse[i].md, fReuse[i].pa);
++			fReuse[i].md = NULL;
++		}
++	}
++	fReuseBytes = 0;
++}
++
+ void
+ SweetAcceleratorUserClient::v2Release(SweetV2BO *bo)
+ {
+@@ -636,8 +655,25 @@ SweetAcceleratorUserClient::v2Release(SweetV2BO *bo)
+ 		bo->md->release();
+ 	} else {
+ 		fFrees++;
+-		fPoolBytes -= bo->md->getLength();
+-		sweet_pool_release(bo->md, bo->pool_pa);
++		uint64_t len = bo->md->getLength();
++		fPoolBytes -= len;
++		unsigned slot = 16;
++		if (len >= (1u << 20) && bo->md->getRetainCount() <= 1 && fReuseBytes + len <= (64ULL << 20)) {
++			for (unsigned i = 0; i < 16; i++) {
++				if (fReuse[i].md == NULL) {
++					slot = i;
++					break;
++				}
++			}
++		}
++		if (slot < 16) {
++			fReuse[slot].md = bo->md;
++			fReuse[slot].pa = bo->pool_pa;
++			fReuse[slot].len = len;
++			fReuseBytes += len;
++		} else {
++			sweet_pool_release(bo->md, bo->pool_pa);
++		}
+ 	}
+ 	bzero(bo, sizeof(*bo));
+ }
+@@ -701,19 +737,39 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 		if (!v2PoolAllowed(len)) {
+ 			return kIOReturnNoMemory;
+ 		}
+-		if (sweet_gpu_pool_alloc(len, &pa)) {
+-			return kIOReturnNoMemory;
++		IOMemoryDescriptor *md = NULL;
++		IOLockLock(fLock);
++		for (unsigned i = 0; len >= (1u << 20) && i < 16; i++) {
++			if (fReuse[i].md != NULL && fReuse[i].len == len) {
++				md = fReuse[i].md;
++				pa = fReuse[i].pa;
++				fReuse[i].md = NULL;
++				fReuseBytes -= len;
++				fReuseHits++;
++				break;
++			}
+ 		}
+-		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa, len, kIODirectionInOut);
+-		IOMemoryMap *km = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
+-		if (km == NULL) {
+-			OSSafeReleaseNULL(md);
+-			sweet_gpu_pool_free(pa, len);
+-			return kIOReturnNoMemory;
++		IOLockUnlock(fLock);
++		if (md == NULL) {
++			if (sweet_gpu_pool_alloc(len, &pa)) {
++				IOLockLock(fLock);
++				v2ReuseDrain();		/* give the cache back and try once more */
++				IOLockUnlock(fLock);
++				if (sweet_gpu_pool_alloc(len, &pa)) {
++					return kIOReturnNoMemory;
++				}
++			}
++			md = IOMemoryDescriptor::withPhysicalAddress(pa, len, kIODirectionInOut);
++			IOMemoryMap *km = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++			if (km == NULL) {
++				OSSafeReleaseNULL(md);
++				sweet_gpu_pool_free(pa, len);
++				return kIOReturnNoMemory;
++			}
++			bzero((void *)km->getVirtualAddress(), len);
++			__asm__ volatile ("dsb sy" ::: "memory");
++			km->release();
+ 		}
+-		bzero((void *)km->getVirtualAddress(), len);
+-		__asm__ volatile ("dsb sy" ::: "memory");
+-		km->release();
+ 		IOLockLock(fLock);
+ 		uint64_t h = 0;
+ 		IOReturn r = v2NewSlot(md, rq->bytes, false, &h);
+@@ -738,9 +794,9 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 					mb[k] += b;
+ 				}
+ 				IOLog("SWEET MTL: v2 %s holds %llu MB of GPU pool (%llu MB buffer); allocs %u frees %u imports %u/%u; "
+-				    "live <256K %u/%lluM <1M %u/%lluM <8M %u/%lluM 8M %u/%lluM >8M %u/%lluM\n", fName, fPoolBytes >> 20,
++				    "live <256K %u/%lluM <1M %u/%lluM <8M %u/%lluM 8M %u/%lluM >8M %u/%lluM; reuse %u hits %lluM kept\n", fName, fPoolBytes >> 20,
+ 				    len >> 20, fAllocs, fFrees, fImports, fImportFrees, n[0], mb[0] >> 20, n[1], mb[1] >> 20, n[2], mb[2] >> 20,
+-				    n[3], mb[3] >> 20, n[4], mb[4] >> 20);
++				    n[3], mb[3] >> 20, n[4], mb[4] >> 20, fReuseHits, fReuseBytes >> 20);
+ 			}
+ 		}
+ 		IOLockUnlock(fLock);
+-- 
+2.56.0
+
