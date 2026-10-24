@@ -238,6 +238,16 @@ copy at 0xe2000000 survives a warm reset.
 it: CA's CPU renderer has no blur) after installing the metal2 CI bundle (tools/sunfish-metal2-install.sh
 works over the same USB address once dropbear is on the root).
 
+## GPU works (2026-10-24, r9-metal, kernel with 0904-0908)
+
+r8's GPU trail (`/dev/pmem` 0xE2000000): GMU booted (init result 0x100), cmd-db mx 0x30010 / cx 0x30000 /
+xo 0x300a0 / vrm.soc 0x43400, HFI tables acked at 500 MHz, GX on, SMRs with DT masks kept (84000005,
+84010000), ME_INIT idle, then PAS mem setup refused pil_gpu_region 0x8bc15400 (0xffcfffba). 0908 tries a
+1 MB-aligned region first (a620_zap's p_align): r9 boots with the GPU, Metal on Turnip (SpringBoard, WebKit),
+blur right, the iPhone X frame scaled to fit. ~5 % GPU busy at 20 presents/s idle. Metal also needed
+`/var/local/m2v-cache` mode 777 (SpringBoard runs as mobile). Wi-Fi: wifid joined only ~10 min after the
+radio was ready, then worked. Brightness (0906), vibration (0907): no result yet (live log started late).
+
 ### Other ports checked (2026-10-24)
 - joranv1/ios-sailfish (Pixel 1, A530): GL path, not Metal: Mesa freedreno GLES in backboardd (sweetgl.dylib
   + EAGL shim) with CA's GL renderer; blur because sweetgl supplies CA's missing GL texture functions (variable
