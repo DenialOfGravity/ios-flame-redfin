@@ -167,3 +167,5 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   (CCI0 m0, 0x20), ultra-wide IMX481 (CCI0 m1, 0x34), front IMX355 (CCI1 m0, 0x34) powered up in their module files'
   order (SLG51000 LDOs over SE9 at 0x75 with Google's tuning, PM8150L GPIO 2/8, reset GPIO 23/25/21, MCLK from camcc
   at 19.2 MHz, titan top GDSC), chip ID register 0x0016 read by bit-banged I2C on the CCI pins. Needs sweethaptic=1.
+- 0920 XNU's I/O map (osfmk/arm/io_map.c) 8 -> 32 MiB: ml_io_map() is KMA_NOFAIL and SWEET drivers never unmap;
+  ~600 KB more (0919's first version) and every boot reset a few seconds later (r16a-r16e).

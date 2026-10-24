@@ -17,7 +17,10 @@ log). r16b still reset ~8 s after the boot look; r16c (no camera driver)
 did not. The boot look now reads only GCC and pins; camcc ("c 12") and the
 probe switch the GCC camera XO clock on first (off here; critical in Linux).
 r16d (GCC + pin reads only) still reset ~8 s later: sweetcam=2 no longer
-looks at boot ("c 9" does).
+looks at boot ("c 9" does). r16e (nothing at boot but the mappings) reset
+too: XNU's 8 MiB I/O map ran out (0920). The driver maps only the pages it uses
+now (GCC 0xb000, camcc 0x5000 and 0xc000, TLMM EAST GPIO 13-28) and keeps its
+SPMI channel mappings.
 sweet_haptic.c exports sweet_se9_xfer() for the PMIC.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -132,10 +135,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 new file mode 100644
-index 0000000..1ce5e4a
+index 0000000..ca9691a
 --- /dev/null
 +++ b/bsd/dev/sweet_cam.c
-@@ -0,0 +1,892 @@
+@@ -0,0 +1,917 @@
 +/*
 + * redfin (Pixel 5) cameras, step 1: one sensor powered up as Android powers it, its chip ID read,
 + * powered down again. After HackiOS's redwood_camera.c (cam=1 / cam=2), with this phone's numbers.
@@ -199,22 +202,29 @@ index 0000000..1ce5e4a
 +void sweet_cam_init(void);
 +int sweet_cam_cmd(unsigned what);
 +
-+#define GCC_PA          0x00100000u
-+#define CAMCC_PA        0x0ad00000u
-+#define TLMM_EAST_PA    0x0f900000u     /* TLMM 0x0f000000 + EAST tile: GPIO 13..28 */
++/*
++ * Only the pages used are mapped, once: XNU's I/O map is 8 MiB (osfmk/arm/io_map.c, raised by 0920) and
++ * nothing is ever unmapped; r16a-r16e reset ~8 s after this driver mapped ~600 KB (GCC 384 KB, camcc 64 KB,
++ * TLMM 128 KB), when SpringBoard's first frames needed mappings of their own (io_map is KMA_NOFAIL).
++ */
++#define GCC_CAM_PA      0x0010b000u     /* GCC page with the camera AHB and XO branches */
++#define CAMCC_MCLK_PA   0x0ad05000u     /* camcc page with MCLK0-4 */
++#define CAMCC_TOP_PA    0x0ad0c000u     /* camcc page with the GDSC clock and the titan top GDSC */
++#define TLMM_CAM_PA     0x0f90d000u     /* TLMM EAST tile from GPIO 13: GPIO 13..28 */
++#define TLMM_FIRST      13u
 +#define SP_CORE_PA      0x0c440000u
 +#define SP_CHNLS_PA     0x0c600000u
 +#define SP_OBS_PA       0x0e600000u
 +#define SP_CNFG_PA      0x0c40a000u
 +
-+#define GCC_CAMERA_AHB  0xb008u         /* critical in gcc-lito.c */
-+#define GCC_CAMERA_XO   0xb03cu
-+#define CAMCC_GDSC_CLK  0xc1a0u
-+#define TITAN_GDSCR     0xc1c4u         /* [0] collapse, [31] on */
++#define GCC_CAMERA_AHB  0x008u          /* GCC 0xb008, critical in gcc-lito.c */
++#define GCC_CAMERA_XO   0x03cu          /* GCC 0xb03c */
++#define CAMCC_GDSC_CLK  0x1a0u          /* camcc 0xc1a0 */
++#define TITAN_GDSCR     0x1c4u          /* camcc 0xc1c4: [0] collapse, [31] on */
 +#define CBCR_OFF        (1u << 31)
 +
-+#define GPIO_CFG(n)     (0x1000u * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
-+#define GPIO_IO(n)      (0x1000u * (n) + 4u)    /* [0] in, [1] out */
++#define GPIO_CFG(n)     (0x1000u * ((n) - TLMM_FIRST))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
++#define GPIO_IO(n)      (0x1000u * ((n) - TLMM_FIRST) + 4u)    /* [0] in, [1] out */
 +#define CFG_PULL_UP     3u
 +#define CFG_OUTPUT      (1u << 9)
 +#define CFG_FUNC(f)     ((uint32_t)(f) << 2)
@@ -233,23 +243,23 @@ index 0000000..1ce5e4a
 +struct sensor {
 +	const char *name;
 +	unsigned sda, scl, reset, mclk_pin, mclk_ma;
-+	uint32_t mclk_rcg, mclk_cbcr;
++	uint32_t mclk_rcg, mclk_cbcr;   /* offsets in camcc's MCLK page (camcc 0x5000 + ...) */
 +	uint8_t slave;                  /* 7-bit */
 +	uint16_t id;
 +	struct step up[10], down[10];
 +};
 +static const struct sensor sensors[] = {
-+	{ "rear IMX363", 17, 18, 23, 13, 4, 0x5004, 0x501c, 0x10, 0x0363,
++	{ "rear IMX363", 17, 18, 23, 13, 4, 0x004, 0x01c, 0x10, 0x0363,
 +	  { { ST_LDO, 7, 1800, 1 }, { ST_LDO, 3, 2850, 1 }, { ST_PGPIO, 8, 0, 0 }, { ST_LDO, 1, 2850, 1 },
 +	    { ST_LDO, 4, 1800, 1 }, { ST_LDO, 6, 1100, 1 }, { ST_RESET, 0, 0, 1 }, { ST_MCLK, 0, 0, 10 }, { ST_END, 0, 0, 0 } },
 +	  { { ST_MCLK, 0, 0, 1 }, { ST_RESET, 0, 0, 1 }, { ST_LDO, 6, 0, 1 }, { ST_LDO, 4, 0, 1 }, { ST_LDO, 1, 0, 1 },
 +	    { ST_PGPIO, 8, 0, 20 }, { ST_LDO, 3, 0, 1 }, { ST_LDO, 7, 0, 1 }, { ST_END, 0, 0, 0 } } },
-+	{ "rear ultra-wide IMX481", 19, 20, 25, 14, 4, 0x5024, 0x503c, 0x1a, 0x0481,
++	{ "rear ultra-wide IMX481", 19, 20, 25, 14, 4, 0x024, 0x03c, 0x1a, 0x0481,
 +	  { { ST_LDO, 7, 1800, 1 }, { ST_LDO, 2, 2850, 1 }, { ST_LDO, 5, 1100, 1 }, { ST_MCLK, 0, 0, 1 },
 +	    { ST_RESET, 0, 0, 1 }, { ST_END, 0, 0, 0 } },
 +	  { { ST_RESET, 0, 0, 1 }, { ST_MCLK, 0, 0, 1 }, { ST_LDO, 5, 0, 1 }, { ST_LDO, 2, 0, 1 }, { ST_LDO, 7, 0, 1 },
 +	    { ST_END, 0, 0, 0 } } },
-+	{ "front IMX355", 27, 28, 21, 15, 2, 0x5044, 0x505c, 0x1a, 0x0355,
++	{ "front IMX355", 27, 28, 21, 15, 2, 0x044, 0x05c, 0x1a, 0x0355,
 +	  { { ST_LDO, 7, 1800, 0 }, { ST_PGPIO, 2, 0, 1 }, { ST_MCLK, 0, 0, 1 }, { ST_RESET, 0, 0, 12 }, { ST_END, 0, 0, 0 } },
 +	  { { ST_RESET, 0, 0, 0 }, { ST_MCLK, 0, 0, 1 }, { ST_PGPIO, 2, 0, 1 }, { ST_LDO, 7, 0, 1 }, { ST_END, 0, 0, 0 } } },
 +};
@@ -264,7 +274,7 @@ index 0000000..1ce5e4a
 +#define SLG_FAULT_LOG1          0x1115
 +
 +static struct {
-+	vm_offset_t gcc, camcc, tlmm, sp_core, sp_cnfg;
++	vm_offset_t gcc, camcc, mclk, tlmm, sp_core, sp_cnfg;   /* camcc = its 0xc000 page, mclk = its 0x5000 page */
 +	unsigned mode;
 +	bool broken, slg_up, slg_cs_raised, gdsc_switched, gdsc_clk_switched;
 +	uint8_t ldo_on;                 /* bits we switched on */
@@ -327,6 +337,8 @@ index 0000000..1ce5e4a
 +
 +/* ---- PM8150L GPIOs through the APPS EE's arbiter channels (as sweet_haptic.c / sweet_torch.c) ---- */
 +
++static struct { uint16_t apid; bool write; vm_offset_t va; } chan_cache[16];
++
 +static bool
 +spmi_channel(unsigned sid, unsigned periph, bool write, vm_offset_t *ch)
 +{
@@ -346,8 +358,23 @@ index 0000000..1ce5e4a
 +		printf("SWEET CAM: spmi %x:%x %s refused (apid %#x owner %u)\n", sid, periph << 8, write ? "write" : "read", apid, own);
 +		return false;
 +	}
-+	*ch = ml_io_map(write ? SP_CHNLS_PA + 0x10000u * apid : SP_OBS_PA + 0x80u * apid, 0x1000);
-+	return *ch != 0;
++	for (unsigned i = 0; i < sizeof(chan_cache) / sizeof(chan_cache[0]); i++) {
++		if (chan_cache[i].va && chan_cache[i].apid == apid && chan_cache[i].write == write) {
++			*ch = chan_cache[i].va;
++			return true;
++		}
++	}
++	for (unsigned i = 0; i < sizeof(chan_cache) / sizeof(chan_cache[0]); i++) {
++		if (!chan_cache[i].va) {
++			chan_cache[i].va = ml_io_map(write ? SP_CHNLS_PA + 0x10000u * apid : SP_OBS_PA + 0x80u * apid, 0x80);
++			chan_cache[i].apid = (uint16_t)apid;
++			chan_cache[i].write = write;
++			*ch = chan_cache[i].va;
++			return *ch != 0;
++		}
++	}
++	printf("SWEET CAM: no room for another SPMI channel mapping\n");
++	return false;
 +}
 +
 +static int
@@ -642,32 +669,32 @@ index 0000000..1ce5e4a
 +			return true;
 +		}
 +		wr(cm.tlmm, GPIO_CFG(s->mclk_pin), cm.found_mclk_pin);
-+		wr(cm.camcc, s->mclk_cbcr, rd(cm.camcc, s->mclk_cbcr) & ~1u);
-+		(void)wait_bits(cm.camcc, s->mclk_cbcr, CBCR_OFF, CBCR_OFF, 500);
-+		wr(cm.camcc, s->mclk_rcg + 4, cm.found_mclk_cfg);
-+		wr(cm.camcc, s->mclk_rcg, rd(cm.camcc, s->mclk_rcg) | 1u);
-+		(void)wait_bits(cm.camcc, s->mclk_rcg, 1u, 0, 500);
++		wr(cm.mclk, s->mclk_cbcr, rd(cm.mclk, s->mclk_cbcr) & ~1u);
++		(void)wait_bits(cm.mclk, s->mclk_cbcr, CBCR_OFF, CBCR_OFF, 500);
++		wr(cm.mclk, s->mclk_rcg + 4, cm.found_mclk_cfg);
++		wr(cm.mclk, s->mclk_rcg, rd(cm.mclk, s->mclk_rcg) | 1u);
++		(void)wait_bits(cm.mclk, s->mclk_rcg, 1u, 0, 500);
 +		cm.mclk_on = false;
 +		return true;
 +	}
-+	cm.found_mclk_cfg = rd(cm.camcc, s->mclk_rcg + 4);
-+	cm.found_mclk_cbcr = rd(cm.camcc, s->mclk_cbcr);
++	cm.found_mclk_cfg = rd(cm.mclk, s->mclk_rcg + 4);
++	cm.found_mclk_cbcr = rd(cm.mclk, s->mclk_cbcr);
 +	cm.found_mclk_pin = rd(cm.tlmm, GPIO_CFG(s->mclk_pin));
 +	if (cm.found_mclk_cbcr & 1u) {
 +		give_up("MCLK on already (somebody else's)");
 +		return false;
 +	}
 +	cm.mclk_on = true;
-+	wr(cm.camcc, s->mclk_rcg + 4, (cm.found_mclk_cfg & ~0x371fu) | 1u);    /* XO, divider 1, no M/N */
-+	wr(cm.camcc, s->mclk_rcg, rd(cm.camcc, s->mclk_rcg) | 1u);
-+	if (!wait_bits(cm.camcc, s->mclk_rcg, 1u, 0, 500) || (rd(cm.camcc, s->mclk_rcg + 4) & 0x371fu) != 1u) {
-+		printf("SWEET CAM: MCLK RCG cmd %#x cfg %#x\n", rd(cm.camcc, s->mclk_rcg), rd(cm.camcc, s->mclk_rcg + 4));
++	wr(cm.mclk, s->mclk_rcg + 4, (cm.found_mclk_cfg & ~0x371fu) | 1u);    /* XO, divider 1, no M/N */
++	wr(cm.mclk, s->mclk_rcg, rd(cm.mclk, s->mclk_rcg) | 1u);
++	if (!wait_bits(cm.mclk, s->mclk_rcg, 1u, 0, 500) || (rd(cm.mclk, s->mclk_rcg + 4) & 0x371fu) != 1u) {
++		printf("SWEET CAM: MCLK RCG cmd %#x cfg %#x\n", rd(cm.mclk, s->mclk_rcg), rd(cm.mclk, s->mclk_rcg + 4));
 +		give_up("an RCG that does not update");
 +		return false;
 +	}
-+	wr(cm.camcc, s->mclk_cbcr, cm.found_mclk_cbcr | 1u);
-+	if (!wait_bits(cm.camcc, s->mclk_cbcr, CBCR_OFF, 0, 500)) {
-+		printf("SWEET CAM: MCLK branch %#x\n", rd(cm.camcc, s->mclk_cbcr));
++	wr(cm.mclk, s->mclk_cbcr, cm.found_mclk_cbcr | 1u);
++	if (!wait_bits(cm.mclk, s->mclk_cbcr, CBCR_OFF, 0, 500)) {
++		printf("SWEET CAM: MCLK branch %#x\n", rd(cm.mclk, s->mclk_cbcr));
 +		give_up("an MCLK branch that does not run");
 +		return false;
 +	}
@@ -855,8 +882,8 @@ index 0000000..1ce5e4a
 +	printf("SWEET CAM: camcc GDSC clock %#x, titan top GDSC %#x\n", rd(cm.camcc, CAMCC_GDSC_CLK), rd(cm.camcc, TITAN_GDSCR));
 +	for (unsigned i = 0; i < sizeof(sensors) / sizeof(sensors[0]); i++) {
 +		const struct sensor *s = &sensors[i];
-+		printf("SWEET CAM: %u %s: MCLK RCG cmd %#x cfg %#x branch %#x\n", i, s->name, rd(cm.camcc, s->mclk_rcg),
-+		    rd(cm.camcc, s->mclk_rcg + 4), rd(cm.camcc, s->mclk_cbcr));
++		printf("SWEET CAM: %u %s: MCLK RCG cmd %#x cfg %#x branch %#x\n", i, s->name, rd(cm.mclk, s->mclk_rcg),
++		    rd(cm.mclk, s->mclk_rcg + 4), rd(cm.mclk, s->mclk_cbcr));
 +	}
 +	sleep_ms(300);
 +}
@@ -984,12 +1011,13 @@ index 0000000..1ce5e4a
 +cam_thread(void *arg __unused, wait_result_t wr __unused)
 +{
 +	sleep_ms(12000);        /* after the haptic driver has SE9 up (8 s) */
-+	cm.gcc = ml_io_map(GCC_PA, 0x60000);
-+	cm.camcc = ml_io_map(CAMCC_PA, 0x10000);
-+	cm.tlmm = ml_io_map(TLMM_EAST_PA, 0x20000);
-+	cm.sp_core = ml_io_map(SP_CORE_PA, 0x2000);
++	cm.gcc = ml_io_map(GCC_CAM_PA, 0x40);
++	cm.camcc = ml_io_map(CAMCC_TOP_PA, 0x200);
++	cm.mclk = ml_io_map(CAMCC_MCLK_PA, 0x100);
++	cm.tlmm = ml_io_map(TLMM_CAM_PA, 0x10000);
++	cm.sp_core = ml_io_map(SP_CORE_PA, 0x1100);
 +	cm.sp_cnfg = ml_io_map(SP_CNFG_PA, 0x1000);
-+	if (!cm.gcc || !cm.camcc || !cm.tlmm || !cm.sp_core || !cm.sp_cnfg) {
++	if (!cm.gcc || !cm.camcc || !cm.mclk || !cm.tlmm || !cm.sp_core || !cm.sp_cnfg) {
 +		printf("SWEET CAM: mapping failed\n");
 +		cm.tlmm = 0;
 +		goto out;

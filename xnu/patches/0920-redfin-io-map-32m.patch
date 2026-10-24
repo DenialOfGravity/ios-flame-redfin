@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sat, 24 Oct 2026 19:30:00 +0200
+Subject: [PATCH] 0920 redfin: 32 MiB I/O map
+
+osfmk/arm/io_map.c gives ml_io_map() an 8 MiB submap; allocations are
+KMA_NOFAIL and the SWEET drivers never unmap. With patch 0919's first
+version (~600 KB of camera mappings) every boot reset a few seconds after
+the driver's mappings, when SpringBoard's first frames were drawn
+(r16a-r16e); the same kernel without the camera driver ran on (r16c).
+32 MiB is x86's IO_MAP_SIZE.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WuzsiVGCDDmN2GPRLJvX3w
+---
+diff --git a/osfmk/arm/io_map.c b/osfmk/arm/io_map.c
+--- a/osfmk/arm/io_map.c
++++ b/osfmk/arm/io_map.c
+@@ -62,7 +62,11 @@
+ 
+ extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
+ 
+-#define IO_MAP_SIZE            (8ul << 20)
++/*
++ * SWEET (0920): 32 MiB, as on x86. The SWEET drivers map their blocks with ml_io_map() and never unmap;
++ * on redfin the 8 MiB ran out once a driver mapped ~600 KB more (KMA_NOFAIL: a panic, r16a-r16e).
++ */
++#define IO_MAP_SIZE            (32ul << 20)
+ 
+ __startup_data static struct mach_vm_range io_range;
+ static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;
+-- 
+2.43.0
