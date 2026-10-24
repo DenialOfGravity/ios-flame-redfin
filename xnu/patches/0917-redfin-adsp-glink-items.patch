@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sat, 24 Oct 2026 16:46:28 +0200
+Subject: [PATCH] 0917 redfin: make GLINK's descriptor and our queue before the DSP starts
+
+r14b: the DSP came up (slave-kernel 0x2 after 37 ms, its own power
+after 38 ms) and made GLINK items 478 and 480; step 8 found no 479. As
+Linux's qcom_glink_smem_register(), our side allocates 478 (32 bytes) and
+479 (FIFO_0, 16 KB) in the partition, in step 6, before the DSP starts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GizUhEzkc6MoTcLnCZCfFa
+---
+  bsd/dev/sweet_adsp.c | 50 ++++++++++++++++++++++++++++++++++++++------
+
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+index a2be90a..0327f72 100644
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -1509,24 +1509,25 @@ step_image(void)
+ 
+ /* ---- step 6: our SMP2P item ------------------------------------------------------------------------ */
+ 
++static bool glink_items_make(void);
+ static struct block smem_lock = { "shared memory's lock", 0x01f43000, 0x1000 };
+ #define LOCK_OWNER              0x000
+ #define LOCK_US                 1u
+ 
+ /* Our item made in the partition, as Linux's qcom_smem_alloc_private() makes one (redwood_wifi.c: our_item_make()). */
+ static bool
+-our_item_make(uint32_t partition)
++our_item_alloc(uint32_t partition, uint32_t item, uint32_t wanted)
+ {
+ 	struct smem_partition header;
+ 	struct smem_entry entry;
+-	const uint32_t item_size = (sizeof(struct smp2p) + 7) & ~7u, need_bytes = sizeof(entry) + item_size;
++	const uint32_t item_size = (wanted + 7) & ~7u, need_bytes = sizeof(entry) + item_size;
+ 	uint32_t owner = ~0u, at;
+ 	bool made = false;
+ 
+ 	lck_mtx_lock(&redwood_smem_alloc_lock);         /* (the Wi-Fi's start allocates under the same hardware lock) */
+ 	need(&smem_lock);
+ 	printf("adsp: %u: about to take the lock (%#x), write an entry for item %u with %u bytes behind it at the partition's mark, "
+-	    "move the mark by %u, and release the lock\n", step, smem_lock.phys + LOCK_OWNER, ITEM_SMP2P_OURS, item_size, need_bytes);
++	    "move the mark by %u, and release the lock\n", step, smem_lock.phys + LOCK_OWNER, item, item_size, need_bytes);
+ 	snprintf(last_write, sizeof(last_write), "step %u took the shared memory's lock", step);
+ 	for (uint32_t ms = 0; ms <= 1000; ms++) {
+ 		wr(smem_lock.base + LOCK_OWNER, LOCK_US);
+@@ -1547,7 +1548,7 @@ our_item_make(uint32_t partition)
+ 		goto out;
+ 	}
+ 	for (at = sizeof(header); at < header.free_uncached;) {
+-		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == ITEM_SMP2P_OURS ||
++		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == item ||
+ 		    entry.size > header.size) {
+ 			break;
+ 		}
+@@ -1562,9 +1563,9 @@ our_item_make(uint32_t partition)
+ 		printf("adsp: %u: no room: %u bytes wanted, %u free: nothing is written\n", step, need_bytes, header.free_cached - at);
+ 		goto out;
+ 	}
+-	smem_poke(partition + at, SMEM_CANARY | ITEM_SMP2P_OURS << 16);
++	smem_poke(partition + at, SMEM_CANARY | item << 16);
+ 	smem_poke(partition + at + 4, item_size);
+-	smem_poke(partition + at + 8, item_size - (uint32_t)sizeof(struct smp2p));
++	smem_poke(partition + at + 8, item_size - wanted);
+ 	smem_poke(partition + at + 12, 0);
+ 	settle();
+ 	smem_poke(partition + __offsetof(struct smem_partition, free_uncached), at + need_bytes);
+@@ -1577,6 +1578,37 @@ out:
+ 	return made;
+ }
+ 
++static bool
++our_item_make(uint32_t partition)
++{
++	return our_item_alloc(partition, ITEM_SMP2P_OURS, sizeof(struct smp2p));
++}
++
++/*
++ * redfin: as Linux's qcom_glink_smem_register() at the DSP's start, our side makes GLINK's descriptor
++ * (478, 32 bytes) and our queue (479, FIFO_0, 16 KB) if they are not there; the DSP makes its own (480).
++ * On lito nothing before us has (r14b: the DSP made 478 and 480, and step 8 found no 479).
++ */
++static bool
++glink_items_make(void)
++{
++	uint32_t size = 0, partition = smem_partition(SMEM_US, SMEM_ADSP, &size, &size);
++
++	if (partition == 0) {
++		return false;
++	}
++	if (smem_item(ITEM_GLINK_DESCRIPTOR, &size) == 0 && !our_item_alloc(partition, ITEM_GLINK_DESCRIPTOR, 32)) {
++		return false;
++	}
++	if (smem_item(ITEM_GLINK_OUR_QUEUE, &size) == 0) {
++		if (!our_item_alloc(partition, ITEM_GLINK_OUR_QUEUE, 16384)) {
++			return false;
++		}
++		printf("adsp: %u: GLINK's descriptor (478) and our queue (479, 16 KB) are there\n", step);
++	}
++	return true;
++}
++
+ static void glink_reset(void);
+ 
+ static bool
+@@ -1632,6 +1664,9 @@ step_our_item(void)
+ 		return false;
+ 	}
+ 	show_words("our item reads back", &ours);
++	if (!glink_items_make()) {               /* redfin: before the DSP starts, as Linux */
++		return false;
++	}
+ 	glink_reset();
+ 	return true;
+ }
+@@ -2955,6 +2990,9 @@ step_queues(void)
+ 	uint32_t head, tail;
+ 
+ 	announce("find GLINK's descriptor and the two queues, and read what the audio DSP has put into its own");
++	if (!glink_items_make()) {
++		return false;
++	}
+ 	if (!glink_find()) {
+ 		printf("adsp: %u: GLINK's items are not all there, or not of a shape this knows (descriptor %#x, ours %#x of %u bytes, "
+ 		    "the DSP's %#x of %u)\n", step, glink.descriptor, glink.ours, glink.ours_size, glink.theirs, glink.theirs_size);
+-- 
+2.43.0
