@@ -400,20 +400,40 @@ replaced by class and selector, the Metal device list and FigFlashlight's caller
 all eight methods are replaced (16.7.x addresses logged: `+[BWFigCaptureDeviceVendor sharedCaptureDeviceVendor]` at
 0x1a1f40c84 unslid, etc.). The old plug-in is kept on the PC in `backup-audio/` (`*.before-camera`).
 
-**What stops it now:** AVFoundation (`camera_avtest`) blocks in `FigCaptureSourceRemoteCopyCaptureSources` ->
-`FigXPCRemoteClientCreate`, a synchronous XPC message to mediaserverd that is never answered, while mediaserverd sits idle:
-its capture-source server is never started, so the vendor (and camera_device.c) is never asked. That is the ADT
-camera capability (`/arm-io/isp`) and the MobileGestalt cache made from it, which r15a/r15b found to hang SpringBoard
-when no capture device existed; the device exists now.
+**Camera.app (2026-10-25, r18c-r18e): the session starts and the first preview picture is given.** What it took:
+- r18c: ADT with the camera (`mkadt.py --highmem --camera`, `adt-camonly.adt`) and a MobileGestalt cache made on it
+  (the r18b one kept as `com.apple.MobileGestalt.plist.r18b`). Still no capture devices: mediaserverd never started its
+  capture servers. MediaToolbox's `FigMediaServerStart` starts them (CMCaptureCore `FigStartCaptureServers`) only when
+  `MediaToolbox.framework/<D22|D221|Default>/SubServerConfiguration.plist` has `StartRecorderServer` = true; ios-sweet's
+  root set it false (the portrait-filter prewarm crash, which inject_media.c now no-ops). Set true on the phone (originals
+  beside them as `SubServerConfiguration.plist.before-camera`; copies in the PC's `recon/mg/ssc-*`): AVFoundation lists
+  "Back Camera" (16 formats) and "Front Camera" (18), and Camera.app opens with its full interface.
+- 0924 (r18d): tccd's sandbox extension for kTCCServiceCamera could not be issued (the Sandbox stand-in returned ENOENT),
+  which Camera.app takes for a refusal: AVCaptureDeviceInput -11852 "Cannot use Back Camera". Extensions are issued now.
+- 0925 (r18e): mediaserverd died at every session start in VideoToolbox's FigGetAlignmentForIOSurfaceOutputToDisplayService
+  (`-[__NSCFNumber objectForKey:]`): AppleCLCD's DisplayPipePlaneBaseAlignment is a dictionary on an iPhone.
+- 0926 (r18e): /dev/redwood-camera tries a sensor start again (r18d gave the device up for the boot after one PMIC GPIO
+  read-back of 0 during mediaserverd's restarts).
+- RedwoodAudio.driver (r18e-user): -[BWMultiFilterThumbnailNode prepareForCurrentConfigurationToBecomeLive] wrote
+  through its Metal filter renderer's NULL `filterDescriptor` (no Metal device in mediaserverd) right after
+  "PrimaryScaler: the first picture given (1504x1128 420f)": the node is made ready as a plain BWNode and renders nothing
+  (no filter thumbnails). Installed; not yet seen with Camera.app in the foreground (below).
+- Tools: `imgdump imp ADDR` names the Objective-C method holding an address (a2s only has `<redacted>` in CMCapture);
+  `mg/dis.sh` on the container disassembles `imgdump read` dumps.
+
+Stopped there because the battery ran down (13% at boot to 5%, -640 mA with Camera.app streaming on USB power): the
+phone was sent to fastboot mode to charge. Camera.app was also behind alerts it cannot get past without a tap
+(location services, then "Low Battery"), which make it inactive, so its session does not run.
 
 **Next for the cameras:**
-1. Boot with `mkadt.py --camera` (and later `--flash`) plus a rebuilt MobileGestalt cache (the r15a copy
-   `MobileGestalt.plist.r15a-camera` was made for this), with this plug-in in place; then `camera_avtest`, mediaserverd's
-   `redwood: camera:` lines, and Camera.app. Way back: the plain ADT and the original cache.
-2. Colour tuning: the `com.qti.tuned.*` files of /vendor/lib64/camera (twrp-pull-camera takes only the sensor
-   modules now) -> `camera-<sensor>.isp` (HackiOS camtuning.py reads its phone's V3 files: a V2 reader as for the
-   tables).
-3. The IMX363's lens motor (actuator on CCI0) for FOCUS; the flashlight button through the stream's TorchLevel.
+1. Charged, boot r18e, dismiss the alerts once (Cancel on the location one), open Camera: the preview should show the
+   back camera (no colour tuning yet: identity matrix). Check mediaserverd stays up (`klog`, `CRASH` lines), then a
+   photograph, the front camera, video.
+2. The vendor starts each stream as it is reserved, so a session's set-up switches sensors 3-4 times (~0.35 s each);
+   starting the worker only when the graph is configured would make opening the camera quicker. The SMMU reports a
+   fault (FSR 0x400) when a stream is stopped mid-frame: harmless so far, worth a look.
+3. Colour tuning: the `com.qti.tuned.*` files of /vendor/lib64/camera -> `camera-<sensor>.isp`.
+4. The IMX363's lens motor (actuator on CCI0) for FOCUS; the flashlight button through the stream's TorchLevel.
 
 ## Done so far
 
