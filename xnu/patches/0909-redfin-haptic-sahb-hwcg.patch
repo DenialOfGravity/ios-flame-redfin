@@ -1,0 +1,44 @@
+From 0506c84e637a856e282065cc6a16862b6a81e0af Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sat, 24 Oct 2026 13:11:33 +0200
+Subject: [PATCH] 0909 redfin: haptics: s_ahb is hardware clock gated, do not
+ wait for it
+
+r9 klog: PM7250B GPIO1 high (mode 1, out 0x80, en 0x80), SE9 DFS level 0
+fine, then "GCC branch 0x18008 halted (0x80000002)": the wrapper 1 slave
+AHB branch has HW_CTL set (gcc-lito hwcg_reg 0x18008) and reads CLK_OFF
+while idle. Skip its halt check when HW_CTL is set.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GizUhEzkc6MoTcLnCZCfFa
+---
+ bsd/dev/sweet_haptic.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/bsd/dev/sweet_haptic.c b/bsd/dev/sweet_haptic.c
+index 5e39c11..089256f 100644
+--- a/bsd/dev/sweet_haptic.c
++++ b/bsd/dev/sweet_haptic.c
+@@ -246,8 +246,19 @@ hap_clocks(void)
+ 			return false;
+ 		}
+ 	}
++	/*
++	 * 0909: s_ahb (0x18008) is hardware clock gated (gcc-lito hwcg_reg 0x18008, HW_CTL bit 1 set): its
++	 * CLK_OFF reads 1 while idle (r9: 0x80000002), so only the other branches must report running.
++	 */
++	uint32_t sahb = hap_rd(hp.gcc, 0x18008);
++	if (sahb & 2u) {
++		printf("SWEET HAPTIC: s_ahb %#x is hardware gated: not checked\n", sahb);
++	}
+ 	static const uint32_t branches[] = { 0x18004, 0x18008, 0x23138, 0x23140, 0x1839c };
+ 	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		if (branches[i] == 0x18008 && (sahb & 2u)) {
++			continue;
++		}
+ 		if (!hap_wait_clear(hp.gcc, branches[i], 1u << 31)) {
+ 			printf("SWEET HAPTIC: GCC branch %#x halted (%#x)\n", branches[i], hap_rd(hp.gcc, branches[i]));
+ 			return false;
+-- 
+2.43.0
+
