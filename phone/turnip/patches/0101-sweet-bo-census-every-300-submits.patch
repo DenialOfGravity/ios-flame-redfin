@@ -1,14 +1,16 @@
 diff --git a/src/freedreno/vulkan/tu_queue.cc b/src/freedreno/vulkan/tu_queue.cc
 --- a/src/freedreno/vulkan/tu_queue.cc
 +++ b/src/freedreno/vulkan/tu_queue.cc
-@@ -562,7 +562,9 @@
+@@ -562,7 +562,11 @@
        goto out;
     }
  
 -   tu_debug_bos_print_stats(device);
 +   /* SweetMetal2: TU_DEBUG=bos prints its census every 300 submits, not on each (60 per second) */
-+   if (device->submit_count % 300 == 0)
++   if (device->submit_count % 300 == 0) {
 +      tu_debug_bos_print_stats(device);
++      fflush(NULL);	/* mesa's log file is a stdio stream */
++   }
  
     if (u_trace_submission_data) {
        u_trace_submission_data->submission_id = device->submit_count;
