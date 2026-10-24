@@ -450,6 +450,38 @@ register_hevc_encoder(void)
 	say("redwood: mediaserverd: the software HEVC encoder of VCPHEVC.videocodec registered for 'hvc1' (%d)\n", status);
 }
 
+/*
+ * Camera.app's filter thumbnails (the grid of the photo filters, each filter applied to the live
+ * picture). -[BWMultiFilterThumbnailNode prepareForCurrentConfigurationToBecomeLive] asks its filter
+ * renderer for -filterDescriptor and writes into what it returns; the renderer is a Metal one and this
+ * process has no Metal device (MTL2 lists the processes that do), so it is nil, the descriptor NULL and
+ * mediaserverd died (SIGSEGV at 0x8) as soon as the preview's first picture was given (r18e, iOS
+ * 16.7.x). The node is made ready as any node is (its superclass's method) and passes nothing on: no
+ * thumbnails, the preview and photographs unaffected.
+ */
+static void
+thumbnail_prepare(id self, SEL selector)
+{
+	Class super_class = class_getSuperclass(objc_getClass("BWMultiFilterThumbnailNode"));
+	IMP ready = super_class != Nil ? class_getMethodImplementation(super_class, selector) : NULL;
+	static bool said;
+
+	if (!said) {
+		said = true;
+		say("redwood: mediaserverd: the filter thumbnails are not made (their renderer wants Metal): the node made ready as a %s\n",
+		    super_class != Nil ? class_getName(super_class) : "(none)");
+	}
+	if (ready != NULL) {
+		((void (*)(id, SEL))ready)(self, selector);
+	}
+}
+
+static void
+thumbnail_render(id self, SEL selector, void *sample_buffer, id input)
+{
+	(void)self, (void)selector, (void)sample_buffer, (void)input;
+}
+
 struct method_spec {
 	const char *selector, *types;
 	IMP imp;
@@ -513,6 +545,9 @@ static struct replacement {
 	  (IMP)quality_prioritization, &original_quality_prioritization, true, false },
 	{ "BWGNRNode", "renderSampleBuffer:forInput:", 0 /* 16.5: 0x1a1ec83b8UL */, (IMP)gnr_render, NULL, true, false },
 	{ "BWNodeOutput", "emitSampleBuffer:", 0 /* 16.5: 0x1a1ea37e0UL */, (IMP)emit_sample_buffer, &original_emit_sample_buffer, true, false },
+	/* (redfin, 16.7.x: not in HackiOS's list) */
+	{ "BWMultiFilterThumbnailNode", "prepareForCurrentConfigurationToBecomeLive", 0, (IMP)thumbnail_prepare, NULL, true, false },
+	{ "BWMultiFilterThumbnailNode", "renderSampleBuffer:forInput:", 0, (IMP)thumbnail_render, NULL, true, false },
 };
 
 /* ---- the Metal device leaves this process before the capture stack asks for it -------------------- */
@@ -632,6 +667,12 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 		method = r->instance ? class_getInstanceMethod(cls, sel_registerName(r->selector)) :
 		    class_getClassMethod(cls, sel_registerName(r->selector));
 		original = method ? method_getImplementation(method) : NULL;
+		/* redfin: a method the class only inherits is not replaced (that would replace its superclass's) */
+		if (method != NULL && r->instance && class_getSuperclass(cls) != Nil &&
+		    class_getInstanceMethod(class_getSuperclass(cls), sel_registerName(r->selector)) == method) {
+			say("redwood: -[%s %s] is its superclass's: left alone\n", r->class_name, r->selector);
+			continue;
+		}
 		/*
 		 * redfin: `expected' is iOS 16.5's (HackiOS's phone); on the iPhone X's 16.7.x it is 0 here, unknown: the
 		 * method is replaced by its class and selector alone, and where its code lies is said, so that it can be
