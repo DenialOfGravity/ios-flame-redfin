@@ -43,3 +43,15 @@
 - USB: sunfish HS PHY is QUSB2 v2 (mainline sm7150.dtsi), the driver ran flame's femto init on it.
   xnu 0151 (kernel27): GCC_QUSB2PHY_PRIM_BCR pulse + Linux qusb2 v2 table (sweetqusb=0 = old path).
   k57 (kernel27, 19:52): USB 2 still does not enumerate → needs the physical replug / cold power-off.
+
+## [20:55] Wi-Fi join — **ROOT CAUSE FOUND, JOIN WORKS**
+- Cause: we gave the WLAN firmware a 1 MB MSA region over QMI; sunfish's DT wlan_msa_mem is
+  0x98d00000 + **2 MB**. The firmware heap's upper half was never assigned to it → its WMI event buffer pool
+  (allocator 0xb01ab640) got corrupted → assert at the first heavy allocation (vdev start).
+- Found by bisecting with wlan-steps probes: crash with no scan (k64), no HTT setup (k65), and no
+  regdomain/pdev/chan list (k66) → only QMI/INIT/vdev left → compared MSA vs mainline sunfish DTS.
+- Fix: wlfw.c MSA_SIZE 0x200000 (CI 40046754986). k67 probe: `vdev start resp: status 0`.
+- k68 join test: auth 0, assoc 0 aid 1, 4-way handshake done, `*** joined 'Johann' ***`, rx frames to IP.
+- Open: wland's own wlan.conf join (bridge mode) gets no IP on en0 — iOS (configd) only does DHCP for
+  networks wifid joined. Next: join from Settings → Wi-Fi.
+- wlan.conf deleted + verified after every test.
