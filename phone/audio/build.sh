@@ -21,4 +21,7 @@ codesign -f -s - out/sound_test
 # camera_test (HackiOS, MIT): /dev/redwood-camera's frames as a program gets them, with camera_isp.c
 ../../work/userland/bin/ios-cc -O2 -Wall -Wno-unused-parameter -o out/camera_test camera_test.c camera_isp.c
 codesign -f -s - out/camera_test
-ls -la out/RedwoodAudio.driver out/sound_test out/camera_test
+# camera_avtest (HackiOS, MIT): the cameras AVFoundation lists for applications (camera_device.c's, in mediaserverd)
+../../work/userland/bin/ios-cc -O2 -fobjc-arc -framework Foundation -framework AVFoundation -o out/camera_avtest camera_avtest.m
+codesign -f -s - out/camera_avtest
+ls -la out/RedwoodAudio.driver out/sound_test out/camera_test out/camera_avtest
