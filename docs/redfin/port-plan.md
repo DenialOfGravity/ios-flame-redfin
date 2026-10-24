@@ -419,7 +419,7 @@ all eight methods are replaced (16.7.x addresses logged: `+[BWFigCaptureDeviceVe
   "PrimaryScaler: the first picture given (1504x1128 420f)": the node is made ready as a plain BWNode and renders nothing
   (no filter thumbnails). Installed; not yet seen with Camera.app in the foreground (below).
 - Tools: `imgdump imp ADDR` names the Objective-C method holding an address (a2s only has `<redacted>` in CMCapture);
-  `mg/dis.sh` on the container disassembles `imgdump read` dumps.
+  `tools/dis.sh FILE ADDR` disassembles `imgdump read` dumps.
 
 Stopped there because the battery ran down (13% at boot to 5%, -640 mA with Camera.app streaming on USB power): the
 phone was sent to fastboot mode to charge. Camera.app was also behind alerts it cannot get past without a tap
