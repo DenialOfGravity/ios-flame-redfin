@@ -801,9 +801,9 @@ torch_set(struct stream *s, CFTypeRef value)
 	level = level < 0 ? 0 : level > 1 ? 1 : level;
 	thousandths = (uint32_t)(level * 1000 + 0.5f);
 	/* redfin: the kernel's flashlight is sysctl kern.sweet_torch (xnu 0918, sweettorch=2), thousandths as here */
-	int value = (int)thousandths;
+	int kernel_level = (int)thousandths;
 	(void)s;
-	if (sysctlbyname("kern.sweet_torch", NULL, NULL, &value, sizeof(value)) != 0) {
+	if (sysctlbyname("kern.sweet_torch", NULL, NULL, &kernel_level, sizeof(kernel_level)) != 0) {
 		say("the flashlight at %u of 1000 NOT TAKEN (kern.sweet_torch: %s)", thousandths, strerror(errno));
 	} else {
 		say("the flashlight at %u of 1000", thousandths);
