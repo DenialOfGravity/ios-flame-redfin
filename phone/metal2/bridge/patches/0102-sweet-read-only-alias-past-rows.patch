@@ -1,0 +1,49 @@
+diff --git a/crates/metal2vulkan-runtime/src/linear_plan.rs b/crates/metal2vulkan-runtime/src/linear_plan.rs
+index eeaf5f6e..bda5059b 100644
+--- a/crates/metal2vulkan-runtime/src/linear_plan.rs
++++ b/crates/metal2vulkan-runtime/src/linear_plan.rs
+@@ -732,6 +732,10 @@ pub(super) enum Holds {
+     /// pitch among them, but nothing past them ([`padded_alone`]): a texture that only reads, over
+     /// rows that lie apart, under `PaddedReadsPolicy::Alias`.
+     Padding,
++    /// ios-on-pixel: a texture that only reads, its image reaching up to 3 rows past its last
++    /// (Turnip rounds a linear image's rows up to 4 for the GMEM blits' over-fetch, which only
++    /// stores make): sampling never reads them, and `aliases` keeps them inside the buffer.
++    ReadsPastRows,
+ }
+ 
+ impl Holds {
+@@ -741,6 +745,10 @@ impl Holds {
+         match self {
+             Holds::Texels => texels_alone(layout, size, array_pitch),
+             Holds::Padding => padded_alone(layout, size, array_pitch),
++            Holds::ReadsPastRows => {
++                let last = array_pitch.saturating_mul(layout.slices - 1);
++                last.saturating_add(size) <= Holds::ReadsPastRows.reach(layout)
++            }
+         }
+     }
+ 
+@@ -749,6 +757,9 @@ impl Holds {
+         match self {
+             Holds::Texels => layout.end() - layout.offset,
+             Holds::Padding => rows_end(layout) - layout.offset,
++            Holds::ReadsPastRows => {
++                (rows_end(layout) - layout.offset).saturating_add(layout.row_pitch.saturating_mul(3))
++            }
+         }
+     }
+ }
+@@ -805,6 +816,12 @@ pub(super) fn holding(
+     policy: PaddedReadsPolicy,
+ ) -> Result<Holds, String> {
+     let (rows, slices) = apart(layout);
++    // ios-on-pixel: a texture that only reads aliases its texels, tight or apart, whatever rows past
++    // its last the driver's image rounds up to (IOSurface layers CA samples: else copied in on every
++    // frame, ~5 ms of backboardd's).
++    if only_reads(usage) && policy == PaddedReadsPolicy::Alias && layout.slices == 1 {
++        return Ok(Holds::ReadsPastRows);
++    }
+     let apart = if rows {
+         format!(
+             "its rows lie {} bytes apart, {} bytes of texels each",
