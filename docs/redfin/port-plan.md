@@ -248,6 +248,11 @@ blur right, the iPhone X frame scaled to fit. ~5 % GPU busy at 20 presents/s idl
 `/var/local/m2v-cache` mode 777 (SpringBoard runs as mobile). Wi-Fi: wifid joined only ~10 min after the
 radio was ready, then worked. Brightness (0906), vibration (0907): no result yet (live log started late).
 
+**r10 (kernel with 0909, `sweetbl=1 sweethaptic=2`):** vibration works (boot buzz, `flame-cmd.py 'v 300'`), not
+yet driven by iOS; the brightness slider changes the panel through DCS 0x51, no visible cost with the GPU.
+Sensors: the live DT has no accelerometer, gyro, light or proximity node on an APPS bus: they sit behind the
+ADSP's sensor core (SSC, QMI), like audio. APPS-reachable extras: the PM8150L flash LED (qpnp-flash-led-v2 @0xd300).
+
 ### Other ports checked (2026-10-24)
 - joranv1/ios-sailfish (Pixel 1, A530): GL path, not Metal: Mesa freedreno GLES in backboardd (sweetgl.dylib
   + EAGL shim) with CA's GL renderer; blur because sweetgl supplies CA's missing GL texture functions (variable
