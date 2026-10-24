@@ -1,0 +1,125 @@
+From a76609866bce1ea2596d6d68008a74515efd3fa7 Mon Sep 17 00:00:00 2001
+From: Yofuness <compiledchickennuggets@gmail.com>
+Date: Fri, 23 Oct 2026 22:54:11 -0400
+Subject: [PATCH] 0158 sunfish: non-blocking present (busy slot: retry next
+ vsync tick, no CPU fallback)
+
+present() blocked ~23 ms per call behind client render jobs on the single ring;
+the vsync tick then missed 1-2 ticks: ~17 panel updates/s with the GPU ~50%
+busy. A still-queued present slot now returns busy; the framebuffer keeps the
+frame dirty and shows the newest one on the next tick.
+---
+ bsd/dev/sweet_gpu.c                   | 23 +++++++++++++++++++++--
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 23 +++++++++++++++++++++--
+ 2 files changed, 42 insertions(+), 4 deletions(-)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 8ca0220..50c15b0 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -590,6 +590,7 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
+ 
+ static uint32_t present_fence[2];      /* of the present last queued from each IB slot */
+ static uint32_t present_next;
++static uint32_t stat_busy;	/* 0158: presents put off a tick (slot still queued) */
+ 
+ /* With sweet_gpu_lock: the present from IB slot k has landed (or the GPU was reset). 0, or -1 if reset. */
+ static int
+@@ -743,6 +744,24 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 	 * CA paces on came late). Two IB slots: only the one two presents back must have landed.
+ 	 */
+ 	uint32_t k = present_next & 1;
++	/*
++	 * 0158: never block the vsync tick behind client render jobs. The present of this IB slot (two frames
++	 * back) still queued: 1, "busy" — the framebuffer keeps the frame and tries again on the next tick
++	 * (sweetpresentwait=1: the old blocking wait).
++	 */
++	static int block = -1;
++	if (block < 0 && !PE_parse_boot_argn("sweetpresentwait", &block, sizeof(block)))
++		block = 0;
++	if (!block && present_fence[k] && !a6_fence_done(&gpu, present_fence[k])) {
++		if (gpu_hung_locked(500)) {
++			gpu_recover_locked("present");
++			lck_mtx_unlock(&sweet_gpu_lock);
++			return -1;
++		}
++		stat_busy++;
++		lck_mtx_unlock(&sweet_gpu_lock);
++		return 1;
++	}
+ 	int rc = present_wait_locked(k, "present");
+ 	if (rc == 0) {
+ 		a6_write(a6_pool_pa(&gpu, PRESENT_IB(k)), ib, 4ULL * n);
+@@ -760,8 +779,8 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 		uint64_t c, g;
+ 		absolutetime_to_nanoseconds(stat_clean_abs, &c);
+ 		absolutetime_to_nanoseconds(stat_gpu_abs, &g);
+-		a6_log("present: %llu frames, avg cache clean %llu us, GPU blit %llu us\n", stat_frames,
+-		    c / 1000 / 300, g / 1000 / 300);
++		a6_log("present: %llu frames, avg cache clean %llu us, GPU blit %llu us, put off %u\n", stat_frames,
++		    c / 1000 / 300, g / 1000 / 300, stat_busy);
+ 		stat_clean_abs = stat_gpu_abs = 0;
+ 	}
+ 	*out_dx = frame.dx;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index c392ff9..98ac699 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -147,6 +147,7 @@ public:
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
+ 	bool presentGPU(const uint8_t *rec);
++	bool fPresentBusy;	/* 0158: the last present was put off (GPU busy): show fPending on the next tick */
+ 	void copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n);
+ 	static void presentLoop(void *arg);
+ };
+@@ -352,9 +353,16 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+ 		uint64_t t0 = mach_absolute_time();
++		fb->fPresentBusy = false;
+ 		fb->present(rec);
+ 		fb->fStatPresentAbs += mach_absolute_time() - t0;
+-		fb->fStatPresents++;
++		if (fb->fPresentBusy) {
++			IOLockLock(fb->fLock);
++			fb->fDirty = true;	/* not shown: again on the next tick (fPending, maybe newer by then) */
++			IOLockUnlock(fb->fLock);
++		} else {
++			fb->fStatPresents++;
++		}
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ }
+@@ -377,9 +385,16 @@ AppleCLCD::presentLoop(void *arg)
+ 		IOLockUnlock(fb->fLock);
+ 		if (go) {
+ 			uint64_t t0 = mach_absolute_time();
++			fb->fPresentBusy = false;
+ 			fb->present(fb->fPresentRec);
+ 			fb->fStatPresentAbs += mach_absolute_time() - t0;
+-			fb->fStatPresents++;
++			if (fb->fPresentBusy) {
++				IOLockLock(fb->fLock);
++				fb->fDirty = true;
++				IOLockUnlock(fb->fLock);
++			} else {
++				fb->fStatPresents++;
++			}
+ 		}
+ 	}
+ }
+@@ -553,6 +568,10 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 	int rc = sweet_gpu_present(slot, s->kernelAddress(), s->offset, s->width, s->height, s->bytesPerRow,
+ 	    fRowBytes, fCornerRadius, &dx, &dy, &dw, &dh);
+ 	s->release();
++	if (rc == 1) {
++		fPresentBusy = true;	/* 0158: the GPU still has the present before last: next tick */
++		return true;
++	}
+ 	if (rc) {
+ 		return gpu_fallback(7, "GPU blit failed");
+ 	}
+-- 
+2.56.0
+
