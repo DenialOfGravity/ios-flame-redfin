@@ -318,7 +318,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	if (cap.frames_va && result != EINVAL) {
  		frames_look(bytes);
  		printf("SWEET CAM: %s mode %u frame: files read /dev/pmem %llu %u (%ux%u RAW10 packed, lines %u bytes apart, %s first)\n",
-@@ -2187,6 +2233,568 @@
+@@ -2187,6 +2233,569 @@
  	return result;
  }
  
@@ -349,6 +349,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 +#include <miscfs/devfs/devfs.h>
 +
 +extern void sweet_gpu_pool_free(uint64_t pa, uint64_t bytes);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);     /* (not exported to bsd/ by its header) */
 +
 +#define REDWOOD_CAMERA_MAGIC            "RWFRAME1"
 +struct redwood_camera_frame {
@@ -887,7 +888,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  /*
   * r17b: "c 20" took the phone down again with not one of its lines in the log, the stages' 300 ms apart
   * notwithstanding: a poke runs on the USB driver's command thread (sweet_usb.c), the thread that also sends the
-@@ -2225,6 +2833,10 @@
+@@ -2225,6 +2834,10 @@
  		printf("SWEET CAM: %u ms before each stage\n", cam_step_ms);
  		return 0;
  	}
@@ -898,7 +899,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	if (what == 20 || what == 21) {
  		if (job.busy) {
  			return EBUSY;
-@@ -2268,9 +2880,14 @@
+@@ -2268,9 +2881,14 @@
  	return sweet_cam_cmd_args(what, 0, 0, 0);
  }
  
@@ -913,7 +914,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	sleep_ms(12000);        /* after the haptic driver has SE9 up (8 s) */
  	cm.gcc = ml_io_map(GCC_CAM_PA, 0x40);
  	cm.camcc = ml_io_map(CAMCC_TOP_PA, 0x200);
-@@ -2291,6 +2908,12 @@
+@@ -2291,6 +2909,12 @@
  		look();
  		lck_mtx_unlock(&sweet_cam_lock);
  	}
@@ -926,7 +927,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  	if (cm.mode >= 3) {
  		for (unsigned i = 0; i < sizeof(sensors) / sizeof(sensors[0]); i++) {
  			(void)sweet_cam_cmd(i);
-@@ -2307,6 +2930,7 @@
+@@ -2307,6 +2931,7 @@
  sweet_cam_init(void)
  {
  	PE_parse_boot_argn("sweetcam", &cm.mode, sizeof(cm.mode));
