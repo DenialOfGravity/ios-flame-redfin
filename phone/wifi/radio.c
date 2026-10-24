@@ -549,9 +549,10 @@ static uint8_t wmi_mac[6];
 static uint32_t wmi_rf_chains;
 /*
  * Test hook: /var/local/wlan-steps.conf, a hex mask of ath10k station steps we used to skip (default all on):
- * bit 0 keepalive off, bit 1 sta ps params, bit 2 rts threshold, bit 3 vdev start in HT20 mode.
+ * bit 0 keepalive off, bit 1 sta ps params, bit 2 rts threshold, bit 3 vdev start in HT20 mode;
+ * bits 4-6 (ours, before vdev start): sta ps mode off, pdev tx power limits, vdev wmm.
  */
-static uint32_t w_steps = 0xf;
+static uint32_t w_steps = 0x7f;
 static int w_steps_read;
 static uint32_t steps(void)
 {
@@ -1761,8 +1762,16 @@ static void w_join_begin(void)
 	s_start_resp = 0;
 	LOG("join: '%.*s' %02x:%02x:%02x:**:**:** %u MHz %d dBm %s", (int)s_ssid_len, s_ssid, s_bssid[0], s_bssid[1],
 	    s_bssid[2], s_freq, bss[best].rssi, s_rsn ? "WPA2" : "open");
-	w_ps_off();
-	int t2 = w_pdev_param(3, 40), t5 = w_pdev_param(4, 40), wm = w_vdev_wmm();
+	/* steps bits 4-6: our own pre-start commands (ath10k does not send these before vdev start) */
+	if (steps() & 0x10)
+		w_ps_off();
+	int t2 = 0, t5 = 0, wm = 0;
+	if (steps() & 0x20) {
+		t2 = w_pdev_param(3, 40);
+		t5 = w_pdev_param(4, 40);
+	}
+	if (steps() & 0x40)
+		wm = w_vdev_wmm();
 	LOG("join: tx power limit 2G/5G 20 dBm %s, vdev wmm %s", t2 || t5 ? "FAILED" : "ok", wm ? "FAILED" : "ok");
 	fflush(stdout);
 	if (w_vdev_start(s_freq, bcn, dtim)) {
