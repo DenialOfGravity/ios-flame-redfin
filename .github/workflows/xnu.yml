@@ -115,7 +115,26 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      # On a failed build: the compiler's errors to branch builds-xnu-log (fetchable with git where logs are not)
+      - name: Publish the build errors
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          P=$RUNNER_TEMP/errlog
+          rm -rf "$P" && mkdir -p "$P" && cd "$P"
+          git init -q -b builds-xnu-log
+          grep -n -E 'error:|error generated|errors generated|\*\*\* \[' "$RUNNER_TEMP/build.log" | head -300 > errors.txt || true
+          grep -n -B3 -A12 -E ' error:' "$RUNNER_TEMP/build.log" | head -1500 > errors-context.txt || true
+          tail -300 "$RUNNER_TEMP/build.log" > tail.txt || true
+          printf 'source %s\nrun %s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > BUILD.txt
+          git add -A
+          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com commit -qm "build errors of $GITHUB_RUN_ID"
+          git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-xnu-log
 
       - name: Save incremental build cache
         if: success()
