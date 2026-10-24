@@ -1,0 +1,20 @@
+camera_device.c:1546:60: warning: 'CVBufferGetAttachment' is deprecated: first deprecated in iOS 15.0 [-Wdeprecated-declarations]
+        CFTypeRef ours = image != NULL && md_attachment != NULL ? CVBufferGetAttachment(image, md_attachment, NULL) : NULL, theirs;
+                                                                  ^~~~~~~~~~~~~~~~~~~~~
+                                                                  CVBufferCopyAttachment
+/Applications/Xcode_15.4.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS17.5.sdk/System/Library/Frameworks/CoreVideo.framework/Headers/CVBuffer.h:106:33: note: 'CVBufferGetAttachment' has been explicitly marked deprecated here
+CV_EXPORT CFTypeRef CV_NULLABLE CVBufferGetAttachment( CVBufferRef CV_NONNULL buffer, CFStringRef CV_NONNULL key, CVAttachmentMode * CV_NULLABLE attachmentMode )  API_DEPRECATED_WITH_REPLACEMENT("CVBufferCopyAttachment", macos(10.4, 12.0), ios(4.0,15.0), tvos(9.0, 15.0), watchos(4.0, 8.0));
+                                ^
+1 warning generated.
+-rwxr-xr-x  1 runner  staff   86496 Oct 24 22:08 out/camera_avtest
+-rwxr-xr-x  1 runner  staff  104704 Oct 24 22:08 out/camera_test
+-rwxr-xr-x  1 runner  staff   68752 Oct 24 22:08 out/mg_test
+-rwxr-xr-x  1 runner  staff   87920 Oct 24 22:08 out/sound_test
+
+out/RedwoodAudio.driver:
+total 336
+drwxr-xr-x  5 runner  staff     160 Oct 24 22:08 .
+drwxr-xr-x  7 runner  staff     224 Oct 24 22:08 ..
+-rw-r--r--  1 runner  staff    1048 Oct 24 22:08 Info.plist
+-rwxr-xr-x  1 runner  staff  165920 Oct 24 22:08 RedwoodAudio
+drwxr-xr-x  3 runner  staff      96 Oct 24 22:08 _CodeSignature
