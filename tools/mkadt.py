@@ -5,7 +5,7 @@ Only what the early boot path actually reads (see ios-sweet's NOTES.md); every
 MMIO address comes from the flame (Pixel 4, SM8150) live FDT. The kernel's
 built-in drivers still match the Redmi names (xiaomi,sweet, qcom,kryo470,
 sweet,display), so those stay next to the flame ones.
-Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--camera] [--flash]
 """
 import hashlib, os, struct, sys
 
@@ -87,6 +87,22 @@ PANIC_LOG_PA = 0x1f9000000
 PANIC_LOG_SIZE = 0x80000
 
 
+# CAMERA (HackiOS xnuloader/loader.c, cam=5 / torch=N): MobileGestalt finds the cameras at
+# IODeviceTree:/arm-io/isp (its camera-rear / camera-front: still-camera, rear-/front-facing-camera),
+# and SpringBoard shows Camera.app only then. The node has neither compatible nor device_type, so no
+# driver matches it. /product/camera "flash" is MobileGestalt's camera-flash: without it Control
+# Center has no flashlight button. Only what this phone has is said; the rest of the iPhone X's
+# camera node (pearl, burst, slow motion ...) is left out. MobileGestalt caches its answers: move
+# its cache aside once after changing these (/private/var/containers/Shared/SystemGroup/
+# systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist).
+def isp_node(ph):
+    return node('isp', [ph(), ('camera-rear', u32(1)), ('camera-front', u32(1))])
+
+
+def product_camera_node(ph, flash):
+    return node('camera', [ph()] + ([('flash', u32(1))] if flash else []))
+
+
 def node(name, props=(), children=()):
     n = adt.Node()
     n.props = [('name', 0, cstr(name))] + [(k, 0, v) for k, v in props]
@@ -94,8 +110,10 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
-    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
+def build(seed=None, qemu=False, highmem=False, camera=False, flash=False):
+    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
+    camera=True: /arm-io/isp (Camera.app on the home screen); flash=True: /product/camera flash
+    (the flashlight in Control Center). See CAMERA below."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
@@ -223,7 +241,7 @@ def build(seed=None, qemu=False, highmem=False):
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
             ('canvas-height', u32(2436)),
-        ])])
+        ])] + ([isp_node(ph)] if camera else []))
 
     fbcon = node('sweet-fbcon', [
         ph(),
@@ -261,8 +279,10 @@ def build(seed=None, qemu=False, highmem=False):
 
     product_props = d22ap_product()
     haptics = d22ap_product_child('haptics')
-    product = [node('product', [ph()] + product_props,
-                    [node('haptics', [ph()] + haptics)] if haptics else [])] if product_props else []
+    product_children = [node('haptics', [ph()] + haptics)] if haptics else []
+    if flash or camera:
+        product_children.append(product_camera_node(ph, flash))
+    product = [node('product', [ph()] + product_props, product_children)] if product_props else []
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
@@ -280,7 +300,8 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
+                 camera='--camera' in sys.argv, flash='--flash' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

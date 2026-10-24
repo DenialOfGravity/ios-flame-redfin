@@ -9,7 +9,8 @@ strobe and no safety timer, as leds-qpnp-flash-v2.c does it. sweettorch=1
 looks only; =2 switches it (poke "t MA [MS]", sysctl kern.sweet_torch 0..1000);
 =3 also blinks once at 5 mA. At most sweettorch_ma per channel (default 100,
 cap 200; Android's torch is 300), at most sweettorch_secs (120, cap 600) at a
-time, faults and over-temperature checked ten times a second while lit.
+time, faults (LED fault, open/short, VPH droop) and the PM8150L temperature
+alarm checked ten times a second while lit; switching off is always allowed.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01WuzsiVGCDDmN2GPRLJvX3w
@@ -72,10 +73,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/sweet_torch.c b/bsd/dev/sweet_torch.c
 new file mode 100644
-index 0000000..977594b
+index 0000000..837909e
 --- /dev/null
 +++ b/bsd/dev/sweet_torch.c
-@@ -0,0 +1,478 @@
+@@ -0,0 +1,529 @@
 +/*
 + * redfin (Pixel 5) flashlight: the PM8150L flash LED module ("qcom,qpnp-flash-led-v2"), SPMI slave 5,
 + * peripheral 0xd3 (registers 0xd300..0xd3ff). The rear flash LED is on channels 0 and 1 together
@@ -91,11 +92,16 @@ index 0000000..977594b
 + *         MOD_CTRL (0x46) bit 7, then EN_LED_CTRL (0x4c) bits 0-1.
 + *   off   EN_LED_CTRL bits 0-1 clear, MOD_CTRL bit 7 clear, TGR_CURRENT 0, SAFETY_TMR 0x13.
 + *   faults  INT_RT_STS (0x10) bit 0 (led-fault-irq), LED_STATUS1 (0x08) != 0 (open/short),
-+ *         LED_STATUS2 (0x09) bit 4 (VPH droop) or bits 2:0 (over-temperature stages).
++ *         LED_STATUS2 (0x09) bit 4 (VPH droop), as qpnp_flash_led_irq_handler reads them.
++ *         LED_STATUS2 bits 2:0 (OTST) are not faults: Linux reads them only to pick a derating
++ *         step after lowering the thresholds itself (r15a lit 50 mA and saw 0x04 after 1.4 s).
++ *   heat  the PM8150L's own temperature alarm (SID 4, 0x2400, qcom-spmi-temp-alarm.c: STATUS
++ *         0x08, stage [1:0] on GEN1 / state [6:4] on GEN2): any stage above 0 and the light goes off.
 + *
 + * Writes go through one function that only takes the registers above on that one peripheral (the
 + * arbiter channel is checked to be SID 5 / 0xd3 and owned by the APPS EE), and every write is read
-+ * back. Any surprise turns the light off and stops the driver for the rest of the boot.
++ * back. Any surprise turns the light off and stops the driver for the rest of the boot (the
++ * writes that turn it off are always allowed, also after a failure: r15a's were not).
 + *
 + * Boot-arg sweettorch=1: a look only (the module's type, subtype, and registers, nothing written);
 + * sweettorch=2: the light can be switched: poke/command line "t MA [MS]" (tools/flame-cmd.py 't 50 1000'),
@@ -158,9 +164,15 @@ index 0000000..977594b
 +#define TORCH_S_DEFAULT  120u
 +#define TORCH_S_CAP      600u
 +
++struct tc_chan {
++	vm_offset_t obs, chnl;  /* read (observer) and write channel of one peripheral */
++	unsigned apid, sid, periph;
++};
 +static struct {
-+	vm_offset_t core, cnfg, chnl, obs;
-+	unsigned apid, max_ma, max_s;
++	vm_offset_t core, cnfg;
++	struct tc_chan fl, alarm;
++	bool alarm_gen2;
++	unsigned max_ma, max_s;
 +	bool ready, dead, lit, on_the_fly;
 +	unsigned lit_ma;
 +	uint64_t lit_since;
@@ -197,11 +209,11 @@ index 0000000..977594b
 +	thread_block(THREAD_CONTINUE_NULL);
 +}
 +
-+/* The arbiter channel of SID 5 / 0xd3, owned by the APPS EE (0); as sweet_haptic.c's hap_spmi. */
++/* The arbiter channel of one peripheral; the write channel only when the APPS EE (0) owns it. */
 +static bool
-+tc_find_channel(void)
++tc_find_channel(struct tc_chan *c, unsigned sid, unsigned periph, bool want_write)
 +{
-+	unsigned ppid = (FL_SID << 8) | FL_PERIPH, n = tc_rd32(tc.core, 4) & 0x7ffu, apid = 0xffff, own = 7;
++	unsigned ppid = (sid << 8) | periph, n = tc_rd32(tc.core, 4) & 0x7ffu, apid = 0xffff, own = 7;
 +	uint32_t version = tc_rd32(tc.core, 0);
 +	if (version < 0x50000000u || version >= 0x70000000u) {
 +		printf("SWEET TORCH: SPMI arbiter %#x is not v5\n", version);
@@ -219,22 +231,25 @@ index 0000000..977594b
 +		}
 +	}
 +	if (apid == 0xffff) {
-+		printf("SWEET TORCH: no arbiter channel for %x:%x\n", FL_SID, FL_PERIPH);
++		printf("SWEET TORCH: no arbiter channel for %x:%x\n", sid, periph << 8);
 +		return false;
 +	}
-+	tc.apid = apid;
-+	tc.obs = ml_io_map(SP_OBS_PA + 0x80u * apid, 0x1000);
-+	tc.chnl = own == 0 ? ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000) : 0;
-+	printf("SWEET TORCH: flash module %x:%x on APID %u, owner EE %u%s\n", FL_SID, FL_PERIPH << 8, apid, own,
-+	    own == 0 ? "" : " (not ours: read only)");
-+	return tc.obs != 0;
++	c->apid = apid;
++	c->sid = sid;
++	c->periph = periph;
++	c->obs = ml_io_map(SP_OBS_PA + 0x80u * apid, 0x1000);
++	c->chnl = want_write && own == 0 ? ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000) : 0;
++	printf("SWEET TORCH: %x:%x on APID %u, owner EE %u%s\n", sid, periph << 8, apid, own,
++	    !want_write ? "" : own == 0 ? "" : " (not ours: read only)");
++	return c->obs != 0;
 +}
 +
 +/* One transfer; retried when the arbiter dropped it (as HackiOS redwood_torch.c). */
 +static int
-+tc_xfer(bool write, uint8_t reg, uint8_t *val)
++tc_xfer(const struct tc_chan *c, bool write, uint8_t reg, uint8_t *val)
 +{
-+	vm_offset_t ch = write ? tc.chnl : tc.obs;
++	vm_offset_t ch = write ? c->chnl : c->obs;
++	unsigned at = (c->periph << 8) + reg;
 +	if (!ch) {
 +		return -1;
 +	}
@@ -253,7 +268,7 @@ index 0000000..977594b
 +			delay(1);
 +		}
 +		if (i == 1000) {
-+			printf("SWEET TORCH: spmi %s %#x timeout\n", write ? "write" : "read", 0xd300 + reg);
++			printf("SWEET TORCH: spmi %s %x:%#x timeout\n", write ? "write" : "read", c->sid, at);
 +			tc.dead = true;
 +			return -1;
 +		}
@@ -261,7 +276,7 @@ index 0000000..977594b
 +			continue;       /* dropped */
 +		}
 +		if (st & 0x6u) {
-+			printf("SWEET TORCH: spmi %s %#x status %#x\n", write ? "write" : "read", 0xd300 + reg, st);
++			printf("SWEET TORCH: spmi %s %x:%#x status %#x\n", write ? "write" : "read", c->sid, at, st);
 +			return -1;
 +		}
 +		if (!write) {
@@ -269,14 +284,14 @@ index 0000000..977594b
 +		}
 +		return 0;
 +	}
-+	printf("SWEET TORCH: spmi %#x dropped 3 times\n", 0xd300 + reg);
++	printf("SWEET TORCH: spmi %x:%#x dropped 3 times\n", c->sid, at);
 +	return -1;
 +}
 +
 +static int
 +tc_read(uint8_t reg, uint8_t *val)
 +{
-+	return tc_xfer(false, reg, val);
++	return tc_xfer(&tc.fl, false, reg, val);
 +}
 +
 +static bool
@@ -294,17 +309,26 @@ index 0000000..977594b
 +	}
 +}
 +
-+/* masked write, read back; any mismatch stops the driver */
++/*
++ * masked write, read back; any mismatch stops the driver. dark = a write that only switches the
++ * light off or its current to 0: allowed after the driver stopped, and tried even if the read fails.
++ */
 +static int
-+tc_write(uint8_t reg, uint8_t mask, uint8_t val)
++tc_write_x(uint8_t reg, uint8_t mask, uint8_t val, bool dark)
 +{
 +	uint8_t old = 0, back = 0;
-+	if (tc.dead || !tc_writable(reg) || tc_read(reg, &old)) {
-+		tc.dead = true;
++	if (!tc_writable(reg) || (tc.dead && !dark)) {
 +		return -1;
 +	}
++	if (tc_read(reg, &old)) {
++		tc.dead = true;
++		if (!dark) {
++			return -1;
++		}
++		old = 0;
++	}
 +	uint8_t v = (uint8_t)((old & ~mask) | (val & mask));
-+	if (tc_xfer(true, reg, &v) || tc_read(reg, &back)) {
++	if (tc_xfer(&tc.fl, true, reg, &v) || tc_read(reg, &back)) {
 +		tc.dead = true;
 +		return -1;
 +	}
@@ -319,12 +343,19 @@ index 0000000..977594b
 +	return 0;
 +}
 +
++static int
++tc_write(uint8_t reg, uint8_t mask, uint8_t val)
++{
++	return tc_write_x(reg, mask, val, false);
++}
++
 +static void
 +tc_dump(const char *why)
 +{
 +	static const uint8_t regs[] = { FL_TYPE, FL_SUBTYPE, FL_STATUS1, FL_STATUS2, FL_INT_RT_STS,
 +		                        FL_SAFETY(0), FL_SAFETY(1), FL_TGR(0), FL_TGR(1), FL_MOD_CTRL, FL_IRES,
-+		                        FL_STROBE(0), FL_STROBE(1), FL_EN_LED, FL_HDRM(0), FL_HDRM(1), FL_CHICKEN };
++		                        FL_STROBE(0), FL_STROBE(1), FL_EN_LED, FL_HDRM(0), FL_HDRM(1), 0x55, 0x56, 0x57, 0x58,
++		                        0x76, FL_CHICKEN };
 +	char line[200];
 +	int n = snprintf(line, sizeof(line), "SWEET TORCH: %s:", why);
 +	for (unsigned i = 0; i < sizeof(regs) && n < (int)sizeof(line) - 12; i++) {
@@ -342,11 +373,14 @@ index 0000000..977594b
 +tc_off(const char *why)
 +{
 +	bool was = tc.lit;
-+	(void)tc_write(FL_EN_LED, FL_CHANNELS, 0);
-+	(void)tc_write(FL_MOD_CTRL, FL_MOD_EN, 0);
++	int err = tc_write_x(FL_EN_LED, FL_CHANNELS, 0, true);
++	err |= tc_write_x(FL_MOD_CTRL, FL_MOD_EN, 0, true);
 +	for (unsigned ch = 0; ch < 2; ch++) {
-+		(void)tc_write(FL_TGR(ch), 0x7f, 0);
-+		(void)tc_write(FL_SAFETY(ch), 0xff, FL_SAFETY_OFF);
++		err |= tc_write_x(FL_TGR(ch), 0x7f, 0, true);
++		err |= tc_write_x(FL_SAFETY(ch), 0xff, FL_SAFETY_OFF, true);
++	}
++	if (err) {
++		printf("SWEET TORCH: switching off did not read back (%s)\n", why);
 +	}
 +	tc.lit = false;
 +	tc.lit_ma = 0;
@@ -413,14 +447,23 @@ index 0000000..977594b
 +static bool
 +tc_check(void)
 +{
-+	uint8_t rt = 0, s1 = 0, s2 = 0;
-+	if (tc_read(FL_INT_RT_STS, &rt) || tc_read(FL_STATUS1, &s1) || tc_read(FL_STATUS2, &s2)) {
-+		return false;
-+	}
-+	if ((rt & FL_RT_FAULT) || s1 || (s2 & (FL_VPH_DROOP | FL_OTST))) {
-+		printf("SWEET TORCH: fault: rt_sts %#x status1 %#x status2 %#x\n", rt, s1, s2);
++	uint8_t rt = 0, s1 = 0, s2 = 0, alarm = 0;
++	static uint8_t otst_said = 0xff;
++	if (tc_read(FL_INT_RT_STS, &rt) || tc_read(FL_STATUS1, &s1) || tc_read(FL_STATUS2, &s2) ||
++	    tc_xfer(&tc.alarm, false, 0x08, &alarm)) {
 +		tc.dead = true;
 +		return false;
++	}
++	unsigned stage = tc.alarm_gen2 ? (alarm >> 4) & 7u : alarm & 3u;
++	if ((rt & FL_RT_FAULT) || s1 || (s2 & FL_VPH_DROOP) || stage) {
++		printf("SWEET TORCH: fault: rt_sts %#x status1 %#x status2 %#x, PM8150L temperature stage %u\n",
++		    rt, s1, s2, stage);
++		tc.dead = true;
++		return false;
++	}
++	if ((s2 & FL_OTST) != otst_said) {
++		otst_said = s2 & FL_OTST;
++		printf("SWEET TORCH: OTST %#x (derating band, not a fault) at %u mA\n", otst_said, tc.lit_ma);
 +	}
 +	return true;
 +}
@@ -439,9 +482,18 @@ index 0000000..977594b
 +	tc_sleep(6000);
 +	tc.core = ml_io_map(SP_CORE_PA, 0x2000);
 +	tc.cnfg = ml_io_map(SP_CNFG_PA, 0x1000);
-+	if (!tc.core || !tc.cnfg || !tc_find_channel()) {
++	if (!tc.core || !tc.cnfg || !tc_find_channel(&tc.fl, FL_SID, FL_PERIPH, mode >= 2) ||
++	    !tc_find_channel(&tc.alarm, 4, 0x24, false)) {
 +		goto out;
 +	}
++	uint8_t atype = 0, asub = 0, astatus = 0;
++	if (tc_xfer(&tc.alarm, false, 0x04, &atype) || tc_xfer(&tc.alarm, false, 0x05, &asub) ||
++	    tc_xfer(&tc.alarm, false, 0x08, &astatus) || atype != 0x09 || (asub != 0x08 && asub != 0x09)) {
++		printf("SWEET TORCH: PM8150L temperature alarm: type %#x subtype %#x: not usable\n", atype, asub);
++		goto out;
++	}
++	tc.alarm_gen2 = asub == 0x09;
++	printf("SWEET TORCH: PM8150L temperature alarm GEN%u, status %#x\n", tc.alarm_gen2 ? 2 : 1, astatus);
 +	uint8_t type = 0, sub = 0, chicken = 0;
 +	if (tc_read(FL_TYPE, &type) || tc_read(FL_SUBTYPE, &sub)) {
 +		goto out;
@@ -453,7 +505,7 @@ index 0000000..977594b
 +		printf("SWEET TORCH: %x:%x is type %#x, not a flash LED module\n", FL_SID, FL_PERIPH << 8, type);
 +		goto out;
 +	}
-+	if (mode < 2 || !tc.chnl) {
++	if (mode < 2 || !tc.fl.chnl) {
 +		printf("SWEET TORCH: look only (sweettorch=%u)\n", mode);
 +		goto out;
 +	}
