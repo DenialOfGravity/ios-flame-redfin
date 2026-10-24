@@ -28,4 +28,5 @@ for m in expt exq nettest openapp oslog prefs runmigrator; do build $m $m.m -fob
 build imgtest imgtest.m -fobjc-arc -framework Foundation -framework ImageIO -framework CoreGraphics
 build lsreg lsreg.m -fobjc-arc -framework Foundation -framework MobileCoreServices
 build netsvc netsvc.m -fobjc-arc -framework Foundation -framework SystemConfiguration
+build memwarn memwarn.c
 ls -l out
