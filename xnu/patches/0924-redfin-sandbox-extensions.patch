@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sun, 25 Oct 2026 00:30:00 +0200
+Subject: [PATCH] 0924 redfin: sandbox extensions issued, for TCC (Camera.app)
+
+The "Sandbox" stand-in (0050) failed extension issue and consume with
+ENOENT. tccd gives every process it allows a sandbox extension for the
+service and takes a failure to issue it for a refusal: Camera.app logged
+"Failed to issue Sandbox Extension for kTCCServiceCamera", its
+AVCaptureDeviceInput failed with -11852 "Cannot use Back Camera" and the
+preview stayed black though mediaserverd's camera device was there.
+
+Issue (op 5) now writes a token of ours into the caller's buffer (the
+fifth word of libsystem_sandbox's argument block, 2048 bytes of malloc)
+and succeeds; consume (op 6) gives handle 1. HackiOS's minisandbox allows
+both outright (leaving the buffer as malloc left it).
+
+---
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -279,14 +279,55 @@
+  * launchd reports mach lookups as "error = 159: Sandbox restriction"
+  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
+  * "profile not found"). SWEET runs without a sandbox: operations succeed
+- * (checks allow, profile init is accepted); the few that must return
+- * data (container paths, extension tokens) fail with ENOENT. The first
++ * (checks allow, profile init is accepted); container paths fail with
++ * ENOENT, extensions are issued and consumed (below). The first
+  * use of each operation number is logged.
+  */
+ static uint64_t sweet_sandbox_seen;
+ 
++/*
++ * Extension tokens. tccd hands the processes it allows a sandbox extension
++ * for the service (sandbox_extension_issue_generic("com.apple.tcc.kTCCServiceCamera")
++ * and the like), and takes a failure to issue one for a refusal: Camera.app
++ * was told "Failed to issue Sandbox Extension for kTCCServiceCamera", its
++ * AVCaptureDeviceInput failed with -11852 "Cannot use Back Camera" and the
++ * preview stayed black. With no sandbox an extension is nothing to enforce:
++ * issuing one writes a token of our own into the caller's buffer, and
++ * consuming one gives handle 1 (release and the rest are allowed).
++ *
++ * libsystem_sandbox (iOS 16), issue (op 5): { u64 class, u64 type, u64 path,
++ * u64 flags, u64 token buffer (malloc 2048, not cleared), u64 pid,
++ * u64 pid version } -- the buffer is returned as the token when the call
++ * succeeds. Consume (op 6): { u64 token, u64 length + 1, u64 handle out }.
++ */
++#define SWEET_SANDBOX_TOKEN "0000000000000000000000000000000000000000;00;00000000;00000000;sweet"
++
++static int
++sweet_sandbox_issue(user_addr_t arg)
++{
++	uint64_t a[7];
++	int error = copyin(arg, a, sizeof(a));
++
++	if (error == 0) {
++		error = copyout(SWEET_SANDBOX_TOKEN, (user_addr_t)a[4], sizeof(SWEET_SANDBOX_TOKEN));
++	}
++	return error;
++}
++
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_consume(user_addr_t arg)
++{
++	uint64_t a[3], handle = 1;
++	int error = copyin(arg, a, sizeof(a));
++
++	if (error == 0 && a[2] != 0) {
++		error = copyout(&handle, (user_addr_t)a[2], sizeof(handle));
++	}
++	return error;
++}
++
++static int
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+@@ -295,9 +336,11 @@
+ 		printf("SWEET Sandbox: %s op %d\n", name, call);
+ 	}
+ 	switch (call) {
+-	case 4:         /* container path (audit token / pid) */
+ 	case 5:         /* extension issue */
++		return sweet_sandbox_issue(arg);
+ 	case 6:         /* extension consume */
++		return sweet_sandbox_consume(arg);
++	case 4:         /* container path (audit token / pid) */
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:
+-- 
+2.43.0

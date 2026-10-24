@@ -179,3 +179,6 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
 - 0923 /dev/redwood-camera (sweetcamdev=1 with sweetcam=2): HackiOS cam=5's device for its camera_device.c in
   mediaserverd: frame header + RAW10 per read, EXPOSURE/SENSOR/FOCUS writes; sessions on stream_up(), three GPU-pool
   places, next address at each RDI0 SOF; sensors 1 back IMX363, 2 front IMX355, 3 ultra-wide IMX481; linear gain.
+- 0924 Sandbox stand-in: extension issue (op 5) writes a token into libsystem_sandbox's buffer, consume (op 6) gives
+  handle 1. tccd took the old ENOENT for a refusal: Camera.app's AVCaptureDeviceInput failed -11852, black preview.
+  Also needed on the phone: MediaToolbox SubServerConfiguration.plist StartRecorderServer=true (capture servers).
