@@ -35,6 +35,9 @@ env:
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
 
+permissions:
+  contents: write
+
 jobs:
   build:
     # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
@@ -172,3 +175,22 @@ jobs:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
+
+      # The kernel also goes to branch builds-xnu (one force-pushed commit), so it can be fetched with git
+      # where artifact downloads are blocked: git fetch --depth 1 origin builds-xnu
+      - name: Publish to the builds-xnu branch
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          P=$RUNNER_TEMP/publish
+          rm -rf "$P" && mkdir -p "$P" && cd "$P"
+          git init -q -b builds-xnu
+          for f in "$GITHUB_WORKSPACE"/out/kernel.*; do gzip -9 -c "$f" > "$(basename "$f").gz"; done
+          cp "$GITHUB_WORKSPACE/out/SHA256SUMS" .
+          printf 'source %s\nref %s\nrun %s\n' "$GITHUB_SHA" "$GITHUB_REF_NAME" "$GITHUB_RUN_ID" > BUILD.txt
+          git add -A
+          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com \
+            commit -qm "xnu kernel from $GITHUB_REF_NAME ${GITHUB_SHA::12} (run $GITHUB_RUN_ID)"
+          git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-xnu
