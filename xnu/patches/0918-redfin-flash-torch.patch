@@ -13,6 +13,8 @@ time, faults (LED fault, open/short, VPH droop) and the PM8150L temperature
 alarm checked ten times a second while lit; switching off is always allowed.
 At start it writes the settings leds-qpnp-flash-v2.c init writes for this DT
 (headroom auto mode off, ISC and warm-up delays, ramp rates, VPH droop).
+LED faults count only when they stay for three checks (r15c saw a one-check
+open/short flag at 0.7 s; Linux only logs them); the temperature alarm at once.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01WuzsiVGCDDmN2GPRLJvX3w
@@ -75,10 +77,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/sweet_torch.c b/bsd/dev/sweet_torch.c
 new file mode 100644
-index 0000000..7de5556
+index 0000000..e0c3115
 --- /dev/null
 +++ b/bsd/dev/sweet_torch.c
-@@ -0,0 +1,568 @@
+@@ -0,0 +1,585 @@
 +/*
 + * redfin (Pixel 5) flashlight: the PM8150L flash LED module ("qcom,qpnp-flash-led-v2"), SPMI slave 5,
 + * peripheral 0xd3 (registers 0xd300..0xd3ff). The rear flash LED is on channels 0 and 1 together
@@ -484,11 +486,28 @@ index 0000000..7de5556
 +		return false;
 +	}
 +	unsigned stage = tc.alarm_gen2 ? (alarm >> 4) & 7u : alarm & 3u;
-+	if ((rt & FL_RT_FAULT) || s1 || (s2 & FL_VPH_DROOP) || stage) {
-+		printf("SWEET TORCH: fault: rt_sts %#x status1 %#x status2 %#x, PM8150L temperature stage %u\n",
-+		    rt, s1, s2, stage);
++	static unsigned bad_in_a_row, said;
++	if (stage) {
++		printf("SWEET TORCH: PM8150L temperature stage %u: off\n", stage);
 +		tc.dead = true;
 +		return false;
++	}
++	/*
++	 * r15c: STATUS1 0x1 and INT_RT_STS 0x4 for one check, 0.7 s after lighting, gone at the next read
++	 * with the LED still ramped up (0xd0). Linux only logs these (qpnp_flash_led_irq_handler); the
++	 * module protects itself from a real short. So only a fault that stays for 3 checks counts.
++	 */
++	if ((rt & FL_RT_FAULT) || s1 || (s2 & FL_VPH_DROOP)) {
++		if (said++ < 20) {
++			printf("SWEET TORCH: fault flags: rt_sts %#x status1 %#x status2 %#x (%u in a row)\n", rt, s1, s2,
++			    bad_in_a_row + 1);
++		}
++		if (++bad_in_a_row >= 3) {
++			tc.dead = true;
++			return false;
++		}
++	} else {
++		bad_in_a_row = 0;
 +	}
 +	if ((s2 & FL_OTST) != otst_said) {
 +		otst_said = s2 & FL_OTST;
