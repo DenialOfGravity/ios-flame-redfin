@@ -103,3 +103,19 @@ Bench (tools/sunfish-fpsbench.sh, BENCH_TIGHT=1, Settings swipes, 30 s):
 - Turnip TU_DEBUG=bos census (phone/turnip/patches/0101, /var/local/tubos): at the first print backboardd
   held ~128 MB but Turnip listed 5 BOs (1 MB); later prints were buffered (fflush added, re-run pending).
 - Phone left on k91 (kernel33, 565 MHz, flamereboot=0) to charge, battery 3706 mV.
+
+## [00:40] Night run: where backboardd's GPU time goes
+- Brightness: tools/sunfish-dim.sh 10 (LM_0 blend alpha); user confirmed "a lot lower", text readable.
+- Experiments without rebuilds: tools/sunfish-m2env-bench.sh TAG [KEY=VALUE...] (writes
+  /var/local/mtl2-env, TUDBG=... -> /var/local/mtl2-tu-debug, restarts backboardd, benches).
+  Pre-create /var/local/turnip-<proc>.log mode 666 (clients run as mobile).
+- No effect on fps or backboardd GPU ms: TU_AUTOTUNE_ALGO prefer_sysmem / prefer_gmem, TU_DEBUG=sysmem / gmem,
+  turnip 0102 TU_SWEET_PRIM_ORDER=0 (no per-overlap flush for fetch draws). Not fill rate.
+- Bridge telemetry (/var/local/mtl2-telemetry): 1 render pass per frame, 14-46 draws, ctc 7.5-16 ms.
+- MESA_GPU_TRACES=print (per-op GPU timestamps) per backboardd frame (~11.5 ms):
+  copy_buffer_to_image ~13x = 6.6 ms, copy_image_to_buffer 1.4 ms, the render pass itself 3.5 ms.
+- Cause: Turnip reports requiresDedicatedAllocation for every external image, so metal2vulkan never
+  aliases an IOSurface (host-pointer import) and keeps a private "shadow" image, copied in/out each frame.
+  Also CA's 16/32-byte row pitches are refused for explicit DRM-linear layouts (turnip 0103 logs them).
+- Fixes: xnu 0159 (kernel35) rounds single-plane IOSurface rows to 64 bytes (sweetsurfalign=0 off) — alone
+  no change; turnip 0104: host-allocation images not dedicated (testing).
