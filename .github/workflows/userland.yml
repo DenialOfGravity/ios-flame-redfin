@@ -93,7 +93,7 @@ jobs:
           cp phone/wifi/out/wland ../out/
           bash phone/tools/build.sh || echo "::warning::some phone tools failed"
           sh phone/haptics/build.sh && cp phone/haptics/out/SweetHaptics.dylib ../out/ || echo "::warning::SweetHaptics.dylib failed"
-          sh phone/audio/build.sh && cp -R phone/audio/out/RedwoodAudio.driver phone/audio/out/sound_test ../out/ || echo "::warning::RedwoodAudio.driver failed"
+          sh phone/audio/build.sh && cp -R phone/audio/out/RedwoodAudio.driver phone/audio/out/sound_test phone/audio/out/camera_test ../out/ || echo "::warning::RedwoodAudio.driver failed"
           for t in psx pstack netsvc nettest oslog prefs openapp lsreg memwarn pmem a2s; do
             [ -f phone/tools/out/$t ] && cp phone/tools/out/$t ../out/ || true
           done
