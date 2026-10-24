@@ -819,6 +819,10 @@ static void scan_start(void)
 	if (scan_started)
 		return;
 	scan_started = 1;
+	if (steps() & 0x200) {			/* probe: no regdomain, pdev params, dbglog or channel list */
+		LOG("probe: regdomain/pdev/dbglog/chan list skipped");
+		goto vdev_create;
+	}
 	/*
 	 * sunfish: WMI_PDEV_SET_REGDOMAIN first (ath10k_regd_update; tag 0x51, cmd 0x4001), with the
 	 * firmware's own eeprom code, FCC conformance limits. The HL3.2.2 firmware asserted in vdev
@@ -871,6 +875,10 @@ static void scan_start(void)
 		p = put32(c, 40u << 8);
 	}
 	int a = wmi_send(CMD_SCAN_CHAN_LIST, m, (uint32_t)(p - m));
+	if (0) {
+vdev_create:
+		a = 0;
+	}
 	uint8_t v[4 + 20] = { 0 };
 	c = put_tlv(v, TAG_VDEV_CREATE_CMD, 20);
 	c = put32(c, 0);				/* vdev 0 */
