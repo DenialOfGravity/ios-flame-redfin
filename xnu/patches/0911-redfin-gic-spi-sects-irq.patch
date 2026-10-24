@@ -1,0 +1,263 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sat, 24 Oct 2026 14:06:52 +0200
+Subject: [PATCH] 0911 redfin: GIC SPIs for SWEET drivers; sec_ts touch on its interrupt
+
+sweet_spi_attach/mask/dispatch from sailfish 0181 (after HackiOS's
+gic_v3_spi_attach): a SWEET driver configures, routes and enables a GIC
+SPI, and sleh_irq hands it the INTID. sec_ts takes the TLMM summary
+interrupt (SPI 208 = INTID 240) for its attention pin gpio9 instead of
+waking every 8 ms. It falls back to polling if the line is seen low with
+no interrupt, or if another pin storms the summary. sectouchirq=0 polls.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GizUhEzkc6MoTcLnCZCfFa
+---
+  osfmk/arm64/sleh.c   |  8 ++++-
+  pexpert/arm/pe_fiq.c | 76 ++++++++++++++++++++++++++++++++++++++++++++
+  bsd/dev/sweet_sects.c | 92 +++++++++++++++++++++++++++++++++++++++----
+
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..b23b888 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1847,6 +1847,10 @@ handle_simd_trap(arm_saved_state_t *state, uint32_t esr)
+ 	__builtin_unreachable();
+ }
+ 
++#if defined(SWEET)
++extern bool sweet_spi_dispatch(uint32_t intid);
++#endif
++
+ void
+ sleh_irq(arm_saved_state_t *state)
+ {
+@@ -1882,7 +1886,9 @@ sleh_irq(arm_saved_state_t *state)
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+-		if (cdp->interrupt_handler) {
++		if (sweet_spi_dispatch(intid)) {
++			/* a SWEET driver's device interrupt (pexpert/arm/pe_fiq.c) */
++		} else if (cdp->interrupt_handler) {
+ 			cdp->interrupt_handler(cdp->interrupt_target,
+ 			    cdp->interrupt_refCon,
+ 			    cdp->interrupt_nub,
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..ec9b97f 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -73,6 +73,82 @@ find_gicr_pe_base()
+ 	panic("%s: cannot find GICR base for core %u", __func__, ml_get_cpu_number(phys_id));
+ }
+ 
++#if defined(SWEET)
++/*
++ * Device interrupts (GIC SPIs, INTIDs 32..1019) for SWEET drivers, after
++ * HackiOS's gic_v3_spi_attach() (github.com/oosexgang/hackios-xnu-kernel,
++ * osfmk/arm64/gic_v3_irq.c, APSL 2.0): configured (edge/level), routed to
++ * the processor that attaches it, enabled; its handler runs in interrupt
++ * context (sleh_irq -> sweet_spi_dispatch) and must quiet the device
++ * before returning (the interrupt is ended after it).
++ */
++#define GICD_ISENABLER(n)       (0x0100 + 4 * (n))
++#define GICD_ICENABLER(n)       (0x0180 + 4 * (n))
++#define GICD_IPRIORITYR(n)      (0x0400 + (n))
++#define GICD_ICFGR(n)           (0x0C00 + 4 * (n))
++#define GICD_IROUTER(n)         (0x6000 + 8 * (n))
++#define SWEET_SPI_MAX           1020
++
++static struct {
++	void (*fn)(void *arg);
++	void *arg;
++} sweet_spi[SWEET_SPI_MAX];
++
++static void
++sweet_gicd_rwp(void)
++{
++	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++		;
++	}
++}
++
++bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
++void sweet_spi_mask(uint32_t intid, bool masked);
++bool sweet_spi_dispatch(uint32_t intid);
++
++bool
++sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg)
++{
++	if (intid < 32 || intid >= SWEET_SPI_MAX || fn == NULL || gicd_base == 0) {
++		return false;
++	}
++	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1") & 0xFF00FFFFFFULL;   /* Aff3, Aff2.1.0 */
++	gicd_write32(GICD_ICENABLER(intid / 32), 1u << (intid % 32));
++	sweet_gicd_rwp();
++	sweet_spi[intid].arg = arg;
++	sweet_spi[intid].fn = fn;
++	__builtin_arm_dmb(DMB_ISH);
++	uint32_t cfg = gicd_read32(GICD_ICFGR(intid / 16)), bit = 2u << (2 * (intid % 16));
++	gicd_write32(GICD_ICFGR(intid / 16), edge ? (cfg | bit) : (cfg & ~bit));
++	*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(intid)) = 0xA0;
++	*(volatile uint64_t *)(gicd_base + GICD_IROUTER(intid)) = mpidr;
++	gicd_write32(GICD_ISENABLER(intid / 32), 1u << (intid % 32));
++	sweet_gicd_rwp();
++	kprintf("SWEET GIC: SPI intid %u (%s) attached, routed to MPIDR 0x%llx\n", intid, edge ? "edge" : "level", mpidr);
++	return true;
++}
++
++/* Masked: the line stays quiet at the GIC (a driver giving up on a storming interrupt). */
++void
++sweet_spi_mask(uint32_t intid, bool masked)
++{
++	if (intid >= 32 && intid < SWEET_SPI_MAX && gicd_base) {
++		gicd_write32(masked ? GICD_ICENABLER(intid / 32) : GICD_ISENABLER(intid / 32), 1u << (intid % 32));
++	}
++}
++
++/* From sleh_irq: false if nobody attached the INTID. */
++bool
++sweet_spi_dispatch(uint32_t intid)
++{
++	if (intid >= SWEET_SPI_MAX || sweet_spi[intid].fn == NULL) {
++		return false;
++	}
++	sweet_spi[intid].fn(sweet_spi[intid].arg);
++	return true;
++}
++#endif /* SWEET */
++
+ void
+ pe_init_fiq()
+ {
+diff --git a/bsd/dev/sweet_sects.c b/bsd/dev/sweet_sects.c
+index 64090d6..4ccb205 100644
+--- a/bsd/dev/sweet_sects.c
++++ b/bsd/dev/sweet_sects.c
+@@ -20,7 +20,8 @@
+  * (READ_ONE_EVENT), which keeps every transfer inside one FIFO fill.
+  *
+  * Boot-args: sectouch=1 on (default off until it has run on a phone),
+- * sectouchdelay=N start after N s, sectouchlog=1 log every event.
++ * sectouchdelay=N start after N s, sectouchlog=1 log every event,
++ * sectouchirq=0 poll instead of taking the attention interrupt.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -190,6 +191,52 @@ st_irq_asserted(void)
+ 	return !(st_rd(st.west, ST_GPIO_IO(ST_PIN_IRQ)) & 1u);
+ }
+ 
++/*
++ * 0911: the attention line as an interrupt. TLMM GPIO 9 (level low) feeds the
++ * TLMM summary interrupt, GIC SPI 208 = INTID 240 (live DT pinctrl@f000000
++ * interrupts = <0 0xd0 4>). Per-pin INTR_CFG (+0x8): bit 0 enable, 1 polarity
++ * (0 = low), 3:2 detection (0 = level), 4 raw status, 7:5 target (3 = apps);
++ * INTR_STATUS (+0xc) bit 0, cleared by writing 0 (pinctrl-lito.c PINGROUP).
++ * The handler masks the pin and wakes the thread, which drains the events and
++ * unmasks it. If the line is seen low without an interrupt arriving (summary
++ * not delivered, e.g. routed elsewhere), or the summary storms for another
++ * pin, the driver goes back to 8 ms polling. sectouchirq=0 keeps polling.
++ */
++#define ST_IRQ_INTID            240u
++#define ST_INTR_CFG(n)          (ST_GPIO_CFG(n) + 0x8u)
++#define ST_INTR_STATUS(n)       (ST_GPIO_CFG(n) + 0xcu)
++#define ST_INTR_CFG_ON          ((3u << 5) | (1u << 4))        /* apps, raw status, level low; | 1 enables */
++extern bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
++extern void sweet_spi_mask(uint32_t intid, bool masked);
++static volatile bool st_irq_on;
++static volatile uint32_t st_irqs, st_irq_others;
++
++static void
++st_irq(__unused void *arg)
++{
++	if (st_rd(st.west, ST_INTR_STATUS(ST_PIN_IRQ)) & 1u) {
++		st_wr(st.west, ST_INTR_CFG(ST_PIN_IRQ), ST_INTR_CFG_ON); /* masked until the thread has read */
++		st_wr(st.west, ST_INTR_STATUS(ST_PIN_IRQ), 0);
++		st_irqs++;
++		thread_wakeup(&st_sleep_chan);
++	} else if (++st_irq_others > 1000) {
++		sweet_spi_mask(ST_IRQ_INTID, true);     /* another pin holds the summary line */
++		st_irq_on = false;
++		thread_wakeup(&st_sleep_chan);
++	}
++}
++
++/* Unmask the attention interrupt and sleep until it fires or ms pass. */
++static void
++st_irq_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&st_sleep_chan, THREAD_UNINT, deadline);
++	st_wr(st.west, ST_INTR_CFG(ST_PIN_IRQ), ST_INTR_CFG_ON | 1u);  /* after assert_wait: no lost wakeup */
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ static bool
+ st_clocks(void)
+ {
+@@ -604,16 +651,25 @@ st_thread(void *arg, wait_result_t result)
+ 	if (!err) {
+ 		err = st_write(SEC_CMD_SENSE_ON, NULL, 0);
+ 	}
+-	printf("SWEET SECTS: sense on err=%d; polling every 8 ms\n", err);
+ 	if (err) {
++		printf("SWEET SECTS: sense on err=%d\n", err);
+ 		goto out;
+ 	}
+-	unsigned errors = 0, events = 0, ticks = 0;
++	int irq = 1;
++	(void)PE_parse_boot_argn("sectouchirq", &irq, sizeof(irq));
++	if (irq) {
++		st_wr(st.west, ST_INTR_CFG(ST_PIN_IRQ), ST_INTR_CFG_ON);
++		st_wr(st.west, ST_INTR_STATUS(ST_PIN_IRQ), 0);
++		st_irq_on = sweet_spi_attach(ST_IRQ_INTID, false, st_irq, NULL);
++	}
++	printf("SWEET SECTS: sense on; %s\n", st_irq_on ? "interrupt (TLMM gpio9, INTID 240)" : "polling every 8 ms");
++	unsigned errors = 0, events = 0, ticks = 0, missed = 0;
++	uint32_t seen = 0;
+ 	while (!st.dead) {
+ 		uint8_t ev[8];
+-		/* The IRQ line (level low) says events are queued; also read every
+-		 * ~100 ms in case the line does not work as assumed. */
+-		bool poll = (++ticks % 12u) == 0;
++		/* The IRQ line (level low) says events are queued; when polling also
++		 * read every ~100 ms in case the line does not work as assumed. */
++		bool poll = st_irq_on || (++ticks % 12u) == 0;
+ 		for (unsigned n = 0; n < 32 && (poll || st_irq_asserted()) && !st.dead; ++n) {
+ 			poll = false;
+ 			if (st_read(SEC_READ_ONE_EVENT, ev, sizeof(ev))) {
+@@ -630,7 +686,29 @@ st_thread(void *arg, wait_result_t result)
+ 			}
+ 			st_handle(ev);
+ 		}
+-		st_wait(8);
++		if (!st_irq_on) {
++			if (irq && st_irq_others > 1000 && st_irq_others < 2000) {
++				st_irq_others = 2000;
++				printf("SWEET SECTS: summary interrupt held by another pin (%u ours): polling\n", st_irqs);
++			}
++			st_wait(8);
++			continue;
++		}
++		seen = st_irqs;
++		st_irq_wait(500);
++		/* Timed out with the line low and no interrupt: it is not reaching us. */
++		if (st_irq_on && st_irqs == seen && st_irq_asserted() && ++missed >= 3) {
++			sweet_spi_mask(ST_IRQ_INTID, true);
++			st_irq_on = false;
++			printf("SWEET SECTS: attention low but no interrupt (%u taken): polling every 8 ms\n", st_irqs);
++		}
++		if (st_irqs != seen) {
++			missed = 0;
++		}
++	}
++	if (st_irq_on) {
++		sweet_spi_mask(ST_IRQ_INTID, true);
++		st_wr(st.west, ST_INTR_CFG(ST_PIN_IRQ), ST_INTR_CFG_ON);
+ 	}
+ 	st_release_all();
+ out:
+-- 
+2.43.0

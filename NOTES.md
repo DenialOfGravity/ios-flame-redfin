@@ -138,3 +138,11 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
 - 0909 haptics: skip the halt check of the hardware-gated wrapper 1 s_ahb branch (r9 stopped there).
 - 0908 a620 zap shader into 1 MB-aligned memory (b02's p_align; r8 failed PAS mem setup at 0x8bc15400 with
   0xffcfffba after GMU, HFI, GX and ME_INIT had all worked): `sweetzappa=PA`, 0xc8100000, then the DT region.
+- 0910 no set/way D-cache clean on every idle WFI (sailfish 0180: idle CPU 133% -> 22%); AppleKeyStore
+  says no passcode (lock state 0x6, sls 3) so coreduetd stops polling it; AKS logs 5 lines per selector.
+- 0911 GIC SPIs for SWEET drivers (sailfish 0181: `sweet_spi_attach`, dispatched from sleh_irq); sec_ts on
+  its attention interrupt (TLMM gpio9 -> summary SPI 208 = INTID 240) with a polling fallback;
+  `sectouchirq=0` polls as before.
+- 0912 vibration for iOS: sysctl `kern.sweet_haptic` (ms | strength << 16) queues a pulse;
+  `sweetui=1` inserts /var/local/lib/SweetHaptics.dylib (phone/haptics) into SpringBoard and apps,
+  mapping UIKit feedback generators and the vibrate sound onto it; `sweetenv=` from sailfish 0104/0163.

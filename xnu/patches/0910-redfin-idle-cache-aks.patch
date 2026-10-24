@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sat, 24 Oct 2026 14:06:52 +0200
+Subject: [PATCH] 0910 redfin: no set/way cache clean on idle; AKS reports no passcode
+
+From sailfish 0180: cpu_idle cleaned and invalidated the whole D-cache by
+set/way on every WFI (platform_cache_idle_enter). The caches stay coherent
+and powered while a core waits, so SWEET skips it (sailfish measured idle
+CPU 133% -> 22%). AppleKeyStore answers lock state 0x6 (no passcode,
+unlocked since boot) and sls 3: with 0x4/0, coreduetd polled the device
+state thousands of times a minute (r10 log: 2678 AKS lines). AKS logs at
+most 5 lines per selector.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GizUhEzkc6MoTcLnCZCfFa
+---
+  osfmk/arm64/cpu.c | 7 ++++++-
+  iokit/Kernel/arm/SweetKeyStore.cpp | 20 +++++++++++++-------
+
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index b082a10..c670765 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -568,7 +568,12 @@ cpu_idle(void)
+ #endif /* MONOTONIC */
+ 
+ 	if (wfi) {
+-#if !defined(APPLE_ARM64_ARCH_FAMILY)
++#if !defined(APPLE_ARM64_ARCH_FAMILY) && !defined(SWEET)
++		/*
++		 * (Not on SWEET: the caches stay coherent and powered while a core
++		 * waits; this cleaned and invalidated the whole D-cache by set/way
++		 * on every idle entry. HackiOS's generic boards skip it too.)
++		 */
+ 		platform_cache_idle_enter();
+ #endif
+ 
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index 73d9267..610fe3a 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -55,9 +55,12 @@ enum {
+ 
+ /*
+  * aks lock state bits (aks_get_lock_state): bit 2 is "unlocked since boot"
+- * (MobileKeyBag MKBDeviceUnlockedSinceBoot); clear lock bits = unlocked.
++ * (MobileKeyBag MKBDeviceUnlockedSinceBoot), bit 1 "no passcode"; clear
++ * lock bits = unlocked. 0910 (after sailfish 0180): with only bit 2 and lock
++ * state 0, coreduetd asked thousands of times a minute; answer no passcode,
++ * lock state disabled (HackiOS MiniAppleKeyStore.cpp does the same).
+  */
+-#define SWEET_AKS_LOCK_STATE    0x4
++#define SWEET_AKS_LOCK_STATE    0x6
+ 
+ class AppleKeyStore : public IOService {
+ 	OSDeclareDefaultStructors(AppleKeyStore);
+@@ -150,7 +153,7 @@ sweet_aks_device_state(IOExternalMethodArguments *args)
+ 		const char *key;
+ 		uint8_t value;
+ 	} fields[] = {
+-		{ "ss", SWEET_AKS_LOCK_STATE }, { "sls", 0 }, { "sb", 0 }, { "sfa", 0 },
++		{ "ss", SWEET_AKS_LOCK_STATE }, { "sls", 3 }, { "sb", 0 }, { "sfa", 0 },
+ 		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
+ 	};
+ 	uint8_t buf[128];
+@@ -275,10 +278,13 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		break;
+ 	}
+ 
+-	char name[32];
+-	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	static uint32_t logged[128];            /* a few lines per selector */
++	if (selector >= 128 || logged[selector]++ < 5) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
++		    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	}
+ 	return ret;
+ }
+ #endif /* SWEET */
+-- 
+2.43.0
