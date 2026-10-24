@@ -1,0 +1,115 @@
+From b90380a4fc1cec992e1a053a4dd5861191241b65 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sat, 24 Oct 2026 12:38:39 +0200
+Subject: [PATCH] 0908 redfin: a620 zap into 1 MB-aligned memory, with
+ fallbacks
+
+r8's GPU trail: GMU booted, HFI tables acked, GX on, CP ME_INIT idle,
+then "zap: mem setup rc 4291821498" (0xffcfffba) for pil_gpu_region
+0x8bc15400. a620_zap.b02's program header asks for 1 MB alignment and
+redfin's kgsl-hyp node has no memory-region (Linux's PIL allocates
+aligned memory), so try: boot-arg sweetzappa=PA, 0xc8100000 (1 MB
+aligned, outside XNU and the GPU pool), then the DT region, with a
+PAS_SHUTDOWN and a fresh init-image between tries. SCM codes in hex.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GizUhEzkc6MoTcLnCZCfFa
+---
+ bsd/dev/sweet_a6xx.c | 62 ++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 49 insertions(+), 13 deletions(-)
+
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index f2c0f99..b16dab2 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -9,6 +9,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
+ #else
+ #include <string.h>
+ #endif
+@@ -1073,31 +1074,66 @@ static int64_t scm(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint6
+ 	return (int64_t)x[0];
+ }
+ 
+-static int zap_load(struct a6_gpu *g)
++/*
++ * 0908 (redfin): r8's GPU log stopped at "zap: mem setup rc 4291821498" (0xffcfffba) for pil_gpu_region
++ * 0x8bc15400. a620_zap.b02's program header asks for 1 MB alignment (p_align 0x100000; sunfish's a615
++ * zap did not) and redfin's kgsl-hyp node has no memory-region, so Linux's PIL put it in memory it
++ * allocated with that alignment. Tried in order: boot-arg sweetzappa=PA (if given), 0xc8100000 (1 MB
++ * aligned HLOS RAM outside XNU and the GPU pool), then the DT region; between tries the PAS state is
++ * reset (PAS_SHUTDOWN) and the image initialised again.
++ */
++static int zap_try(struct a6_gpu *g, uint64_t pa, const uint8_t *b02, uint32_t slen)
+ {
+ 	uint64_t r1 = 0;
+-	uint32_t mlen, slen;
+-	const uint8_t *mdt = a6_firmware(ZAP_MDT, &mlen), *b02 = a6_firmware(ZAP_B02, &slen);
+-	if (!mdt || !b02 || slen > ZAP_SIZE)
+-		return -1;
+-	a6_write(a6_pool_pa(g, A6_OFF_ZAP_META), mdt, mlen);
+ 	int64_t rc = scm(1, 2 | (2u << 6), PAS_GPU, a6_pool_pa(g, A6_OFF_ZAP_META), 0, &r1);
+ 	if (rc || r1) {
+-		a6_log("zap: init image rc %lld r1 %llx\n", (long long)rc, (unsigned long long)r1);
++		a6_log("zap: init image rc %llx r1 %llx\n", (unsigned long long)rc, (unsigned long long)r1);
+ 		return -1;
+ 	}
+-	rc = scm(2, 3, PAS_GPU, ZAP_REGION, ZAP_SIZE, &r1);
++	rc = scm(2, 3, PAS_GPU, pa, ZAP_SIZE, &r1);
+ 	if (rc || r1) {
+-		a6_log("zap: mem setup rc %lld r1 %llx\n", (long long)rc, (unsigned long long)r1);
+-		return -1;
++		a6_log("zap: mem setup at %llx rc %llx r1 %llx\n", (unsigned long long)pa, (unsigned long long)rc,
++		    (unsigned long long)r1);
++		return -2;
+ 	}
+ 	static uint8_t seg[ZAP_SIZE];
+ 	memset(seg, 0, sizeof(seg));
+ 	memcpy(seg, b02, slen);
+-	a6_write(ZAP_REGION, seg, ZAP_SIZE);
++	a6_write(pa, seg, ZAP_SIZE);
+ 	rc = scm(5, 1, PAS_GPU, 0, 0, &r1);
+-	a6_log("zap: auth and reset rc %lld r1 %llx\n", (long long)rc, (unsigned long long)r1);
+-	return rc || r1 ? -1 : 0;
++	a6_log("zap: at %llx: auth and reset rc %llx r1 %llx\n", (unsigned long long)pa, (unsigned long long)rc,
++	    (unsigned long long)r1);
++	return rc || r1 ? -3 : 0;
++}
++
++static int zap_load(struct a6_gpu *g)
++{
++	uint32_t mlen, slen;
++	const uint8_t *mdt = a6_firmware(ZAP_MDT, &mlen), *b02 = a6_firmware(ZAP_B02, &slen);
++	if (!mdt || !b02 || slen > ZAP_SIZE)
++		return -1;
++	a6_write(a6_pool_pa(g, A6_OFF_ZAP_META), mdt, mlen);
++#if A6_GPU_ID == 620
++	uint64_t try_pa[3] = { 0, 0xc8100000ull, ZAP_REGION };
++#ifdef KERNEL
++	uint64_t over = 0;
++	if (PE_parse_boot_argn("sweetzappa", &over, sizeof(over)) && over && !(over & 0xfff))
++		try_pa[0] = over;
++#endif
++	for (unsigned i = 0; i < 3; i++) {
++		if (!try_pa[i])
++			continue;
++		int rc = zap_try(g, try_pa[i], b02, slen);
++		if (rc == 0)
++			return 0;
++		uint64_t r1 = 0;
++		int64_t src = scm(6, 1, PAS_GPU, 0, 0, &r1);	/* PAS_SHUTDOWN before the next try */
++		a6_log("zap: try %u failed (%d); pas shutdown rc %llx\n", i, rc, (unsigned long long)src);
++	}
++	return -1;
++#else
++	return zap_try(g, ZAP_REGION, b02, slen);
++#endif
+ }
+ 
+ /* ---- ring ---- */
+-- 
+2.43.0
+
