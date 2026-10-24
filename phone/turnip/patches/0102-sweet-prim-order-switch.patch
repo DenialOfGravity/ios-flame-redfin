@@ -1,0 +1,35 @@
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index dba43f9a9c9..ae72a0fed5b 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -3769,6 +3769,10 @@ tu6_emit_prim_mode_sysmem(struct tu_cs *cs,
+     */
+    raster_order_attachment_access |= TU_DEBUG(RAST_ORDER);
+ 
++   /* sweet 0102: TU_SWEET_PRIM_ORDER=0 (metal2vulkan's fetch blending): no per-overlap flush in
++    * sysmem either (no UBWC on these targets). */
++   static const unsigned sweet_prim_order = debug_get_num_option("TU_SWEET_PRIM_ORDER", 1);
++
+    /* If there is a feedback loop, then the shader can read the previous value
+     * of a pixel being written out. It can also write some components and then
+     * read different components without a barrier in between. This is a
+@@ -3781,6 +3785,8 @@ tu6_emit_prim_mode_sysmem(struct tu_cs *cs,
+       (raster_order_attachment_access || feedback_loops ||
+        fs->fs.dynamic_input_attachments_used) ?
+       FLUSH_PER_OVERLAP_AND_OVERWRITE : NO_FLUSH;
++   if (!sweet_prim_order)
++      sysmem_prim_mode = NO_FLUSH;
+ 
+    if (sysmem_prim_mode == FLUSH_PER_OVERLAP_AND_OVERWRITE)
+       *sysmem_single_prim_mode = true;
+@@ -4419,6 +4425,10 @@ tu_pipeline_builder_parse_rasterization_order(
+        */
+       gmem_prim_mode = FLUSH_PER_OVERLAP;
+    }
++   /* sweet 0102: TU_SWEET_PRIM_ORDER=0: rasterization-order access without the per-overlap flush (a
++    * test of what it costs; overlapping fetch draws may then read a stale pixel) */
++   if (!debug_get_num_option("TU_SWEET_PRIM_ORDER", 1))
++      gmem_prim_mode = NO_FLUSH;
+ 
+    struct tu_cs cs;
+ 
