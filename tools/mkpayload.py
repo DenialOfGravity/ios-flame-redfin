@@ -155,8 +155,8 @@ def add_poke_to_adt(adt_blob, script):
     return adt.serialize(root)
 
 
-# redfin Adreno 620 (kgsl adreno_gpu_core_a620): a650 GMU + SQE, a620 zap. Which a620_zap.bNN
-# holds the image is unverified: check vendor.img /firmware (sunfish: a618/a630/a615_zap.b02).
+# redfin Adreno 620 (kgsl adreno_gpu_core_a620): a650 GMU + SQE, a620 zap. a620_zap.mdt's only
+# PT_LOAD segment is b02 (paddr 0x5000, 0x68c bytes, relocatable): it goes at pil_gpu_region's start.
 GPU_FW = ('a650_gmu.bin', 'a650_sqe.fw', 'a620_zap.mdt', 'a620_zap.b02')
 
 

@@ -13,10 +13,22 @@ P=$PWD/work/boot
 base="debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 ufsrw=1 rootrw=1"
 base="$base unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1"
 base="$base wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 ufslogsecs=2 flamereboot=1800"
-base="$base flametouch=0 sweettouch=0 sweetkeys=1 sweetusb=2 sweetgpu=0 sweetgpufreq=5 sweetgpudelay=0 sweetfb_thread=0 sweetmtl=0 sweetddr=0"
+base="$base flametouch=0 sweettouch=0 sweetkeys=1 sweetusb=2 sweetgpu=0 sweetgpufreq=3 sweetgpudelay=0 sweetfb_thread=0 sweetmtl=0 sweetddr=0"
 base="$base sweetbattery=1 sectouch=0"
-# redfin: touch is Samsung sec_ts on SPI SE0 (no driver yet), so sweettouch/flametouch stay 0.
-# GPU is an A620: sweetgpu=0 sweetmtl=0 (CPU rendering) until the redfin GPU patches exist.
+# redfin: touch is Samsung sec_ts on SPI SE0 (sectouch=1), so sweettouch/flametouch stay 0.
+# GPU (A620, xnu 0904/0905): sweetgpu=0 sweetmtl=0 = CPU rendering. GPU=1 below = kernel GPU + the GPU
+# present (CA still renders on the CPU); GPU=2 = plus Metal on Turnip (sweetmtl=2, needs the metal2 install);
+# FLIP=1 adds the double-buffered present (sweetfbflip=1). sweetgpufreq: 1 275, 2 400, 3 500, 4 625 MHz.
+GPU=${GPU:-0}
+if [ "$GPU" -ge 1 ]; then
+	base=$(printf '%s\n' $base | grep -v -e '^sweetgpu=' -e '^sweetfb_thread=' -e '^sweetddr=' | tr '\n' ' ')
+	base="$base sweetgpu=1 sweetfb_thread=1 sweetddr=1"
+	[ "${FLIP:-0}" = 1 ] && base="$base sweetfbflip=1"
+fi
+if [ "$GPU" -ge 2 ]; then
+	base=$(printf '%s\n' $base | grep -v -e '^sweetmtl=' | tr '\n' ' ')
+	base="$base sweetmtl=2"
+fi
 # Real time: PM8150 RTC + offset (tools/flame-rtc.py LOG calibrates it once).
 [ -f work/rtc-offset ] && base="$base sweetrtcoff=$(cat work/rtc-offset)"
 # Extra args replace defaults with the same key (XNU would take the first).
@@ -26,7 +38,7 @@ for a in "$@"; do
 done
 cmdline="$base $*"
 echo "$cmdline" > "$P/$name.cmdline"
-python3 -I tools/mkpayload.py "$kernel" "$P/redfin-hi.adt" "$P/$name.payload" --cmdline "$cmdline" --gpufw "${GPUFW:-$PWD/../restore/fw/gpu}" >/dev/null
+python3 -I tools/mkpayload.py "$kernel" "$P/redfin-hi.adt" "$P/$name.payload" --cmdline "$cmdline" --gpufw "${GPUFW:-/mnt/c/ClaudeProjects/iOS_Pixel5/ios-redfin-tree/ios-redfin/recon/fw}" >/dev/null
 shim/build.sh "$P/$name.payload" "$P/$name.img" >/dev/null
 echo "$(date +%T) built $name.img; waiting for fastboot"
 until fastboot devices | grep -q fastboot; do sleep 2; done

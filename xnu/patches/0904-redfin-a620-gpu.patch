@@ -1,0 +1,784 @@
+From 0a64ce035fffd45acf9ee9519c80f4d02894c55e Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sat, 24 Oct 2026 11:33:52 +0200
+Subject: [PATCH 1/2] 0904 redfin: Adreno 620 bring-up (A650-family GMU, HFI
+ v2, lito addresses)
+
+sweet_a6xx.h/.c select the GPU with A6_GPU_ID (620 here; 618 and 640 keep
+their values, including the ones sunfish 0129-0148 had made unconditional):
+- lito addresses: GPU 0x3d00000, GPUCC 0x3d90000, kgsl-smmu 0x3da0000,
+  RSCC 0x3de0000 (its own block on the A650 family), chip id 0x06020000,
+  panel buffer 0xa0000000; GCC ddrss_gpu_axi back at 0x71154, plus the
+  gpucc hlos1_vote_gpu_smmu clock lito's SMMU and GMU nodes vote.
+- SMMU: DT masks (GMU <5 0x400>, GPU <0 0x401>) with a fall back to the
+  exact SID if the SMR does not read back, the SMR count from IDR0 (lito
+  has 5), no sunfish attach-impl-defs, GMU SID 4 routed as on sunfish.
+- GMU: kgsl's A650-family VMA (DTCM at 0x10004000; the cache window
+  memory comes from a650_gmu.bin's own PREALLOC_REQ blocks, mapped from
+  the pool), zero-size firmware blocks skipped, RSC sequencer words of the
+  A650 family, PDC TCS addresses from cmd-db (mx/cx/xo, vrm.soc command 3
+  on the A620), cmd-db at lito's fixed 0x80860000, veto_fal10, kgsl's
+  4-queue HFI table with its priorities.
+- HFI v2 tables: the five redfin levels (275/400/500/625 MHz), bandwidth
+  table with lito's CN0/MC0/SH0/ACV addresses from cmd-db.
+- hw_init for the A620 (kgsl a6xx_start + DT): GMEM 512 KB, hang cycles
+  0x3ffff, prim fifo 0x10000 + TSE skip off, UCHE_CLIENT_PF 1, bicubic
+  weights, UBWC 3 with highest bank bit 14, CP_APRIV_CNTL, a650_sqe.fw.
+- a620_zap.mdt/.b02 into pil_gpu_region 0x8bc15400.
+- Kernel present blit: Mesa FD620's magic registers, RB_CCU_CNTL for one CCU.
+sweet_gpu.c: default sweetgpufreq=3 (500 MHz); the GPU buffer pool skips
+kregistry_mem (0xc8000000) and the log trail at 0xe2000000.
+SweetAccelerator: Adreno 620 device info for Turnip (chip 0x06020000,
+512 KB GMEM, hbb 14, UBWC 3).
+
+Sources: LineageOS android_kernel_google_redbull lineage-22.2
+(drivers/gpu/msm adreno-gpulist.h, adreno_a6xx.c, adreno_a6xx_gmu.c,
+kgsl_gmu.c, kgsl_hfi.c; lito-gpu.dtsi, gcc-lito.c, gpucc-lito.c), the
+phone's live DT and firmware (recon), Mesa 85fda3b3 freedreno_devices.py.
+Not run on the phone yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GizUhEzkc6MoTcLnCZCfFa
+---
+ bsd/dev/sweet_a6xx.c                  | 332 ++++++++++++++++++++++++--
+ bsd/dev/sweet_a6xx.h                  |  39 ++-
+ bsd/dev/sweet_gpu.c                   |  17 +-
+ iokit/Kernel/arm/SweetAccelerator.cpp |  14 +-
+ 4 files changed, 368 insertions(+), 34 deletions(-)
+
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 966ebb5..38adad5 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -92,10 +92,16 @@ static void zero_pa(uint64_t pa, uint64_t size)
+ #define TCR2_VAL	((7u << 15) | 2u)
+ 
+ #define GMU_SID		5
++#define GPU_SID		0
++#if A6_GPU_ID == 618
+ /* A618 (0141): DT #iommu-cells = 1 → exact SIDs, mask 0 (the hypervisor drops SMRs with flame's masks) */
+ #define GMU_SID_MASK	0
+-#define GPU_SID		0
+ #define GPU_SID_MASK	0
++#else
++/* lito/sm8150 DT: #iommu-cells = 2, gmu_kernel <5 0x400>, gfx3d_user <0 0x401> (smmu_bank falls back to 0) */
++#define GMU_SID_MASK	0x400
++#define GPU_SID_MASK	0x401
++#endif
+ 
+ #define GMEM_L1(g)	a6_pool_pa(g, 0x0000)
+ #define GMEM_L2_0(g)	a6_pool_pa(g, 0x1000)
+@@ -119,7 +125,11 @@ static void zero_pa(uint64_t pa, uint64_t size)
+ #define VA_HFI		0x60005000u
+ #endif
+ 
++#if A6_GPU_ID == 620
++#define RSCC		0x03de0000ull	/* A650 family: the RSCC is its own block (redfin kgsl-3d0 reg "rscc") */
++#else
+ #define RSCC		(A6_GPU_BASE + 0x6a000ull + 0x23000)	/* GMU + 0x23000; sunfish 0x0508d000 (was hardcoded flame 0x02c6a000) */
++#endif
+ #define RSCC_REG(o)	(RSCC + 4ull * (o))
+ #define PDC		0x0b290000ull
+ #define PDC_REG(o)	(PDC + 4ull * (o))
+@@ -215,9 +225,17 @@ static int power_cx(void)
+ 	       rd32(GPUCC + GPUCC_GMU_RCG + 4), rd32(GPUCC + GPUCC_AHB), rd32(GPUCC + GPUCC_CXO),
+ 	       rd32(GPUCC + GPUCC_CX_GMU));
+ 	branch_on("gcc gpu_cfg_ahb", GCC + 0x71004);
++#if A6_GPU_ID == 618
+ 	branch_on("gcc ddrss_gpu_axi", GCC + 0x4452c);	/* gcc-sdmmagpie (sm8150: 0x71154) */
++#else
++	branch_on("gcc ddrss_gpu_axi", GCC + 0x71154);	/* gcc-sm8150, gcc-lito */
++#endif
+ 	branch_on("gcc gpu_memnoc_gfx", GCC + 0x7100c);
+ 	branch_on("gcc gpu_snoc_dvm_gfx", GCC + 0x71018);
++#if A6_GPU_ID == 620
++	/* 0904: lito's kgsl-smmu and GMU nodes also vote gpu_cc_hlos1_vote_gpu_smmu_clk (gpucc-lito 0x5000) */
++	branch_on("gpucc hlos1_vote_gpu_smmu", GPUCC + 0x5000);
++#endif
+ 
+ 	uint64_t gdsc = GPUCC + GPUCC_CX_GDSCR;
+ 	wr32(gdsc, rd32(gdsc) & ~1u);
+@@ -271,14 +289,22 @@ static void smmu_bank(int smr, int cb, uint64_t ttbr0, uint32_t sid, uint32_t ma
+ 	wr32(SMMU + 0x68, 0);					/* TLBIALLNSNH */
+ 	wr32(SMMU + 0x70, 0);					/* TLBGSYNC */
+ 	wait_bit(SMMU + 0x74, 1, 0, 10);
++#if A6_GPU_ID == 618
+ 	/* A618 (0140): DT attach-impl-defs of arm,smmu-kgsl@5040000, written by arm-smmu at attach */
+ 	static const uint32_t impl[][2] = { {0x6000, 0x2378}, {0x6060, 0x1055}, {0x678c, 0x08}, {0x6794, 0x28},
+ 	    {0x6800, 0x06}, {0x6900, 0x3ff}, {0x6924, 0x204}, {0x6928, 0x11000}, {0x6930, 0x800},
+ 	    {0x6960, 0xffffffff}, {0x6b64, 0x1a5551}, {0x6b68, 0x9a82a382} };
+ 	for (unsigned i = 0; i < sizeof(impl) / sizeof(impl[0]); i++)
+ 		wr32(SMMU + impl[i][0], impl[i][1]);
++#endif
++	/* redfin's kgsl-smmu node has no attach-impl-defs (qsmmu-v500, qcom,skip-init): nothing to write */
+ 	wr32(S2CR(smr), (uint32_t)cb);
+ 	wr32(SMR(smr), (1u << 31) | (mask << 16) | sid);
++	if (mask && rd32(SMR(smr)) != ((1u << 31) | (mask << 16) | sid)) {
++		/* sunfish's hypervisor dropped masked SMRs (0141): take the exact SID instead */
++		a6_log("smmu: smr%d with mask %x reads %x; exact sid %u instead\n", smr, mask, rd32(SMR(smr)), sid);
++		wr32(SMR(smr), (1u << 31) | sid);
++	}
+ 	a6_log("smmu: scr0 %x sgfsr %x s2cr%d %x impl6000 %x; smr0-4 %x %x %x %x %x\n", rd32(SMMU), rd32(SMMU + 0x48),
+ 	    smr, rd32(S2CR(smr)), rd32(SMMU + 0x6000), rd32(SMR(0)), rd32(SMR(1)), rd32(SMR(2)), rd32(SMR(3)), rd32(SMR(4)));
+ 	a6_log("smmu: smr%d %x -> cb%d cbar %x sctlr %x tcr %x tcr2 %x\n", smr, rd32(SMR(smr)), cb,
+@@ -289,7 +315,14 @@ static int smmu_pick(int32_t *smr_out, int32_t *cb_out, int cb_min)
+ {
+ 	int smr = -1, cb = -1;
+ 	uint32_t used_cb = 0;
+-	for (int i = 0; i < 6; i++) {
++	/* SMR count from IDR0.NUMSMRG: redfin's kgsl-smmu has 5 ("stream matching with 5 register groups") */
++	int nsmr = 6;
++#if A6_GPU_ID == 620
++	nsmr = (int)(rd32(SMMU + 0x20) & 0xff);
++	if (nsmr <= 0 || nsmr > 6)
++		nsmr = 5;
++#endif
++	for (int i = 0; i < nsmr; i++) {
+ 		uint32_t m = rd32(SMR(i)), c = rd32(S2CR(i));
+ 		if ((m >> 31) && ((c >> 16) & 3) == 0)
+ 			used_cb |= 1u << (c & 0xff);
+@@ -342,6 +375,64 @@ int a6_clear_fault(const struct a6_gpu *g)
+ 
+ /* ---- stage 2: GMU boot ---- */
+ 
++#if A6_GPU_ID == 620
++/*
++ * A650 family (A620): the GMU's address map is kgsl's gmu_vma, not gmu_vma_legacy: ITCM at 0, one cache
++ * window from 16 KB to 16 MB, DTCM at 256 MB + 16 KB. a650_gmu.bin starts with zero-length blocks that
++ * ask for the cache memory it needs (type 1 PREALLOC_REQ, value = size; redfin's: 0x4000 + 0x8000,
++ * 0x144000 + 0x13000, 0x157000 + 0x9000), as kgsl's gmu_prealloc_req serves them. They are mapped here
++ * from pool + 0x10000 up to the dummy page (0x80000 bytes), and fw_load copies cache blocks through this
++ * table. Type 7 (PREALLOC_PERSIST) at 0x60000000 is the dummy page, mapped anyway.
++ */
++#define GMU_VA_DTCM	0x10004000u
++#define GMU_CACHE_END	0x1000000u
++#define GMU_CACHE_POOL	0x10000u
++#define GMU_CACHE_POOL_END 0x90000u
++#define GMU_PREALLOC_MAX 8
++static struct { uint32_t va, size; uint64_t pa; } gmu_prealloc[GMU_PREALLOC_MAX];
++static unsigned gmu_nprealloc;
++
++static int gmu_prealloc_map(struct a6_gpu *g)
++{
++	uint32_t len;
++	const uint8_t *fw = a6_firmware("a650_gmu.bin", &len);
++	if (!fw)
++		return -1;
++	uint32_t next = GMU_CACHE_POOL;
++	gmu_nprealloc = 0;
++	for (uint32_t o = 0; o + 16 <= len; o += 16) {
++		uint32_t blk[4];
++		memcpy(blk, fw + o, 16);	/* addr, size, type, value */
++		if (blk[1])
++			break;			/* zero-length metadata blocks come first */
++		if (blk[2] != 1 || blk[0] < VA_ICACHE || blk[0] >= GMU_CACHE_END)
++			continue;		/* ITCM/DTCM ranges, versions, the persistent dummy page */
++		uint32_t va = blk[0] & ~0xfffu, size = (blk[0] + blk[3] - va + 0xfff) & ~0xfffu;
++		if (gmu_nprealloc == GMU_PREALLOC_MAX || va + size > 0x200000 || next + size > GMU_CACHE_POOL_END) {
++			a6_log("gmu: prealloc %x + %x does not fit (pool next %x)\n", blk[0], blk[3], next);
++			return -1;
++		}
++		gmu_prealloc[gmu_nprealloc].va = va;
++		gmu_prealloc[gmu_nprealloc].size = size;
++		gmu_prealloc[gmu_nprealloc].pa = a6_pool_pa(g, next);
++		map_gmu_pages(GMEM_L3_LOW(g), va, a6_pool_pa(g, next), size, 1);
++		a6_log("gmu: cache %x + %x -> pool + %x\n", va, size, next);
++		gmu_nprealloc++;
++		next += size;
++	}
++	return gmu_nprealloc ? 0 : -1;
++}
++
++/* Pool PA for a GMU cache-window address range, 0 if no prealloc covers it */
++static uint64_t gmu_prealloc_pa(uint32_t addr, uint32_t size)
++{
++	for (unsigned i = 0; i < gmu_nprealloc; i++)
++		if (addr >= gmu_prealloc[i].va && addr + size <= gmu_prealloc[i].va + gmu_prealloc[i].size)
++			return gmu_prealloc[i].pa + (addr - gmu_prealloc[i].va);
++	return 0;
++}
++#endif
++
+ static int gmu_smmu(struct a6_gpu *g)
+ {
+ 	if (smmu_pick(&g->gmu_smr, &g->gmu_cb, 0)) {
+@@ -353,14 +444,19 @@ static int gmu_smmu(struct a6_gpu *g)
+ 	wr64(GMEM_L1(g) + 8, GMEM_L2_1(g) | 3);
+ 	wr64(GMEM_L2_0(g) + 0, GMEM_L3_LOW(g) | 3);
+ 	wr64(GMEM_L2_1(g) + 8 * ((VA_DUMMY >> 21) & 0x1ff), GMEM_L3_6(g) | 3);
++#if A6_GPU_ID == 620
++	if (gmu_prealloc_map(g))
++		return -1;
++#else
+ 	map_gmu_pages(GMEM_L3_LOW(g), VA_ICACHE, GMEM_ICACHE(g), CACHE_SIZE, 1);
+ 	map_gmu_pages(GMEM_L3_LOW(g), VA_DCACHE, GMEM_DCACHE(g), CACHE_SIZE, 1);
++#endif
+ 	map_gmu_pages(GMEM_L3_6(g), VA_DUMMY, GMEM_DUMMY(g), 0x1000, 0);
+ 	map_gmu_pages(GMEM_L3_6(g), VA_LOG, GMEM_LOG(g), A6_GMU_LOG_SIZE, 0);
+ 	map_gmu_pages(GMEM_L3_6(g), VA_HFI, GMEM_HFI(g), 0x5000, 0);	/* table + 4 queues */
+ 	smmu_bank(g->gmu_smr, g->gmu_cb, GMEM_L1(g), GMU_SID, GMU_SID_MASK);
+-#if A6_GPU_ID == 618
+-	/* 0142: the A618 GMU also has SID 4 (DT gmu_user cb); route it to the same bank */
++#if A6_GPU_ID == 618 || A6_GPU_ID == 620
++	/* 0142: the A618 GMU also has SID 4 (DT gmu_user cb); route it to the same bank (redfin's DT has it too) */
+ 	int32_t smr4, cb_unused;
+ 	if (!smmu_pick(&smr4, &cb_unused, g->gmu_cb + 1)) {
+ 		wr32(S2CR(smr4), (uint32_t)g->gmu_cb);
+@@ -371,37 +467,78 @@ static int gmu_smmu(struct a6_gpu *g)
+ 	return 0;
+ }
+ 
+-/* a6xx_gmu_rpmh_init (pdc_address_offset 0x30090 for A640 and A618; sunfish: TCS3 cmd1 data 2). */
++static uint32_t cmddb_addr(const char *id);
++
++/*
++ * a6xx_gmu_rpmh_init: kgsl _load_gmu_rpmh_ucode. The TCS addresses are cmd-db's mx.lvl, cx.lvl and xo.lvl
++ * (flame's were 0x30010, 0x30000, 0x30090; flame and sunfish wrote them as constants, kept for those).
++ * TCS3 cmd1 data: 2 on the A618 and the A650 family (A620), 3 on the A640.
++ * A650 family (0904): the RSCC is its own block (DT "rscc", RSCC above), its sequencer has other words, and
++ * the A620 adds a fourth command per TCS for vrm.soc + 4 when cmd-db has it (enable banks stay 7, as kgsl).
++ */
+ static void rpmh_init(void)
+ {
++#if A6_GPU_ID == 620
++	static const uint32_t rsc_seq[] = { 0xeaaae5a0, 0xe1a1ebab, 0xa2e0a581, 0xecac82e2, 0x0020edad };
++#else
++	static const uint32_t rsc_seq[] = { 0xa7a506a0, 0xa1e6a6e7, 0xa2e081e1, 0xe9a982e2, 0x0020e8a8 };
++#endif
+ 	static const uint32_t rscc[][2] = {
+ 		{ 0x0004, 1u << 24 }, { 0x000b, 1 }, { 0x000e, 0 }, { 0x000d, 0 }, { 0x0010, 0 }, { 0x000f, 0 },
+ 		{ 0x0012, 0x80000000 }, { 0x0011, 0 }, { 0x0100, 0 }, { 0x0008, 0x4520 }, { 0x0009, 0x4510 },
+-		{ 0x000a, 0x4514 }, { 0x0180, 0xa7a506a0 }, { 0x0181, 0xa1e6a6e7 }, { 0x0182, 0xa2e081e1 },
+-		{ 0x0183, 0xe9a982e2 }, { 0x0184, 0x0020e8a8 },
++		{ 0x000a, 0x4514 },
+ 	};
+ 	static const uint32_t seq[] = { 0xfebea1e1, 0xa5a4a3a2, 0x8382a6e0, 0xbce3e284, 0x002081fc };
+-	static const uint32_t pdc[][2] = {
+-		{ 0x1573, 7 }, { 0x1574, 0 }, { 0x1572, 0 }, { 0x1575, 0x10108 }, { 0x1576, 0x30010 },
+-		{ 0x1577, 1 }, { 0x1579, 0x10108 }, { 0x157a, 0x30000 }, { 0x157b, 0 }, { 0x157d, 0x10108 },
+-		{ 0x157e, 0x30090 }, { 0x157f, 0 },
+-		{ 0x15d7, 7 }, { 0x15d8, 0 }, { 0x15d6, 0 }, { 0x15d9, 0x10108 }, { 0x15da, 0x30010 },
+-		{ 0x15db, 2 }, { 0x15dd, 0x10108 }, { 0x15de, 0x30000 }, { 0x15df, 2 }, { 0x15e1, 0x10108 },	/* TCS3 cmd1 data: A618 2, A640 3 */
+-		{ 0x15e2, 0x30090 }, { 0x15e3, 3 },
+-		{ 0x1148, 0 }, { 0x1140, 0x80000001 },
++	uint32_t mx = 0x30010, cx = 0x30000, xo = 0x30090, vrm = 0;
++#if A6_GPU_ID == 620
++	uint32_t a;
++	if ((a = cmddb_addr("mx.lvl")) != 0)
++		mx = a;
++	if ((a = cmddb_addr("cx.lvl")) != 0)
++		cx = a;
++	if ((a = cmddb_addr("xo.lvl")) != 0)
++		xo = a;
++	vrm = cmddb_addr("vrm.soc");
++	a6_log("rpmh: cmd-db mx.lvl %x cx.lvl %x xo.lvl %x vrm.soc %x\n", mx, cx, xo, vrm);
++#endif
++#if A6_GPU_ID == 640
++	const uint32_t tcs3_cx = 3;
++#else
++	const uint32_t tcs3_cx = 2;
++#endif
++	const uint32_t pdc[][2] = {
++		{ 0x1573, 7 }, { 0x1574, 0 }, { 0x1572, 0 }, { 0x1575, 0x10108 }, { 0x1576, mx },
++		{ 0x1577, 1 }, { 0x1579, 0x10108 }, { 0x157a, cx }, { 0x157b, 0 }, { 0x157d, 0x10108 },
++		{ 0x157e, xo }, { 0x157f, 0 },
++		{ 0x15d7, 7 }, { 0x15d8, 0 }, { 0x15d6, 0 }, { 0x15d9, 0x10108 }, { 0x15da, mx },
++		{ 0x15db, 2 }, { 0x15dd, 0x10108 }, { 0x15de, cx }, { 0x15df, tcs3_cx }, { 0x15e1, 0x10108 },
++		{ 0x15e2, xo }, { 0x15e3, 3 },
+ 	};
+ 	for (unsigned i = 0; i < sizeof(rscc) / sizeof(rscc[0]); i++)
+ 		wr32(RSCC_REG(rscc[i][0]), rscc[i][1]);
++	for (unsigned i = 0; i < sizeof(rsc_seq) / sizeof(rsc_seq[0]); i++)
++		wr32(RSCC_REG(0x0180 + i), rsc_seq[i]);
+ 	for (unsigned i = 0; i < sizeof(seq) / sizeof(seq[0]); i++)
+ 		wr32(PDC_SEQ + 4 * i, seq[i]);
+ 	for (unsigned i = 0; i < sizeof(pdc) / sizeof(pdc[0]); i++)
+ 		wr32(PDC_REG(pdc[i][0]), pdc[i][1]);
++	if (vrm) {
++		/* TCS1/TCS3 cmd3 (PDC_CMD_OFFSET 4 words per command) */
++		wr32(PDC_REG(0x1575 + 12), 0x10108);
++		wr32(PDC_REG(0x1576 + 12), vrm + 4);
++		wr32(PDC_REG(0x1577 + 12), 0);
++		wr32(PDC_REG(0x15d9 + 12), 0x10108);
++		wr32(PDC_REG(0x15da + 12), vrm + 4);
++		wr32(PDC_REG(0x15db + 12), 1);
++	}
++	wr32(PDC_REG(0x1148), 0);		/* PDC_GPU_SEQ_START_ADDR */
++	wr32(PDC_REG(0x1140), 0x80000001);	/* PDC_GPU_ENABLE_PDC */
+ }
+ 
+ static void hfi_table(struct a6_gpu *g)
+ {
+ 	uint64_t t = GMEM_HFI(g);
+-#if A6_GPU_ID == 618
++#if A6_GPU_ID == 618 || A6_GPU_ID == 620
+ 	/* kgsl hfi_init: HFI_QUEUE_MAX = 4 queues (the 4th, dispatch, disabled),
+ 	 * sizes in dwords (flame wrote bytes for 3 queues; the A640 fw tolerated it). */
+ 	const uint32_t nq = 4;
+@@ -423,6 +560,10 @@ static void hfi_table(struct a6_gpu *g)
+ #if A6_GPU_ID == 618
+ 		static const uint32_t legacy_idx[4] = { 0, 4, 5, 1 };	/* cmd, msg, dbg, dsp0 (HFI_*_IDX_LEGACY) */
+ 		wr32(h + 8, (10u << 8) | legacy_idx[q]);
++#elif A6_GPU_ID == 620
++		/* QUEUE_HDR_TYPE(idx, pri): cmd 0/10, msg 1/10, dbg 2/40, dsp0 3/20 (kgsl_hfi.h) */
++		static const uint32_t pri[4] = { 10, 10, 40, 20 };
++		wr32(h + 8, (pri[q] << 8) | q);
+ #else
+ 		wr32(h + 8, (10u << 8) | q);
+ #endif
+@@ -436,7 +577,13 @@ static void hfi_table(struct a6_gpu *g)
+ static int fw_load(struct a6_gpu *g)
+ {
+ 	uint32_t len;
++#if A6_GPU_ID == 620
++	const uint8_t *fw = a6_firmware("a650_gmu.bin", &len);	/* kgsl adreno_gpu_core_a620.gmufw_name */
++#elif A6_GPU_ID == 618
+ 	const uint8_t *fw = a6_firmware("a618_gmu.bin", &len);
++#else
++	const uint8_t *fw = a6_firmware("a640_gmu.bin", &len);
++#endif
+ 	if (!fw)
+ 		return -1;
+ #if A6_GPU_ID == 618
+@@ -457,8 +604,18 @@ static int fw_load(struct a6_gpu *g)
+ 		memcpy(&size, p + 4, 4);
+ 		const uint8_t *data = p + 16;
+ 		uint64_t dst = 0;
++		if (size == 0) {		/* metadata (kgsl load_gmu_fw skips zero-size blocks) */
++			p = data;
++			continue;
++		}
+ 		if (addr < 0x4000)
+ 			dst = GMU_REG(GMU_ITCM) + addr;
++#if A6_GPU_ID == 620
++		else if (addr >= GMU_VA_DTCM && addr + size <= GMU_VA_DTCM + 0x4000)
++			dst = GMU_REG(GMU_DTCM) + (addr - GMU_VA_DTCM);
++		else if (addr >= VA_ICACHE && addr + size <= GMU_CACHE_END)
++			dst = gmu_prealloc_pa(addr, size);
++#endif
+ 		else if (addr >= 0x40000 && addr < 0x44000)
+ 			dst = GMU_REG(GMU_DTCM) + (addr - 0x40000);
+ 		else if (addr >= VA_ICACHE && addr + size <= VA_ICACHE + CACHE_SIZE)
+@@ -483,6 +640,10 @@ static int gmu_boot(struct a6_gpu *g)
+ 	rpmh_init();
+ 	hfi_table(g);
+ 
++#if A6_GPU_ID == 620
++	/* kgsl a6xx_gmu_fw_start: veto_fal10 (adreno_gpu_core_a620) -> GPU_GMU_CX_GMU_CX_FAL_INTF = 1 */
++	wr32(GMU_REG(0x1f8f0), 1);
++#endif
+ 	wr32(GMU_REG(GMU_GENERAL_7), 1);
+ 	wr32(GMU_REG(GMU_RSCC_REQ), 1u << 1);
+ 	(void)wait_bit(GMU_REG(GMU_RSCC_ACK), 1u << 1, 1, 200);	/* never acks; harmless */
+@@ -557,6 +718,13 @@ static int gmu_boot(struct a6_gpu *g)
+ static const uint32_t gpu_khz[] = { 0, 180000, 267000, 355000, 430000, 565000, 650000, 800000, 825000 };
+ static const uint32_t gpu_lvl[] = { 0, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_SVS_L2, LVL_NOM, LVL_NOM_L1, LVL_TURBO,
+     LVL_TURBO_L1 };
++#elif A6_GPU_ID == 620
++/*
++ * 0904: redfin live DT gpu-pwrlevels-0/-1 (speed bins 0 and 132; SM7250 "765G"): 275 LOW_SVS, 400 SVS,
++ * 500 SVS_L1, 625 NOM (lito-gpu.dtsi opp table). Bin 115 tops out at 540, same NOM corner.
++ */
++static const uint32_t gpu_khz[] = { 0, 275000, 400000, 500000, 625000 };
++static const uint32_t gpu_lvl[] = { 0, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_NOM };
+ #else
+ static const uint32_t gpu_khz[] = { 0, 180000, 267000, 355000, 430000, 565000 };
+ static const uint32_t gpu_lvl[] = { 0, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_SVS_L2, LVL_NOM };
+@@ -565,10 +733,26 @@ static const uint32_t gpu_lvl[] = { 0, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_SVS
+ static const uint32_t gmu_khz[] = { 0, 200000 };
+ static const uint32_t gmu_lvl[] = { 0, LVL_MIN_SVS };
+ 
+-static int cmddb_aux(const char *id, uint64_t *aux, uint32_t *len)
++#define CMDDB_MAGIC	0x0c0330db
++#define CMDDB_LITO	0x80860000ull	/* lito.dtsi qcom,cmd-db: a fixed reserved-memory region (0901) */
++
++static uint64_t cmddb_base(void)
+ {
++#if A6_GPU_ID == 620
++	if (rd32(CMDDB_LITO + 4) == CMDDB_MAGIC)
++		return CMDDB_LITO;
++#endif
+ 	uint64_t db = rd32(0x0c3f000cull);
+-	if (rd32(db + 4) != 0x0c0330db)
++	if (db < 0x80000000ull || (db & 3))
++		return 0;	/* no AOP locator (lito): do not read through a random address */
++	return rd32(db + 4) == CMDDB_MAGIC ? db : 0;
++}
++
++/* cmd-db entry by name: its RPMh address and aux data (Linux cmd_db_read_addr / cmd_db_read_aux_data) */
++static int cmddb_find(const char *id, uint32_t *addr, uint64_t *aux, uint32_t *len)
++{
++	uint64_t db = cmddb_base();
++	if (!db)
+ 		return -1;
+ 	uint64_t data = db + 4 + 4 + 8 * 16 + 4 + 4;
+ 	for (uint32_t r = 0; r < 8; r++) {
+@@ -584,14 +768,29 @@ static int cmddb_aux(const char *id, uint64_t *aux, uint32_t *len)
+ 			if (strncmp(name, id, 8))
+ 				continue;
+ 			uint32_t w5 = rd32(ent + 20);
+-			*len = w5 & 0xffff;
+-			*aux = data + doff + (w5 >> 16);
++			if (addr)
++				*addr = rd32(ent + 16);
++			if (len)
++				*len = w5 & 0xffff;
++			if (aux)
++				*aux = data + doff + (w5 >> 16);
+ 			return 0;
+ 		}
+ 	}
+ 	return -1;
+ }
+ 
++static uint32_t __attribute__((unused)) cmddb_addr(const char *id)
++{
++	uint32_t a = 0;
++	return cmddb_find(id, &a, NULL, NULL) ? 0 : a;
++}
++
++static int cmddb_aux(const char *id, uint64_t *aux, uint32_t *len)
++{
++	return cmddb_find(id, NULL, aux, len);
++}
++
+ static uint32_t aux16(uint64_t aux, uint32_t i)
+ {
+ 	return (rd32(aux + 2 * (i & ~1u)) >> (16 * (i & 1))) & 0xffff;
+@@ -757,9 +956,9 @@ static int gmu_hfi(struct a6_gpu *g)
+ 	    rd32(SMMU_CB(g->gmu_cb) + CB_FAR + 4), rd32(SMMU_CB(g->gmu_cb) + CB_FAR));
+ #else
+ 	memset(msg, 0, sizeof(msg));
+-	msg[1] = 6;
++	msg[1] = NLVL;
+ 	msg[2] = 2;
+-	for (int i = 0; i < 6; i++) {
++	for (int i = 0; i < NLVL; i++) {	/* v2: struct opp_gx_desc { vote, acd, freq } x 16 */
+ 		msg[3 + 3 * i] = gx[i];
+ 		msg[4 + 3 * i] = 0xffffffff;
+ 		msg[5 + 3 * i] = gpu_khz[i];
+@@ -779,6 +978,37 @@ static int gmu_hfi(struct a6_gpu *g)
+ 	};
+ 	for (unsigned i = 0; i < sizeof(bw) / sizeof(bw[0]); i++)
+ 		msg[bw[i][0]] = bw[i][1];
++#if A6_GPU_ID == 620
++	/*
++	 * 0904: lito's BCM addresses from cmd-db instead of flame's: one cnoc command (CN0, as sunfish) and
++	 * the three DDR ones (MC0, SH0, ACV), level 0 only (the kernel votes MC0/SH0 itself, gpu_bus_vote).
++	 * hfi_bwtable_cmd: cnoc addrs at 6, cnoc data [2][6] at 12, ddr addrs at 24, ddr data [16][8] at 32.
++	 */
++	{
++		static const char *const ddr[] = { "MC0", "SH0", "ACV" };
++		uint32_t cn0 = cmddb_addr("CN0"), da[3], nd = 0;
++		for (unsigned i = 0; i < 3; i++)
++			if ((da[nd] = cmddb_addr(ddr[i])) != 0)
++				nd++;
++		a6_log("hfi: bw cmd-db CN0 %x, ddr %u found (%x %x %x)\n", cn0, nd, nd > 0 ? da[0] : 0,
++		    nd > 1 ? da[1] : 0, nd > 2 ? da[2] : 0);
++		if (cn0 && nd) {
++			memset(msg, 0, sizeof(msg));
++			msg[1] = 1;
++			msg[2] = 1;
++			msg[3] = nd;
++			msg[4] = 1;
++			msg[5] = 1;
++			msg[6] = cn0;
++			msg[12] = 0x40000000;
++			msg[18] = 0x60000001;
++			for (uint32_t i = 0; i < nd; i++) {
++				msg[24 + i] = da[i];
++				msg[32 + i] = 0x40000000;
++			}
++		}
++	}
++#endif
+ 	rc |= hfi_send(g, 3, msg, 32 + 128);
+ 	msg[1] = 0;
+ 	rc |= hfi_send(g, 14, msg, 2);
+@@ -812,7 +1042,20 @@ static int gmu_hfi(struct a6_gpu *g)
+ /* ---- zap shader through TrustZone PAS ---- */
+ 
+ #define PAS_GPU		13
++#if A6_GPU_ID == 620
++/* redfin live DT pil_gpu_region@8bc15400 (0x2000); a620_zap's one loadable segment (b02, 0x68c) goes at its start */
++#define ZAP_REGION	0x8bc15400ull
++#define ZAP_MDT		"a620_zap.mdt"
++#define ZAP_B02		"a620_zap.b02"
++#elif A6_GPU_ID == 618
+ #define ZAP_REGION	0x98f95000ull	/* sunfish reserved-memory gpu_region (flame 0x9a915000) */
++#define ZAP_MDT		"a615_zap.mdt"
++#define ZAP_B02		"a615_zap.b02"
++#else
++#define ZAP_REGION	0x9a915000ull
++#define ZAP_MDT		"a640_zap.mdt"
++#define ZAP_B02		"a640_zap.b02"
++#endif
+ #define ZAP_SIZE	0x2000u
+ #define SCM_PIL(cmd)	(0x42000000ull | (2u << 8) | (cmd))
+ 
+@@ -829,7 +1072,7 @@ static int zap_load(struct a6_gpu *g)
+ {
+ 	uint64_t r1 = 0;
+ 	uint32_t mlen, slen;
+-	const uint8_t *mdt = a6_firmware("a615_zap.mdt", &mlen), *b02 = a6_firmware("a615_zap.b02", &slen);
++	const uint8_t *mdt = a6_firmware(ZAP_MDT, &mlen), *b02 = a6_firmware(ZAP_B02, &slen);
+ 	if (!mdt || !b02 || slen > ZAP_SIZE)
+ 		return -1;
+ 	a6_write(a6_pool_pa(g, A6_OFF_ZAP_META), mdt, mlen);
+@@ -1207,7 +1450,7 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
+ 		/* UCHE: write range max, trap base, write-through base (trap 0x1fffffffff000) */
+ 		{ 0x0e05, 0xffffffc0 }, { 0x0e06, 0x1ffff }, { 0x0e09, 0xfffff000 }, { 0x0e0a, 0x1ffff },
+ 		{ 0x0e07, 0xfffff000 }, { 0x0e08, 0x1ffff },
+-#if A6_GPU_ID == 618
++#if A6_GPU_ID == 618 || A6_GPU_ID == 620
+ 		{ 0x0e0b, 0x100000 }, { 0x0e0c, 0 }, { 0x0e0d, 0x17ffff }, { 0x0e0e, 0 },	/* GMEM range: 512 KB */
+ #else
+ 		{ 0x0e0b, 0x100000 }, { 0x0e0c, 0 }, { 0x0e0d, 0x1fffff }, { 0x0e0e, 0 },	/* GMEM range */
+@@ -1220,18 +1463,37 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
+ 		{ 0x08c2, 0x02000140 }, { 0x08c1, 0x8040362c }, { 0x08c3, 128 },	/* ROQ, mem pool */
+ #endif
+ 		{ 0x098d, 1 }, { 0x0500, 1 },		/* CP_AHB_CNTL, RBBM_PERFCTR_CNTL */
++#if A6_GPU_ID == 620
++		{ 0x001f, (1u << 30) | 0x3ffff },	/* RBBM_INTERFACE_HANG_INT_CNTL: a620 hang_detect_cycles */
++#else
+ 		{ 0x001f, (1u << 30) | 0x1fffff },	/* RBBM_INTERFACE_HANG_INT_CNTL */
+-#if A6_GPU_ID == 618
++#endif
++#if A6_GPU_ID == 618 || A6_GPU_ID == 620
+ 		{ 0x0e19, 1 },				/* UCHE_CLIENT_PF (kgsl) */
+ #else
+ 		{ 0x0e19, (1u << 7) | 1 },		/* UCHE_CLIENT_PF */
+ #endif
++#if A6_GPU_ID == 620
++		/* PC_DBG_ECO_CNTL: a620 prim_fifo_threshold 0x10000 | disable_tseskip (bit 9) */
++		{ 0x9e00, 0x00010000 | (1u << 9) },
++		/* a650 family: bicubic filter weights (TPL1_BICUBIC_WEIGHTS_TABLE_0..4) */
++		{ 0xb608, 0 }, { 0xb609, 0x3fe05ff4 }, { 0xb60a, 0x3fa0ebee }, { 0xb60b, 0x3f5193ed },
++		{ 0xb60c, 0x3f0243f0 },
++#else
+ 		{ 0x9e00, 0x00180000 },			/* PC_DBG_ECO_CNTL: prim_fifo_threshold */
++#endif
+ 		{ 0x08d0, 0 },				/* CP_PERFCTR_CP_SEL[0]: always count */
+ #if A6_GPU_ID == 618
+ 		/* a6xx_set_ubwc_config for A618 (0145): highest bank bit 14 (DT, hbb_lo 1), no AMSBC */
+ 		{ 0x8e08, 1u << 1 }, { 0xb604, 1u << 1 }, { 0xae02, 1u << 1 },
+ 		{ 0x0e01, 1u << 21 }, { 0x0534, 0 },
++#elif A6_GPU_ID == 620
++		/*
++		 * kgsl a6xx_start with redfin's DT: ubwc-mode 3 (mode 0, AMSBC), highest-bank-bit 14 (lower_bit 1),
++		 * min-access-length 32, a650 family uavflagprd_inv 2 in SP_NC_MODE_CNTL.
++		 */
++		{ 0x8e08, (1u << 4) | (1u << 1) }, { 0xb604, 1u << 1 }, { 0xae02, (2u << 4) | (1u << 1) },
++		{ 0x0e01, 1u << 21 }, { 0x0534, 0 },
+ #else
+ 		/* a6xx_set_ubwc_config: highest bank bit 15 (hbb_lo 2), AMSBC, UBWC 3 */
+ 		{ 0x8e08, (1u << 4) | (2u << 1) }, { 0xb604, 2u << 1 }, { 0xae02, 2u << 1 },
+@@ -1242,7 +1504,11 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
+ 		wr32(GREG(init[i][0]), init[i][1]);
+ 
+ 	uint32_t len;
++#if A6_GPU_ID == 620
++	const uint8_t *sqe = a6_firmware("a650_sqe.fw", &len);	/* kgsl adreno_gpu_core_a620.sqefw_name */
++#else
+ 	const uint8_t *sqe = a6_firmware("a630_sqe.fw", &len);
++#endif
+ 	if (!sqe || len < 8 || len > 0x10000)
+ 		return -1;
+ 	a6_write(a6_pool_pa(g, A6_OFF_SQE), sqe + 4, (len - 4 + 3) & ~3u);	/* minus the first dword */
+@@ -1251,6 +1517,10 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
+ 	wr32(GREG(CP_RB_BASE), (uint32_t)a6_pool_va(A6_OFF_RING));
+ 	wr32(GREG(CP_RB_BASE + 1), 0);
+ 	wr32(GREG(CP_RB_CNTL), 0x0800020c);	/* 32K ring, 32-byte blocks, no rptr update */
++#if A6_GPU_ID == 620
++	/* ADRENO_APRIV (a620): CP_APRIV_CNTL = kgsl A6XX_APRIV_DEFAULT (CD write/read, RB rptr wb, priv level, fetch) */
++	wr32(GREG(0x0844), (1u << 6) | (1u << 5) | (1u << 3) | (1u << 2) | (1u << 1));
++#endif
+ 	g->wptr = 0;
+ 	wr32(GREG(CP_SQE_CNTL), 1);
+ 
+@@ -1274,16 +1544,28 @@ int a6_power_up(struct a6_gpu *g)
+ 
+ /* The A640 state turnip writes before any work (tu6_init_hw + the device's magic registers). */
+ static const uint32_t blit_init[][2] = {
++#if A6_GPU_ID == 620
++	/* 0904: Mesa freedreno_devices.py FD620 raw_magic_regs (PC/VFD power 0, TPL1 0x01008000, SP chicken 0x400,
++	 * SP_DBG_ECO 0x01000000, RB_RBP_CNTL 0) instead of the A640's */
++	{ 0x9804, 0x1f }, { 0x9805, 0 }, { 0xa0f8, 0 }, { 0xb600, 0x01008000 }, { 0x8600, 0 },
++	{ 0xae03, 0x400 }, { 0xae00, 0x01000000 }, { 0xbe04, 0 }, { 0x9600, 0x2000000 }, { 0x0e12, 1 },
++	{ 0x8e01, 0 }, { 0x8e04, 0x4100000 }, { 0xae04, 0 }, { 0xae0f, 0x3f }, { 0xb605, 0x44 },
++#else
+ 	{ 0x9804, 0x1f }, { 0x9805, 1 }, { 0xa0f8, 1 }, { 0xb600, 0x8000 }, { 0x8600, 0 },
+ 	{ 0xae03, 0x420 }, { 0xae00, 0 }, { 0xbe04, 0 }, { 0x9600, 0x2000000 }, { 0x0e12, 1 },
+ 	{ 0x8e01, 1 }, { 0x8e04, 0x4100000 }, { 0xae04, 0 }, { 0xae0f, 0x3f }, { 0xb605, 0x44 },
++#endif
+ 	{ 0xbe00, 0x80 }, { 0xbe01, 0 }, { 0xab20, 0 }, { 0xb182, 0 }, { 0xbb11, 0 }, { 0xa9a8, 0 },
+ 	{ 0xab00, 5 }, { 0xa009, 3 }, { 0x8811, 0x10 }, { 0x8110, 0 }, { 0x8818, 0 }, { 0x8819, 0 },
+ 	{ 0x881a, 0 }, { 0x881b, 0 }, { 0x881c, 0 }, { 0x881d, 0 }, { 0x881e, 0 }, { 0x88f0, 0 },
+ 	{ 0x9236, 0 }, { 0x9300, 0 }, { 0x9306, 1 }, { 0xb183, 0 }, { 0x80af, 0 }, { 0x8099, 0 },
+ 	{ 0x980a, 0 }, { 0x9210, 0 }, { 0x9211, 0 }, { 0x9602, 0 }, { 0x9e72, 0 }, { 0xb309, 0xa2 },
+ 	{ 0xb986, 0xfc }, { 0xa007, 0 }, { 0x8864, 0 }, { 0xb800, 0x102 },
++#if A6_GPU_ID == 620
++	{ 0x8e07, 0x08000000 },		/* RB_CCU_CNTL: sysmem, colour after 1 CCU x 64 KB of depth (A640: 2 CCUs) */
++#else
+ 	{ 0x8e07, 0x10000000 },		/* RB_CCU_CNTL: sysmem, full CCU */
++#endif
+ };
+ 
+ #define EV_CACHE_FLUSH_TS	0x04
+diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
+index 2ae7440..d2be646 100644
+--- a/bsd/dev/sweet_a6xx.h
++++ b/bsd/dev/sweet_a6xx.h
+@@ -48,11 +48,34 @@
+ #define A6_RING_SIZE		0x8000u
+ #define A6_RING_DW		(A6_RING_SIZE / 4)
+ 
++/*
++ * Which Adreno this kernel drives: 640 (flame, SM8150), 618 (sunfish, SM7150, legacy GMU) or
++ * 620 (redfin, SM7250 lito: A650-family GMU and register spec, HFI v2, 512 KB GMEM).
++ */
++#ifndef A6_GPU_ID
++#define A6_GPU_ID		620	/* redfin (sunfish: 618, flame: 640) */
++#endif
++
++#if A6_GPU_ID == 620
++#define A6_FB_PA		0xa0000000ull	/* redfin cont_splash_region (0x2300000 long) */
++/*
++ * 0904: two panel buffers for the GPU present (sweetfbflip=1): the front one ABL scans out, the back
++ * one A6_FB_BUF_OFF above it, both inside the splash region. Mapped for the GPU: 10 x 2 MB.
++ */
++#define A6_FB_SIZE		0x1400000ull
++#define A6_FB_BUF_OFF		0xa00000ull
++#define A6_CHIP_ID		0x06020000ull	/* redfin live DT qcom,chipid */
++#elif A6_GPU_ID == 618
+ #define A6_FB_PA		0x9c000000ull
+ #define A6_FB_SIZE		0xa00000ull	/* mapped for the GPU: 5 x 2 MB */
+-
+-#define A6_GPU_ID		618	/* sunfish (flame: 640) */
++#define A6_FB_BUF_OFF		0ull		/* one panel buffer */
+ #define A6_CHIP_ID		0x06010800ull	/* sunfish DT qcom,chipid */
++#else
++#define A6_FB_PA		0x9c400000ull
++#define A6_FB_SIZE		0xa00000ull
++#define A6_FB_BUF_OFF		0ull
++#define A6_CHIP_ID		0x06040001ull
++#endif
+ 
+ struct a6_gpu {
+ 	uint64_t pool_pa;
+@@ -157,10 +180,20 @@ uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *d
+ #define A6_CP_MEMCPY		0x75
+ 
+ /* Register/state access for status and dumps */
++#if A6_GPU_ID == 620
++#define A6_GPU_BASE		0x03d00000ull	/* redfin kgsl-3d0 */
++#define A6_GPUCC		0x03d90000ull	/* gpucc-lito */
++#define A6_SMMU			0x03da0000ull	/* redfin kgsl-smmu (CB5-7 belong to the hypervisor) */
++#elif A6_GPU_ID == 618
+ #define A6_GPU_BASE		0x05000000ull	/* sunfish kgsl-3d0 (flame 0x02c00000) */
+-#define A6_GREG(o)		(A6_GPU_BASE + 4ull * (o))
+ #define A6_GPUCC		0x05090000ull	/* gpucc-sdmmagpie */
+ #define A6_SMMU			0x05040000ull	/* sunfish kgsl-iommu */
++#else
++#define A6_GPU_BASE		0x02c00000ull
++#define A6_GPUCC		0x02c90000ull
++#define A6_SMMU			0x02ca0000ull
++#endif
++#define A6_GREG(o)		(A6_GPU_BASE + 4ull * (o))
+ #define A6_SMMU_CB(n)		(A6_SMMU + 0x8000 + 0x1000ull * (n))
+ #define A6_FSR_FAULT		0xc00001feu
+ #define A6_GMEM_LOG_OFF		0x91000ull
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 50c15b0..92f3605 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -45,7 +45,7 @@ extern int vprintf(const char *fmt, va_list ap);
+ extern void sweet_smc(uint64_t x[8]);
+ 
+ void sweet_gpu_init(void);
+-#define GPU_TRAIL_PA	0xE2000000ull	/* sunfish: low RAM outside XNU (a6_log mirror) */
++#define GPU_TRAIL_PA	0xE2000000ull	/* sunfish/redfin: low RAM outside XNU (a6_log mirror; the GPU pool skips it) */
+ #define GPU_TRAIL_SIZE	0x10000u
+ bool sweet_gpu_ready(void);
+ int sweet_gpu_surface_slot(uint64_t key);
+@@ -330,7 +330,11 @@ sweet_gpu_init(void)
+ 	}
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
+ 	a6_init_state(&gpu, ptoa_64(pn));
++#if A6_GPU_ID == 620
++	uint32_t lvl = 3;	/* redfin: sweetgpufreq=1 (275), 2 (400), 3 (500), 4 (625) */
++#else
+ 	uint32_t lvl = 4;	/* boot-arg sweetgpufreq=1 (180) .. 5 (565); A618 also 6 (650), 7 (800), 8 (825) */
++#endif
+ 	PE_parse_boot_argn("sweetgpufreq", &lvl, sizeof(lvl));
+ 	{
+ 		extern int a6_submit_wfi;
+@@ -976,8 +980,19 @@ sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, ui
+ #define GPOOL_UNIT      0x4000ULL
+ #define GPOOL_FREE_MAX  4096
+ static const struct { uint64_t pa, size; } gpool_ranges[] = {
++#if A6_GPU_ID == 620
++	/*
++	 * redfin (0904): the same HLOS RAM (live DT memory 0xc0000000 + 3 GB, XNU from 4 GB), minus
++	 * kregistry_mem 0xc8000000 + 64 KB (no-map in the DT), wland's rmtfs buffer 0xe1001000-0xe1281000
++	 * and the GPU log trail / GMU dump area at 0xe2000000 (GPU_TRAIL_PA, 0xe2010000).
++	 */
++	{ 0xc4000000ULL, 0x04000000ULL },       /* 64 MB, up to kregistry */
++	{ 0xc8400000ULL, 0x17c00000ULL },       /* 380 MB */
++	{ 0xe2400000ULL, 0x1dc00000ULL },       /* 476 MB */
++#else
+ 	{ 0xc4000000ULL, 0x1c000000ULL },       /* 448 MB (the first 64 MB left to ABL's ramdisk) */
+ 	{ 0xe1400000ULL, 0x1ec00000ULL },       /* 492 MB; 0xe1000000-0xe1400000 is wland's rmtfs buffer (hyp-assigned to the modem) */
++#endif
+ };
+ static struct { uint64_t pa, size; } gpool_free[GPOOL_FREE_MAX];       /* sorted by address, merged */
+ static uint32_t gpool_nfree;
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index cb50f91..864b02d 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -119,7 +119,7 @@ SweetAccelerator::start(IOService *provider)
+ 	setProperty("MetalPluginName", plugin);
+ 	setProperty("MetalPluginClassName", which == 2 ? "SweetMTL2Device" : "SweetMTLDevice");
+ 	setProperty("IOGLBundleName", plugin);
+-	setProperty("model", "Adreno 618");
++	setProperty("model", "Adreno 620");	/* redfin (0904) */
+ 	setProperty(kIOUserClientClassKey, "SweetAcceleratorUserClient");
+ 	registerService();
+ 	IOLog("SWEET MTL: IOAcceleratorES published (MetalPluginName %s)\n", plugin);
+@@ -421,8 +421,8 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
+ 		if (args->scalarOutputCount < 3) {
+ 			return kIOReturnBadArgument;
+ 		}
+-		out[0] = 618;
+-		out[1] = 0x06040001;
++		out[0] = 620;		/* redfin (0904): bsd/dev/sweet_a6xx.h A6_GPU_ID / A6_CHIP_ID */
++		out[1] = 0x06020000;
+ 		out[2] = sweet_gpu_ready();
+ 		return kIOReturnSuccess;
+ 	case 1: {
+@@ -711,7 +711,11 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 		V2_OUT(NativeAdrenoAbiDeviceInfo);
+ 		/* what bsd/dev/sweet_a6xx.c's hw_init programs: GMEM 1 MB at 0x100000, UBWC 3 (hbb 15, lvl 2+3 swizzle) */
+ 		/* sunfish A618 (0145): chip id, 512 KB GMEM, highest bank bit 14, UBWC 2 (DT qcom,ubwc-mode) */
+-		rp->chip_id = 0x06010800;
++		/*
++		 * redfin A620 (0904): chip id 0x06020000 (Mesa FD620), 512 KB GMEM at 0x100000, highest bank bit 14,
++		 * UBWC 3 (DT qcom,ubwc-mode = 3: sweet_a6xx.c programs AMSBC), level 2+3 swizzle as on flame.
++		 */
++		rp->chip_id = 0x06020000;
+ 		rp->gmem_bytes = 0x80000;
+ 		rp->gmem_base = 0x100000;
+ 		rp->uche_trap_base = 0x1fffffffff000ULL;
+@@ -720,7 +724,7 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 		rp->highest_bank_bit = 14;
+ 		rp->ubwc_swizzle = 0x6;
+ 		rp->macrotile_mode = 0;
+-		rp->ubwc_version = 2;
++		rp->ubwc_version = 3;
+ 		rp->flags = NativeAdrenoDeviceClientIova;
+ 		return kIOReturnSuccess;
+ 	}
+-- 
+2.43.0
+

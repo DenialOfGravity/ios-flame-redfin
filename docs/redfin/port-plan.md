@@ -210,6 +210,48 @@ Redfin patches renamed 0900-0902 (+0903: QUSB2 off on redfin). Patch numbers abo
 Working copy: one git clone in WSL, `~/ios-redfin`; the PC folder keeps only `backup\` and `recon\`
 (data the scripts read; never in git). Image and checksum list: `~/redfin-work`, `work/iosroot/`.
 
+## GPU round 1 (2026-10-24): A620 kernel bring-up written, not booted yet
+
+Upstream sunfish merged up to 16553aa (xnu 0152-0160: GPU hang detection by CP progress, ring-full waits,
+per-client pool reuse, no WFI between submits, non-blocking present, 64-byte surface rows; Turnip 0101-0104;
+metal2 bridge 0102). New: **0904** (Adreno 620) and **0905** (double-buffered present), see NOTES.md.
+
+What 0904 takes from where (kgsl = LineageOS android_kernel_google_redbull lineage-22.2):
+- A620 is A650 family in kgsl (`adreno_is_a650_family`): separate RSCC (DT `rscc` 0x3de0000), A650 RSC
+  sequencer words, gmu_vma (DTCM at 0x10004000, cache window 16 KB-16 MB), TCS3 cmd1 data 2, vrm.soc TCS cmd 3,
+  veto_fal10, APRIV, bicubic weights, hang cycles 0x3ffff, prim fifo 0x10000 + TSE skip off.
+- a650_gmu.bin (recon\fw) asks for its cache memory itself: PREALLOC_REQ 0x4000+0x8000, 0x144000+0x13000,
+  0x157000+0x9000; data blocks ITCM 0/0x200/0x400, cache 0x4000/0x157000, DTCM 0x10004000/0x10007fdc.
+- a620_zap.mdt: one PT_LOAD (b02, paddr 0x5000, 0x68c bytes) into pil_gpu_region 0x8bc15400.
+- Live DT: kgsl-smmu has 5 SMRs ("stream matching with 5 register groups"), CB5-7 hyp-protected,
+  `qcom,actlr` 0x32b (not written), no attach-impl-defs; DT masks GMU <5 0x400>, GPU <0 0x401>.
+- Mesa 85fda3b3 has FD620 (gen1, 1 CCU, 512 KB GMEM): Turnip needs no device patch.
+
+**Boot r6 (GPU probe):** `GPU=1 tools/redfin-boot.sh r6 KERNEL sectouch=1 sectouchdelay=20` (kernel from CI with
+0904/0905). sweetgpu=1, present thread on, CA still on the CPU. Expect in the live log (`SWEET GPU:`):
+`rpmh: cmd-db mx.lvl ...`, `gmu: cache 4000 + 8000 -> pool + 10000` (3 lines), `gmu: N firmware blocks loaded`,
+`gmu: init result 100 BOOTED`, `hfi: bw cmd-db CN0 ...`, `hfi: perf/bw tables ... -> 0`, `oob gpu_set acked`,
+`ring me_init ... idle`, `zap: auth and reset rc 0`, `bring-up done, GPU ready`, then
+`SWEET FB: frames now scaled to fit by the GPU`. Any `TIMEOUT` line says which stage to look at; the trail
+copy at 0xe2000000 survives a warm reset.
+**r7:** r6 + `FLIP=1` (tear-free present). **r8:** `GPU=2` (Metal on Turnip; blur, materials and Safari need
+it: CA's CPU renderer has no blur) after installing the metal2 CI bundle (tools/sunfish-metal2-install.sh
+works over the same USB address once dropbear is on the root).
+
+### Other ports checked (2026-10-24)
+- joranv1/ios-sailfish (Pixel 1, A530): GL path, not Metal: Mesa freedreno GLES in backboardd (sweetgl.dylib
+  + EAGL shim) with CA's GL renderer; blur because sweetgl supplies CA's missing GL texture functions (variable
+  blur 0x26/0x27, colour matrix 0x14, vibrant 0x2d) and emulates framebuffer fetch. Taken over: the
+  double-buffered present (0164 -> 0905). Candidates next: interrupts for touch (0181, GICv3 SPI attach; sec_ts
+  IRQ is TLMM 9), touch move coalescing (0182 `sweettouchhz`), panel brightness by DCS 0x51 (0168), display
+  sleep via the mixer (0167), CPU boost (0183: on redfin the prime core at 0x18327800 is the analogue).
+- Yofuness/ios-flame `sunfish` (Pixel 4a, A618): Metal on Turnip works; merged.
+- SourceQuality/ios-taimen (Pixel 2 XL, A540), Asuniia/ios-kirin, jiracipika/ios-sailfish (pixel7 branch):
+  GL path like sailfish (taimen ~60 fps by write-combined Mesa heap + seed-based surface flushes: the Metal
+  path already maps its buffers write-combined).
+- MakrSas/ios-topaz (Redmi Note 12, A610): GPU-pool patches, audio, 4K pages. zeroninefourfour/ios-extra:
+  A618 GMU experiments. tutpyhoon/ios-coral (Pixel 4 XL, A640): flame tree on coral, no new GPU work.
+
 ## Done so far
 
 **Shim** (boots in place of iBoot)

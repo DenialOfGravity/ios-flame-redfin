@@ -119,3 +119,12 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
 - 0903 upstream sunfish 0151's QUSB2 v2 init off by default (`sweetqusb=1` to force): redfin's HS PHY is
   the femto at 0x088e3000 and 0x088e2000 is its EUD register. Upstream 0150 (GPU pool skips wland's
   rmtfs buffer at 0xe1000000) applies to redfin unchanged: same pool range, same rmtfs address.
+- 0904 Adreno 620 (`A6_GPU_ID` 620 in sweet_a6xx.h; 618/640 keep their values): lito addresses (GPU
+  0x3d00000, GPUCC 0x3d90000, SMMU 0x3da0000, RSCC 0x3de0000), A650-family GMU (kgsl gmu_vma: DTCM at
+  0x10004000, cache memory from a650_gmu.bin's PREALLOC_REQ blocks), RSC/PDC with cmd-db addresses,
+  HFI v2 with 275/400/500/625 MHz and lito's BCMs, A620 hw_init (512 KB GMEM, UBWC 3 hbb 14, APRIV,
+  a650_sqe.fw), a620_zap into 0x8bc15400, Mesa FD620 values for the present blit, Turnip device info
+  0x06020000. GPU buffer pool skips kregistry_mem 0xc8000000 and the 0xe2000000 log trail.
+- 0905 double-buffered GPU present (`sweetfbflip=1`, off by default): blit into the buffer not on screen
+  (second one at 0xa0a00000 in the splash region), flip VIG0+VIG1 once the fence lands, never write the
+  old buffer before the flip latched (as ios-sailfish 0164).
