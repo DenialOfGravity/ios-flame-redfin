@@ -21,7 +21,15 @@ Claude-Session: https://claude.ai/code/session_01WuzsiVGCDDmN2GPRLJvX3w
 diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
 --- a/bsd/dev/sweet_cam.c
 +++ b/bsd/dev/sweet_cam.c
-@@ -849,6 +849,708 @@
+@@ -55,6 +55,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <vm/memory_types.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -849,6 +850,708 @@
  	return result;
  }
  
@@ -730,7 +738,7 @@ diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
  int
  sweet_cam_cmd(unsigned what)
  {
-@@ -866,6 +1568,8 @@
+@@ -866,6 +1569,8 @@
  		look_slg();
  	} else if (what == 12) {
  		look_camcc();
