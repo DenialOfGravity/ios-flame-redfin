@@ -189,6 +189,13 @@ has no rfclka2 and the icnss node has no clocks, so wland now skips the vote whe
 makes the qdss AOSS message non-fatal and logs the cmd-db list (a2a825f). Crash reports were only
 background extensions (Spotlight importers, TTS, mediaserverd) with the clock unset (1969).
 
+Wi-Fi round 2 (rfclk fix): the modem boots (cx[7] mss[6], 99 MB loaded, ready after 100 ms), GLINK
+and QRTR come up, rmtfs/pd-mapper/tftp serve, then ERR-FATAL 7 ms after the modem asked rmtfs for
+2621440 bytes: wland's buffer was sunfish's 2 MB, so it refused. lito DT rmtfs_sharedmem is 0x280000;
+BUF_SIZE is now 2.5 MB (0xe1001000-0xe1281000, System RAM on redfin, inside upstream 0150's GPU-pool
+gap). wland now logs grant/refuse and the modem's crash reason (SMEM 421). Later, for the GPU:
+kregistry_mem 0xc8000000 (64 KB) sits inside the first GPU pool range 0xc4000000-0xe0000000.
+
 Upstream sync (2026-10-24): merged Yofuness `sunfish` up to 8dcca4d (wland ath10k station steps +
 wlan-steps.conf / wlan-scan.conf hooks, sunfish-wifitest.sh, xnu 0150 GPU pool vs rmtfs, 0151 QUSB2).
 Redfin patches renamed 0900-0902 (+0903: QUSB2 off on redfin). Patch numbers above are the old ones.
