@@ -1,0 +1,28 @@
+diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
+index fa2ca902903..cf04275fcc5 100644
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -733,8 +733,12 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
+          /* only expect simple 2D images for now */
+          if (image->vk.mip_levels != 1 ||
+             image->vk.array_layers != 1 ||
+-            image->vk.extent.depth != 1)
++            image->vk.extent.depth != 1) {
++            mesa_logw("sweet: explicit layout refused: %ux%u fmt %d mips %u layers %u depth %u",
++                      image->vk.extent.width, image->vk.extent.height, (int)image->vk.format,
++                      image->vk.mip_levels, image->vk.array_layers, image->vk.extent.depth);
+             return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
++         }
+ 
+          plane_layout.offset = plane_layouts[i].offset;
+          plane_layout.pitch = plane_layouts[i].rowPitch;
+@@ -766,6 +770,9 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
+       if (!fdl6_layout_image(layout, &device->physical_device->dev_info,
+                              &params, plane_layouts ? &plane_layout : NULL)) {
+          assert(plane_layouts); /* can only fail with explicit layout */
++         mesa_logw("sweet: explicit layout refused: %ux%u fmt %d pitch %u offset %u (pitchalign %u, tile %u)",
++                   width0, height0, (int)image->vk.format, (unsigned)plane_layout.pitch,
++                   (unsigned)plane_layout.offset, layout->pitchalign, tile_mode);
+          return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
+       }
+ 
