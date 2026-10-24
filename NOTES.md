@@ -146,3 +146,7 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
 - 0912 vibration for iOS: sysctl `kern.sweet_haptic` (ms | strength << 16) queues a pulse;
   `sweetui=1` inserts /var/local/lib/SweetHaptics.dylib (phone/haptics) into SpringBoard and apps,
   mapping UIKit feedback generators and the vibrate sound onto it; `sweetenv=` from sailfish 0104/0163.
+- 0913 network privileges from the iOS Sandbox's entitlement map (socket delegation, network statistics,
+  NECP, global proc info) for the kernel, platform binaries and entitled processes. r11 showed WebKit
+  networking, nsurlsessiond, trustd and mDNSResponder denied PRIV_NET_PRIVILEGED_SOCKET_DELEGATE, which
+  makes necp_client_add refuse every connection they open for an app.

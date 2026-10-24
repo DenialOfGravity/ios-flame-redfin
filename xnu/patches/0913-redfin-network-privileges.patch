@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sat, 24 Oct 2026 14:27:54 +0200
+Subject: [PATCH] 0913 redfin: network privileges for platform daemons (socket delegation)
+
+The r11 log: com.apple.WebKit.Networking, nsurlsessiond, trustd,
+mDNSResponder, cloudd and geod were all denied privilege 10001
+(PRIV_NET_PRIVILEGED_SOCKET_DELEGATE). necp_client_add refuses an NECP
+client attributed to another process or bundle without it (EPERM), so
+every connection a daemon opened on an app's behalf failed: Safari pages
+stalled, the App Store and certificate checks went nowhere. Grant the
+network privileges the iOS Sandbox grants from entitlements (and
+PRIV_GLOBAL_PROC_INFO) to the kernel, platform binaries, and processes
+holding the matching entitlement.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GizUhEzkc6MoTcLnCZCfFa
+---
+  bsd/kern/sweet_amfi.c | 41 ++++++++++++++++++++++++++++++++++++++++-
+
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index ff2c725..fe16a36 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -362,7 +362,46 @@ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+  * apps die in CoreAnimation setup: work_interval_create(CA_CLIENT) needs
+  * PRIV_WORK_INTERVAL ("Failed to create work interval", SpringBoard).
+  * Grant that one; log the first denial of each other privilege per process.
++ *
++ * 0913: network privileges, which the iOS Sandbox grants from entitlements. Without
++ * PRIV_NET_PRIVILEGED_SOCKET_DELEGATE, the daemons that open connections for apps
++ * (com.apple.WebKit.Networking, nsurlsessiond, trustd, mDNSResponder, cloudd, geod) had
++ * every attributed NECP client refused (necp_client_add: EPERM), so Safari, the App
++ * Store and certificate checks stalled or failed. Granted to the kernel and platform
++ * binaries, or to a process holding the matching entitlement.
+  */
++static const struct {
++	int priv;
++	const char *entitlement;
++} sweet_priv_entitled[] = {
++	{ PRIV_NET_PRIVILEGED_TRAFFIC_CLASS, "com.apple.private.network.traffic-class" },
++	{ PRIV_NET_PRIVILEGED_SOCKET_DELEGATE, "com.apple.private.network.socket-delegate" },
++	{ PRIV_NET_INTERFACE_CONTROL, "com.apple.private.network.interface-control" },
++	{ PRIV_NET_PRIVILEGED_NETWORK_STATISTICS, "com.apple.private.network.statistics" },
++	{ PRIV_NET_PRIVILEGED_NECP_POLICIES, "com.apple.private.necp.policies" },
++	{ PRIV_NET_PRIVILEGED_NECP_MATCH, "com.apple.private.necp.match" },
++	{ PRIV_NET_QOSMARKING_POLICY_OVERRIDE, "com.apple.private.network.qosmarking-policy-override" },
++	{ PRIV_NET_RESTRICTED_ROUTE_NC_READ, "com.apple.private.network.route-nc-read" },
++	{ PRIV_NET_VALIDATED_RESOLVER, "com.apple.private.network.validated-resolver" },
++	{ PRIV_GLOBAL_PROC_INFO, "com.apple.private.kernel.global-proc-info" },
++};
++
++static bool
++sweet_priv_entitled_grant(int priv)
++{
++	for (size_t i = 0; i < sizeof(sweet_priv_entitled) / sizeof(sweet_priv_entitled[0]); i++) {
++		if (sweet_priv_entitled[i].priv != priv) {
++			continue;
++		}
++		proc_t p = current_proc();
++		if (p == kernproc || csproc_get_platform_binary(p)) {
++			return true;
++		}
++		void *ent = sweet_proc_entitlements(p);
++		return ent != NULL && sweet_entitlements_bool(ent, sweet_priv_entitled[i].entitlement);
++	}
++	return false;
++}
+ #define SWEET_PRIV_LOG_MAX      64
+ static struct {
+ 	int  priv;
+@@ -373,7 +412,7 @@ static int sweet_priv_logged_count;
+ static int
+ sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
+ {
+-	if (priv == PRIV_WORK_INTERVAL) {
++	if (priv == PRIV_WORK_INTERVAL || sweet_priv_entitled_grant(priv)) {
+ 		return 0;
+ 	}
+ 	char name[20];
+-- 
+2.43.0
