@@ -1,0 +1,54 @@
+From ec546a40f718131d733f5f3c13a4b35a0c8bfc88 Mon Sep 17 00:00:00 2001
+From: Yofuness <compiledchickennuggets@gmail.com>
+Date: Fri, 23 Oct 2026 22:38:02 -0400
+Subject: [PATCH] 0157 sunfish: no CP_WAIT_FOR_IDLE after client submits
+ (sweetwfi=1 restores)
+
+---
+ bsd/dev/sweet_a6xx.c | 7 ++++++-
+ bsd/dev/sweet_gpu.c  | 4 ++++
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index f4aa958..966ebb5 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -14,6 +14,8 @@
+ #endif
+ #include "sweet_a6xx.h"
+ 
++int a6_submit_wfi;	/* 0157: CP_WAIT_FOR_IDLE after each client submit (boot-arg sweetwfi) */
++
+ #define rd32		a6_rd
+ #define wr32		a6_wr
+ 
+@@ -925,7 +927,10 @@ uint32_t a6_submit_ibs_async(struct a6_gpu *g, const uint64_t *iova, const uint3
+ 		dw[n++] = (uint32_t)(iova[i] >> 32);
+ 		dw[n++] = dwords[i] & 0xfffff;
+ 	}
+-	dw[n++] = a6_pkt7(A6_CP_WAIT_FOR_IDLE, 0);
++	/* 0157: no wait-for-idle between client submits (sweetwfi=1 brings it back): CACHE_FLUSH_TS below
++	 * lands only once the work before it is done, and the CP may start the next submit meanwhile */
++	if (a6_submit_wfi)
++		dw[n++] = a6_pkt7(A6_CP_WAIT_FOR_IDLE, 0);
+ 	dw[n++] = a6_pkt7(0x3e, 3);		/* ... -> ts + 8 */
+ 	dw[n++] = 0x980 | 2u << 18;
+ 	dw[n++] = (uint32_t)(ts + 8);
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 0065a16..8ca0220 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -332,6 +332,10 @@ sweet_gpu_init(void)
+ 	a6_init_state(&gpu, ptoa_64(pn));
+ 	uint32_t lvl = 4;	/* boot-arg sweetgpufreq=1 (180) .. 5 (565); A618 also 6 (650), 7 (800), 8 (825) */
+ 	PE_parse_boot_argn("sweetgpufreq", &lvl, sizeof(lvl));
++	{
++		extern int a6_submit_wfi;
++		PE_parse_boot_argn("sweetwfi", &a6_submit_wfi, sizeof(a6_submit_wfi));
++	}
+ 	gpu.perf_level = lvl;
+ 	pool_kva = va;
+ 	vm_offset_t pva = 0;
+-- 
+2.56.0
+
