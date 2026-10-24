@@ -94,7 +94,7 @@ jobs:
           bash phone/tools/build.sh || echo "::warning::some phone tools failed"
           sh phone/haptics/build.sh && cp phone/haptics/out/SweetHaptics.dylib ../out/ || echo "::warning::SweetHaptics.dylib failed"
           # (the build's output goes out with the files: the run's own logs cannot be fetched from Claude's container)
-          sh phone/audio/build.sh > ../out/audio-build.log 2>&1 && cp -R phone/audio/out/RedwoodAudio.driver phone/audio/out/sound_test phone/audio/out/camera_test phone/audio/out/camera_avtest ../out/ || { echo "::warning::RedwoodAudio.driver failed"; tail -40 ../out/audio-build.log; }
+          sh phone/audio/build.sh > ../out/audio-build.log 2>&1 && cp -R phone/audio/out/RedwoodAudio.driver phone/audio/out/sound_test phone/audio/out/camera_test phone/audio/out/camera_avtest phone/audio/out/mg_test ../out/ || { echo "::warning::RedwoodAudio.driver failed"; tail -40 ../out/audio-build.log; }
           for t in psx pstack netsvc nettest oslog prefs openapp lsreg memwarn pmem a2s; do
             [ -f phone/tools/out/$t ] && cp phone/tools/out/$t ../out/ || true
           done

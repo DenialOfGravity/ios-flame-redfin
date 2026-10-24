@@ -24,4 +24,7 @@ codesign -f -s - out/camera_test
 # camera_avtest (HackiOS, MIT): the cameras AVFoundation lists for applications (camera_device.c's, in mediaserverd)
 ../../work/userland/bin/ios-cc -O2 -fobjc-arc -framework Foundation -framework AVFoundation -o out/camera_avtest camera_avtest.m
 codesign -f -s - out/camera_avtest
-ls -la out/RedwoodAudio.driver out/sound_test out/camera_test out/camera_avtest
+# mg_test (HackiOS, MIT): MobileGestalt's answers (the camera keys among them)
+../../work/userland/bin/ios-cc -O2 -framework CoreFoundation -o out/mg_test mg_test.c
+codesign -f -s - out/mg_test
+ls -la out/RedwoodAudio.driver out/sound_test out/camera_test out/camera_avtest out/mg_test
