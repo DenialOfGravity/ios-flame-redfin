@@ -182,3 +182,8 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
 - 0924 Sandbox stand-in: extension issue (op 5) writes a token into libsystem_sandbox's buffer, consume (op 6) gives
   handle 1. tccd took the old ENOENT for a refusal: Camera.app's AVCaptureDeviceInput failed -11852, black preview.
   Also needed on the phone: MediaToolbox SubServerConfiguration.plist StartRecorderServer=true (capture servers).
+- 0925 AppleCLCD DisplayPipePlaneBaseAlignment as { PlaneBaseAlignmentLinear = 64 } (a dictionary, as on an iPhone):
+  VideoToolbox's FigGetAlignmentForIOSurfaceOutputToDisplayService took the number for one and mediaserverd died
+  ("-[__NSCFNumber objectForKey:]") each time Camera.app's capture session started.
+- 0926 /dev/redwood-camera: PMIC GPIO writes tried three times; a session whose sensor did not start is tried again
+  (three failures in a row before EIO for the boot). r18d gave the device up after one gpio8 read-back of 0.
