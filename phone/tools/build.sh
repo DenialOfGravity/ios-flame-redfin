@@ -29,4 +29,5 @@ build imgtest imgtest.m -fobjc-arc -framework Foundation -framework ImageIO -fra
 build lsreg lsreg.m -fobjc-arc -framework Foundation -framework MobileCoreServices
 build netsvc netsvc.m -fobjc-arc -framework Foundation -framework SystemConfiguration
 build memwarn memwarn.c
+build pmem pmem.c
 ls -l out
