@@ -1855,7 +1855,17 @@ static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
  @synchronized(texture) {
   const void *cb=(__bridge const void *)commandBuffer;
   if(cb && texture.lastCommandBuffer==cb)return;   // this command buffer already chose its picture
+  const bool firstUse=!texture.lastCommandBuffer;
   texture.lastCommandBuffer=cb;
+  // The first use of a copy whose surface was written after it was made (a picture decoded into a surface CA already made the
+  // texture for, drawn once: thumbnails, Photos) is filled here, synchronously, into the bound turn (nothing has sampled it yet).
+  if(firstUse && !texture.filling && IOSurfaceGetSeed(texture.ycbcrSource)!=texture.surfaceSeed) {
+   const uint32_t seed=IOSurfaceGetSeed(texture.ycbcrSource);
+   for(NBTexture *turn in texture.turns)if(turn.handle==texture.handle) {
+    if(ycbcrFillTurn(turn,texture.ycbcrSource,texture.descriptor.width,texture.descriptor.height,texture.ycbcr709))texture.surfaceSeed=seed;
+    break;
+   }
+  }
   if(NBTexture *ready=texture.readyTurn) {
    texture.previousHandle=texture.handle;
    texture.handle=ready.handle;texture.buffer=ready.buffer;texture.surfaceSeed=texture.readySeed;texture.readyTurn=nil;
