@@ -46,7 +46,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stddef.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
 #include "camera_isp.h"
 
 void redwood_camera_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
@@ -116,6 +118,7 @@ static CMBaseClassID (*device_class_id)(void);
 static CMBaseClassID (*stream_class_id)(void);
 static CFStringRef port_back;           /* kFigCapturePortType_BackFacingCamera */
 static CFStringRef port_front;          /* kFigCapturePortType_FrontFacingCamera */
+static CFStringRef port_ultra_wide;     /* kFigCapturePortType_BackFacingSuperWideCamera (redfin: the ultra-wide camera, B3) */
 
 /*
  * The frames' metadata: what H10ISP's stream attaches to every frame (a dictionary under
@@ -163,6 +166,8 @@ find_functions(void)
 	port_back = port != NULL ? *port : NULL;
 	port = dlsym(RTLD_DEFAULT, "kFigCapturePortType_FrontFacingCamera");
 	port_front = port != NULL ? *port : NULL;
+	port = dlsym(RTLD_DEFAULT, "kFigCapturePortType_BackFacingSuperWideCamera");
+	port_ultra_wide = port != NULL ? *port : NULL;
 	port = dlsym(RTLD_DEFAULT, "kFigCaptureSampleBufferAttachmentKey_MetadataDictionary");
 	md_attachment = port != NULL ? *port : NULL;
 	for (int i = 0; i < MD_KEYS; i++) {
@@ -349,7 +354,7 @@ output_info(int width, int height)
 }
 
 static CFDictionaryRef
-format(int sensor_width, int sensor_height, int max_fps, bool binned, double fov)
+format(int sensor_width, int sensor_height, int max_fps, bool binned, double fov, double pixel_size)
 {
 	CFMutableDictionaryRef f = (CFMutableDictionaryRef)new_dict(), outputs = (CFMutableDictionaryRef)new_dict();
 	CMVideoFormatDescriptionRef fd = NULL;
@@ -364,6 +369,7 @@ format(int sensor_width, int sensor_height, int max_fps, bool binned, double fov
 	put(f, "VideoBinningFactorHorizontal", number_i(binned ? 2 : 1));
 	put(f, "VideoBinningFactorVertical", number_i(binned ? 2 : 1));
 	put(f, "VideoFieldOfView", number_f(fov));
+	put(f, "PixelSize", number_f(pixel_size));      /* (redfin: the Pixel 5's sensor's pitch, um) */
 	put(f, "VideoMinIntegrationTime", number_i(100));
 	put(f, "VideoMaxIntegrationTime", number_i(1000000 / 15));
 	put(f, "VideoRawBitDepth", number_i(10));
@@ -424,21 +430,42 @@ static const char *const output_names[OUTPUTS] = { "PrimaryScaler", "SecondarySc
  * (its devices' uniqueIDs, and the stream formats its formats and presets are matched to by sensor size
  * and frame rate): the wide camera as the back camera, the front one as the front camera. The kernel
  * gives one sensor's frames at a time; a stream's frames start with its own sensor's (see worker()).
+ *
+ * redfin (plan B3): the formats keep the iPhone X's sensor sizes and frame rates -- they are the keys the plist's
+ * formats and presets are found by, and a size the plist does not have loses the AVCaptureDevice formats -- but
+ * what they do is the Pixel 5's: each asks the kernel for a kind of sensor mode (REDWOOD_CAMERA_MODE_*: the photo
+ * mode, the 16:9 >= 30 fps video mode, the >= 60 fps one), the pictures are scaled from whatever size the mode has
+ * (MODE_CHANGED), and the frame rate is the mode's. The optics are the Pixel 5's (focal length in mm, f-number,
+ * pixel pitch in um, horizontal field of view in degrees from the sensor's width and the focal length): IMX363
+ * 4.38 mm (27 mm equivalent) f/1.7 1.4 um; IMX355 2.59 mm (24 mm eq.) f/2.0 1.12 um; IMX481 2.13 mm (16 mm eq.) f/2.2
+ * 1.0 um. The ultra-wide camera is a third device (sensor 3) only with /private/var/local/camera-ultrawide: the
+ * iPhone X has none, its port and formats are not in D22's plist, and how the capture stack takes that is for the
+ * phone to show.
  */
+struct camera_format {
+	int             width, height, fps;     /* the iPhone X's (the plist's keys) */
+	uint32_t        kind;                   /* REDWOOD_CAMERA_MODE_*: the mode the kernel is asked for */
+};
+
 static const struct camera {
 	uint32_t        sensor;         /* the kernel's (the frames' sensor, REDWOOD_CAMERA_SENSOR) */
 	const char      *name, *unique_id;
 	bool            turned;         /* its sensor the other way up from the iPhone's: the pictures turned half round */
 	double          focal_length, f_number, pixel_size, fov;
-	int             formats[2][3];  /* sensor width, height, frames a second of "Photo" and of a video format */
-} cameras[2] = {
-	{ 1, "Back Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:0", false, 4.0, 1.8, 1.22, 65.0,
-	  { { 4032, 3024, 30 }, { 4224, 2376, 60 } } },        /* "Photo", "Video-60" */
+	struct camera_format formats[2];        /* "Photo", and a video format */
+	bool            lens_motor;     /* focus can move (where the kernel says so: the frames' focus) */
+} cameras[3] = {
+	{ 1, "Back Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:0", false, 4.38, 1.7, 1.4, 65.6,
+	  { { 4032, 3024, 30, REDWOOD_CAMERA_MODE_PHOTO }, { 4224, 2376, 60, REDWOOD_CAMERA_MODE_VIDEO60 } }, true },  /* "Photo", "Video-60" */
 	/* redfin: the front IMX355's pictures came out upside down untouched (r18g, Camera.app's own thumbnail): turned,
-	 * as HackiOS's phone's was; the optics are still HackiOS's numbers */
-	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", true, 2.87, 2.2, 1.0, 70.0,
-	  { { 3088, 2320, 30 }, { 3840, 2160, 30 } } },        /* "Photo", "Video-30" */
+	 * as HackiOS's phone's was */
+	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", true, 2.59, 2.0, 1.12, 70.9,
+	  { { 3088, 2320, 30, REDWOOD_CAMERA_MODE_PHOTO }, { 3840, 2160, 30, REDWOOD_CAMERA_MODE_VIDEO } }, false },  /* "Photo", "Video-30" */
+	/* (the iPhone 11's uniqueID for its ultra-wide; the back camera's plist keys) */
+	{ 3, "Back Ultra Wide Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:5", false, 2.13, 2.2, 1.0, 94.5,
+	  { { 4032, 3024, 30, REDWOOD_CAMERA_MODE_PHOTO }, { 4224, 2376, 60, REDWOOD_CAMERA_MODE_VIDEO60 } }, false },
 };
+#define CAMERAS 3
 
 struct stream {
 	CFArrayRef      formats;
@@ -449,6 +476,8 @@ struct stream {
 	unsigned        stills_wanted;  /* photographs asked for by StillImageCaptureNow, not yet given */
 	int             format_index;
 	double          min_fps, max_fps;
+	bool            min_fps_set;    /* (redfin) MinimumFrameRate was set by the graph */
+	volatile bool   mode_wanted;    /* (redfin) FormatIndex changed while the frames run: the kernel to be asked for its mode */
 	float           zoom;           /* ZoomFactor: the picture is the middle 1/zoom of the sensor each way */
 	const struct camera *camera;
 	CFStringRef     port;
@@ -457,10 +486,17 @@ struct stream {
 	float           af_window[4];   /* AFWindowParams: where to focus, as fractions of the frame (x0, y0, x1, y1) */
 	struct output   out[OUTPUTS];
 	pthread_mutex_t lock;
-	pthread_t       worker;
 	volatile bool   running;
 	volatile bool   graph_running;  /* the capture graph has started this stream: frames may be given out */
-	bool            worker_started;
+	/*
+	 * redfin (B8): the worker threads. Each has the generation it was started for and goes when that is not the
+	 * stream's any more; a stop waits for them a while (workers, worker_gone), not for ever: a worker can be
+	 * inside the kernel's read for seconds while the sensor starts or stops.
+	 */
+	volatile unsigned generation;
+	unsigned        workers;
+	pthread_mutex_t worker_lock;
+	pthread_cond_t  worker_gone;
 	int             torch;
 	uint64_t        frames, stills_given;
 };
@@ -651,8 +687,12 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		if (i < 0 || i >= CFArrayGetCount(s->formats)) {
 			return ERR_PARAM;
 		}
+		/* redfin (B3): the format's kind of sensor mode, asked of the kernel at the next frame (worker()) */
+		if (s->format_index != (int)i) {
+			s->mode_wanted = s->running;
+		}
 		s->format_index = (int)i;
-		say("stream: format %lld", (long long)i);
+		say("stream: format %lld (%s)", (long long)i, mode_name(s->camera->formats[i < 2 ? i : 0].kind));
 		return 0;
 	}
 	if (key_is(key, "ZoomFactor")) {
@@ -680,7 +720,8 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 			CFNumberGetValue(value, kCFNumberDoubleType, &fps);
 		}
 		*(key_is(key, "MinimumFrameRate") ? &s->min_fps : &s->max_fps) = fps;
-		say_once("stream: set", key, value);
+		s->min_fps_set |= key_is(key, "MinimumFrameRate");
+		say_value("stream: set", key, value);  /* (redfin: AE keeps to them, see fps_limits()) */
 		return 0;
 	}
 	if (key_is(key, "VideoOutputConfigurations") || key_is(key, "VideoOutputsEnabled") || key_is(key, "VideoOutputHandlers")) {
@@ -1306,69 +1347,187 @@ load_tuning(struct isp *isp, uint32_t sensor)
 	}
 }
 
-static void *
-worker(void *context)
+static const char *
+mode_name(uint32_t kind)
 {
-	CMBaseObjectRef o = context;
+	return kind == REDWOOD_CAMERA_MODE_PHOTO ? "photo" : kind == REDWOOD_CAMERA_MODE_VIDEO ? "video" :
+	    kind == REDWOOD_CAMERA_MODE_VIDEO60 ? "video60" : "auto";
+}
+
+/* the start of the frame's exposure, where the kernel gives it (reserved[1..2]), else when it was done */
+static uint64_t
+frame_time(const struct redwood_camera_frame *f)
+{
+	uint64_t sof = (uint64_t)f->reserved[REDWOOD_CAMERA_R_SOF_HI] << 32 | f->reserved[REDWOOD_CAMERA_R_SOF_LO];
+
+	return sof != 0 && sof <= f->time ? sof : f->time;
+}
+
+/* whether the frames are of the kind of mode the format wants (by their proportions and rate: the kernel says no more) */
+static bool
+mode_fits(const struct redwood_camera_frame *f, uint32_t kind)
+{
+	double aspect = f->height ? (double)f->width / f->height : 0;
+	uint32_t fps_milli = f->reserved[REDWOOD_CAMERA_R_FPS_MILLI];
+
+	switch (kind) {
+	case REDWOOD_CAMERA_MODE_PHOTO:
+		return aspect < 1.5;
+	case REDWOOD_CAMERA_MODE_VIDEO:
+		return aspect > 1.6;
+	case REDWOOD_CAMERA_MODE_VIDEO60:
+		return aspect > 1.6 && (fps_milli == 0 || fps_milli >= 59000);
+	default:
+		return true;
+	}
+}
+
+/*
+ * The frame rate AE keeps to (redfin, B3): no slower than MinimumFrameRate -- but not below 15 a second unless the
+ * graph asked for less than the format's 2 on purpose: the formats say 2, and AVFoundation passes that on as the
+ * default --, no faster than MaximumFrameRate, as frame lengths in lines.
+ */
+static void
+fps_limits(const struct stream *s, const struct redwood_camera_frame *f, struct isp *isp)
+{
+	double min_fps = s->min_fps_set && s->min_fps > 2.5 ? s->min_fps : 15, max_fps = s->max_fps;
+
+	isp->max_frame_lines = 0;
+	isp->min_frame_lines = 0;
+	if (f->line_ns == 0) {
+		return;
+	}
+	if (min_fps > 0) {
+		double lines = 1e9 / (min_fps * f->line_ns);
+
+		isp->max_frame_lines = lines < f->frame_lines_min ? f->frame_lines_min : f->frame_lines_max && lines > f->frame_lines_max ?
+		    f->frame_lines_max : (uint32_t)lines;
+	}
+	if (max_fps > 0) {
+		double lines = ceil(1e9 / (max_fps * f->line_ns));
+
+		isp->min_frame_lines = lines > f->frame_lines_min ? (uint32_t)lines : 0;
+		if (isp->max_frame_lines && isp->min_frame_lines > isp->max_frame_lines) {
+			isp->max_frame_lines = isp->min_frame_lines;
+		}
+	}
+}
+
+static bool
+worker_wanted(const struct stream *s, unsigned generation)
+{
+	return s->running && s->generation == generation;
+}
+
+/* a pause of `ms', cut short when the worker is not wanted any more */
+static void
+worker_pause(const struct stream *s, unsigned generation, unsigned ms)
+{
+	for (unsigned waited = 0; waited < ms && worker_wanted(s, generation); waited += 50) {
+		usleep(50000);
+	}
+}
+
+/* one worker has the kernel's camera open at a time: the next waits for the last to close it */
+static pthread_mutex_t device_owner = PTHREAD_MUTEX_INITIALIZER;
+
+struct worker_start {
+	CMBaseObjectRef o;
+	unsigned        generation;
+};
+
+/*
+ * The frames of one opening of the kernel's camera: until the worker is not wanted, or the kernel's camera fails
+ * (then the caller opens it again, a little later). The frame's size is learned from its header: a buffer that
+ * is too small is made larger (a mode with more pixels: MODE_CHANGED), one that is larger is used as it is.
+ */
+static const char *
+frames(CMBaseObjectRef o, unsigned generation, int device)
+{
 	struct stream *s = stream_of(o);
 	struct redwood_camera_frame head;
 	struct isp isp;
 	struct isp_stats st;
-	uint8_t *buffer = NULL;
-	size_t bytes = 0;
-	uint32_t tuned_for = ~0u;
-	bool switched = false;
+	uint8_t *buffer = malloc(sizeof(head));
+	size_t bytes = sizeof(head);
+	uint32_t tuned_for = ~0u, width = 0, height = 0;
+	bool switched = false, mode_asked = false;
 	float lux = -1, cct = -1;
 	struct af af = { 0 };
-	int device = open(REDWOOD_CAMERA_DEVICE, O_RDWR), failures = 0;
+	unsigned failures = 0;
+	const char *why = "stopped";
 
-	pthread_setname_np("redwood-camera");
-	if (device < 0) {
-		say("no %s (%s): no frames", REDWOOD_CAMERA_DEVICE, strerror(errno));
-		return NULL;
-	}
 	isp_init(&isp);
-	while (s->running && failures < 5) {
-		ssize_t n;
+	while (buffer != NULL && worker_wanted(s, generation)) {
+		ssize_t n = read(device, buffer, bytes);
+		const struct redwood_camera_frame *f = (const void *)buffer;
+		size_t need;
 
-		if (buffer == NULL) {
-			n = read(device, &head, sizeof(head));
-			if (n != (ssize_t)sizeof(head)) {
-				failures += n < 0 && errno == EAGAIN ? 0 : 1;
-				if (n < 0 && errno == EIO) {
-					say("the kernel's camera has had a fault: no frames");
-					break;
-				}
-				continue;
-			}
-			if (head.sensor != s->camera->sensor) {
-				/* another camera's frames (the kernel's last sensor): changed, and the next ones are this one's */
-				if (!switched) {
-					struct redwood_camera_command c = { .command = REDWOOD_CAMERA_SENSOR, .a = s->camera->sensor, .b = ~0u };
-
-					switched = true;
-					say("the kernel's frames are camera %u's: to %u, the %s", head.sensor, s->camera->sensor, s->camera->name);
-					(void)write(device, &c, sizeof(c));
-				}
-				continue;
-			}
-			bytes = sizeof(head) + (size_t)head.stride * head.height;
-			buffer = malloc(bytes);
-			say("frames of %ux%u from the kernel (the %s)", head.width, head.height, s->camera->name);
-			continue;
+		if (n < 0 && errno == EIO) {
+			why = "the kernel's camera has had a fault";
+			break;
 		}
-		n = read(device, buffer, bytes);
-		if (n != (ssize_t)bytes) {
-			if (n < 0 && errno == EIO) {
-				say("the kernel's camera has had a fault: no more frames");
+		if (n < (ssize_t)offsetof(struct redwood_camera_frame, reserved) || memcmp(f->magic, REDWOOD_CAMERA_MAGIC, 8) != 0 ||
+		    f->header_bytes < offsetof(struct redwood_camera_frame, reserved) || f->header_bytes > 4096 ||
+		    f->stride < f->width * 10 / 8 || f->height == 0) {
+			if (!(n < 0 && (errno == EAGAIN || errno == EINTR)) && ++failures >= 5) {
+				why = n < 0 ? strerror(errno) : "frames that are not frames";
 				break;
 			}
-			failures += n < 0 && errno == EAGAIN ? 0 : 1;
+			continue;
+		}
+		need = f->header_bytes + (size_t)f->stride * f->height;
+		if (f->sensor != s->camera->sensor) {
+			/* another camera's frames (the kernel's last sensor): changed, and the next ones are this one's */
+			if (!switched) {
+				struct redwood_camera_command c = { .command = REDWOOD_CAMERA_SENSOR, .a = s->camera->sensor, .b = ~0u,
+					.c = s->camera->formats[s->format_index & 1].kind };
+
+				switched = mode_asked = true;
+				s->mode_wanted = false;
+				say("the kernel's frames are camera %u's: to %u, the %s (a %s mode)", f->sensor, s->camera->sensor, s->camera->name,
+				    mode_name(c.c));
+				(void)write(device, &c, sizeof(c));
+			}
+			continue;
+		}
+		if (need > bytes) {
+			uint8_t *larger = realloc(buffer, need);
+
+			if (larger == NULL) {
+				why = "no memory for a frame";
+				break;
+			}
+			buffer = larger;
+			bytes = need;
+			continue;       /* (this frame is lost: its bytes did not fit) */
+		}
+		if ((size_t)n < need) {
+			if (++failures >= 5) {
+				why = "frames shorter than their headers say";
+				break;
+			}
 			continue;
 		}
 		failures = 0;
+		if (f->width != width || f->height != height || (f->reserved[REDWOOD_CAMERA_R_FLAGS] & REDWOOD_CAMERA_MODE_CHANGED)) {
+			say("frames of %ux%u from the kernel (the %s, %.1f fps mode%s)", f->width, f->height, s->camera->name,
+			    f->reserved[REDWOOD_CAMERA_R_FPS_MILLI] / 1000.0, f->reserved[REDWOOD_CAMERA_R_FLAGS] & REDWOOD_CAMERA_MODE_CHANGED ?
+			    ", a new mode" : "");
+			width = f->width;
+			height = f->height;
+		}
+		/* the format's kind of mode (B3): asked once a format, if the frames are not of it */
+		if (s->mode_wanted || (!mode_asked && !mode_fits(f, s->camera->formats[s->format_index & 1].kind))) {
+			struct redwood_camera_command c = { .command = REDWOOD_CAMERA_SENSOR, .a = s->camera->sensor, .b = ~0u,
+				.c = s->camera->formats[s->format_index & 1].kind };
 
-		const struct redwood_camera_frame *f = (const void *)buffer;
+			s->mode_wanted = false;
+			mode_asked = true;
+			say("the format wants a %s mode: asked of the kernel", mode_name(c.c));
+			(void)write(device, &c, sizeof(c));
+		}
+
 		const uint8_t *raw = buffer + f->header_bytes;
 		struct redwood_camera_command c;
 
@@ -1387,6 +1546,7 @@ worker(void *context)
 		isp_tune(&isp, lux, cct);
 		isp.zoom = s->zoom;
 		isp.turned = s->camera->turned;
+		fps_limits(s, f, &isp);
 		if (isp_ae(&isp, f, &st, &c)) {
 			(void)write(device, &c, sizeof(c));
 		}
@@ -1451,8 +1611,54 @@ worker(void *context)
 		}
 	}
 	free(buffer);
-	close(device);
-	say("the frames stopped (%llu)", s->frames);
+	if (isp.tuning != NULL) {
+		free(isp.tuning->file);
+		free(isp.tuning);
+	}
+	return buffer == NULL ? "no memory" : why;
+}
+
+/*
+ * The worker: the kernel's camera opened, its frames (frames()), and opened again after a fault or a run of
+ * failed reads, a little later each time (redfin, B8: it used to give up after five failed reads, for good).
+ */
+static void *
+worker(void *context)
+{
+	struct worker_start start = *(struct worker_start *)context;
+	struct stream *s = stream_of(start.o);
+	unsigned again = 0;
+
+	free(context);
+	pthread_setname_np("redwood-camera");
+	pthread_mutex_lock(&device_owner);
+	while (worker_wanted(s, start.generation)) {
+		int device = open(REDWOOD_CAMERA_DEVICE, O_RDWR);
+		const char *why;
+		unsigned pause;
+
+		if (device < 0) {
+			why = strerror(errno);
+		} else {
+			why = frames(start.o, start.generation, device);
+			close(device);
+		}
+		if (!worker_wanted(s, start.generation)) {
+			break;
+		}
+		pause = again < 5 ? 250u << again : 5000;
+		if (again++ < 10 || again % 20 == 0) {
+			say("the frames stopped (%s): the kernel's camera opened again in %u ms (%u)", why, pause, again);
+		}
+		worker_pause(s, start.generation, pause);
+	}
+	pthread_mutex_unlock(&device_owner);
+	say("the frames stopped (%llu)", (unsigned long long)s->frames);
+	pthread_mutex_lock(&s->worker_lock);
+	s->workers--;
+	pthread_cond_broadcast(&s->worker_gone);
+	pthread_mutex_unlock(&s->worker_lock);
+	CFRelease(start.o);
 	return NULL;
 }
 
@@ -1462,13 +1668,39 @@ worker(void *context)
  * takes a moment to settle and the exposure longer), the second only when the graph starts the
  * stream itself (`graph` true, the FigCaptureStream start method).
  */
-static CMBaseObjectRef all_streams[2];  /* the device's, back and front */
+static CMBaseObjectRef all_streams[CAMERAS];    /* the device's, back, front (and ultra-wide) */
 static OSStatus stream_stop(CMBaseObjectRef o);
+
+/* the stream's workers gone, or `ms' passed: whether they are */
+static bool
+workers_gone(struct stream *s, unsigned ms)
+{
+	struct timespec until;
+	struct timeval now;
+	bool gone;
+
+	gettimeofday(&now, NULL);
+	until.tv_sec = now.tv_sec + (time_t)(ms / 1000);
+	until.tv_nsec = now.tv_usec * 1000L + (long)(ms % 1000) * 1000000L;
+	if (until.tv_nsec >= 1000000000L) {
+		until.tv_sec++;
+		until.tv_nsec -= 1000000000L;
+	}
+	pthread_mutex_lock(&s->worker_lock);
+	while (s->workers > 0 && pthread_cond_timedwait(&s->worker_gone, &s->worker_lock, &until) == 0) {
+	}
+	gone = s->workers == 0;
+	pthread_mutex_unlock(&s->worker_lock);
+	return gone;
+}
 
 static OSStatus
 stream_begin(CMBaseObjectRef o, bool graph)
 {
 	struct stream *s = stream_of(o);
+	struct worker_start *start;
+	pthread_attr_t attributes;
+	pthread_t thread;
 
 	if (graph) {
 		pthread_mutex_lock(&s->lock);
@@ -1480,20 +1712,38 @@ stream_begin(CMBaseObjectRef o, bool graph)
 		return 0;
 	}
 	/* one camera at a time: the kernel gives one sensor's frames (the other stream's worker stopped first) */
-	for (int i = 0; i < 2; i++) {
+	for (int i = 0; i < CAMERAS; i++) {
 		if (all_streams[i] != NULL && all_streams[i] != o && stream_of(all_streams[i])->running) {
 			say("stream: the %s's frames stop for the %s's", stream_of(all_streams[i])->camera->name, s->camera->name);
 			(void)stream_stop(all_streams[i]);
 		}
 	}
-	s->running = true;
-	s->frames = 0;
-	say("stream: frames begin (format %d)", s->format_index);
-	if (pthread_create(&s->worker, NULL, worker, o) != 0) {
-		s->running = false;
+	if ((start = malloc(sizeof(*start))) == NULL) {
 		return ERR_UNSUPPORTED;
 	}
-	s->worker_started = true;
+	s->frames = 0;
+	s->mode_wanted = false;
+	start->o = o;
+	start->generation = ++s->generation;
+	s->running = true;
+	pthread_mutex_lock(&s->worker_lock);
+	s->workers++;
+	pthread_mutex_unlock(&s->worker_lock);
+	CFRetain(o);                    /* (the worker's, until it goes) */
+	say("stream: frames begin (format %d, a %s mode)", s->format_index, mode_name(s->camera->formats[s->format_index & 1].kind));
+	pthread_attr_init(&attributes);
+	pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+	if (pthread_create(&thread, &attributes, worker, start) != 0) {
+		pthread_attr_destroy(&attributes);
+		s->running = false;
+		pthread_mutex_lock(&s->worker_lock);
+		s->workers--;
+		pthread_mutex_unlock(&s->worker_lock);
+		CFRelease(o);
+		free(start);
+		return ERR_UNSUPPORTED;
+	}
+	pthread_attr_destroy(&attributes);
 	return 0;
 }
 
@@ -1512,14 +1762,16 @@ stream_stop(CMBaseObjectRef o)
 	    (unsigned long long)s->out[0].delivered);
 	pthread_mutex_lock(&s->lock);
 	s->graph_running = false;
+	s->stills_wanted = 0;           /* (redfin, B6: a photograph asked for and not given is not given to the next session) */
 	for (int i = 0; i < OUTPUTS; i++) {
 		let_go(&s->out[i]);
 	}
 	pthread_mutex_unlock(&s->lock);
 	s->running = false;
-	if (s->worker_started) {
-		pthread_join(s->worker, NULL);
-		s->worker_started = false;
+	s->generation++;
+	/* (redfin, B8: not for ever: the worker may be in the kernel's read while the sensor starts or stops; it goes when that returns) */
+	if (!workers_gone(s, 1500)) {
+		say("stream: its worker is still in the kernel: left to finish on its own");
 	}
 	return 0;
 }
@@ -1622,8 +1874,7 @@ stream_finalize(CMBaseObjectRef o)
 static CFStringRef
 stream_description(CMBaseObjectRef o)
 {
-	(void)o;
-	return CFRetain(CFSTR("<RedwoodCaptureStream: the wide camera>"));
+	return CFStringCreateWithFormat(NULL, NULL, CFSTR("<RedwoodCaptureStream: the %s>"), stream_of(o)->camera->name);
 }
 
 static const struct base_class stream_base = {
@@ -1647,6 +1898,8 @@ stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef
 	memset(s, 0, sizeof(*s));
 	pthread_mutex_init(&s->lock, NULL);
 	pthread_mutex_init(&s->metadata_lock, NULL);
+	pthread_mutex_init(&s->worker_lock, NULL);
+	pthread_cond_init(&s->worker_gone, NULL);
 	s->torch = -1;
 	s->min_fps = 2;
 	s->zoom = 1;
@@ -1659,8 +1912,9 @@ stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef
 		s->out[i].name = output_names[i];
 	}
 
-	CFDictionaryRef f[2] = { format(camera->formats[0][0], camera->formats[0][1], camera->formats[0][2], false, camera->fov),
-		format(camera->formats[1][0], camera->formats[1][1], camera->formats[1][2], false, camera->fov) };
+	CFDictionaryRef f[2] = { format(camera->formats[0].width, camera->formats[0].height, camera->formats[0].fps, false, camera->fov,
+		camera->pixel_size), format(camera->formats[1].width, camera->formats[1].height, camera->formats[1].fps, false, camera->fov,
+		camera->pixel_size) };
 
 	s->formats = CFArrayCreate(NULL, (const void **)f, 2, &kCFTypeArrayCallBacks);
 	s->supported = supported(stream_props, sizeof(stream_props) / sizeof(stream_props[0]));
@@ -1777,7 +2031,7 @@ static CFStringRef
 device_description(CMBaseObjectRef o)
 {
 	(void)o;
-	return CFRetain(CFSTR("<RedwoodCaptureDevice: the POCO X5 Pro's wide camera>"));
+	return CFRetain(CFSTR("<RedwoodCaptureDevice: the Pixel 5's cameras>"));
 }
 
 static const struct base_class device_base = {
@@ -1794,8 +2048,10 @@ OSStatus
 redwood_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, CMBaseObjectRef *out)
 {
 	static bool found, usable;
-	CMBaseObjectRef device = NULL, stream[2];
+	CMBaseObjectRef device = NULL, stream[CAMERAS];
+	CFStringRef ports[CAMERAS];
 	struct device *d;
+	int n = 0;
 
 	(void)options;
 	if (!found) {
@@ -1805,28 +2061,43 @@ redwood_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, 
 	if (!usable || out == NULL) {
 		return ERR_UNSUPPORTED;
 	}
-	if ((stream[0] = stream_create(allocator, &cameras[0], port_back)) == NULL) {
-		return ERR_UNSUPPORTED;
+	ports[0] = port_back;
+	ports[1] = port_front;
+	/* redfin (B3): the ultra-wide camera, where asked for and CMCapture has its port */
+	ports[2] = access("/private/var/local/camera-ultrawide", F_OK) == 0 ? port_ultra_wide : NULL;
+	if (access("/private/var/local/camera-ultrawide", F_OK) == 0 && port_ultra_wide == NULL) {
+		say("no ultra-wide camera: kFigCapturePortType_BackFacingSuperWideCamera is not there");
 	}
-	if ((stream[1] = stream_create(allocator, &cameras[1], port_front)) == NULL) {
-		CFRelease(stream[0]);
-		return ERR_UNSUPPORTED;
+	for (int i = 0; i < CAMERAS; i++) {
+		if (ports[i] == NULL) {
+			continue;
+		}
+		if ((stream[n] = stream_create(allocator, &cameras[i], ports[i])) == NULL) {
+			while (n > 0) {
+				CFRelease(stream[--n]);
+			}
+			return ERR_UNSUPPORTED;
+		}
+		n++;
 	}
 	if (derived_create(allocator, &device_vtable, device_class_id(), &device) != 0 || device == NULL) {
-		CFRelease(stream[0]);
-		CFRelease(stream[1]);
+		while (n > 0) {
+			CFRelease(stream[--n]);
+		}
 		say("the device cannot be made");
 		return ERR_UNSUPPORTED;
 	}
 	d = derived_storage(device);
 	memset(d, 0, sizeof(*d));
-	d->streams = CFArrayCreate(NULL, (const void **)stream, 2, &kCFTypeArrayCallBacks);
-	all_streams[0] = stream[0];             /* (kept by the device's array) */
-	all_streams[1] = stream[1];
+	d->streams = CFArrayCreate(NULL, (const void **)stream, n, &kCFTypeArrayCallBacks);
+	for (int i = 0; i < CAMERAS; i++) {
+		all_streams[i] = i < n ? stream[i] : NULL;      /* (kept by the device's array) */
+	}
 	d->supported = supported(device_props, sizeof(device_props) / sizeof(device_props[0]));
-	CFRelease(stream[0]);
-	CFRelease(stream[1]);
+	for (int i = 0; i < n; i++) {
+		CFRelease(stream[i]);
+	}
 	*out = device;
-	say("the device made: two streams, the back camera and the front one");
+	say("the device made: %d streams, the back camera, the front one%s", n, n > 2 ? " and the ultra-wide one" : "");
 	return 0;
 }
