@@ -139,7 +139,9 @@ static CFStringRef port_ultra_wide;     /* kFigCapturePortType_BackFacingSuperWi
  */
 enum {
 	MD_PORT, MD_PTS, MD_EXPOSURE, MD_AGC, MD_ISP_DGAIN, MD_SENSOR_DGAIN, MD_ISO_BASE, MD_FRAME_RATE, MD_LUX, MD_SNR,
-	MD_AF_STATUS, MD_FOCUSING, MD_AE_STABLE, MD_AE_LOCKED, MD_AWB_STABLE, MD_AWB_LOCKED, MD_AF_LOCKED, MD_ZOOM, MD_KEYS
+	MD_AF_STATUS, MD_FOCUSING, MD_AE_STABLE, MD_AE_LOCKED, MD_AWB_STABLE, MD_AWB_LOCKED, MD_AF_LOCKED, MD_ZOOM,
+	/* redfin (B5, B7): the lens, the white balance's gains and colour temperature (names and units to be checked on the phone) */
+	MD_FOCUS_POSITION, MD_LENS_POSITION, MD_AWB_R, MD_AWB_G, MD_AWB_B, MD_AWB_CCT, MD_CCT, MD_KEYS
 };
 static const char *const md_names[MD_KEYS] = {
 	"kFigCaptureStreamMetadata_PortType", "kFigCaptureSampleBufferAttachmentKey_OriginalPresentationTimeStamp",
@@ -149,6 +151,9 @@ static const char *const md_names[MD_KEYS] = {
 	"kFigCaptureStreamMetadata_FocusingMethod", "kFigCaptureStreamMetadata_AEStable", "kFigCaptureStreamMetadata_AELocked",
 	"kFigCaptureStreamMetadata_AWBStable", "kFigCaptureStreamMetadata_AWBLocked", "kFigCaptureStreamMetadata_AFLocked",
 	"kFigCaptureStreamMetadata_ZoomFactor",
+	"kFigCaptureStreamMetadata_FocusPosition", "kFigCaptureStreamMetadata_LensPosition", "kFigCaptureStreamMetadata_AWBRGain",
+	"kFigCaptureStreamMetadata_AWBGGain", "kFigCaptureStreamMetadata_AWBBGain", "kFigCaptureStreamMetadata_AWBCCT",
+	"kFigCaptureStreamMetadata_ColorTemperature",
 };
 static CFStringRef md_key[MD_KEYS];
 static CFStringRef md_attachment;       /* kFigCaptureSampleBufferAttachmentKey_MetadataDictionary */
@@ -307,6 +312,16 @@ static const struct prop stream_props[] = {
 	{ "FocusNow", "Collection", "WriteOnly" }, { "PeakTrackingFocusNow", "Collection", "WriteOnly" },
 	{ "LockAFNow", "Boolean", "WriteOnly" }, { "ManualFocusNow", "Collection", "WriteOnly" },
 	{ "AFWindowParams", "Collection", "ReadWrite" }, { "AutoFocusMode", "Number", "ReadWrite" },
+	/*
+	 * redfin (plan B4/B7): the window a tap meters on, and what a custom exposure or white balance may be set by --
+	 * the capture stack sets only what is listed, and these names are guesses (H10ISP's are not known here): what it
+	 * really sets is said once ("stream: set (not used)"), for the phone to show
+	 */
+	{ "AEWindowParams", "Collection", "ReadWrite" }, { "ExposureMode", "Number", "ReadWrite" },
+	{ "ManualExposureNow", "Collection", "WriteOnly" }, { "IntegrationTimeAndGain", "Collection", "ReadWrite" },
+	{ "ManualExposureParams", "Collection", "ReadWrite" }, { "ExposureDurationAndISO", "Collection", "ReadWrite" },
+	{ "ManualAWBGainsNow", "Collection", "WriteOnly" }, { "WhiteBalanceGains", "Collection", "ReadWrite" },
+	{ "ManualWhiteBalanceGains", "Collection", "ReadWrite" },
 }, device_props[] = {
 	{ "StreamArray", "Collection", "ReadOnly" }, { "Clock", "Clock", "ReadOnly" }, { "ClientIsActive", "Boolean", "ReadWrite" },
 	{ "SupportedSynchronizedStreamsGroups", "Collection", "ReadOnly" }, { "MemoryPoolID", "Number", "ReadWrite" },
@@ -442,6 +457,9 @@ static const char *const output_names[OUTPUTS] = { "PrimaryScaler", "SecondarySc
  * iPhone X has none, its port and formats are not in D22's plist, and how the capture stack takes that is for the
  * phone to show.
  */
+static const char *mode_name(uint32_t kind);
+static uint64_t frame_time(const struct redwood_camera_frame *f);
+
 struct camera_format {
 	int             width, height, fps;     /* the iPhone X's (the plist's keys) */
 	uint32_t        kind;                   /* REDWOOD_CAMERA_MODE_*: the mode the kernel is asked for */
@@ -499,7 +517,23 @@ struct stream {
 	pthread_cond_t  worker_gone;
 	int             torch;
 	uint64_t        frames, stills_given;
+	/*
+	 * redfin (plan B4-B7): what the capture stack asks of exposure, white balance, focus and the flash (the
+	 * properties below; the worker takes a copy each frame, under ctl_lock).
+	 */
+	pthread_mutex_t ctl_lock;
+	bool            ae_locked, ae_manual, limit_ae_range, awb_locked, awb_manual;
+	float           ae_bias, ae_roi[4], ae_max_gain, manual_gain, wb_manual[3];
+	uint32_t        ae_max_exposure_us, manual_us;
+	int             af_mode;        /* AF_MODE_*: what focus does once it has found the sharpest */
+	int32_t         manual_focus;   /* ManualFocusNow: where the lens is to go (0 infinity to 1023 macro), -1: nowhere */
+	volatile bool   has_focus;      /* the frames say where the lens is (a lens motor): HasAutoFocusPositionSensor */
+	int             flash_mode;     /* FlashMode: 0 off, 1 on, 2 auto */
+	int             still_flash;    /* the flash the latest StillImageCaptureNow asked for: 0 off, 1 on, 2 auto, -1 as FlashMode */
 };
+
+/* AF_MODE_*: after a search, focus keeps watching (continuous), or stays where it is (auto: one search) */
+enum { AF_MODE_AUTO = 1, AF_MODE_CONTINUOUS = 2 };
 
 static struct stream *
 stream_of(CMBaseObjectRef o)
@@ -543,8 +577,21 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 		value = number_f(s->max_fps);
 	} else if (key_is(key, "Clock")) {
 		value = CFRetain(CMClockGetHostTimeClock());
-	} else if (key_is(key, "TorchLevel") || key_is(key, "ExposureBias")) {
-		value = number_f(0);
+	} else if (key_is(key, "TorchLevel")) {
+		/* redfin (B6): the flashlight's level as the kernel has it (kern.sweet_torch, thousandths) */
+		int level = 0;
+		size_t size = sizeof(level);
+
+		value = number_f(sysctlbyname("kern.sweet_torch", &level, &size, NULL, 0) == 0 && level > 0 ? level / 1000.0 : 0);
+	} else if (key_is(key, "ExposureBias")) {
+		value = number_f(s->ae_bias);
+	} else if (key_is(key, "FlashMode")) {
+		value = number_i(s->flash_mode);
+	} else if (key_is(key, "MaxIntegrationTime")) {
+		value = number_i(s->ae_max_exposure_us ? s->ae_max_exposure_us : 1000000 / 15);
+	} else if (key_is(key, "AEMaxGain")) {
+		value = number_f(s->ae_max_gain > 0 ? s->ae_max_gain : 64);
+
 	} else if (key_is(key, "VideoOutputConfigurations") || key_is(key, "VideoOutputsEnabled")) {
 		/*
 		 * ReadWrite, but the capture-graph builder READS these back while it builds the graph
@@ -607,10 +654,12 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 
 		value = CFArrayCreate(NULL, (const void **)&srgb, 1, &kCFTypeArrayCallBacks);
 		CFRelease(srgb);
-	} else if (key_is(key, "ColorSpace") || key_is(key, "DeviceOrientation") || key_is(key, "FlashMode")) {
+	} else if (key_is(key, "ColorSpace") || key_is(key, "DeviceOrientation")) {
 		value = number_i(0);
-	} else if (key_is(key, "HasAutoFocusPositionSensor") || key_is(key, "HighCurrentTorchEnabled") ||
-	    key_is(key, "DeferAdditionOfAttachments")) {
+	} else if (key_is(key, "HasAutoFocusPositionSensor")) {
+		/* redfin (B5): where the frames say where the lens is (the kernel's lens motor) */
+		value = CFRetain(s->has_focus ? kCFBooleanTrue : kCFBooleanFalse);
+	} else if (key_is(key, "HighCurrentTorchEnabled") || key_is(key, "DeferAdditionOfAttachments")) {
 		value = CFRetain(kCFBooleanFalse);
 	} else {
 		say_once("stream: no answer for", key, NULL);
@@ -671,6 +720,213 @@ af_window(struct stream *s, CFTypeRef value)
 	s->af_window[1] = (float)y0;
 	s->af_window[2] = (float)(x0 + width);
 	s->af_window[3] = (float)(y0 + height);
+}
+
+/*
+ * The lens's travel focus uses (the kernel's positions: 0 infinity, 1023 macro). TODO(WS-A's actuator report): these are
+ * HackiOS's phone's; the Pixel 5's IMX363 actuator's infinity and macro DACs (and whether its OIS controller owns the
+ * coil) are for WS-A to find, and these follow.
+ */
+#define AF_NEAR         16              /* (off the stop at 0) */
+#define AF_FAR          768             /* (its module file's actuator region goes to 700; near 1023 the PM8008i's LDO5 said over-current) */
+#define AF_STEP         48
+#define AF_FINE         12
+
+/* ---- redfin (plan B4-B7): the controls' values ------------------------------------------------------------------- */
+
+/* a number, a boolean as 0 or 1, or a CMTime's dictionary in seconds */
+static bool
+number_of(CFTypeRef value, double *n)
+{
+	if (value == NULL) {
+		return false;
+	}
+	if (CFGetTypeID(value) == CFNumberGetTypeID()) {
+		return CFNumberGetValue(value, kCFNumberDoubleType, n);
+	}
+	if (CFGetTypeID(value) == CFBooleanGetTypeID()) {
+		*n = CFBooleanGetValue(value) ? 1 : 0;
+		return true;
+	}
+	if (CFGetTypeID(value) == CFDictionaryGetTypeID() && CFDictionaryContainsKey(value, CFSTR("timescale"))) {
+		CMTime t = CMTimeMakeFromDictionary(value);
+
+		if (CMTIME_IS_NUMERIC(t)) {
+			*n = CMTimeGetSeconds(t);
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+name_has(CFStringRef key, const char *part)
+{
+	char name[128];
+
+	return CFGetTypeID(key) == CFStringGetTypeID() && CFStringGetCString(key, name, sizeof(name), kCFStringEncodingUTF8) &&
+	    strcasestr(name, part) != NULL;
+}
+
+/* the value under the first key with `part' in its name (a dictionary's), as a number */
+static bool
+dict_find(CFDictionaryRef d, const char *part, double *n, const char *not_part)
+{
+	CFIndex count = CFDictionaryGetCount(d);
+	const void **keys = calloc((size_t)count + 1, sizeof(void *)), **values = calloc((size_t)count + 1, sizeof(void *));
+	bool found = false;
+
+	if (keys == NULL || values == NULL) {
+		free(keys);
+		free(values);
+		return false;
+	}
+	CFDictionaryGetKeysAndValues(d, keys, values);
+	for (CFIndex i = 0; i < count && !found; i++) {
+		if (name_has(keys[i], part) && (not_part == NULL || !name_has(keys[i], not_part))) {
+			found = number_of(values[i], n);
+		}
+	}
+	free(keys);
+	free(values);
+	return found;
+}
+
+/*
+ * A rectangle of the frame as fractions (x0, y0, x1, y1): a dictionary of X/Y/Width/Height (CGRect's) or
+ * hStart/vStart/width/height (AFWindowParams'), or an array whose first item is one; thousandths where the numbers
+ * are larger than 1. False: none (the whole frame).
+ */
+static bool
+rect_of(CFTypeRef value, float r[4])
+{
+	double x = 0, y = 0, w = 0, h = 0;
+
+	if (value != NULL && CFGetTypeID(value) == CFArrayGetTypeID()) {
+		value = CFArrayGetCount(value) > 0 ? CFArrayGetValueAtIndex(value, 0) : NULL;
+	}
+	if (value == NULL || CFGetTypeID(value) != CFDictionaryGetTypeID()) {
+		return false;
+	}
+	if (!dict_find(value, "width", &w, NULL) || !dict_find(value, "height", &h, NULL) || w <= 0 || h <= 0) {
+		return false;
+	}
+	if (!dict_find(value, "hStart", &x, NULL)) {
+		dict_find(value, "x", &x, "max");
+	}
+	if (!dict_find(value, "vStart", &y, NULL)) {
+		dict_find(value, "y", &y, "max");
+	}
+	if (w > 1.001 || h > 1.001 || x > 1.001 || y > 1.001) {
+		x /= 1000, y /= 1000, w /= 1000, h /= 1000;
+	}
+	if (w >= 0.98 && h >= 0.98) {
+		return false;           /* (the whole frame) */
+	}
+	x = x < 0 ? 0 : x > 1 ? 1 : x;
+	y = y < 0 ? 0 : y > 1 ? 1 : y;
+	r[0] = (float)x;
+	r[1] = (float)y;
+	r[2] = (float)(x + w > 1 ? 1 : x + w);
+	r[3] = (float)(y + h > 1 ? 1 : y + h);
+	return r[2] > r[0] && r[3] > r[1];
+}
+
+/*
+ * A custom exposure, however it comes (the names are not known here): a duration (a CMTime, seconds below 10,
+ * microseconds above) under a key with "Integration", "Duration" or "Exposure" in its name, a gain under one with
+ * "ISO" (ISOBase 32 is 1x), "Gain" or "AGC" (256 is 1x where it is that large). True if a duration was found.
+ */
+static bool
+exposure_of(CFTypeRef value, uint32_t *us, float *gain)
+{
+	double d = 0, g = 0;
+
+	if (value == NULL || CFGetTypeID(value) != CFDictionaryGetTypeID()) {
+		return false;
+	}
+	if (!dict_find(value, "Integration", &d, NULL) && !dict_find(value, "Duration", &d, NULL) &&
+	    !dict_find(value, "Exposure", &d, "Bias")) {
+		return false;
+	}
+	*us = (uint32_t)(d < 10 ? d * 1e6 : d);
+	*gain = 1;
+	if (dict_find(value, "ISO", &g, NULL)) {
+		*gain = (float)(g / 32);
+	} else if (dict_find(value, "Gain", &g, NULL) || dict_find(value, "AGC", &g, NULL)) {
+		*gain = (float)(g >= 64 ? g / 256 : g);
+	}
+	*gain = *gain < 1 ? 1 : *gain;
+	return *us > 0;
+}
+
+/* white balance gains: R, G, B under keys with "Red"/"Green"/"Blue" (or "R"/"G"/"B" alone), or an array of three */
+static bool
+gains_of(CFTypeRef value, float g[3])
+{
+	double r = 0, gr = 0, b = 0;
+
+	if (value != NULL && CFGetTypeID(value) == CFArrayGetTypeID() && CFArrayGetCount(value) == 3) {
+		bool all = number_of(CFArrayGetValueAtIndex(value, 0), &r) && number_of(CFArrayGetValueAtIndex(value, 1), &gr) &&
+		    number_of(CFArrayGetValueAtIndex(value, 2), &b);
+
+		if (!all) {
+			return false;
+		}
+	} else if (value == NULL || CFGetTypeID(value) != CFDictionaryGetTypeID() || !dict_find(value, "Red", &r, NULL) ||
+	    !dict_find(value, "Green", &gr, NULL) || !dict_find(value, "Blue", &b, NULL)) {
+		if (value == NULL || CFGetTypeID(value) != CFDictionaryGetTypeID() || !dict_find(value, "RGain", &r, NULL) ||
+		    !dict_find(value, "GGain", &gr, NULL) || !dict_find(value, "BGain", &b, NULL)) {
+			return false;
+		}
+	}
+	if (r <= 0 || gr <= 0 || b <= 0) {
+		return false;
+	}
+	/* (as ratios to green: whatever their unit, it goes) */
+	g[0] = (float)(r / gr);
+	g[1] = 1;
+	g[2] = (float)(b / gr);
+	return true;
+}
+
+/* StillImageCaptureNow's: how many pictures, and the flash (0 off, 1 on, 2 auto; -1 not said) */
+static void
+still_request(CFTypeRef value, unsigned *count, int *flash)
+{
+	double n;
+
+	*count = 1;
+	*flash = -1;
+	if (value == NULL || CFGetTypeID(value) != CFDictionaryGetTypeID()) {
+		return;
+	}
+	if (dict_find(value, "Flash", &n, "Torch")) {
+		*flash = n <= 0 ? 0 : n >= 2 ? 2 : 1;
+	}
+	if ((dict_find(value, "NumberOf", &n, NULL) || dict_find(value, "Count", &n, NULL)) && n >= 1) {
+		*count = n > 8 ? 8 : (unsigned)n;
+	}
+}
+
+/* ManualFocusNow's lens position: AVFoundation's 0 (nearest) to 1 (furthest), as the kernel's 0 (infinity) to 1023 */
+static int32_t
+focus_of(CFTypeRef value)
+{
+	double p = -1;
+
+	if (value != NULL && CFGetTypeID(value) == CFDictionaryGetTypeID()) {
+		if (!dict_find(value, "LensPosition", &p, NULL) && !dict_find(value, "Position", &p, NULL)) {
+			return -1;
+		}
+	} else if (!number_of(value, &p)) {
+		return -1;
+	}
+	if (p > 1.001) {
+		return (int32_t)(p > 1023 ? 1023 : p);  /* (already a position) */
+	}
+	p = p < 0 ? 0 : p;
+	return (int32_t)((1 - p) * (AF_FAR - AF_NEAR) + AF_NEAR + 0.5);
 }
 
 static OSStatus
@@ -782,10 +1038,15 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		 * it will know the frames again). One frame of the sensor goes to the StillImage output for
 		 * each ask.
 		 */
+		unsigned count;
+		int flash;
+
+		still_request(value, &count, &flash);
 		pthread_mutex_lock(&s->lock);
-		s->stills_wanted++;
+		s->stills_wanted += count;      /* (redfin, B6: as many as asked for) */
+		s->still_flash = flash;
 		pthread_mutex_unlock(&s->lock);
-		say_once("stream: a photograph asked for", key, value);
+		say_value("stream: a photograph asked for", key, value);
 		return 0;
 	}
 	if (key_is(key, "VideoOutputsColorInfo")) {
@@ -801,6 +1062,121 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		torch_set(s, value);
 		return 0;
 	}
+	/* ---- redfin (plan B4): exposure ---- */
+	if (key_is(key, "LockAENow") || key_is(key, "UnlockAENow")) {
+		pthread_mutex_lock(&s->ctl_lock);
+		s->ae_locked = key_is(key, "LockAENow");
+		if (!s->ae_locked) {
+			s->ae_manual = false;
+		}
+		pthread_mutex_unlock(&s->ctl_lock);
+		say("stream: exposure %s", s->ae_locked ? "locked" : "unlocked");
+		return 0;
+	}
+	if (key_is(key, "ExposureBias")) {
+		double bias = 0;
+
+		number_of(value, &bias);
+		s->ae_bias = (float)(bias < -8 ? -8 : bias > 8 ? 8 : bias);
+		say_once("stream: set", key, value);
+		return 0;
+	}
+	if (key_is(key, "RegionOfInterestForCameraControls") || key_is(key, "AEWindowParams")) {
+		float r[4] = { 0, 0, 0, 0 };
+		bool some = rect_of(value, r);
+
+		pthread_mutex_lock(&s->ctl_lock);
+		memcpy(s->ae_roi, r, sizeof(r));
+		pthread_mutex_unlock(&s->ctl_lock);
+		if (some) {
+			say_value("stream: exposure: metered on", key, value);
+		}
+		return 0;
+	}
+	if (key_is(key, "MaxIntegrationTime")) {
+		double us = 0;
+
+		number_of(value, &us);
+		s->ae_max_exposure_us = us <= 0 ? 0 : us < 10 ? (uint32_t)(us * 1e6) : (uint32_t)us;
+		say_once("stream: set", key, value);
+		return 0;
+	}
+	if (key_is(key, "AEMaxGain")) {
+		double g = 0;
+
+		number_of(value, &g);
+		s->ae_max_gain = (float)(g >= 256 ? g / 256 : g);
+		say_once("stream: set", key, value);
+		return 0;
+	}
+	if (key_is(key, "LimitAERange")) {
+		double on = 0;
+
+		number_of(value, &on);
+		s->limit_ae_range = on != 0;
+		say_once("stream: set", key, value);
+		return 0;
+	}
+	if (key_is(key, "ExposureMode")) {
+		double mode = 2;
+
+		/* (AVCaptureExposureMode: 0 locked, 1 auto, 2 continuous, 3 custom) */
+		number_of(value, &mode);
+		pthread_mutex_lock(&s->ctl_lock);
+		s->ae_locked = mode == 0;
+		s->ae_manual = mode == 3 && s->manual_us != 0;
+		pthread_mutex_unlock(&s->ctl_lock);
+		say_value("stream: exposure:", key, value);
+		return 0;
+	}
+	if (key_is(key, "ManualExposureNow") || key_is(key, "IntegrationTimeAndGain") || key_is(key, "ManualExposureParams") ||
+	    key_is(key, "ExposureDurationAndISO")) {
+		uint32_t us;
+		float gain;
+
+		say_value("stream: exposure:", key, value);
+		if (exposure_of(value, &us, &gain)) {
+			pthread_mutex_lock(&s->ctl_lock);
+			s->ae_manual = true;
+			s->manual_us = us;
+			s->manual_gain = gain;
+			pthread_mutex_unlock(&s->ctl_lock);
+			say("stream: a custom exposure: %.2f ms at %.2fx", us / 1000.0, gain);
+		}
+		return 0;
+	}
+	/* ---- redfin (plan B7): white balance ---- */
+	if (key_is(key, "LockAWBNow") || key_is(key, "UnlockAWBNow")) {
+		pthread_mutex_lock(&s->ctl_lock);
+		s->awb_locked = key_is(key, "LockAWBNow");
+		if (!s->awb_locked) {
+			s->awb_manual = false;
+		}
+		pthread_mutex_unlock(&s->ctl_lock);
+		say("stream: white balance %s", s->awb_locked ? "locked" : "unlocked");
+		return 0;
+	}
+	if (key_is(key, "ManualAWBGainsNow") || key_is(key, "WhiteBalanceGains") || key_is(key, "ManualWhiteBalanceGains")) {
+		float g[3];
+
+		say_value("stream: white balance:", key, value);
+		if (gains_of(value, g)) {
+			pthread_mutex_lock(&s->ctl_lock);
+			memcpy(s->wb_manual, g, sizeof(g));
+			s->awb_manual = true;
+			pthread_mutex_unlock(&s->ctl_lock);
+		}
+		return 0;
+	}
+	/* ---- redfin (plan B6): the flash ---- */
+	if (key_is(key, "FlashMode")) {
+		double mode = 0;
+
+		number_of(value, &mode);
+		s->flash_mode = mode <= 0 ? 0 : mode >= 2 ? 2 : 1;
+		say_value("stream: set", key, value);
+		return 0;
+	}
 	if (key_is(key, "AutoFocusNow") || key_is(key, "ContinuousAutoFocusNow") || key_is(key, "FocusNow") ||
 	    key_is(key, "PeakTrackingFocusNow") || key_is(key, "LockAFNow") || key_is(key, "ManualFocusNow") ||
 	    key_is(key, "AFWindowParams") || key_is(key, "AutoFocusMode")) {
@@ -814,15 +1190,31 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		    CFArrayGetCount(value) > 0)) {
 			say_value("stream: focus:", key, value);        /* (an empty window, the middle: often, unsaid) */
 		}
+		/*
+		 * redfin (B5): ContinuousAutoFocusNow is a mode (focus keeps watching the scene and searches again), AutoFocusNow
+		 * (and FocusNow, PeakTrackingFocusNow) one search that then stays (AVCaptureFocusModeAutoFocus); ManualFocusNow
+		 * takes the lens where it is asked (AVFoundation's lens position) and keeps it there.
+		 */
+		pthread_mutex_lock(&s->ctl_lock);
 		if (key_is(key, "AFWindowParams")) {
 			af_window(s, value);
 		} else if (key_is(key, "LockAFNow")) {
 			s->af_locked = true;
+		} else if (key_is(key, "ManualFocusNow")) {
+			int32_t at = focus_of(value);
+
+			if (at >= 0) {
+				s->manual_focus = at;
+				s->af_locked = true;
+			}
 		} else if (key_is(key, "AutoFocusNow") || key_is(key, "ContinuousAutoFocusNow") || key_is(key, "FocusNow") ||
 		    key_is(key, "PeakTrackingFocusNow")) {
+			s->af_mode = key_is(key, "ContinuousAutoFocusNow") ? AF_MODE_CONTINUOUS : AF_MODE_AUTO;
 			s->af_locked = false;
+			s->manual_focus = -1;
 			s->af_now = true;
 		}
+		pthread_mutex_unlock(&s->ctl_lock);
 		return 0;
 	}
 	say_once("stream: set (not used)", key, value);
@@ -960,13 +1352,21 @@ md_put(CFMutableDictionaryRef m, int key, CFTypeRef value)
 	}
 }
 
+/* redfin (B4-B7): what the frame's metadata say of the controls */
+struct md_extra {
+	int             af_status;      /* 2: searching (a photograph waits for it), 0 not */
+	bool            af_locked, ae_locked, awb_locked, flash;
+	float           cct;
+};
+
 /* the frame's metadata, as H10ISP's stream gives them (see md_names) */
 static CFDictionaryRef
-frame_metadata(const struct isp *isp, const struct redwood_camera_frame *f, const struct isp_stats *st, CFStringRef port)
+frame_metadata(const struct isp *isp, const struct redwood_camera_frame *f, const struct isp_stats *st, CFStringRef port,
+    const struct md_extra *x)
 {
 	CFMutableDictionaryRef m;
 	double exposure = f->exposure_lines * (double)f->line_ns / 1e9, analog = f->gain_unity ? (double)f->gain / f->gain_unity : 1;
-	double total = analog * isp->digital, fps = f->frame_lines && f->line_ns ? 1e9 / ((double)f->frame_lines * f->line_ns) : 30;
+	double total = analog * isp->sensor_digital * isp->digital, fps = f->frame_lines && f->line_ns ? 1e9 / ((double)f->frame_lines * f->line_ns) : 30;
 	/* (green's level for a second at 1x, a quarter of it: a room's 70 or so, daylight's tens of thousands) */
 	double lux = exposure > 0 && total > 0 ? st->mean[1] / (exposure * total) / 4 : 0;
 
@@ -975,22 +1375,43 @@ frame_metadata(const struct isp *isp, const struct redwood_camera_frame *f, cons
 	}
 	m = (CFMutableDictionaryRef)new_dict();
 	md_put(m, MD_PORT, CFRetain(port));
-	md_put(m, MD_PTS, CMTimeCopyAsDictionary(CMClockMakeHostTimeFromSystemUnits(f->time), NULL));
+	md_put(m, MD_PTS, CMTimeCopyAsDictionary(CMClockMakeHostTimeFromSystemUnits(frame_time(f)), NULL));
 	md_put(m, MD_EXPOSURE, number_f(exposure));
 	md_put(m, MD_AGC, number_i((int64_t)(analog * 256 + 0.5)));
 	md_put(m, MD_ISP_DGAIN, number_i((int64_t)(isp->digital * 256 + 0.5)));
-	md_put(m, MD_SENSOR_DGAIN, number_i(256));
+	md_put(m, MD_SENSOR_DGAIN, number_i((int64_t)(isp->sensor_digital * 256 + 0.5)));
 	md_put(m, MD_ISO_BASE, number_f(32));
 	md_put(m, MD_FRAME_RATE, number_f(fps));
 	md_put(m, MD_LUX, number_i((int64_t)(lux + 0.5)));
 	md_put(m, MD_SNR, number_f(40 - 10 * log10(total < 1 ? 1 : total)));
-	md_put(m, MD_AF_STATUS, number_i(0));
+	/* redfin (B4, B5, B7): as they are, not always settled and never locked */
+	md_put(m, MD_AF_STATUS, number_i(x->af_status));
 	md_put(m, MD_FOCUSING, number_i(0));
-	md_put(m, MD_AE_STABLE, CFRetain(kCFBooleanTrue));
-	md_put(m, MD_AE_LOCKED, CFRetain(kCFBooleanFalse));
-	md_put(m, MD_AWB_STABLE, CFRetain(kCFBooleanTrue));
-	md_put(m, MD_AWB_LOCKED, CFRetain(kCFBooleanFalse));
-	md_put(m, MD_AF_LOCKED, CFRetain(kCFBooleanFalse));
+	md_put(m, MD_AE_STABLE, CFRetain(isp->ae_stable || x->ae_locked ? kCFBooleanTrue : kCFBooleanFalse));
+	md_put(m, MD_AE_LOCKED, CFRetain(x->ae_locked ? kCFBooleanTrue : kCFBooleanFalse));
+	md_put(m, MD_AWB_STABLE, CFRetain(isp->awb_stable || x->awb_locked ? kCFBooleanTrue : kCFBooleanFalse));
+	md_put(m, MD_AWB_LOCKED, CFRetain(x->awb_locked ? kCFBooleanTrue : kCFBooleanFalse));
+	md_put(m, MD_AF_LOCKED, CFRetain(x->af_locked ? kCFBooleanTrue : kCFBooleanFalse));
+	if (f->focus != REDWOOD_CAMERA_NO_FOCUS) {
+		/* (the kernel's position, 0 infinity to 1023 macro; and AVFoundation's lens position, 0 nearest to 1 furthest) */
+		md_put(m, MD_FOCUS_POSITION, number_i(f->focus));
+		md_put(m, MD_LENS_POSITION, number_f(f->focus <= AF_NEAR ? 1 : f->focus >= AF_FAR ? 0 :
+		    1 - (double)(f->focus - AF_NEAR) / (AF_FAR - AF_NEAR)));
+	}
+	{
+		/* (the gains as AVFoundation has them, the least 1; in 1024ths) */
+		float least = isp->wb[0] < isp->wb[2] ? isp->wb[0] : isp->wb[2];
+
+		least = least < isp->wb[1] ? least : isp->wb[1];
+		least = least > 0 ? least : 1;
+		md_put(m, MD_AWB_R, number_i((int64_t)(isp->wb[0] / least * 1024 + 0.5)));
+		md_put(m, MD_AWB_G, number_i((int64_t)(isp->wb[1] / least * 1024 + 0.5)));
+		md_put(m, MD_AWB_B, number_i((int64_t)(isp->wb[2] / least * 1024 + 0.5)));
+	}
+	if (x->cct > 0) {
+		md_put(m, MD_AWB_CCT, number_i((int64_t)(x->cct + 0.5)));
+		md_put(m, MD_CCT, number_i((int64_t)(x->cct + 0.5)));
+	}
 	/*
 	 * The zoom the picture was made with: the source node takes it for what the ISP applied
 	 * (-[BWMultiStreamCameraSourceNode _ispAppliedZoomFactorFromSampleBufferMetadataDictionary:outputIndex:])
@@ -1051,7 +1472,7 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 		CFRelease(m);
 	}
 
-	CMTime pts = CMClockMakeHostTimeFromSystemUnits(f->time);
+	CMTime pts = CMClockMakeHostTimeFromSystemUnits(frame_time(f));
 
 	((pixel_buffer_handler)out->handler)(pb, pts);
 	/*
@@ -1136,11 +1557,7 @@ colour_temperature(const struct isp *isp)
  * -- it finds what was tapped however far out of focus it was, where the climb gave up on the flat
  * of the curve.
  */
-enum { AF_WATCH, AF_STEADY, AF_CLIMB, AF_SWEEP, AF_FINE_SEARCH, AF_SETTLE };
-#define AF_NEAR         16              /* (off the stop at 0) */
-#define AF_FAR          768             /* (its module file's actuator region goes to 700; near 1023 the PM8008i's LDO5 said over-current) */
-#define AF_STEP         48
-#define AF_FINE         12
+enum { AF_WATCH, AF_STEADY, AF_CLIMB, AF_SWEEP, AF_FINE_SEARCH, AF_SETTLE, AF_MANUAL };
 
 struct af {
 	int             state;
@@ -1158,7 +1575,18 @@ struct af {
 	bool            sweep;          /* ... and the whole travel measured */
 	float           sum_sharpness, sum_level;
 	unsigned        measured;
+	/* redfin (B5) */
+	bool            hold;           /* a one-off search (AF_MODE_AUTO) done: the lens stays until focus is asked for again */
+	int32_t         manual_at;      /* the ManualFocusNow position being gone to or held (-1: none) */
 };
+
+/* whether focus is looking for the sharpest, or the lens is on its way somewhere (AFStatus; a photograph waits for it) */
+static bool
+af_searching(const struct af *af)
+{
+	return af->state == AF_CLIMB || af->state == AF_SWEEP || af->state == AF_FINE_SEARCH || af->state == AF_SETTLE ||
+	    af->state == AF_MANUAL || (af->state == AF_STEADY && af->now) || af->at != af->target;
+}
 
 static void
 af_go(int device, struct af *af, uint32_t target)
@@ -1182,7 +1610,8 @@ af_go(int device, struct af *af, uint32_t target)
 }
 
 static void
-af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const uint8_t *raw, const float window[4], bool locked)
+af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const uint8_t *raw, const float window[4], bool locked,
+    int mode, int32_t manual)
 {
 	float level, sharpness;
 	unsigned needed = f->gain >= 16 * f->gain_unity ? 2 : 1;      /* (in the dark, two frames to a measurement) */
@@ -1192,6 +1621,15 @@ af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const 
 	}
 	if (af->at == 0 && af->target == 0) {
 		af->at = af->target = f->focus;         /* (where the kernel put it) */
+		af->manual_at = -1;
+	}
+	/* redfin (B5): ManualFocusNow: the lens there, a step at a time, and held */
+	if (manual >= 0 && manual != af->manual_at) {
+		af->manual_at = manual;
+		af->state = AF_MANUAL;
+		af->now = af->sweep = false;
+		af_go(device, af, (uint32_t)manual);
+		return;
 	}
 	if (af->wait > 0) {
 		af->wait--;
@@ -1200,6 +1638,19 @@ af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const 
 	if (af->at != af->target) {
 		af_go(device, af, af->target);          /* (the next step of a longer way) */
 		return;
+	}
+	if (af->state == AF_MANUAL) {
+		af->state = AF_WATCH;
+		af->hold = true;
+		say("focus: the lens at %u, as asked", af->at);
+		return;
+	}
+	/* redfin (B5): a frame exposed while the lens moved (the kernel's LENS_MOVING) is no measure of where it is */
+	if (f->reserved[REDWOOD_CAMERA_R_FLAGS] & REDWOOD_CAMERA_LENS_MOVING) {
+		return;
+	}
+	if (af->state == AF_WATCH && (locked || af->hold)) {
+		return;                 /* (nothing to measure for) */
 	}
 	sharpness = isp_sharpness(f, raw, window[0], window[1], window[2], window[3], &level);
 	af->sum_sharpness += sharpness;
@@ -1320,7 +1771,10 @@ af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const 
 		af->sharpness = sharpness;
 		af->level = level;
 		af->unlike = 0;
-		say("focus: the lens at %u after %u moves (sharpness %.3f)", af->at, af->steps, sharpness);
+		af->hold = mode == AF_MODE_AUTO;        /* (redfin, B5: one search, and the lens stays) */
+		say("focus: the lens at %u after %u moves (sharpness %.3f)%s", af->at, af->steps, sharpness, af->hold ? ", held" : "");
+		return;
+	case AF_MANUAL:
 		return;
 	}
 }
@@ -1390,7 +1844,7 @@ mode_fits(const struct redwood_camera_frame *f, uint32_t kind)
 static void
 fps_limits(const struct stream *s, const struct redwood_camera_frame *f, struct isp *isp)
 {
-	double min_fps = s->min_fps_set && s->min_fps > 2.5 ? s->min_fps : 15, max_fps = s->max_fps;
+	double min_fps = s->min_fps_set && (s->min_fps > 2.5 || s->limit_ae_range) ? s->min_fps : 15, max_fps = s->max_fps;
 
 	isp->max_frame_lines = 0;
 	isp->min_frame_lines = 0;
@@ -1431,6 +1885,14 @@ worker_pause(const struct stream *s, unsigned generation, unsigned ms)
 /* one worker has the kernel's camera open at a time: the next waits for the last to close it */
 static pthread_mutex_t device_owner = PTHREAD_MUTEX_INITIALIZER;
 
+/* redfin (B6): a photograph with the flash, on its way */
+enum { SHOT_IDLE, SHOT_EXPOSING, SHOT_FIRING };
+struct shot {
+	int             state;
+	unsigned        frames, waited;
+	uint32_t        lines, gain;    /* the exposure asked for it */
+};
+
 struct worker_start {
 	CMBaseObjectRef o;
 	unsigned        generation;
@@ -1454,6 +1916,7 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 	bool switched = false, mode_asked = false;
 	float lux = -1, cct = -1;
 	struct af af = { 0 };
+	struct shot shot = { 0 };
 	unsigned failures = 0;
 	const char *why = "stopped";
 
@@ -1530,6 +1993,35 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 
 		const uint8_t *raw = buffer + f->header_bytes;
 		struct redwood_camera_command c;
+		float window[4];
+		bool af_locked, af_now, give_still = false, has_flash = s->camera->sensor != 2;
+		int af_mode, flash = 0;
+		int32_t manual_focus;
+
+		/* redfin (B4-B7): the controls as the capture stack has set them, for this frame */
+		pthread_mutex_lock(&s->ctl_lock);
+		isp.ae_locked = s->ae_locked || shot.state != SHOT_IDLE;
+		isp.ae_bias = s->ae_bias;
+		memcpy(isp.ae_roi, s->ae_roi, sizeof(isp.ae_roi));
+		isp.ae_max_gain = s->ae_max_gain;
+		isp.ae_max_exposure_us = s->ae_max_exposure_us;
+		isp.manual = s->ae_manual;
+		isp.manual_us = s->manual_us;
+		isp.manual_gain = s->manual_gain;
+		isp.awb_locked = s->awb_locked;
+		isp.awb_manual = s->awb_manual;
+		memcpy(isp.wb_manual, s->wb_manual, sizeof(isp.wb_manual));
+		memcpy(window, s->af_window, sizeof(window));
+		af_locked = s->af_locked;
+		af_mode = s->af_mode;
+		manual_focus = s->manual_focus;
+		af_now = s->af_now;
+		s->af_now = false;
+		pthread_mutex_unlock(&s->ctl_lock);
+		if (f->focus != REDWOOD_CAMERA_NO_FOCUS && !s->has_focus) {
+			s->has_focus = true;
+			say("the %s's lens moves (the kernel says where it is: %u)", s->camera->name, f->focus);
+		}
 
 		isp_measure(&isp, f, raw, &st);
 		isp_awb(&isp, &st);
@@ -1550,17 +2042,82 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 		if (isp_ae(&isp, f, &st, &c)) {
 			(void)write(device, &c, sizeof(c));
 		}
-		if (s->af_now) {
-			s->af_now = false;
-			/* (whatever it was doing: at once, from the next frame) */
+		if (af_now) {
+			/* (whatever it was doing: at once, from the next frame; a tap sweeps, continuous focus climbs) */
 			af.state = AF_STEADY;
 			af.now = true;
-			af.sweep = true;
+			af.sweep = af_mode != AF_MODE_CONTINUOUS;
+			af.hold = false;
+			af.manual_at = -1;
 		}
-		af_frame(device, &af, f, raw, s->af_window, s->af_locked);
+		af_frame(device, &af, f, raw, window, af_locked, af_mode, manual_focus);
 		s->frames++;
 
-		CFDictionaryRef metadata = frame_metadata(&isp, f, &st, s->port);
+		/*
+		 * redfin (B6): a photograph. Not while focus is still searching (up to 20 frames); with the flash (asked for,
+		 * or FlashMode on, or auto in the dark), the exposure is made shorter for it first (the flash's own light about
+		 * 2 EV at a photograph's distance: a quarter of the exposure, at most 1/60 s), then the kernel lights the next
+		 * full frame (FLASH) and the frame that carries FLASH_LIT is the photograph; a kernel that never says so has
+		 * the photograph without flash after 8 frames.
+		 */
+		pthread_mutex_lock(&s->lock);
+		unsigned stills_wanted = s->graph_running ? s->stills_wanted : 0;
+		int wish = s->still_flash;
+
+		pthread_mutex_unlock(&s->lock);
+		if (stills_wanted == 0) {
+			shot.state = SHOT_IDLE;
+			shot.waited = 0;
+		} else if (shot.state == SHOT_IDLE) {
+			flash = wish >= 0 ? wish : s->flash_mode;
+			flash = flash == 2 ? lux > 335 : flash;         /* (auto: about 8x at 1/30 s and darker) */
+			if (af_searching(&af) && af.state != AF_WATCH && shot.waited++ < 20) {
+				/* (focus first) */
+			} else if (!flash || !has_flash) {
+				give_still = true;
+			} else {
+				uint32_t sixtieth = f->line_ns ? (uint32_t)(1e9 / 60 / f->line_ns) : f->exposure_lines;
+				double unity = f->gain_unity ? f->gain_unity : 256, total = f->exposure_lines * (double)f->gain / unity * isp.digital;
+				struct redwood_camera_command e = { .command = REDWOOD_CAMERA_EXPOSURE };
+
+				e.a = f->exposure_lines < sixtieth ? f->exposure_lines : sixtieth;
+				e.a = e.a < 4 ? 4 : e.a;
+				double g = total / 4 / e.a, most = f->gain_max > f->gain_unity ? (double)f->gain_max / unity : 1;
+
+				g = g < 1 ? 1 : g > most ? most : g;
+				e.b = (uint32_t)(g * unity + 0.5);
+				shot.lines = e.a;
+				shot.gain = e.b;
+				shot.state = SHOT_EXPOSING;
+				shot.frames = 0;
+				isp.asked = false;
+				isp.digital = 1;
+				(void)write(device, &e, sizeof(e));
+				say("a photograph with the flash: the exposure %.1f ms at %.2fx for it", e.a * (double)f->line_ns / 1e6, g);
+			}
+		} else if (shot.state == SHOT_EXPOSING) {
+			if ((f->exposure_lines == shot.lines && f->gain <= shot.gain + shot.gain / 50) || ++shot.frames >= 4) {
+				struct redwood_camera_command l = { .command = REDWOOD_CAMERA_FLASH, .a = 300, .b = 1, .c = 0 };
+
+				(void)write(device, &l, sizeof(l));
+				shot.state = SHOT_FIRING;
+				shot.frames = 0;
+			}
+		} else if (shot.state == SHOT_FIRING) {
+			if (f->reserved[REDWOOD_CAMERA_R_FLAGS] & REDWOOD_CAMERA_FLASH_LIT) {
+				give_still = true;
+				say("the flash lit frame %llu: the photograph", (unsigned long long)f->sequence);
+			} else if (++shot.frames >= 8) {
+				give_still = true;
+				say("no frame lit by the flash (the kernel's FLASH): the photograph without it");
+			}
+		}
+
+		struct md_extra extra = {
+			.af_status = af_searching(&af) ? 2 : 0, .af_locked = af_locked || af.hold, .ae_locked = isp.ae_locked && shot.state == SHOT_IDLE,
+			.awb_locked = isp.awb_locked || isp.awb_manual, .cct = cct, .flash = give_still && shot.state == SHOT_FIRING,
+		};
+		CFDictionaryRef metadata = frame_metadata(&isp, f, &st, s->port, &extra);
 
 		/*
 		 * Only once the graph has started the stream. Its PixelBufferHandler blocks hand the buffer
@@ -1591,23 +2148,39 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 			if (out->handler == NULL || out->config == NULL || !(out->enabled || i == 0)) {
 				continue;
 			}
-			if (still && s->stills_wanted == 0) {
+			if (still && (!give_still || s->stills_wanted == 0)) {
 				continue;
 			}
 			deliver(s, out, &isp, f, raw, metadata);
 			if (still) {
 				s->stills_wanted--;
+				give_still = false;
+				shot.state = SHOT_IDLE;
+				shot.waited = 0;
+				isp.asked = false;      /* (AE goes on from what the frames say) */
 				say("the photograph is given (%llu so far)", (unsigned long long)++s->stills_given);
 			}
 		}
+		if (give_still && s->stills_wanted > 0) {
+			/* (no still image output to give it to: not asked for again and again, the flash with it) */
+			s->stills_wanted--;
+			say("a photograph asked for, and no still image output to give it to");
+		}
 		pthread_mutex_unlock(&s->lock);
+		if (give_still) {
+			shot.state = SHOT_IDLE;
+			shot.waited = 0;
+			isp.asked = false;      /* (AE goes on from what the frames say) */
+		}
 		if (metadata != NULL) {
 			CFRelease(metadata);
 		}
 		if (s->frames == 1 || s->frames % 300 == 0) {
 			say("frame %llu: exposure %.1f ms, gain %.1fx, digital %.2fx, green %.0f above black; white balance R %.2f "
-			    "B %.2f, lux index %.0f, about %.0f K", f->sequence, f->exposure_lines * (double)f->line_ns / 1e6,
-			    (double)f->gain / f->gain_unity, isp.digital, st.mean[1], isp.wb[0], isp.wb[2], lux, cct);
+			    "B %.2f, lux index %.0f, about %.0f K; %.1f fps%s%s", f->sequence, f->exposure_lines * (double)f->line_ns / 1e6,
+			    (double)f->gain / f->gain_unity, isp.digital, st.mean[1], isp.wb[0], isp.wb[2], lux, cct,
+			    f->frame_lines && f->line_ns ? 1e9 / ((double)f->frame_lines * f->line_ns) : 0, isp.ae_locked ? ", AE locked" : "",
+			    isp.manual ? ", custom exposure" : "");
 		}
 	}
 	free(buffer);
@@ -1899,6 +2472,10 @@ stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef
 	pthread_mutex_init(&s->lock, NULL);
 	pthread_mutex_init(&s->metadata_lock, NULL);
 	pthread_mutex_init(&s->worker_lock, NULL);
+	pthread_mutex_init(&s->ctl_lock, NULL);
+	s->af_mode = AF_MODE_CONTINUOUS;
+	s->manual_focus = -1;
+	s->still_flash = -1;
 	pthread_cond_init(&s->worker_gone, NULL);
 	s->torch = -1;
 	s->min_fps = 2;
