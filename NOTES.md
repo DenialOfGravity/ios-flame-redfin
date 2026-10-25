@@ -190,3 +190,11 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
 - 0927 IOSurface lock result: a plane's bytes per row also at +0x10 of its entry, where IOSurface.framework (16.7)
   reads it. Bi-planar surfaces had 0 bytes per row per plane: green photographs, black camera preview, VT -12902.
 - 0928 SweetAccelerator: every refused v2 call logged (first 40 per client), refused imports/maps with details.
+- 0940 IOSurface rows: 0159's 64-byte rounding also for a one-plane surface given with plane info and for every plane of
+  a planar surface (a plane whose rows grew is moved past the one before it; first 16 logged `SWEET SURF: 0940`):
+  `sweetsurfplanar=0` leaves planes as asked, `sweetsurfalign=0` all of it. For Turnip's explicit layouts (pitchalign 6).
+- 0941 render server GPU resilience: a GPU reset caused by another process's job is not reported to backboardd/SpringBoard
+  (their device stays; the hung job's pid is logged; `sweetgpuspare=0` as before), their refused imports are tried again
+  (4 x, 2-16 ms), refusals log both prepare() results.
+- 0942 the `present:` line per 300-frame window: window ms and presents/s, per-frame clean/blit, put off / flips / late in
+  the window, mode (single buffer / flip) and `sweetgpufreq`, totals in brackets.
