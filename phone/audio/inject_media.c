@@ -42,9 +42,12 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
+#include <dirent.h>
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #include <mach/mach_time.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -52,6 +55,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
@@ -276,7 +280,283 @@ video_stabilization_type(id self, SEL selector)
  */
 #define ERROR_NO_SUCH_THING     1852797029      /* 'nope' */
 
-static IMP original_audio_source_start;
+/*
+ * redfin (plan B1): a source told that it started has to behave like one that did, or nothing behind it can end.
+ * Its output never got a sample nor an end: the movie file sink of a recording waits for audio past the stop
+ * time (a video never finalized), and the graph's stop waits for every sink to see end-of-data -- with Live Photo
+ * on, its audio converter and movie sink never did, -[BWGraph stop:] gave up after 10 s and mediaserverd was
+ * killed in it. So, from the faked start, the node's output is given silence: sample buffers of zeros in the
+ * output's own format (the one the graph configured; 44.1 kHz mono 16-bit if it cannot be found), timestamped by
+ * the host clock, about every 20 ms; and at the node's stop its output is marked as ended (markEndOfLiveOutput),
+ * which is what a real audio source does when its audio unit stops. /private/var/local/camera-no-silence keeps the
+ * end and drops the silence. (The preferred way, the HAL plug-in's "Codec" input for the capture audio session,
+ * needs to know what start: fails on: the error is said in full once.)
+ */
+#define SILENT_NODES    4
+#define SILENT_CHUNK    1024            /* frames a buffer */
+
+static struct silent {
+	id                      node;           /* (not retained: a key; cleared at its stop) */
+	id                      output;
+	dispatch_queue_t        queue;
+	dispatch_source_t       timer;
+	CMAudioFormatDescriptionRef format;
+	AudioStreamBasicDescription asbd;
+	uint64_t                start;          /* mach_absolute_time() of the faked start */
+	uint64_t                frames;         /* given so far */
+	uint64_t                buffers;
+	bool                    ours;           /* the format is our guess, not the graph's */
+} silent[SILENT_NODES];
+static pthread_mutex_t silent_lock = PTHREAD_MUTEX_INITIALIZER;
+static mach_timebase_info_data_t silent_timebase;
+
+static id
+send_if(id object, const char *selector)
+{
+	SEL sel = sel_registerName(selector);
+
+	if (object == nil || !((BOOL (*)(id, SEL, SEL))objc_msgSend)(object, sel_registerName("respondsToSelector:"), sel)) {
+		return nil;
+	}
+	return ((id (*)(id, SEL))objc_msgSend)(object, sel);
+}
+
+/* a CoreMedia audio format description, if that is what this is (a plain CF object, never an Objective-C one of the graph's) */
+static CMAudioFormatDescriptionRef
+as_audio_format(id object)
+{
+	if (object == nil || strcmp(object_getClassName(object), "__NSCFType") != 0 ||
+	    CFGetTypeID((CFTypeRef)object) != CMFormatDescriptionGetTypeID() ||
+	    CMFormatDescriptionGetMediaType((CMFormatDescriptionRef)object) != kCMMediaType_Audio) {
+		return NULL;
+	}
+	return (CMAudioFormatDescriptionRef)object;
+}
+
+/* what an object answers to, once per class (for finding the format's accessors on the phone) */
+static void
+say_methods(id object)
+{
+	static Class said[8];
+	Class cls = object != nil ? object_getClass(object) : Nil;
+	unsigned count = 0, i;
+	char line[220];
+	size_t n = 0;
+
+	for (i = 0; cls != Nil && i < 8 && said[i] != Nil; i++) {
+		if (said[i] == cls) {
+			return;
+		}
+	}
+	if (cls == Nil || i == 8) {
+		return;
+	}
+	said[i] = cls;
+	Method *methods = class_copyMethodList(cls, &count);
+
+	say("redwood: mediaserverd: a %s answers to %u methods:\n", class_getName(cls), count);
+	for (i = 0; i < count; i++) {
+		const char *name = sel_getName(method_getName(methods[i]));
+
+		if (n + strlen(name) + 2 >= sizeof(line) - 1) {
+			say("redwood: mediaserverd:   %s\n", line);
+			n = 0;
+		}
+		n += (size_t)snprintf(line + n, sizeof(line) - n, "%s ", name);
+	}
+	if (n > 0) {
+		say("redwood: mediaserverd:   %s\n", line);
+	}
+	free(methods);
+}
+
+/* the format the graph configured on a node's output, or 44.1 kHz mono 16-bit */
+static CMAudioFormatDescriptionRef
+silent_format(id output, bool *ours)
+{
+	static const char *const outputs[] = { "liveFormat", "format", "configuredFormat" };
+	static const char *const formats[] = { "formatDescription", "audioFormatDescription", "CMFormatDescription" };
+	CMAudioFormatDescriptionRef fd = NULL;
+
+	*ours = false;
+	for (size_t i = 0; i < sizeof(outputs) / sizeof(outputs[0]) && fd == NULL; i++) {
+		id f = send_if(output, outputs[i]);
+
+		if (f == nil) {
+			continue;
+		}
+		say_methods(f);
+		if ((fd = as_audio_format(f)) != NULL) {
+			break;
+		}
+		for (size_t j = 0; j < sizeof(formats) / sizeof(formats[0]) && fd == NULL; j++) {
+			fd = as_audio_format(send_if(f, formats[j]));
+		}
+	}
+	if (fd != NULL) {
+		const AudioStreamBasicDescription *a = CMAudioFormatDescriptionGetStreamBasicDescription(fd);
+
+		if (a != NULL && a->mFormatID == kAudioFormatLinearPCM && a->mSampleRate > 0 && a->mBytesPerFrame > 0) {
+			CFRetain(fd);
+			return fd;
+		}
+		say("redwood: mediaserverd: the capture audio's format is not linear PCM: the silence is given in our own\n");
+		fd = NULL;
+	}
+	AudioStreamBasicDescription a = {
+		.mSampleRate = 44100, .mFormatID = kAudioFormatLinearPCM,
+		.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+		.mBytesPerPacket = 2, .mFramesPerPacket = 1, .mBytesPerFrame = 2, .mChannelsPerFrame = 1, .mBitsPerChannel = 16,
+	};
+
+	*ours = true;
+	CMAudioFormatDescriptionCreate(NULL, &a, 0, NULL, 0, NULL, NULL, &fd);
+	return fd;
+}
+
+static void
+silent_tick(void *context)
+{
+	struct silent *sl = context;
+	uint64_t now = mach_absolute_time(), due;
+	const AudioStreamBasicDescription *a = &sl->asbd;
+	double seconds = (double)(now - sl->start) * silent_timebase.numer / silent_timebase.denom / 1e9;
+	size_t frame_bytes = a->mBytesPerFrame * ((a->mFormatFlags & kAudioFormatFlagIsNonInterleaved) ? a->mChannelsPerFrame : 1);
+
+	due = (uint64_t)(seconds * a->mSampleRate);
+	if (due > sl->frames + (uint64_t)a->mSampleRate) {
+		sl->frames = due - SILENT_CHUNK;        /* (more than a second behind: the gap is left, not filled) */
+	}
+	while (sl->frames + SILENT_CHUNK <= due) {
+		CMBlockBufferRef block = NULL;
+		CMSampleBufferRef buffer = NULL;
+		size_t bytes = SILENT_CHUNK * frame_bytes;
+		CMTime pts = CMTimeAdd(CMClockMakeHostTimeFromSystemUnits(sl->start), CMTimeMake((int64_t)sl->frames,
+		    (int32_t)a->mSampleRate));
+
+		if (CMBlockBufferCreateWithMemoryBlock(NULL, NULL, bytes, NULL, NULL, 0, bytes, kCMBlockBufferAssureMemoryNowFlag,
+		    &block) != 0 || block == NULL) {
+			return;
+		}
+		CMBlockBufferFillDataBytes(0, block, 0, bytes);
+		if (CMAudioSampleBufferCreateReadyWithPacketDescriptions(NULL, block, sl->format, SILENT_CHUNK, pts, NULL,
+		    &buffer) == 0 && buffer != NULL) {
+			((void (*)(id, SEL, CMSampleBufferRef))objc_msgSend)(sl->output, sel_registerName("emitSampleBuffer:"), buffer);
+			CFRelease(buffer);
+			if (sl->buffers++ == 0) {
+				say("redwood: mediaserverd: the capture audio's silence: the first buffer given (%.0f Hz, %u channel(s)%s)\n",
+				    a->mSampleRate, a->mChannelsPerFrame, sl->ours ? ", our format" : ", the graph's format");
+			}
+		}
+		CFRelease(block);
+		sl->frames += SILENT_CHUNK;
+	}
+}
+
+static void
+nothing(void *context)
+{
+	(void)context;
+}
+
+/* the faked start: the output made live (if the start did not get that far) and silence from now on */
+static void
+silent_begin(id node)
+{
+	id output = send_if(node, "output");
+	struct silent *sl = NULL;
+	bool no_silence = access("/private/var/local/camera-no-silence", F_OK) == 0;
+
+	if (output == nil) {
+		say("redwood: mediaserverd: the audio source has no output: nothing to give silence to\n");
+		return;
+	}
+	say_methods(output);
+	if (send_if(output, "liveFormat") == nil && send_if(output, "format") != nil &&
+	    ((BOOL (*)(id, SEL, SEL))objc_msgSend)(output, sel_registerName("respondsToSelector:"), sel_registerName("makeConfiguredFormatLive"))) {
+		((void (*)(id, SEL))objc_msgSend)(output, sel_registerName("makeConfiguredFormatLive"));
+		say("redwood: mediaserverd: the audio source's output made live (its start did not get that far)\n");
+	}
+	if (silent_timebase.denom == 0) {
+		mach_timebase_info(&silent_timebase);
+	}
+	pthread_mutex_lock(&silent_lock);
+	for (int i = 0; i < SILENT_NODES && sl == NULL; i++) {
+		sl = silent[i].node == node ? &silent[i] : NULL;
+	}
+	for (int i = 0; i < SILENT_NODES && sl == NULL; i++) {
+		sl = silent[i].node == nil ? &silent[i] : NULL;
+	}
+	if (sl == NULL || sl->timer != NULL) {
+		pthread_mutex_unlock(&silent_lock);
+		say("redwood: mediaserverd: the audio source's silence %s\n", sl == NULL ? "has no room (too many sources)" : "already runs");
+		return;
+	}
+	sl->node = node;
+	sl->output = output;
+	sl->frames = sl->buffers = 0;
+	sl->start = mach_absolute_time();
+	if (sl->format != NULL) {
+		CFRelease(sl->format);
+	}
+	sl->format = silent_format(output, &sl->ours);
+	if (sl->format != NULL && !no_silence) {
+		sl->asbd = *CMAudioFormatDescriptionGetStreamBasicDescription(sl->format);
+		if (sl->queue == NULL) {
+			sl->queue = dispatch_queue_create("redwood.capture-audio-silence", DISPATCH_QUEUE_SERIAL);
+		}
+		sl->timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, sl->queue);
+		dispatch_set_context(sl->timer, sl);
+		dispatch_source_set_event_handler_f(sl->timer, silent_tick);
+		dispatch_source_set_timer(sl->timer, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_MSEC), 20 * NSEC_PER_MSEC,
+		    5 * NSEC_PER_MSEC);
+		dispatch_resume(sl->timer);
+	}
+	pthread_mutex_unlock(&silent_lock);
+	say("redwood: mediaserverd: the audio source gives %s from now on, and an end at its stop\n",
+	    no_silence ? "nothing (camera-no-silence)" : sl->format != NULL ? "silence" : "nothing (no format for silence)");
+}
+
+/* the node's stop: no more silence, and its output ended */
+static void
+silent_end(id node)
+{
+	struct silent *sl = NULL;
+	id output;
+
+	pthread_mutex_lock(&silent_lock);
+	for (int i = 0; i < SILENT_NODES && sl == NULL; i++) {
+		sl = silent[i].node == node ? &silent[i] : NULL;
+	}
+	if (sl == NULL) {
+		pthread_mutex_unlock(&silent_lock);
+		return;                 /* (a source that really started: it ends its own output) */
+	}
+	if (sl->timer != NULL) {
+		dispatch_source_cancel(sl->timer);
+		dispatch_sync_f(sl->queue, NULL, nothing);      /* (a tick under way is done) */
+		dispatch_release(sl->timer);
+		sl->timer = NULL;
+	}
+	output = sl->output;
+	sl->node = nil;
+	sl->output = nil;
+	pthread_mutex_unlock(&silent_lock);
+	if (send_if(output, "liveFormat") == nil && ((BOOL (*)(id, SEL, SEL))objc_msgSend)(output, sel_registerName("respondsToSelector:"),
+	    sel_registerName("liveFormat"))) {
+		say("redwood: mediaserverd: the audio source stops (%llu silent buffers); its output had ended already\n",
+		    (unsigned long long)sl->buffers);
+		return;
+	}
+	if (!((BOOL (*)(id, SEL, SEL))objc_msgSend)(output, sel_registerName("respondsToSelector:"), sel_registerName("markEndOfLiveOutput"))) {
+		say("redwood: mediaserverd: the audio source stops, and its output CANNOT BE ENDED (no -markEndOfLiveOutput)\n");
+		return;
+	}
+	((void (*)(id, SEL))objc_msgSend)(output, sel_registerName("markEndOfLiveOutput"));
+	say("redwood: mediaserverd: the audio source stops (%llu silent buffers): its output ended\n", (unsigned long long)sl->buffers);
+}
+
+static IMP original_audio_source_start, original_audio_source_stop;
 
 static BOOL
 audio_source_start(id self, SEL selector, id *error)
@@ -288,13 +568,27 @@ audio_source_start(id self, SEL selector, id *error)
 	if (started || made == NULL || ((long (*)(id, SEL))objc_msgSend)(made, sel_registerName("code")) != ERROR_NO_SUCH_THING) {
 		return started;
 	}
-	*error = NULL;                  /* (autoreleased by the capture stack: not ours to give back) */
 	if (!said) {
+		id text = send_if(made, "description");
+
 		said = true;
-		say("redwood: mediaserverd: there is no capture audio on this phone: the session's audio source gives nothing, "
-		    "and the camera runs without it\n");
+		say("redwood: mediaserverd: there is no capture audio on this phone: the session's audio source gives silence, "
+		    "and the camera runs without sound\n");
+		say("redwood: mediaserverd: (the audio source's start said: %.180s)\n", text != nil ?
+		    ((const char *(*)(id, SEL))objc_msgSend)(text, sel_registerName("UTF8String")) : "?");
 	}
+	*error = NULL;                  /* (autoreleased by the capture stack: not ours to give back) */
+	silent_begin(self);
 	return true;
+}
+
+static BOOL
+audio_source_stop(id self, SEL selector, id *error)
+{
+	BOOL stopped = original_audio_source_stop != NULL ? ((BOOL (*)(id, SEL, id *))original_audio_source_stop)(self, selector, error) : YES;
+
+	silent_end(self);
+	return stopped;
 }
 
 /*
@@ -421,33 +715,312 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
  * the top), and there is an encoder in it, HEVCVideoEncoder_CreateInstance, that iOS never registers:
  * the codec's VCPHEVCRegisterEncoder is an empty function. It is registered here, as the codec
  * registers its decoder (VTRegisterVideoDecoderWithInfo, not hardware accelerated).
+ *
+ * redfin (plan B2): a video is H.264 when Camera.app's formats are "Most Compatible" (and for any app that asks for
+ * avc1), and the only H.264 encoders VideoToolbox lists on an iPhone are the AVE's. What the phone has is said once
+ * (VideoToolbox's encoder list; the encoder factories the video codec images export, found by walking their export
+ * tries), and a software H.264 encoder is registered for 'avc1' if one is found among them. If none is, a
+ * recording's video settings that ask for avc1 are given hvc1 instead (recording_video_settings below), so that the
+ * video is recorded at all. /private/var/local/camera-no-avc: no H.264 encoder registered (HEVC for every video).
  */
+#ifndef LC_DYLD_EXPORTS_TRIE
+#define LC_DYLD_EXPORTS_TRIE    0x80000033
+#endif
+
+static bool avc_encoder;                /* a software encoder for 'avc1' is there (VideoToolbox's or registered here) */
+
+typedef int (*encoder_create)(uint32_t, CFAllocatorRef, void *);
+
+static uint64_t
+uleb(const uint8_t **p, const uint8_t *end)
+{
+	uint64_t v = 0;
+	unsigned shift = 0;
+
+	while (*p < end) {
+		uint8_t byte = *(*p)++;
+
+		v |= (uint64_t)(byte & 0x7f) << shift;
+		shift += 7;
+		if (!(byte & 0x80) || shift > 63) {
+			break;
+		}
+	}
+	return v;
+}
+
+/* every exported name of the image with `part' in it, by its export trie: said, and each given to found() */
+static unsigned
+walk_trie(const uint8_t *start, const uint8_t *end, const uint8_t *node, char *name, size_t length, const char *const *parts,
+    void (*found)(const char *, void *), void *context, unsigned depth)
+{
+	const uint8_t *p = node;
+	uint64_t terminal;
+	unsigned count = 0, children;
+
+	if (node < start || node >= end || depth > 64) {
+		return 0;
+	}
+	terminal = uleb(&p, end);
+	if (terminal > 0) {
+		for (size_t i = 0; parts[i] != NULL; i++) {
+			if (strstr(name, parts[i]) != NULL) {
+				found(name, context);
+				count++;
+				break;
+			}
+		}
+		p += terminal;
+	}
+	if (p >= end) {
+		return count;
+	}
+	children = *p++;
+	for (unsigned i = 0; i < children && p < end; i++) {
+		size_t edge = strnlen((const char *)p, (size_t)(end - p));
+		uint64_t offset;
+
+		if (length + edge + 1 > 512) {
+			return count;
+		}
+		memcpy(name + length, p, edge);
+		name[length + edge] = 0;
+		p += edge + 1;
+		offset = uleb(&p, end);
+		count += walk_trie(start, end, start + offset, name, length + edge, parts, found, context, depth + 1);
+		name[length] = 0;
+	}
+	return count;
+}
+
+static void
+exports_of(const struct mach_header *header, intptr_t image_slide, const char *const *parts, void (*found)(const char *, void *),
+    void *context)
+{
+	const struct mach_header_64 *mh = (const void *)header;
+	const struct load_command *lc = (const void *)(mh + 1);
+	uint64_t linkedit_vm = 0, linkedit_off = 0, linkedit_size = 0;
+	uint32_t trie_off = 0, trie_size = 0;
+	char name[520] = "";
+
+	if (mh->magic != MH_MAGIC_64) {
+		return;
+	}
+	for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const void *)((const uint8_t *)lc + lc->cmdsize)) {
+		if (lc->cmd == LC_SEGMENT_64 && strcmp(((const struct segment_command_64 *)lc)->segname, "__LINKEDIT") == 0) {
+			linkedit_vm = ((const struct segment_command_64 *)lc)->vmaddr;
+			linkedit_off = ((const struct segment_command_64 *)lc)->fileoff;
+			linkedit_size = ((const struct segment_command_64 *)lc)->vmsize;
+		} else if (lc->cmd == LC_DYLD_EXPORTS_TRIE) {
+			trie_off = ((const struct linkedit_data_command *)lc)->dataoff;
+			trie_size = ((const struct linkedit_data_command *)lc)->datasize;
+		} else if ((lc->cmd == LC_DYLD_INFO || lc->cmd == LC_DYLD_INFO_ONLY) && trie_size == 0) {
+			trie_off = ((const struct dyld_info_command *)lc)->export_off;
+			trie_size = ((const struct dyld_info_command *)lc)->export_size;
+		}
+	}
+	/* (only within the image's __LINKEDIT as mapped: a trie that is not there is not read) */
+	if (linkedit_vm == 0 || trie_size == 0 || trie_off < linkedit_off || trie_off - linkedit_off + (uint64_t)trie_size > linkedit_size) {
+		return;
+	}
+	const uint8_t *trie = (const uint8_t *)(uintptr_t)(linkedit_vm + (uint64_t)image_slide + (trie_off - linkedit_off));
+
+	walk_trie(trie, trie + trie_size, trie, name, 0, parts, found, context, 0);
+}
+
+struct encoder_search {
+	const char *image;
+	encoder_create avc;
+	char avc_name[160];
+	unsigned said;
+};
+
+static void
+encoder_found(const char *symbol, void *context)
+{
+	struct encoder_search *e = context;
+	const char *name = symbol[0] == '_' ? symbol + 1 : symbol;
+	bool avc = (strstr(name, "H264") != NULL || strstr(name, "AVC") != NULL || strstr(name, "Avc") != NULL ||
+	    strstr(name, "h264") != NULL) && strstr(name, "Encoder") != NULL && strstr(name, "CreateInstance") != NULL &&
+	    strstr(name, "Decoder") == NULL;
+
+	if (e->said++ < 40) {
+		const char *base = strrchr(e->image, '/');
+
+		say("redwood: mediaserverd:   %s: %s%s\n", base ? base + 1 : e->image, name, avc ? " (an H.264 encoder?)" : "");
+	}
+	if (avc && e->avc == NULL) {
+		void *handle = dlopen(e->image, RTLD_NOW | RTLD_NOLOAD);
+
+		e->avc = handle != NULL ? (encoder_create)dlsym(handle, name) : NULL;
+		snprintf(e->avc_name, sizeof(e->avc_name), "%s", name);
+	}
+}
+
+/* VideoToolbox's encoders, said once; whether one for `codec' is there that is not hardware accelerated */
+static bool
+software_encoder_listed(void *vt, uint32_t codec, bool say_all)
+{
+	int (*copy_list)(CFDictionaryRef, CFArrayRef *) = dlsym(vt, "VTCopyVideoEncoderList");
+	CFStringRef *k_codec = dlsym(vt, "kVTVideoEncoderList_CodecType"), *k_id = dlsym(vt, "kVTVideoEncoderList_EncoderID");
+	CFStringRef *k_hw = dlsym(vt, "kVTVideoEncoderList_IsHardwareAccelerated");
+	CFArrayRef list = NULL;
+	bool there = false;
+
+	if (copy_list == NULL || k_codec == NULL || k_id == NULL || copy_list(NULL, &list) != 0 || list == NULL) {
+		say("redwood: mediaserverd: VideoToolbox's encoder list cannot be had\n");
+		return false;
+	}
+	for (CFIndex i = 0; i < CFArrayGetCount(list); i++) {
+		CFDictionaryRef e = CFArrayGetValueAtIndex(list, i);
+		CFNumberRef type = CFDictionaryGetValue(e, *k_codec);
+		CFStringRef id = CFDictionaryGetValue(e, *k_id);
+		CFBooleanRef hw = k_hw != NULL ? CFDictionaryGetValue(e, *k_hw) : NULL;
+		uint32_t t = 0;
+		char text[120] = "?";
+
+		if (type != NULL) {
+			CFNumberGetValue(type, kCFNumberSInt32Type, &t);
+		}
+		if (id != NULL) {
+			CFStringGetCString(id, text, sizeof(text), kCFStringEncodingUTF8);
+		}
+		if (say_all) {
+			say("redwood: mediaserverd: VideoToolbox encoder %c%c%c%c %s%s\n", t >> 24, t >> 16 & 255, t >> 8 & 255, t & 255, text,
+			    hw == kCFBooleanTrue ? " (hardware)" : "");
+		}
+		there |= t == codec && hw != kCFBooleanTrue;
+	}
+	CFRelease(list);
+	return there;
+}
+
+static int
+register_encoder(void *vt, uint32_t codec, CFStringRef id, CFStringRef name, void *create)
+{
+	int (*register_with_info)(uint32_t, CFDictionaryRef, void *) = dlsym(vt, "VTRegisterVideoEncoderWithInfo");
+	CFStringRef *id_key = dlsym(vt, "kVTVideoEncoderList_EncoderID");
+	CFStringRef *name_key = dlsym(vt, "kVTVideoEncoderList_EncoderName");
+	CFStringRef *hardware_key = dlsym(vt, "kVTVideoEncoderList_IsHardwareAccelerated");
+	int status;
+
+	if (register_with_info == NULL || id_key == NULL || name_key == NULL || hardware_key == NULL) {
+		return -1;
+	}
+	const void *keys[] = { *id_key, *name_key, *hardware_key };
+	const void *values[] = { id, name, kCFBooleanFalse };
+	CFDictionaryRef info = CFDictionaryCreate(NULL, keys, values, 3, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+
+	status = register_with_info(codec, info, create);
+	CFRelease(info);
+	return status;
+}
+
 static void
 register_hevc_encoder(void)
 {
 	void *codec = dlopen("/System/Library/VideoCodecs/VCPHEVC.videocodec", RTLD_NOW | RTLD_LOCAL);
 	void *vt = dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_NOW | RTLD_GLOBAL);
 	void *create = codec != NULL ? dlsym(codec, "HEVCVideoEncoder_CreateInstance") : NULL;
-	int (*register_encoder)(uint32_t, CFDictionaryRef, void *) = vt != NULL ? dlsym(vt, "VTRegisterVideoEncoderWithInfo") : NULL;
-	CFStringRef *id_key = vt != NULL ? dlsym(vt, "kVTVideoEncoderList_EncoderID") : NULL;
-	CFStringRef *name_key = vt != NULL ? dlsym(vt, "kVTVideoEncoderList_EncoderName") : NULL;
-	CFStringRef *hardware_key = vt != NULL ? dlsym(vt, "kVTVideoEncoderList_IsHardwareAccelerated") : NULL;
 	int status;
 
-	if (create == NULL || register_encoder == NULL || id_key == NULL || name_key == NULL || hardware_key == NULL) {
+	if (vt == NULL || create == NULL || dlsym(vt, "VTRegisterVideoEncoderWithInfo") == NULL) {
 		say("redwood: mediaserverd: no software HEVC encoder to register (%s)\n", codec == NULL ? "no VCPHEVC.videocodec" :
 		    create == NULL ? "no HEVCVideoEncoder_CreateInstance" : "VideoToolbox without VTRegisterVideoEncoderWithInfo");
+	} else {
+		status = register_encoder(vt, 'hvc1', CFSTR("com.apple.videotoolbox.videoencoder.hevc.vcp"), CFSTR("HEVC (VCPHEVC, software)"),
+		    create);
+		say("redwood: mediaserverd: the software HEVC encoder of VCPHEVC.videocodec registered for 'hvc1' (%d)\n", status);
+	}
+	if (vt == NULL) {
 		return;
 	}
-	const void *keys[] = { *id_key, *name_key, *hardware_key };
-	const void *values[] = { CFSTR("com.apple.videotoolbox.videoencoder.hevc.vcp"), CFSTR("HEVC (VCPHEVC, software)"),
-		kCFBooleanFalse };
-	CFDictionaryRef info = CFDictionaryCreate(NULL, keys, values, 3, &kCFTypeDictionaryKeyCallBacks,
-	    &kCFTypeDictionaryValueCallBacks);
+	/* redfin (B2): H.264 */
+	if (software_encoder_listed(vt, 'avc1', true)) {
+		avc_encoder = true;
+		say("redwood: mediaserverd: VideoToolbox has a software H.264 encoder of its own\n");
+		return;
+	}
+	if (access("/private/var/local/camera-no-avc", F_OK) == 0) {
+		say("redwood: mediaserverd: no H.264 encoder registered (camera-no-avc): videos asking for avc1 are made HEVC\n");
+		return;
+	}
+	/* the video codecs' images loaded (they are VideoToolbox's plug-ins; nothing of theirs runs at loading) */
+	DIR *dir = opendir("/System/Library/VideoCodecs");
+	struct dirent *entry;
 
-	status = register_encoder('hvc1', info, create);
-	CFRelease(info);
-	say("redwood: mediaserverd: the software HEVC encoder of VCPHEVC.videocodec registered for 'hvc1' (%d)\n", status);
+	while (dir != NULL && (entry = readdir(dir)) != NULL) {
+		char path[300];
+
+		if (entry->d_name[0] == '.') {
+			continue;
+		}
+		snprintf(path, sizeof(path), "/System/Library/VideoCodecs/%s", entry->d_name);
+		say("redwood: mediaserverd: video codec %s%s\n", entry->d_name, dlopen(path, RTLD_NOW | RTLD_LOCAL) != NULL ? "" : " (not loadable)");
+	}
+	if (dir != NULL) {
+		closedir(dir);
+	}
+	/* their encoder factories, and VideoToolbox's own */
+	static const char *const parts[] = { "Encoder_CreateInstance", "EncoderCreateInstance", "RegisterEncoder", "Encoder_Create", NULL };
+	struct encoder_search e = { 0 };
+
+	say("redwood: mediaserverd: encoder factories exported by the video codecs and VideoToolbox:\n");
+	for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+		const char *image = _dyld_get_image_name(i);
+
+		if (image != NULL && (strstr(image, "/VideoCodecs/") != NULL || strstr(image, "VideoToolbox.framework") != NULL ||
+		    strstr(image, "VCP") != NULL)) {
+			e.image = image;
+			exports_of(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i), parts, encoder_found, &e);
+		}
+	}
+	if (e.avc == NULL) {
+		say("redwood: mediaserverd: no software H.264 encoder found: videos asking for avc1 are made HEVC\n");
+		return;
+	}
+	/* TODO(phase 2): the factory's signature is taken to be VideoToolbox's (as HEVCVideoEncoder_CreateInstance's); check a 1080p30 recording */
+	status = register_encoder(vt, 'avc1', CFSTR("com.apple.videotoolbox.videoencoder.h264.redwood"), CFSTR("H.264 (software)"), (void *)e.avc);
+	avc_encoder = status == 0 && software_encoder_listed(vt, 'avc1', false);
+	say("redwood: mediaserverd: %s registered for 'avc1' (%d)%s\n", e.avc_name, status, avc_encoder ? "" :
+	    "; NOT LISTED after: videos asking for avc1 are made HEVC");
+}
+
+/*
+ * redfin (B2): a recording's video settings: avc1 (H.264) made hvc1 (HEVC) when there is no H.264 encoder here, without
+ * the H.264-only compression properties (profile level, entropy mode), which the HEVC encoder would refuse.
+ */
+static IMP original_video_settings;
+
+static id
+recording_video_settings(id self, SEL selector)
+{
+	id settings = ((id (*)(id, SEL))original_video_settings)(self, selector);
+	CFTypeRef codec, properties;
+	CFMutableDictionaryRef changed;
+	static bool said;
+
+	if (avc_encoder || settings == nil || CFGetTypeID((CFTypeRef)settings) != CFDictionaryGetTypeID() ||
+	    (codec = CFDictionaryGetValue((CFDictionaryRef)settings, CFSTR("AVVideoCodecKey"))) == NULL ||
+	    CFGetTypeID(codec) != CFStringGetTypeID() || !CFEqual(codec, CFSTR("avc1"))) {
+		return settings;
+	}
+	changed = CFDictionaryCreateMutableCopy(NULL, 0, (CFDictionaryRef)settings);
+	CFDictionarySetValue(changed, CFSTR("AVVideoCodecKey"), CFSTR("hvc1"));
+	properties = CFDictionaryGetValue(changed, CFSTR("AVVideoCompressionPropertiesKey"));
+	if (properties != NULL && CFGetTypeID(properties) == CFDictionaryGetTypeID()) {
+		CFMutableDictionaryRef p = CFDictionaryCreateMutableCopy(NULL, 0, properties);
+
+		CFDictionaryRemoveValue(p, CFSTR("ProfileLevel"));
+		CFDictionaryRemoveValue(p, CFSTR("H264EntropyMode"));
+		CFDictionarySetValue(changed, CFSTR("AVVideoCompressionPropertiesKey"), p);
+		CFRelease(p);
+	}
+	if (!said) {
+		said = true;
+		say("redwood: mediaserverd: a recording asked for H.264, for which there is no encoder here: made HEVC\n");
+	}
+	return (id)CFAutorelease(changed);
 }
 
 /*
@@ -566,6 +1139,7 @@ static struct replacement {
 	IMP replacement, *original;
 	bool instance;                  /* an instance method, not a class method */
 	bool done;
+	bool inherited_too;             /* redfin: a method the class only inherits gets an override of its own (original: the superclass's) */
 } replacements[] = {
 	{ "BWCoreImageFilterRenderer", "prewarmPortraitFilterVersion:semanticStyleFilters:", 0 /* 16.5: 0x1a2115c0cUL */,
 	  (IMP)prewarm_portrait_filter, NULL, false, false },
@@ -584,6 +1158,10 @@ static struct replacement {
 	{ "BWMultiFilterThumbnailNode", "prepareForCurrentConfigurationToBecomeLive", 0, (IMP)thumbnail_prepare, NULL, true, false },
 	{ "BWMultiFilterThumbnailNode", "renderSampleBuffer:forInput:", 0, (IMP)thumbnail_render, NULL, true, false },
 	{ "BWNodeInput", "setFormatRequirements:", 0, (IMP)set_format_requirements, &original_set_format_requirements, true, false },
+	/* (redfin, plan B1/B2) */
+	{ "BWAudioSourceNode", "stop:", 0, (IMP)audio_source_stop, &original_audio_source_stop, true, false, true },
+	{ "FigCaptureMovieFileRecordingSettings", "videoSettings", 0, (IMP)recording_video_settings, &original_video_settings, true, false,
+	  true },
 };
 
 /* ---- the Metal device leaves this process before the capture stack asks for it -------------------- */
@@ -706,6 +1284,13 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 		/* redfin: a method the class only inherits is not replaced (that would replace its superclass's) */
 		if (method != NULL && r->instance && class_getSuperclass(cls) != Nil &&
 		    class_getInstanceMethod(class_getSuperclass(cls), sel_registerName(r->selector)) == method) {
+			if (r->inherited_too && r->original != NULL &&
+			    class_addMethod(cls, sel_registerName(r->selector), r->replacement, method_getTypeEncoding(method))) {
+				*r->original = original;
+				say("redwood: mediaserverd: -[%s %s] is its superclass's (at %#lx unslid): given one of its own\n", r->class_name,
+				    r->selector, (uintptr_t)original - slide);
+				continue;
+			}
 			say("redwood: -[%s %s] is its superclass's: left alone\n", r->class_name, r->selector);
 			continue;
 		}
