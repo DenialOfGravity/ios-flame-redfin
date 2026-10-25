@@ -1437,19 +1437,28 @@ static void noteSurfaceTexture(IOSurfaceRef surface,MTLTextureDescriptor *d,NSUI
 }
 // MTLPixelFormatYCBCR8_420_2P (500) and its sRGB twin (501): Core Animation asks for one texture over both planes of a
 // 420f/420v surface (photographs in Photos, videos, the camera). Turnip has no such format. The texture made instead is
-// an RGBA8 copy holding Y, Cb, Cr, 1 in r, g, b, a (what sampling the YCbCr format gives: the colour matrix is the
-// shader's), filled from the surface when the texture is made. It does not follow later writes to the surface, which is
-// right for pictures and wrong for moving ones (the camera's preview is asked for in BGRA, inject_media.c).
+// an RGBA8 copy of the picture in RGB (sRGB-encoded for 501), filled from the surface when the texture is made and again
+// whenever it is bound for drawing after the surface was written (its seed moved on: the camera's preview, a video).
+// What sampling the YCbCr format gives is RGB, the conversion done by the sampler (r18g: Y, Cb, Cr in r, g, b showed as
+// a teal picture: dark grey with Cb = Cr = 0.5 on top). BT.601 (what camera_device.c attaches), full range for 420f
+// and the like, video range for 420v; 16.16 fixed point.
 static bool ycbcrFill(NmbTexture *handle,IOSurfaceRef surface,size_t w,size_t h) {
  const uint8_t *y=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,0),*c=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,1);
  const size_t ys=IOSurfaceGetBytesPerRowOfPlane(surface,0),cs=IOSurfaceGetBytesPerRowOfPlane(surface,1);
  if(!y || !c || !ys || !cs)return false;
+ const bool video=(IOSurfaceGetPixelFormat(surface)&0xff)=='v';
+ const int32_t ky=video?76309:65536,kr=video?104597:91881,kgb=video?25674:22554,kgr=video?53279:46802,kb=video?132201:116130,y0=video?16:0;
  std::vector<uint32_t> row(w*16);
  for(size_t top=0;top<h;top+=16) {
   const size_t rows=std::min<size_t>(16,h-top);
   for(size_t j=0;j<rows;j++) {
    const uint8_t *yl=y+(top+j)*ys,*cl=c+((top+j)/2)*cs;uint32_t *o=row.data()+j*w;
-   for(size_t x=0;x<w;x++) o[x]=0xff000000u|((uint32_t)cl[(x&~(size_t)1)+1]<<16)|((uint32_t)cl[x&~(size_t)1]<<8)|yl[x];
+   for(size_t x=0;x<w;x++) {
+    const int32_t l=((int32_t)yl[x]-y0)*ky+32768,cb=(int32_t)cl[x&~(size_t)1]-128,cr=(int32_t)cl[(x&~(size_t)1)+1]-128;
+    int32_t r=(l+kr*cr)>>16,g=(l-kgb*cb-kgr*cr)>>16,b=(l+kb*cb)>>16;
+    r=r<0?0:r>255?255:r;g=g<0?0:g>255?255:g;b=b<0?0:b>255?255:b;
+    o[x]=0xff000000u|((uint32_t)b<<16)|((uint32_t)g<<8)|(uint32_t)r;
+   }
   }
   const uint64_t region[6]={0,top,0,w,rows,1};
   if(!nmb_texture_replace(handle,region,0,0,row.data(),w*4,w*4*rows,w*4*rows)){NBLOG(@"native-metal: YCbCr copy fill refused: %@",lastError());return false;}
@@ -1461,7 +1470,7 @@ static NBTexture *ycbcrCopy(IOSurfaceRef surface,MTLTextureDescriptor *d) {
  const size_t w=d.width,h=d.height;
  if(!w || !h || IOSurfaceGetWidthOfPlane(surface,0)<w || IOSurfaceGetHeightOfPlane(surface,0)<h ||
     IOSurfaceGetWidthOfPlane(surface,1)*2<w || IOSurfaceGetHeightOfPlane(surface,1)*2<h)return nil;
- MTLTextureDescriptor *rgba=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:w height:h mipmapped:NO];
+ MTLTextureDescriptor *rgba=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:d.pixelFormat==501?MTLPixelFormatRGBA8Unorm_sRGB:MTLPixelFormatRGBA8Unorm width:w height:h mipmapped:NO];
  rgba.usage=MTLTextureUsageShaderRead;rgba.storageMode=MTLStorageModeShared;
  NmbTextureDescriptor descriptor;if(!textureDescriptor(rgba,&descriptor))return nil;
  NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);
