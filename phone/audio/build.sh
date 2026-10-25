@@ -27,4 +27,7 @@ codesign -f -s - out/camera_avtest
 # mg_test (HackiOS, MIT): MobileGestalt's answers (the camera keys among them)
 ../../work/userland/bin/ios-cc -O2 -framework CoreFoundation -o out/mg_test mg_test.c
 codesign -f -s - out/mg_test
-ls -la out/RedwoodAudio.driver out/sound_test out/camera_test out/camera_avtest out/mg_test
+# vt_test: VideoToolbox's pixel transfer without Metal or the hardware scaler
+../../work/userland/bin/ios-cc -O2 -Wall -framework CoreFoundation -framework CoreVideo -framework VideoToolbox -o out/vt_test vt_test.c
+codesign -f -s - out/vt_test
+ls -la out/vt_test out/RedwoodAudio.driver out/sound_test out/camera_test out/camera_avtest out/mg_test
