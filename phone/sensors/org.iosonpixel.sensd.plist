@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The sensd boot job. iOS 16's launchd reads its jobs from /System/Library/xpc/launchd.plist, not from
+  this file: merge this dictionary into its LaunchDaemons under the key
+  /System/Library/LaunchDaemons/org.iosonpixel.sensd.plist, as tools/redfin-install-wifi-wsl.sh does for
+  org.iosonpixel.wland (the python snippet is in docs/redfin/qol-plan.md, WS-S). Binary: /var/local/bin/sensd.
+  sensd waits for /dev/redwood-qrtr and the SNS service itself, so it can start at boot before the DSP is up;
+  KeepAlive restarts it if it ever exits (not after /var/local/sensd.off: it exits 0 then).
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.iosonpixel.sensd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/var/local/bin/sensd</string>
+		<string>--daemon</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>UserName</key>
+	<string>root</string>
+	<key>StandardOutPath</key>
+	<string>/var/local/sensd.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/local/sensd.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+</dict>
+</plist>

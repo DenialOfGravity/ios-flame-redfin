@@ -91,6 +91,8 @@ jobs:
           cd repo
           sh phone/wifi/build.sh
           cp phone/wifi/out/wland ../out/
+          sh phone/sensors/test.sh > ../out/sensd-test.log 2>&1 || { echo "::warning::sensd host tests failed"; tail -20 ../out/sensd-test.log; }
+          sh phone/sensors/build.sh && cp phone/sensors/out/sensd ../out/ || echo "::warning::sensd failed"
           bash phone/tools/build.sh || echo "::warning::some phone tools failed"
           sh phone/haptics/build.sh && cp phone/haptics/out/SweetHaptics.dylib ../out/ || echo "::warning::SweetHaptics.dylib failed"
           # (the build's output goes out with the files: the run's own logs cannot be fetched from Claude's container)

@@ -203,6 +203,89 @@ Phone (Fable): node 5 service list shows 400 → `sensd --list` → accel at 50 
 orientation events type 10 if raw accel does not rotate) → ALS in Settings auto-brightness → proximity (needs a call path
 or a test app) → gyro in a test app. CoreMotion `deviceMotion` is the known risk; raw accel/gyro first.
 
+#### WS-S implementation notes (2026-10-26, branch `ws-s-sensors`)
+
+**Pieces.** Kernel 0971 (`SweetHID.cpp`: `SweetHIDAccel/Gyro/ALS/Prox/Compass/Pressure/Orientation`, `SweetMotion.h`,
+`AppleHIDUsageTables.h` filled in) and 0972 (`bsd/dev/sweet_motion.c`: `/dev/redwood-motion`, `poke m`). Userland
+`phone/sensors/` (sensd, built and host-tested by userland.yml; `sh phone/sensors/test.sh` on any Linux/macOS host),
+launchd job `phone/sensors/org.iosonpixel.sensd.plist`.
+
+**Usage pairs** (verified): Apple vendor page 0xff00 usages accel 3, ALS 4, prox 8, gyro 9, compass 0xa are in
+IOHIDFamily-1035.70.7's `AppleHIDUsageTables.h` (github.com/apple-oss-distributions/IOHIDFamily; from 1090 on the file
+ships empty). Not verifiable from sources: the pressure service's pair (used: HID sensor page 0x20 / 0x31) and the
+`kHIDUsage_AppleVendorMotion_DeviceOrientationType*` values an orientation event carries (used: `orientbase` +
+UIDeviceOrientation, knob). Each service publishes Transport SPU, VendorID 0x5ac, BuiltIn, PrimaryUsagePage/Usage,
+DeviceUsagePairs, ReportInterval (accel/gyro 10000, compass 20000, ALS/prox 100000, pressure 200000 µs),
+SampleInterval, BatchInterval 0, HIDServiceSupport, Product = accel/gyro/als/prox/compass/pressure/orientation.
+
+**SEE protocol** (sns.h has the whole map). Verified against Qualcomm's public docs: the SUID-lookup sensor
+0xabababababababab (= 12370169555311111083), on-change config 514, disable 10, SUID req/event 512/768, the
+sns_client_request_msg field order (suid, msg_id, susp_config, request) and sns_client_event_msg layout. **Not
+verified** (libssc's .proto files are on codeberg/gitlab, which this container cannot reach): the protobuf field
+numbers themselves, attribute ids, the QMI TLV numbers and the proximity event's msg id. sensd decodes defensively
+(proximity told apart from 1025 by wire type; packed or unpacked floats), and `sensd --dump` prints every QMI
+message in hex, so a wrong field number shows up on the first `--list`.
+
+**Units and frames.** sensd writes Android/SEE units (motion.h); the kernel converts with integer arithmetic only:
+accel g = accsign × m/s² / 9.80665 (accsign -1: CoreMotion face-up reads z = -1 g), gyro rad/s (`gyrodeg 1`: deg/s),
+compass µT, pressure kPa, ALS lux (Level, RawChannel0, Illuminance; CCT when given), prox mask
+LargeBodyContact|Receiver (0x41, knob) when near, level = raw. `poke m knob NAME V` changes these at run time.
+
+**sensd.**
+
+    sensd --list                  # kern.sweet_adsp_services, then per sensor: SUID, name/vendor/rates/range
+    sensd --stream accel 50       # every sample; also als, prox (on change), gyro, compass, pressure
+    sensd --all                   # one summary line per sensor per second
+    sensd --daemon                # the boot job: follows ReportInterval (0 = off), restarts on DSP loss
+    options: --dump --secs N --no-motion --no-orient --no-follow --node N --port P
+
+It also derives type-10 orientation samples from accel (300 ms settle). Install: `files put` the binary to
+`/var/local/bin/sensd` (755), then add the job to the root image's launchd.plist (as wland's):
+
+    sudo python3 -I - "$M/System/Library/xpc/launchd.plist" <<'PY'
+    import plistlib, sys
+    p = plistlib.load(open(sys.argv[1], 'rb'))
+    p['LaunchDaemons']['/System/Library/LaunchDaemons/org.iosonpixel.sensd.plist'] = {
+        'Label': 'org.iosonpixel.sensd', 'ProgramArguments': ['/var/local/bin/sensd', '--daemon'],
+        'RunAtLoad': True, 'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 10, 'UserName': 'root',
+        'StandardOutPath': '/var/local/sensd.log', 'StandardErrorPath': '/var/local/sensd.log',
+        'EnvironmentVariables': {'PATH': '/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'}}
+    plistlib.dump(p, open(sys.argv[1], 'wb'), fmt=plistlib.FMT_BINARY)
+    PY
+
+Off switch without a rebuild: `/var/local/sensd.off`.
+
+**S3: the D22AP tree** (`research/ipsw-x/d22ap.adt` on the PC; `tools/adt.py` has only `dump`, so this uses its
+parser). Print every subtree whose name or compatible matches:
+
+    python3 - research/ipsw-x/d22ap.adt <<'PY'
+    import re, sys; sys.path.insert(0, 'tools'); import adt
+    root, _ = adt.parse(adt.load(sys.argv[1]))
+    pat = re.compile(sys.argv[2] if len(sys.argv) > 2 else r'aop|spu|accel|gyro|als|prox|compass|press|motion|orient|baro|mag', re.I)
+    def walk(n, path):
+        p = path + '/' + n.name
+        if pat.search(n.name) or pat.search((n.prop('compatible') or b'').decode('latin1')):
+            print('==', p); adt.dump(n, 1)
+        else:
+            for c in n.children: walk(c, p)
+    walk(root, '')
+    PY
+    # then the same with the pattern '^product$' for /product, and: python3 tools/adt.py dump research/ipsw-x/d22ap.adt | less
+
+Look for: (1) `/arm-io/aop` (and `iop-aop-nub`, `spu`, `aop-*`) children named accel/gyro/als/prox/compass/pressure
+and their `compatible` strings; (2) placement/orientation/rotation matrices or calibration blobs (`*-placement`,
+`*-matrix`, `als-*`, `prox-*`): those are what the real drivers read, and would only matter if a user-space
+daemon reads them from the registry (then mkadt.py must carry them under `/arm-io/aop/...`); (3) `/product` keys
+that look like capabilities (mkadt.py copies /product whole today, so anything there is already on the phone). If the
+D22AP tree has a sensor node and backboardd/locationd log about a missing "accel"/"aop" service, the next step is
+to name our services after those nodes (`IOName`), not to add DT nodes.
+
+**MobileGestalt** (`mg_test KEY...` on the phone; nil = MobileGestalt does not know the key):
+`accelerometer gyroscope magnetometer ambient-light-sensor proximity-sensor` (UIRequiredDeviceCapabilities names; the
+first three are certain, the last two candidates), plus `DeviceSupportsAutoBrightness`, `barometer`,
+`HasBaseband` for comparison. All should already be true from the D22 identity; a false/nil one says where iOS
+decides "no such sensor" before ever opening a service.
+
 ### WS-B — Bluetooth (branch `ws-b-bluetooth`, Opus for btd, lighter model OK for 0980)
 B1 **(M)** `phone/bt/btd` stage 1a, userland only over `/dev/pmem` as wland: RPMh votes (**add** smpa4 1.8 V; ldoc2 1.304,
    ldoc10 3.0-3.3, ldoa14 1.8 are wland's — vote again, never un-vote), TLMM 38-41 → `qup05`, GCC vote 0x52008 bit 15 +

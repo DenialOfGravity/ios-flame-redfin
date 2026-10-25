@@ -215,3 +215,10 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   (4 x, 2-16 ms), refusals log both prepare() results.
 - 0942 the `present:` line per 300-frame window: window ms and presents/s, per-frame clean/blit, put off / flips / late in
   the window, mode (single buffer / flip) and `sweetgpufreq`, totals in brackets.
+- 0971 sensor HID services `SweetHIDAccel/Gyro/ALS/Prox/Compass/Pressure/Orientation` (SweetHID.cpp; usage pairs 0xff00/3,
+  9, 4, 8, 0xa from IOHIDFamily-1035.70.7's AppleHIDUsageTables.h, filled in; pressure 0x20/0x31, orientation 0xff0c/6):
+  every open, user client (pid), copyEvent type and setProperties key/value logged `SWEET MOTION:`, ReportInterval kept;
+  `sweetmotion=MASK` (default 0x7f, 0 = none).
+- 0972 `/dev/redwood-motion` (sensd's samples, qol-plan §3.3; read() = status, ioctl MOTION_GET_WANT) and `poke m`
+  (`m fake accel|gyro|als|prox|compass|pressure|orient [V..]`, `m rot N`, `m stop|secs|status|log|knob|knobs`):
+  bsd/dev/sweet_motion.c.
