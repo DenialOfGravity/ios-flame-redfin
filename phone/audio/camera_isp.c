@@ -572,6 +572,79 @@ lsc_at(const struct isp *isp, float u, float v, float g[3])
 	}
 }
 
+/*
+ * redfin (plan B8): the same arithmetic in integers for the pictures' inner loops (the float code above stays for the
+ * magnified picture and as the reference, isp->reference): values above black in 1/16ths, the lens shading's gains
+ * in 1/4096ths (a row's grid columns interpolated once a row, then along it), the colour matrix in 1/1024ths, 64-bit
+ * sums; rounded where the float code rounds (isp_hosttest compares the two).
+ */
+struct ipipe {
+	int64_t         m[3][3];
+};
+
+static void
+ipipe_init(const struct pipe *p, struct ipipe *q)
+{
+	for (int c = 0; c < 3; c++) {
+		for (int j = 0; j < 3; j++) {
+			q->m[c][j] = (int64_t)llroundf(p->m[c][j] * 1024);
+		}
+	}
+}
+
+/* v: R, G, B in 1/16ths of a 10-bit step */
+static inline void
+ipixel(const struct isp *isp, const struct ipipe *q, int64_t r, int64_t g, int64_t b, uint8_t *rgb)
+{
+	for (int c = 0; c < 3; c++) {
+		int64_t o = (q->m[c][0] * r + q->m[c][1] * g + q->m[c][2] * b + (1 << 13)) >> 14;
+
+		rgb[c] = isp->gamma[o < 0 ? 0 : o > 4095 ? 4095 : o];
+	}
+}
+
+/* a row's lens shading: each colour's gain at each grid column (1/4096ths), at v (0 to 1 down the sensor) */
+struct lsc_row {
+	int32_t         g[3][LSC_W];
+	uint64_t        step;           /* grid columns a pixel, in 1/2^32ths */
+};
+
+static void
+lsc_row_init(const struct isp *isp, float v, uint32_t width, struct lsc_row *r)
+{
+	float gy = v * (LSC_H - 1);
+	int y = (int)gy;
+
+	y = y < 0 ? 0 : y > LSC_H - 2 ? LSC_H - 2 : y;
+	float fy = gy - y;
+
+	for (int c = 0; c < 3; c++) {
+		for (int x = 0; x < LSC_W; x++) {
+			float g = isp->lsc.on ? isp->lsc.gain[c][y][x] * (1 - fy) + isp->lsc.gain[c][y + 1][x] * fy : 1;
+
+			r->g[c][x] = (int32_t)lroundf(g * 4096);
+		}
+	}
+	r->step = ((uint64_t)(LSC_W - 1) << 32) / (width > 1 ? width - 1 : 1);
+}
+
+/* the gains at x (of the row's width) */
+static inline void
+lsc_row_at(const struct lsc_row *r, uint32_t x, int32_t g[3])
+{
+	uint64_t at = ((uint64_t)x * r->step + 32768) >> 16;
+	uint32_t gx = (uint32_t)(at >> 16);
+	int64_t t = (int64_t)(at & 0xffff);
+
+	if (gx > LSC_W - 2) {
+		gx = LSC_W - 2;
+		t = 65536;
+	}
+	for (int c = 0; c < 3; c++) {
+		g[c] = r->g[c][gx] + (int32_t)(((int64_t)(r->g[c][gx + 1] - r->g[c][gx]) * t + 32768) >> 16);
+	}
+}
+
 /* one line of the picture as 8-bit R, G, B */
 static void
 render_line(const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw, uint32_t width, uint32_t height,
@@ -633,6 +706,28 @@ render_line(const struct isp *isp, const struct redwood_camera_frame *f, const u
 	uint64_t step = ((uint64_t)cw << 16) / width, at = (uint64_t)x0 << 16;
 	float v_pos = cells_h > 1 ? (float)cy / (cells_h - 1) : 0, gains[3] = { 1, 1, 1 };
 
+	if (!isp->reference) {
+		/* (redfin, B8: integers) */
+		struct ipipe q;
+		struct lsc_row lr;
+
+		ipipe_init(&p, &q);
+		lsc_row_init(isp, v_pos, cells_w, &lr);
+		for (uint32_t x = 0; x < width; x++, at += step) {
+			uint32_t cx = (uint32_t)(at >> 16);
+			int v[4], g = 0;
+			int32_t gn[3];
+
+			cell(top, f->stride, cx, v);
+			for (int j = 0; j < 4; j++) {
+				g += j != r && j != b ? v[j] : 0;
+			}
+			lsc_row_at(&lr, cx, gn);
+			ipixel(isp, &q, ((int64_t)v[r] * gn[0] + 128) >> 8, ((int64_t)g * gn[1] + 256) >> 9, ((int64_t)v[b] * gn[2] + 128) >> 8,
+			    rgb + 3 * (isp->turned ? width - 1 - x : x));
+		}
+		return;
+	}
 	for (uint32_t x = 0; x < width; x++, at += step) {
 		uint32_t cx = (uint32_t)(at >> 16);
 		int v[4], g = 0;
@@ -770,6 +865,66 @@ full_line(const struct isp *isp, const struct redwood_camera_frame *f, const int
 	int w = (int)f->width;
 	float v_pos = f->height > 1 ? (float)y / (f->height - 1) : 0, gains[3] = { 1, 1, 1 };
 
+	if (!isp->reference) {
+		/*
+		 * (redfin, B8: integers; inside the frame the same means written out -- at a red or blue site green from the
+		 * four beside it and the other colour from the four corners, at a green site each colour from the two of it
+		 * beside it -- and the general loop only at the frame's edges, where it counts clamped neighbours as it does)
+		 */
+		struct ipipe q;
+		struct lsc_row lr;
+		bool inner = y >= 1 && y + 1 < f->height;
+		const int *l0 = l[0], *l1 = l[1], *l2 = l[2];
+
+		ipipe_init(p, &q);
+		lsc_row_init(isp, v_pos, (uint32_t)w, &lr);
+		for (int x = 0; x < w; x++) {
+			int64_t val[3];
+			int32_t gn[3];
+
+			if (inner && x > 0 && x + 1 < w) {
+				int c0 = colour[(y & 1) * 2 + (x & 1)];
+
+				if (c0 == 1) {
+					val[1] = (int64_t)l1[x] * 4;
+					val[colour[(y & 1) * 2 + ((x + 1) & 1)]] = (int64_t)(l1[x - 1] + l1[x + 1]) * 2;
+					val[colour[((y + 1) & 1) * 2 + (x & 1)]] = (int64_t)(l0[x] + l2[x]) * 2;
+				} else {
+					val[c0] = (int64_t)l1[x] * 4;
+					val[1] = l0[x] + l2[x] + l1[x - 1] + l1[x + 1];
+					val[2 - c0] = l0[x - 1] + l0[x + 1] + l2[x - 1] + l2[x + 1];
+				}
+			} else {
+				float sum[3] = { 0, 0, 0 };
+				int n[3] = { 0, 0, 0 };
+
+				for (int dy = -1; dy <= 1; dy++) {
+					const int *line = l[dy + 1];
+					int yy = (int)y + dy;
+
+					yy = yy < 0 ? 0 : yy >= (int)f->height ? (int)f->height - 1 : yy;
+					for (int dx = -1; dx <= 1; dx++) {
+						int xx = x + dx < 0 ? 0 : x + dx >= w ? w - 1 : x + dx;
+						int c = colour[(yy & 1) * 2 + (xx & 1)];
+
+						if (dx == 0 && dy == 0) {
+							sum[c] = (float)line[xx] * 64;
+							n[c] = 64;
+						} else if (n[c] < 64) {
+							sum[c] += (float)line[xx];
+							n[c]++;
+						}
+					}
+				}
+				for (int c = 0; c < 3; c++) {
+					val[c] = (int64_t)lroundf(sum[c] / (n[c] ? n[c] : 1) * 4);
+				}
+			}
+			lsc_row_at(&lr, (uint32_t)x, gn);
+			ipixel(isp, &q, (val[0] * gn[0] + 512) >> 10, (val[1] * gn[1] + 512) >> 10, (val[2] * gn[2] + 512) >> 10, rgb + 3 * x);
+		}
+		return;
+	}
 	for (int x = 0; x < w; x++) {
 		float sum[3] = { 0, 0, 0 };
 		int n[3] = { 0, 0, 0 };

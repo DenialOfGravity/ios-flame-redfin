@@ -105,6 +105,7 @@ struct isp {
 	bool            awb_manual;             /* the white balance's gains are wb_manual's (green 1) */
 	float           wb_manual[3];
 	bool            awb_stable;             /* (AWB's answer) the white balance has stopped moving */
+	bool            reference;              /* the pictures by the float code (the integer code's reference: tests) */
 };
 
 /* frames AE waits for the exposure it asked for before it takes what the frames say (a clamped or lost request) */

@@ -302,9 +302,75 @@ test_awb_lock(void)
 	CHECK(isp.wb[0] == 1.2f && isp.wb[2] == 2.5f, "manual white balance R %.2f B %.2f", isp.wb[0], isp.wb[2]);
 }
 
+/* the integer pictures (B8) against the float ones: at most a step apart, and few of those */
+static void
+compare(const char *what, const uint8_t *a, const uint8_t *b, size_t n)
+{
+	size_t off = 0, worst = 0;
+
+	for (size_t i = 0; i < n; i++) {
+		size_t d = a[i] > b[i] ? a[i] - b[i] : b[i] - a[i];
+
+		off += d != 0;
+		worst = d > worst ? d : worst;
+	}
+	printf("%s: %zu of %zu values differ, by %zu at most\n", what, off, n, worst);
+	CHECK(worst <= 1 && off * 20 < n, "%s: the integer picture is not the float one's", what);
+}
+
+static void
+test_integer_pictures(void)
+{
+	struct sim s;
+	struct isp isp;
+	uint32_t w = 640, h = 480, pw = 400, ph = 300;
+	uint8_t *y[2], *uv[2], *bgra[2], *fy[2], *fuv[2];
+	unsigned seed = 1;
+
+	sim_init(&s, w, h, 0.05);
+	sim_frame(&s);
+	/* noise, so that every site's own value matters */
+	for (uint32_t i = 0; i < s.f.stride * h; i++) {
+		seed = seed * 1103515245 + 12345;
+		s.raw[i] ^= (uint8_t)((seed >> 16) & 7);
+	}
+	isp_init(&isp);
+	isp.wb[0] = 1.9f;
+	isp.wb[2] = 1.4f;
+	isp.digital = 1.3f;
+	isp_set_ccm(&isp, (const float[9]){ 1.6f, -0.4f, -0.2f, -0.3f, 1.5f, -0.2f, 0.05f, -0.6f, 1.55f });
+	isp.lsc.on = true;
+	for (int c = 0; c < 3; c++) {
+		for (int gy = 0; gy < LSC_H; gy++) {
+			for (int gx = 0; gx < LSC_W; gx++) {
+				float dx = (gx - 8) / 8.0f, dy = (gy - 6) / 6.0f;
+
+				isp.lsc.gain[c][gy][gx] = 1 + (0.8f + 0.2f * c) * (dx * dx + dy * dy);
+			}
+		}
+	}
+	for (int k = 0; k < 2; k++) {
+		y[k] = calloc(pw, ph);
+		uv[k] = calloc(pw, ph / 2);
+		bgra[k] = calloc(4 * pw, ph);
+		fy[k] = calloc(w, h);
+		fuv[k] = calloc(w, h / 2);
+		isp.reference = k == 1;
+		isp_render_nv12(&isp, &s.f, s.raw, y[k], pw, uv[k], pw, pw, ph, 0, ph, false);
+		isp_render_bgra(&isp, &s.f, s.raw, bgra[k], 4 * pw, pw, ph, 0, ph);
+		isp_render_full_nv12(&isp, &s.f, s.raw, fy[k], w, fuv[k], w, 0, h, true);
+	}
+	compare("preview Y", y[0], y[1], (size_t)pw * ph);
+	compare("preview CbCr", uv[0], uv[1], (size_t)pw * ph / 2);
+	compare("preview BGRA", bgra[0], bgra[1], (size_t)4 * pw * ph);
+	compare("full Y", fy[0], fy[1], (size_t)w * h);
+	compare("full CbCr", fuv[0], fuv[1], (size_t)w * h / 2);
+}
+
 int
 main(void)
 {
+	test_integer_pictures();
 	test_ae_dark_does_not_freeze();
 	test_ae_bright();
 	test_ae_controls();

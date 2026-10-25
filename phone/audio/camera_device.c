@@ -1421,35 +1421,33 @@ frame_metadata(const struct isp *isp, const struct redwood_camera_frame *f, cons
 	return m;
 }
 
-static void
-deliver(struct stream *s, struct output *out, const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw,
-    CFDictionaryRef metadata)
+/*
+ * A picture of the frame into a buffer of the graph's (the scalers' moving picture, or the photograph: every pixel
+ * of the sensor, isp_render_still_nv12), in pieces on every core. redfin (B8): without the stream's lock, so that the
+ * capture stack's property calls do not wait for it (a 12 MP photograph took a second or more).
+ */
+static bool
+render_into(struct output *out, CVPixelBufferRef pb, const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw,
+    bool still)
 {
-	CVPixelBufferRef pb = output_buffer(out);
-	uint32_t pf, width, height;
+	uint32_t pf = CVPixelBufferGetPixelFormatType(pb), width = (uint32_t)CVPixelBufferGetWidth(pb),
+	    height = (uint32_t)CVPixelBufferGetHeight(pb);
 
-	(void)s;
-	if (pb == NULL) {
-		return;
-	}
-	pf = CVPixelBufferGetPixelFormatType(pb);
-	width = (uint32_t)CVPixelBufferGetWidth(pb);
-	height = (uint32_t)CVPixelBufferGetHeight(pb);
 	if (width == 0 || height == 0 || (pf != PF_420F && pf != PF_420V && pf != PF_BGRA)) {
 		if (out->delivered == 0 && out->said_shape == false) {
 			out->said_shape = true;
 			say("%s: %ux%u %c%c%c%c buffers are not for this ISP", out->name, width, height, pf >> 24, pf >> 16 & 255,
 			    pf >> 8 & 255, pf & 255);
 		}
-		CVPixelBufferRelease(pb);
-		return;
+		return false;
 	}
 	CVPixelBufferLockBaseAddress(pb, 0);
 
-	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, strcmp(out->name, "StillImage") == 0 && pf != PF_BGRA };
+	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, still && pf != PF_BGRA };
 	uint64_t began = mach_absolute_time();
 
-	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
+	dispatch_apply_f(job.pieces, dispatch_get_global_queue(still ? QOS_CLASS_USER_INITIATED : QOS_CLASS_USER_INTERACTIVE, 0), &job,
+	    render_piece);
 	if (job.still) {
 		static mach_timebase_info_data_t tb;
 
@@ -1460,18 +1458,57 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 		    (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6);
 	}
 	CVPixelBufferUnlockBaseAddress(pb, 0);
+	return true;
+}
+
+/* redfin (B8): the picture made once for both scalers where their buffers are alike: copied, not made again */
+static bool
+copy_picture(CVPixelBufferRef from, CVPixelBufferRef to)
+{
+	size_t planes = CVPixelBufferGetPlaneCount(from);
+
+	if (CVPixelBufferGetPixelFormatType(from) != CVPixelBufferGetPixelFormatType(to) ||
+	    CVPixelBufferGetWidth(from) != CVPixelBufferGetWidth(to) || CVPixelBufferGetHeight(from) != CVPixelBufferGetHeight(to) ||
+	    planes != CVPixelBufferGetPlaneCount(to)) {
+		return false;
+	}
+	CVPixelBufferLockBaseAddress(from, kCVPixelBufferLock_ReadOnly);
+	CVPixelBufferLockBaseAddress(to, 0);
+	for (size_t p = 0; p < (planes ? planes : 1); p++) {
+		const uint8_t *a = planes ? CVPixelBufferGetBaseAddressOfPlane(from, p) : CVPixelBufferGetBaseAddress(from);
+		uint8_t *b = planes ? CVPixelBufferGetBaseAddressOfPlane(to, p) : CVPixelBufferGetBaseAddress(to);
+		size_t sa = planes ? CVPixelBufferGetBytesPerRowOfPlane(from, p) : CVPixelBufferGetBytesPerRow(from);
+		size_t sb = planes ? CVPixelBufferGetBytesPerRowOfPlane(to, p) : CVPixelBufferGetBytesPerRow(to);
+		size_t rows = planes ? CVPixelBufferGetHeightOfPlane(from, p) : CVPixelBufferGetHeight(from);
+
+		for (size_t y = 0; a != NULL && b != NULL && y < rows; y++) {
+			memcpy(b + y * sb, a + y * sa, sa < sb ? sa : sb);
+		}
+	}
+	CVPixelBufferUnlockBaseAddress(to, 0);
+	CVPixelBufferUnlockBaseAddress(from, kCVPixelBufferLock_ReadOnly);
+	return true;
+}
+
+static void
+attach(CVPixelBufferRef pb, CFDictionaryRef metadata)
+{
 	CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVAttachmentMode_ShouldPropagate);
 	CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
 	CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2,
 	    kCVAttachmentMode_ShouldPropagate);
-
 	if (metadata != NULL) {
 		CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(NULL, 0, metadata);
 
 		CVBufferSetAttachment(pb, md_attachment, m, kCVAttachmentMode_ShouldPropagate);
 		CFRelease(m);
 	}
+}
 
+/* the picture to the graph (under the stream's lock, the graph running, the handler the one the buffer was taken for) */
+static void
+give(struct output *out, CVPixelBufferRef pb, const struct redwood_camera_frame *f, bool still)
+{
 	CMTime pts = CMClockMakeHostTimeFromSystemUnits(frame_time(f));
 
 	((pixel_buffer_handler)out->handler)(pb, pts);
@@ -1482,7 +1519,7 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	 * the window server copying it), and the next frame drawn into it showed as bands of two frames,
 	 * torn across. Kept, they make the pool take others. (One kept was not enough.)
 	 */
-	if (strcmp(out->name, "StillImage") != 0) {
+	if (!still) {
 		if (out->held[out->held_next] != NULL) {
 			CVPixelBufferRelease(out->held[out->held_next]);
 		}
@@ -1492,9 +1529,68 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 		CVPixelBufferRelease(pb);
 	}
 	if (out->delivered++ == 0) {
-		say("%s: the first picture given (%ux%u %c%c%c%c)", out->name, width, height, pf >> 24, pf >> 16 & 255,
-		    pf >> 8 & 255, pf & 255);
+		uint32_t pf = CVPixelBufferGetPixelFormatType(pb);
+
+		say("%s: the first picture given (%zux%zu %c%c%c%c)", out->name, CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb),
+		    pf >> 24, pf >> 16 & 255, pf >> 8 & 255, pf & 255);
 	}
+}
+
+/*
+ * redfin (B8): the photograph made on a queue of its own, from a copy of the frame and of the processor's state, while
+ * the worker goes on with the moving picture; given to the graph only if the graph still runs and still has the
+ * handler the buffer was taken for.
+ */
+struct still_job {
+	CMBaseObjectRef o;
+	int             output;
+	CVPixelBufferRef pb;
+	void            *handler;
+	struct isp      isp;
+	uint8_t         *frame;         /* the header and the RAW10 */
+	CFDictionaryRef metadata;
+};
+
+static void
+still_made(void *context)
+{
+	struct still_job *j = context;
+	struct stream *s = stream_of(j->o);
+	struct output *out = &s->out[j->output];
+	const struct redwood_camera_frame *f = (const void *)j->frame;
+	bool made = render_into(out, j->pb, &j->isp, f, j->frame + f->header_bytes, true);
+
+	if (made) {
+		attach(j->pb, j->metadata);
+	}
+	pthread_mutex_lock(&s->lock);
+	if (made && s->graph_running && out->handler == j->handler) {
+		give(out, j->pb, f, true);
+		say("the photograph is given (%llu so far)", (unsigned long long)++s->stills_given);
+	} else {
+		CVPixelBufferRelease(j->pb);
+		say("a photograph made and not given (%s)", made ? "the graph stopped or changed" : "its buffer is not for this ISP");
+	}
+	pthread_mutex_unlock(&s->lock);
+	CFRelease(j->handler);
+	if (j->metadata != NULL) {
+		CFRelease(j->metadata);
+	}
+	free(j->frame);
+	CFRelease(j->o);
+	free(j);
+}
+
+static dispatch_queue_t
+still_queue(void)
+{
+	static dispatch_once_t once;
+	static dispatch_queue_t queue;
+
+	dispatch_once(&once, ^{
+		queue = dispatch_queue_create("redwood.camera-still", DISPATCH_QUEUE_SERIAL);
+	});
+	return queue;
 }
 
 /*
@@ -2134,16 +2230,22 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 			s->metadata = CFRetain(metadata);
 			pthread_mutex_unlock(&s->metadata_lock);
 		}
+		/*
+		 * The scalers' outputs are the moving picture and are given every frame. The still image output is the whole
+		 * sensor (4032x3024) and is the photograph: a frame goes to it only when the graph has asked for one, which
+		 * is not something to make thirty times a second. redfin (B8): the buffers are taken under the stream's lock,
+		 * the pictures made without it (once, where both scalers' buffers are alike), and given under it again --
+		 * the photograph on a queue of its own.
+		 */
+		struct { int output; CVPixelBufferRef pb; void *handler; } moving[OUTPUTS];
+		struct still_job *job = NULL;
+		int taken = 0;
+
 		pthread_mutex_lock(&s->lock);
 		for (int i = 0; s->graph_running && i < OUTPUTS; i++) {
 			struct output *out = &s->out[i];
-
-			/*
-			 * The scalers' outputs are the moving picture and are given every frame. The still image
-			 * output is the whole sensor (4032x3024) and is the photograph: a frame goes to it only
-			 * when the graph has asked for one, which is not something to make thirty times a second.
-			 */
 			bool still = strcmp(out->name, "StillImage") == 0;
+			CVPixelBufferRef pb;
 
 			if (out->handler == NULL || out->config == NULL || !(out->enabled || i == 0)) {
 				continue;
@@ -2151,15 +2253,33 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 			if (still && (!give_still || s->stills_wanted == 0)) {
 				continue;
 			}
-			deliver(s, out, &isp, f, raw, metadata);
-			if (still) {
-				s->stills_wanted--;
-				give_still = false;
-				shot.state = SHOT_IDLE;
-				shot.waited = 0;
-				isp.asked = false;      /* (AE goes on from what the frames say) */
-				say("the photograph is given (%llu so far)", (unsigned long long)++s->stills_given);
+			if ((pb = output_buffer(out)) == NULL) {
+				continue;
 			}
+			if (!still) {
+				moving[taken].output = i;
+				moving[taken].pb = pb;
+				moving[taken].handler = (void *)CFRetain(out->handler);
+				taken++;
+				continue;
+			}
+			s->stills_wanted--;
+			give_still = false;
+			if ((job = calloc(1, sizeof(*job))) == NULL || (job->frame = malloc(need)) == NULL) {
+				free(job);
+				job = NULL;
+				CVPixelBufferRelease(pb);
+				say("no memory for a photograph");
+				continue;
+			}
+			memcpy(job->frame, buffer, need);
+			job->o = (CMBaseObjectRef)CFRetain(o);
+			job->output = i;
+			job->pb = pb;
+			job->handler = (void *)CFRetain(out->handler);
+			job->isp = isp;
+			job->isp.tuning = NULL;         /* (the worker's, which it may change: the picture needs none of it) */
+			job->metadata = metadata != NULL ? CFRetain(metadata) : NULL;
 		}
 		if (give_still && s->stills_wanted > 0) {
 			/* (no still image output to give it to: not asked for again and again, the flash with it) */
@@ -2167,10 +2287,38 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 			say("a photograph asked for, and no still image output to give it to");
 		}
 		pthread_mutex_unlock(&s->lock);
-		if (give_still) {
+		if (job != NULL || give_still) {
 			shot.state = SHOT_IDLE;
 			shot.waited = 0;
 			isp.asked = false;      /* (AE goes on from what the frames say) */
+		}
+		if (job != NULL) {
+			dispatch_async_f(still_queue(), job, still_made);
+		}
+		for (int k = 0; k < taken; k++) {
+			struct output *out = &s->out[moving[k].output];
+			bool made = k > 0 && moving[0].pb != NULL && copy_picture(moving[0].pb, moving[k].pb);
+
+			if (!made && !render_into(out, moving[k].pb, &isp, f, raw, false)) {
+				CVPixelBufferRelease(moving[k].pb);
+				moving[k].pb = NULL;
+				continue;
+			}
+			attach(moving[k].pb, metadata);
+		}
+		pthread_mutex_lock(&s->lock);
+		for (int k = 0; k < taken; k++) {
+			struct output *out = &s->out[moving[k].output];
+
+			if (moving[k].pb != NULL && s->graph_running && out->handler == moving[k].handler) {
+				give(out, moving[k].pb, f, false);
+			} else if (moving[k].pb != NULL) {
+				CVPixelBufferRelease(moving[k].pb);
+			}
+		}
+		pthread_mutex_unlock(&s->lock);
+		for (int k = 0; k < taken; k++) {
+			CFRelease(moving[k].handler);
 		}
 		if (metadata != NULL) {
 			CFRelease(metadata);
