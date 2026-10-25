@@ -215,3 +215,13 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   (4 x, 2-16 ms), refusals log both prepare() results.
 - 0942 the `present:` line per 300-frame window: window ms and presents/s, per-frame clean/blit, put off / flips / late in
   the window, mode (single buffer / flip) and `sweetgpufreq`, totals in brackets.
+- 0950 ADSP FastRPC (WS-D): sweet_adsp.c answers `fastrpcglink-apps-dsp` (64 x 0x64 intents) and `glink_ssr`;
+  `/dev/redwood-fastrpc` (0600, one opener) carries 40-byte messages / 16-32-byte answers for phone/fastrpc/fastrpcd;
+  ioctls FASTRPC_SMMU_IDENTITY (SID 0x1403-5 -> apps SMMU bank with translation off, logged `SWEET FASTRPC: SMMU:`)
+  and FASTRPC_ALLOC (RAM < 4 GiB); `adsp_fastrpc=0` old way, `=2` log every message; poke `f 0` status, `f 1` DSP
+  words + last words, `f 2` QRTR services/ports, `f 3 SID` identity, `f 5` SMMU faults (`f 9` help).
+- 0951 pd-mapper (QMI 0x40, port 0x4001) in the ADSP's kernel QRTR: msm/adsp/{root,sensor,audio}_pd + avs/audio,
+  instance 74; announced after the DSP's HELLO and to its lookups; PD failure reports logged (`SWEET PDMAP:`);
+  `adsp_pdm=0` off; poke `f 4` announces again.
+- 0956 `/dev/redwood-qrtr` (qol-plan 3.1): one QRTR port (0x5000+n) per open, {node, port, data} datagrams, ioctl
+  QRTR_LOOKUP, DEL_CLIENT on close; sysctl `kern.sweet_adsp_services` ("svc:inst@node:port,...").

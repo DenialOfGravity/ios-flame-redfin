@@ -1,0 +1,233 @@
+From c45c3aa9ea11aa7e55176a349ec818a7b49b8987 Mon Sep 17 00:00:00 2001
+From: WS-D <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 00:37:43 +0100
+Subject: [PATCH] 0951 redfin: pd-mapper in the ADSP's kernel QRTR
+
+The service registry locator (QMI service 0x40, port 0x4001) is served from
+sweet_adsp.c: announced to the DSP after its QRTR HELLO and given to its
+lookups (followed by the end-of-list record, as Linux's name service does).
+GET_DOMAIN_LIST answers from ios-topaz's table (tms/servreg in
+msm/adsp/{root,sensor,audio}_pd, avs/audio in msm/adsp/audio_pd, instance 74
+as adsp*.jsn); a PD failure report (0x24) is logged with its reason. Boot-arg
+adsp_pdm=0: not served. Poke f 4: announce again.
+---
+ bsd/dev/sweet_adsp.c | 168 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 166 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+index fee7a46..dc3e013 100644
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -2405,6 +2405,148 @@ qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to
+ 	return error;
+ }
+ 
++/*
++ * 0951: pd-mapper, the service registry locator (QMI service 0x40), in the kernel: the DSP's PD
++ * framework asks it which protection domain offers a service (tms/servreg, avs/audio) before it
++ * hands out notifications; Linux's pd-mapper (andersson/pd-mapper) answers from the firmware's
++ * adspr.jsn, adsps.jsn, adspua.jsn, ios-topaz (0144) from this table. It is announced to the DSP
++ * after its HELLO (as Linux's name service announces local services) and given to its lookups.
++ * A PD's failure report (0x24) is logged: it is the sensors PD's own last words.
++ * Boot-arg adsp_pdm=0: not served.
++ */
++#define PDM_SERVICE             0x40u
++#define PDM_INSTANCE            (1u | 1u << 8)  /* version 1, instance 1 (pd-mapper's SERVREG_QMI_VERSION 257) */
++#define PDM_PORT                0x4001u
++#define PDM_DOMAIN_INSTANCE     74u             /* adsp*.jsn qmi_instance_id */
++#define PDM_GET_DOMAIN_LIST     0x21u
++#define PDM_FAILURE_REPORT      0x24u
++
++static const struct {
++	const char *service, *domain;
++} pdm_table[] = {
++	{ "tms/servreg", "msm/adsp/root_pd" },
++	{ "tms/servreg", "msm/adsp/sensor_pd" },
++	{ "tms/servreg", "msm/adsp/audio_pd" },
++	{ "avs/audio", "msm/adsp/audio_pd" },
++};
++static uint32_t pdm_on = 1, pdm_requests, pdm_announced;
++
++static int qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to_port, const void *data, uint32_t length);
++
++static void
++pdm_announce(uint32_t node, uint32_t port)
++{
++	struct qrtr_control server = { .command = QRTR_NEW_SERVER, .words = { PDM_SERVICE, PDM_INSTANCE, QRTR_US, PDM_PORT } };
++	int error;
++
++	if (!pdm_on) {
++		return;
++	}
++	error = qrtr_out_packet(QRTR_NEW_SERVER, QRTR_CONTROL, node, port, &server, sizeof(server));
++	pdm_announced++;
++	printf("SWEET PDMAP: pd-mapper (service 0x40) announced to node %u port %#x at our port %#x: %s\n", node, port, PDM_PORT,
++	    error ? "NOT SENT" : "sent");
++}
++
++/* A QMI TLV of the request (QMI: u8 type, u16 transaction, u16 message, u16 length, then u8 t, u16 l, value). */
++static const uint8_t *
++pdm_tlv(const uint8_t *message, uint32_t length, uint8_t type, uint16_t *found)
++{
++	for (uint32_t at = 7; at + 3 <= length;) {
++		uint16_t l = (uint16_t)(message[at + 1] | message[at + 2] << 8);
++
++		if (at + 3 + l > length) {
++			break;
++		}
++		if (message[at] == type) {
++			*found = l;
++			return message + at + 3;
++		}
++		at += 3 + l;
++	}
++	return NULL;
++}
++
++static uint32_t
++pdm_put(uint8_t *answer, uint32_t at, uint8_t type, const void *value, uint16_t length)
++{
++	answer[at] = type;
++	answer[at + 1] = (uint8_t)length;
++	answer[at + 2] = (uint8_t)(length >> 8);
++	memcpy(answer + at + 3, value, length);
++	return at + 3 + length;
++}
++
++static void
++pdm_input(const struct qrtr_header *header, const uint8_t *message, uint32_t length)
++{
++	uint8_t answer[512], list[320];
++	char name[80] = "", reason[160] = "";
++	uint16_t l = 0, transaction, id, result[2] = { 0, 0 }, total = 0, revision = 1;
++	const uint8_t *value;
++	uint32_t at = 7, listed = 1, offset = 0, instance = PDM_DOMAIN_INSTANCE, zero = 0;
++
++	if (length < 7 || message[0] != 0) {
++		return;
++	}
++	transaction = (uint16_t)(message[1] | message[2] << 8);
++	id = (uint16_t)(message[3] | message[4] << 8);
++	if ((value = pdm_tlv(message, length, 1, &l)) != NULL) {
++		memcpy(name, value, l < sizeof(name) - 1 ? l : sizeof(name) - 1);
++	}
++	pdm_requests++;
++	answer[0] = 2;                          /* a response */
++	answer[1] = (uint8_t)transaction;
++	answer[2] = (uint8_t)(transaction >> 8);
++	answer[3] = (uint8_t)id;
++	answer[4] = (uint8_t)(id >> 8);
++	if (id == PDM_GET_DOMAIN_LIST) {
++		if ((value = pdm_tlv(message, length, 0x10, &l)) != NULL && l == 4) {
++			memcpy(&offset, value, 4);
++		}
++		list[0] = 0;
++		for (unsigned i = 0; i < sizeof(pdm_table) / sizeof(pdm_table[0]); i++) {
++			uint8_t dl = (uint8_t)strlen(pdm_table[i].domain);
++
++			if (strcmp(pdm_table[i].service, name) != 0 || total++ < offset) {
++				continue;
++			}
++			list[listed++] = dl;
++			memcpy(list + listed, pdm_table[i].domain, dl);
++			listed += dl;
++			memcpy(list + listed, &instance, 4);
++			listed += 4;
++			list[listed++] = 0;             /* service_data_valid */
++			memcpy(list + listed, &zero, 4);
++			listed += 4;
++			list[0]++;
++		}
++		at = pdm_put(answer, at, 2, result, sizeof(result));
++		at = pdm_put(answer, at, 0x10, &total, 2);
++		at = pdm_put(answer, at, 0x11, &revision, 2);
++		if (list[0] != 0) {
++			at = pdm_put(answer, at, 0x12, list, (uint16_t)listed);
++		}
++		printf("SWEET PDMAP: node %u port %#x asks for \"%s\" (offset %u): %u domain(s)\n", header->from_node, header->from_port,
++		    name, offset, total);
++	} else if (id == PDM_FAILURE_REPORT) {
++		if ((value = pdm_tlv(message, length, 2, &l)) != NULL) {
++			memcpy(reason, value, l < sizeof(reason) - 1 ? l : sizeof(reason) - 1);
++		}
++		printf("SWEET PDMAP: A PROTECTION DOMAIN FAILED: \"%s\": \"%s\"\n", name, reason);
++		at = pdm_put(answer, at, 2, result, sizeof(result));
++	} else {
++		result[0] = 1;                  /* QMI_RESULT_FAILURE, QMI_ERR_NOT_SUPPORTED */
++		result[1] = 0x5e;
++		at = pdm_put(answer, at, 2, result, sizeof(result));
++		printf("SWEET PDMAP: message %#x from node %u port %#x (%u bytes): not supported\n", id, header->from_node,
++		    header->from_port, length);
++	}
++	answer[5] = (uint8_t)(at - 7);
++	answer[6] = (uint8_t)((at - 7) >> 8);
++	qrtr_out_packet(QRTR_DATA, PDM_PORT, header->from_node, header->from_port, answer, at);
++}
++
+ static void
+ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *control)
+ {
+@@ -2418,6 +2560,7 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
+ 		}
+ 		error = qrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, header->from_node, QRTR_CONTROL, &hello, sizeof(hello));
+ 		printf("adsp: qrtr: HELLO FROM NODE %u; ours to it: %s\n", header->from_node, error == 0 ? "SENT" : "NOT SENT");
++		pdm_announce(header->from_node, QRTR_CONTROL);  /* 0951 */
+ 		break;
+ 	case QRTR_NEW_SERVER:
+ 		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
+@@ -2450,8 +2593,18 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
+ 	case QRTR_NEW_LOOKUP:
+ 		/* the DSP looks for a service of ours (a protection domain's locator, say): there are none yet */
+ 		if (qrtr_lookups++ < 16) {
+-			printf("adsp: qrtr: the DSP looks for service %u (%#x), instance %u: nobody here offers it\n", control->words[0],
+-			    control->words[0], control->words[1]);
++			printf("adsp: qrtr: the DSP looks for service %u (%#x), instance %u: %s\n", control->words[0],
++			    control->words[0], control->words[1], pdm_on && (control->words[0] == 0 || control->words[0] == PDM_SERVICE) ?
++			    "pd-mapper is ours" : "nobody here offers it");
++		}
++		/* 0951: our servers that match, then the end of the list (an empty one), as Linux's name service answers */
++		if (pdm_on && (control->words[0] == 0 || control->words[0] == PDM_SERVICE)) {
++			pdm_announce(header->from_node, header->from_port);
++		}
++		{
++			struct qrtr_control end = { .command = QRTR_NEW_SERVER };
++
++			qrtr_out_packet(QRTR_NEW_SERVER, QRTR_CONTROL, header->from_node, header->from_port, &end, sizeof(end));
+ 		}
+ 		break;
+ 	case QRTR_BYE:
+@@ -2512,6 +2665,10 @@ qrtr_input(const uint8_t *data, uint32_t length)
+ 		qrtr_control(&header, &control);
+ 		return;
+ 	}
++	if (header.to_port == PDM_PORT && pdm_on) {
++		pdm_input(&header, data + at, header.size);     /* 0951 */
++		return;
++	}
+ 	printf("adsp: qrtr: a datagram of %u bytes from node %u port %u to our port %u: nobody here listens there\n", header.size,
+ 	    header.from_node, header.from_port, header.to_port);
+ }
+@@ -3476,6 +3633,12 @@ sweet_adsp_poke(unsigned what, __unused uint64_t a, __unused uint64_t b)
+ 		return 0;
+ 	case 3:
+ 		return fastrpc_smmu_identity((uint32_t)a);
++	case 4:
++		/* 0951: pd-mapper announced again (to the DSP's QRTR node, or node 5 before its hello) */
++		pdm_announce(qrtr_peer ? qrtr_peer : 5, QRTR_CONTROL);
++		printf("SWEET PDMAP: %s, %u requests, announced %u times\n", pdm_on ? "on" : "OFF (adsp_pdm=0)", pdm_requests,
++		    pdm_announced);
++		return 0;
+ 	case 5:
+ 		fastrpc_smmu_faults();
+ 		return 0;
+@@ -3860,6 +4023,7 @@ redwood_adsp_init(void)
+ 		return;
+ 	}
+ 	fastrpc_init();                         /* 0950: /dev/redwood-fastrpc (adsp_fastrpc=0: not) */
++	PE_parse_boot_argn("adsp_pdm", &pdm_on, sizeof(pdm_on));       /* 0951: pd-mapper (adsp_pdm=0: not) */
+ 	if (last_step == 0) {
+ 		/* all of it, on a thread of its own, and left up */
+ 		last_step = STEPS;
+-- 
+2.43.0
+
