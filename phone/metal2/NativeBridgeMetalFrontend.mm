@@ -20,6 +20,9 @@
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include <CommonCrypto/CommonDigest.h>
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -166,6 +169,11 @@ static void waitForResource(id resource);
 @property(nonatomic,strong) NSMutableArray *turns; // a converted copy's pictures (textures over buffers of their own, up to 3): the one
                                                    // bound is borrowed from one of them, filled while the others may still be sampled
 @property(nonatomic) bool borrowedHandle;        // `handle` is a turn's: not released here
+@property(nonatomic,strong) NBTexture *readyTurn; // a converted copy's newest completed picture not bound yet
+@property(nonatomic) uint32_t readySeed,fillSeed; // its surface seed, and the seed of the fill under way
+@property(nonatomic) bool filling;               // a fill runs on the worker
+@property(nonatomic) const void *lastCommandBuffer; // the command buffer that last bound it (identity only)
+@property(nonatomic) NmbTexture *previousHandle; // the picture bound before the current one (its command buffer may not be committed)
 @property(nonatomic) bool ycbcrGPU;              // a two-plane YCbCr texture the runtime converts (its planes' generation set at use)
 @property(nonatomic) bool ycbcr709;              // a converted copy's matrix: BT.709 (else BT.601), read when it was made
 @property(nonatomic,strong) id<MTLTexture> parent;
@@ -173,7 +181,7 @@ static void waitForResource(id resource);
 @property(nonatomic) NSUInteger heapOffset;
 - (void)holdSurface:(IOSurfaceRef)surface;
 @end
-static void ycbcrRefresh(NBTexture *texture);
+static void ycbcrRefresh(NBTexture *texture,id commandBuffer);
 static uint64_t linearAlignment();
 // C4: the device's linear pitch for `format` x `width` rounded up to linearAlignment() (64: Turnip's explicit-layout pitch).
 static uint64_t sweetLinearRow(uint64_t format,uint64_t width);
@@ -710,7 +718,7 @@ static void waitForResource(id resource) {
   [_commandBuffer.surfaces addObject:texture];
   if(shaderWritable((NBTexture *)texture))[_commandBuffer.writtenSurfaces addObject:texture];
  }
- if(texture)ycbcrRefresh((NBTexture *)texture);
+ if(texture)ycbcrRefresh((NBTexture *)texture,_commandBuffer);
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
 }
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
@@ -887,7 +895,7 @@ static void waitForResource(id resource) {
    [self.commandBuffer.surfaces addObject:o];
    if(written&(1u<<i))[self.commandBuffer.writtenSurfaces addObject:o];
   }
-  if(!(written&(1u<<i)))ycbcrRefresh((NBTexture *)o);
+  if(!(written&(1u<<i)))ycbcrRefresh((NBTexture *)o,self.commandBuffer);
  }
  return true;
 }
@@ -1737,7 +1745,32 @@ static bool ycbcrFill(NBBuffer *into,uint64_t row,IOSurfaceRef surface,size_t w,
  const int32_t ky=m[0],kr=m[1],kgb=m[2],kgr=m[3],kb=m[4],y0=video?16:0;
  for(size_t j=0;j<h;j++) {
   const uint8_t *yl=y+j*ys,*cl=c+(j/2)*cs;uint32_t *o=(uint32_t *)(out+j*row);
-  for(size_t x=0;x<w;x+=2) {
+  size_t x=0;
+#if defined(__aarch64__)
+  // 16 pixels a step: the same matrix in 10.6 fixed point, saturating (r19a: 17-21 ms a picture scalar).
+  {
+   const int16_t qy=(int16_t)((ky+512)>>10),qr=(int16_t)((kr+512)>>10),qgb=(int16_t)((kgb+512)>>10),qgr=(int16_t)((kgr+512)>>10),
+                 qb=(int16_t)((kb+512)>>10);
+   const int16x8_t vy0=vdupq_n_s16((int16_t)y0),v128=vdupq_n_s16(128),vround=vdupq_n_s16(32);
+   const uint8x16_t alpha=vdupq_n_u8(255);
+   for(;x+16<=w;x+=16) {
+    const uint8x16_t yv=vld1q_u8(yl+x);
+    const uint8x8x2_t cc=vld2_u8(cl+x);   // 8 (Cb, Cr) pairs
+    const int16x8_t cb=vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(cc.val[0])),v128),cr=vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(cc.val[1])),v128);
+    const int16x8_t dr=vmulq_n_s16(cr,qr),dg=vnegq_s16(vaddq_s16(vmulq_n_s16(cb,qgb),vmulq_n_s16(cr,qgr))),db=vmulq_n_s16(cb,qb);
+    const int16x8_t drl=vzip1q_s16(dr,dr),drh=vzip2q_s16(dr,dr),dgl=vzip1q_s16(dg,dg),dgh=vzip2q_s16(dg,dg),dbl=vzip1q_s16(db,db),dbh=vzip2q_s16(db,db);
+    const int16x8_t ll=vaddq_s16(vmulq_n_s16(vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(yv))),vy0),qy),vround);
+    const int16x8_t lh=vaddq_s16(vmulq_n_s16(vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(yv))),vy0),qy),vround);
+    uint8x16x4_t px;
+    px.val[0]=vcombine_u8(vqshrun_n_s16(vqaddq_s16(ll,drl),6),vqshrun_n_s16(vqaddq_s16(lh,drh),6));
+    px.val[1]=vcombine_u8(vqshrun_n_s16(vqaddq_s16(ll,dgl),6),vqshrun_n_s16(vqaddq_s16(lh,dgh),6));
+    px.val[2]=vcombine_u8(vqshrun_n_s16(vqaddq_s16(ll,dbl),6),vqshrun_n_s16(vqaddq_s16(lh,dbh),6));
+    px.val[3]=alpha;
+    vst4q_u8((uint8_t *)(o+x),px);
+   }
+  }
+#endif
+  for(;x<w;x+=2) {
    const int32_t cb=(int32_t)cl[x]-128,cr=(int32_t)cl[x+1]-128;
    const int32_t dr=kr*cr,dg=-kgb*cb-kgr*cr,db=kb*cb;
    for(size_t i=x;i<x+2 && i<w;i++) {
@@ -1800,30 +1833,55 @@ static bool bufferInFlight(NBBuffer *buffer) {
  return false;
 }
 // At each use of a YCbCr texture (a draw's or a blit's): the GPU texture is told its surface's seed (converted again only when it
-// moved); the CPU copy is filled again when the seed moved, into a turn no committed command buffer still uses (up to 3 turns), which
-// then becomes the one bound. Nothing waits here: cb08d35 waited for the other turn's command buffer with -waitUntilCompleted, which
-// also waits for its completed handlers, and those can be queued behind the very thread that waits (r19a+cb08d35: the preview froze
-// on its first picture). With every turn busy the picture is filled at the next use.
-static void ycbcrRefresh(NBTexture *texture) {
+// moved). The CPU copy (r19a + 5a0c8ed: refilled at the binds of CA's encode thread, 17-21 ms each, and a fresher picture for the
+// later draws of the same frame: "draws in chunks", the UI flickering):
+// - its picture changes only at the first use in a command buffer: every draw of that command buffer samples the same picture;
+// - there it takes the newest completed fill (never waits), and when the surface's seed moved on past it a fill is started on the
+//   worker queue into a turn neither bound nor holding that newest fill nor used by a committed command buffer (up to 3 turns;
+//   none free: started at a later use, counted as a skip);
+// - the first picture is filled at creation, synchronously (a surface drawn once, Photos' and the thumbnails', has it).
+static dispatch_queue_t ycbcrWorker() {
+ static dispatch_queue_t queue;static dispatch_once_t once;
+ dispatch_once(&once,^{queue=dispatch_queue_create("org.iosonpixel.sweetmetal2.ycbcr",
+                     dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_USER_INITIATED,0));});
+ return queue;
+}
+static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
  if(texture.ycbcrGPU) {
   if(texture.surface)nmb_texture_set_converted_generation(texture.handle,(uint64_t)IOSurfaceGetSeed(texture.surface)+1);
   return;
  }
  if(!texture.reportedFormat || !texture.ycbcrSource)return;
  @synchronized(texture) {
+  const void *cb=(__bridge const void *)commandBuffer;
+  if(cb && texture.lastCommandBuffer==cb)return;   // this command buffer already chose its picture
+  texture.lastCommandBuffer=cb;
+  if(NBTexture *ready=texture.readyTurn) {
+   texture.previousHandle=texture.handle;
+   texture.handle=ready.handle;texture.buffer=ready.buffer;texture.surfaceSeed=texture.readySeed;texture.readyTurn=nil;
+  }
   const uint32_t seed=IOSurfaceGetSeed(texture.ycbcrSource);
-  if(seed==texture.surfaceSeed)return;
+  if(texture.filling || seed==texture.surfaceSeed)return;
   const NmbTextureDescriptor current=texture.descriptor;
   NBTexture *next=nil;
-  for(NBTexture *turn in texture.turns)if(turn.handle!=texture.handle && !bufferInFlight(turn.buffer)){next=turn;break;}
+  for(NBTexture *turn in texture.turns)
+   if(turn.handle!=texture.handle && turn.handle!=texture.previousHandle && !bufferInFlight(turn.buffer)){next=turn;break;}
   if(!next && texture.turns.count<3) {
    next=copyTexture((MTLPixelFormat)current.format,current.width,current.height,texture.rowBytes);
    if(next)[texture.turns addObject:next];
   }
   if(!next){gYCbCrSkips++;return;}
-  if(!ycbcrFillTurn(next,texture.ycbcrSource,current.width,current.height,texture.ycbcr709))return;
-  texture.surfaceSeed=seed;
-  texture.handle=next.handle;texture.buffer=next.buffer;
+  texture.filling=true;texture.fillSeed=seed;
+  IOSurfaceRef surface=(IOSurfaceRef)CFRetain(texture.ycbcrSource);
+  const bool bt709=texture.ycbcr709;const size_t w=current.width,h=current.height;
+  dispatch_async(ycbcrWorker(),^{
+   const bool ok=ycbcrFillTurn(next,surface,w,h,bt709);
+   CFRelease(surface);
+   @synchronized(texture) {
+    texture.filling=false;
+    if(ok){texture.readyTurn=next;texture.readySeed=texture.fillSeed;}
+   }
+  });
  }
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
