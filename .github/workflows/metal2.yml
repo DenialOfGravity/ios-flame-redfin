@@ -97,3 +97,5 @@ jobs:
           git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com \
             commit -qm "SweetMetal2.bundle from $GITHUB_REF_NAME ${GITHUB_SHA::12} (run $GITHUB_RUN_ID)"
           git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-metal2
+          # Also to builds-metal2-<ref>: workstream branches building at the same time must not clobber each other
+          git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-metal2:builds-metal2-"$GITHUB_REF_NAME"

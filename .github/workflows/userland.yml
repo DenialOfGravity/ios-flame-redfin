@@ -133,3 +133,5 @@ jobs:
           git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com \
             commit -qm "iOS userland from $GITHUB_REF_NAME ${GITHUB_SHA::12} (run $GITHUB_RUN_ID)"
           git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-userland
+          # Also to builds-userland-<ref>: workstream branches building at the same time must not clobber each other
+          git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-userland:builds-userland-"$GITHUB_REF_NAME"

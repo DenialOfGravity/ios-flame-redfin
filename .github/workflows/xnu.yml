@@ -135,6 +135,7 @@ jobs:
           git add -A
           git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com commit -qm "build errors of $GITHUB_RUN_ID"
           git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-xnu-log
+          git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-xnu-log:builds-xnu-log-"$GITHUB_REF_NAME"
 
       - name: Save incremental build cache
         if: success()
@@ -213,3 +214,5 @@ jobs:
           git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com \
             commit -qm "xnu kernel from $GITHUB_REF_NAME ${GITHUB_SHA::12} (run $GITHUB_RUN_ID)"
           git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-xnu
+          # Also to builds-xnu-<ref>: workstream branches building at the same time must not clobber each other
+          git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-xnu:builds-xnu-"$GITHUB_REF_NAME"
