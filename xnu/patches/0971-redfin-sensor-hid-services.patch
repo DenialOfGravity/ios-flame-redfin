@@ -16,10 +16,10 @@ converted with integer arithmetic only (accel: Android m/s^2 -> -g). Boot-arg
 sweetmotion=MASK (default 0x7f, 0 = no services).
 ---
  iokit/Kernel/arm/hid/AppleHIDUsageTables.h |  91 +++
- iokit/Kernel/arm/hid/SweetHID.cpp          | 615 ++++++++++++++++++++-
+ iokit/Kernel/arm/hid/SweetHID.cpp          | 616 ++++++++++++++++++++-
  iokit/Kernel/arm/hid/SweetMotion.h         |  52 ++
  iokit/KernelConfigTables.cpp               |  35 ++
- 4 files changed, 792 insertions(+), 1 deletion(-)
+ 4 files changed, 793 insertions(+), 1 deletion(-)
  create mode 100644 iokit/Kernel/arm/hid/SweetMotion.h
 
 diff --git a/iokit/Kernel/arm/hid/AppleHIDUsageTables.h b/iokit/Kernel/arm/hid/AppleHIDUsageTables.h
@@ -122,7 +122,7 @@ index c00cbd4..8b0b292 100644
 +
 +#endif /* _APPLEHIDUSAGETABLES_H */
 diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
-index 6d98131..71fd530 100644
+index 6d98131..bb20f5c 100644
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp
 @@ -13,7 +13,9 @@
@@ -136,7 +136,7 @@ index 6d98131..71fd530 100644
   * every N seconds, to test the event path without input hardware.
   */
  #include <IOKit/IOLib.h>
-@@ -601,3 +603,614 @@ sweet_hid_touch(int finger, int down, int x, int y)
+@@ -601,3 +603,615 @@ sweet_hid_touch(int finger, int down, int x, int y)
  		gSweetTouch->touch(finger, down != 0, x, y);
  	}
  }
@@ -157,6 +157,7 @@ index 6d98131..71fd530 100644
 +#include <libkern/c++/OSData.h>
 +#include <libkern/c++/OSBoolean.h>
 +#include <kern/clock.h>
++#include <sys/errno.h>
 +#include "AppleHIDUsageTables.h"
 +#include "IOHIDEventFieldDefs.h"
 +#include "SweetMotion.h"
