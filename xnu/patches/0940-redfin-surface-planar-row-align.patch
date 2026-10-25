@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sun, 25 Oct 2026 21:30:00 +0100
+Subject: [PATCH] 0940 redfin: 64-byte rows for IOSurface planes and one-plane plane info
+
+0159 rounded a surface's rows to 64 bytes only without IOSurfacePlaneInfo, yet
+r18g still had ~100 Turnip 'explicit layout refused' lines a session (A8, RG8,
+BGRA, RGBA at 96/160/224/288/480-byte pitches; pitchalign 6). A surface with
+plane info of one plane is now rounded like one without, and every plane's
+rows are rounded too; a plane whose rows grew is moved past the plane before it
+where the creator's offset would overlap it (page-aligned if the creator's
+was). The first 16 rounded planes are logged. sweetsurfplanar=0 leaves planes
+as asked; sweetsurfalign=0 turns all of it off.
+---
+ iokit/Kernel/arm/SweetSurface.cpp | 50 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 1236510..1f2447f 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -68,6 +68,7 @@ enum {
+ #define kIOSurfaceLockReadOnly          0x1
+ 
+ static IOLock       *sweet_surface_lock;
++static uint32_t      sweet_surface_align_logged;	/* 0940: planes whose rows were rounded, first 16 logged */
+ static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+@@ -336,20 +337,35 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	 * IOSurfaceGetBytesPerRow.
+ 	 */
+ 	static uint32_t row_align = 0xffffffffu;
++	/*
++	 * 0940: the planes' rows too (boot-arg sweetsurfplanar=0: not), and a surface with plane info of one
++	 * plane like one without (Core Animation's A8/RG8/BGRA layers still reached Turnip at 96/160/224-byte
++	 * pitches on r18g: ~100 "explicit layout refused" a session, each texture shadow-copied every frame).
++	 * A plane whose rows grow is moved past the plane before it where the creator's offset would overlap
++	 * it; the creators read rows and plane bases back (IOSurfaceGetBytesPerRowOfPlane, ...BaseAddressOfPlane:
++	 * 0927's lock result). sweetsurfalign=0 turns all of it off.
++	 */
++	static uint32_t planar_align = 0xffffffffu;
+ 	if (row_align == 0xffffffffu) {
+ 		uint32_t v = 64;
+ 		PE_parse_boot_argn("sweetsurfalign", &v, sizeof(v));
+ 		row_align = (v & (v - 1)) == 0 ? v : 0;
++		v = 1;
++		PE_parse_boot_argn("sweetsurfplanar", &v, sizeof(v));
++		planar_align = v ? row_align : 0;
+ 	}
+-	if (row_align > 1 && (one_plane || props->getObject("IOSurfacePlaneInfo") == NULL)) {
++	OSArray *plane_info = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++	if (row_align > 1 && (one_plane || plane_info == NULL || (plane_info->getCount() == 1 && planar_align > 1))) {
+ 		s->bytesPerRow = (s->bytesPerRow + row_align - 1) & ~(row_align - 1);
+ 	}
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+-	OSArray *planes = one_plane ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++	OSArray *planes = one_plane ? NULL : plane_info;
+ 	s->planeCount = 0;
+ 	if (planes != NULL) {
+ 		uint64_t next = s->offset;
++		uint64_t prev_end = s->offset;		/* 0940: the end of the plane before (rows rounded) */
++		bool moved = false;
+ 		if (planes->getCount() > SWEET_SURFACE_MAX_PLANES) {
+ 			return kIOReturnBadArgument;
+ 		}
+@@ -373,6 +389,36 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 			p->offset = sweet_dict_u32(pd, "IOSurfacePlaneOffset", (uint32_t)next);
+ 			p->size = sweet_dict_u32(pd, "IOSurfacePlaneSize",
+ 			    p->bytesPerRow * sweet_div_up(p->height, p->elementHeight));
++			if (planar_align > 1 && (p->bytesPerRow & (planar_align - 1)) != 0) {
++				uint32_t was_row = p->bytesPerRow;
++				uint64_t row = ((uint64_t)p->bytesPerRow + planar_align - 1) & ~(uint64_t)(planar_align - 1);
++				uint64_t size = row * sweet_div_up(p->height, p->elementHeight);
++				if (row > 0xffffffffull || size > 0xffffffffull) {
++					return kIOReturnBadArgument;
++				}
++				p->bytesPerRow = (uint32_t)row;
++				if (size > p->size) {
++					p->size = (uint32_t)size;
++				}
++				moved = true;
++				if (sweet_surface_align_logged < 16) {
++					sweet_surface_align_logged++;
++					IOLog("SWEET SURF: 0940 fmt 0x%x %ux%u plane %u rows %u -> %u\n", s->pixelFormat, s->width,
++					    s->height, i, was_row, p->bytesPerRow);
++				}
++			}
++			if (moved && (uint64_t)p->offset < prev_end) {
++				/* the plane before grew into this one: after it, page-aligned if the creator's was */
++				uint64_t at = (p->offset & PAGE_MASK) == 0 ? round_page(prev_end) :
++				    ((prev_end + planar_align - 1) & ~(uint64_t)(planar_align - 1));
++				if (at + p->size > 0xffffffffull) {
++					return kIOReturnBadArgument;
++				}
++				p->offset = (uint32_t)at;
++			}
++			if ((uint64_t)p->offset + p->size > prev_end) {
++				prev_end = (uint64_t)p->offset + p->size;
++			}
+ 			next = round_page((uint64_t)p->offset + p->size);
+ 			if ((uint64_t)p->offset + p->size > end) {
+ 				end = (uint64_t)p->offset + p->size;
+-- 
+2.43.0

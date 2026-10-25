@@ -85,6 +85,12 @@ NmbTexture *nmb_heap_new_texture(const NmbHeap *, const struct NmbTextureDescrip
 NmbTexture *nmb_texture_new(NmbDevice *, const struct NmbTextureDescriptor *);
 /* A linear texture over a buffer's bytes; iosurface marks the buffer as standing for a surface without planes (Metal's IOSurface rules). */
 NmbTexture *nmb_texture_new_on_buffer(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, bool iosurface);
+/* SweetMetal2: a texture over a planar IOSurface's buffer with the surface's facts (IOSurfaceGetPixelFormat, the plane asked, the luma
+ * size, plane 1's offset in the buffer and bytes per row, the YCbCr matrix attachment: 0 none, 1 601, 2 709, 3 2020, 4 240M, 5 other).
+ * A two-plane YCbCr format (MTLPixelFormatYCBCR8_420_2P over a 420f/420v surface's plane 0) is the runtime's GPU-converted texture. */
+struct NmbSurfaceFacts {uint32_t pixel_format, matrix; uint64_t plane, width, height, chroma_offset, chroma_bytes_per_row;};
+NmbTexture *nmb_texture_new_on_surface(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, bool planar,
+                                       const struct NmbSurfaceFacts *facts);
 NmbTexture *nmb_texture_new_linear(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, uint64_t bytes_per_image);
 /* whole: a view of every level and slice as format; else levels and slices are {start, count} and kind the view's texture type. */
 NmbTexture *nmb_texture_new_view(NmbTexture *, uint64_t format, uint64_t kind, const uint64_t levels[2], const uint64_t slices[2], bool whole);

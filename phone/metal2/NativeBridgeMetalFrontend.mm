@@ -18,6 +18,8 @@
 #include <unordered_map>
 #include <vector>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
+#include <unistd.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -100,6 +102,34 @@ static void journal(const std::string &line) {
  noteProblem([NSString stringWithFormat:@"missing %s %s",class_getName(object_getClass(self)),sel_getName(selector)]);
  [super doesNotRecognizeSelector:selector];
 }
+// SweetMetal2 (C1): an object that conforms to one of Metal's protocols (MTLFunction, MTLSamplerState, ... added at device open) may be
+// sent any selector the protocol, or Metal's private twin of it (NAME + "SPI"), declares. One this file does not implement is answered
+// 0/nil with the protocol's type encoding, logged once (MISSING line), instead of raising in the render server; any other selector still
+// reaches doesNotRecognizeSelector: as before.
+static const char *declaredTypes(Class cls,SEL selector) {
+ for(Class c=cls;c;c=class_getSuperclass(c)) {
+  unsigned count=0;Protocol *__unsafe_unretained *list=class_copyProtocolList(c,&count);
+  for(unsigned i=0;i<count;i++) {
+   Protocol *candidates[2]={list[i],objc_getProtocol([NSString stringWithFormat:@"%s%s",protocol_getName(list[i]),"SPI"].UTF8String)};
+   for(Protocol *p:candidates)for(int required=1;p && required>=0;required--) {
+    struct objc_method_description d=protocol_getMethodDescription(p,selector,required,YES);
+    if(d.types){free(list);return d.types;}
+   }
+  }
+  free(list);
+ }
+ return nullptr;
+}
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {
+ if(NSMethodSignature *own=[super methodSignatureForSelector:selector])return own;
+ const char *types=declaredTypes(object_getClass(self),selector);
+ return types?[NSMethodSignature signatureWithObjCTypes:types]:nil;
+}
+- (void)forwardInvocation:(NSInvocation *)invocation {
+ if(gMissing)gMissing(class_getName(object_getClass(self)),[NSString stringWithFormat:@"%s (answered 0: declared by a Metal protocol)",sel_getName(invocation.selector)].UTF8String);
+ const NSUInteger length=invocation.methodSignature.methodReturnLength;
+ if(length){std::vector<uint8_t> zero(length,0);[invocation setReturnValue:zero.data()];}
+}
 @end
 
 // ---- resources ----
@@ -132,11 +162,17 @@ static void waitForResource(id resource);
 @property(nonatomic) NSUInteger offset,rowBytes,plane;
 @property(nonatomic) uint64_t reportedFormat;   // non-zero: the format the client asked for (a converted copy's)
 @property(nonatomic) uint32_t surfaceSeed;      // a converted copy's: the surface's seed when it was filled
+@property(nonatomic) IOSurfaceRef ycbcrSource;   // a converted copy's surface (retained); not `surface`: the copy is no surface memory
+@property(nonatomic) NmbTexture *spareHandle;    // a converted copy's second texture: filled while the other may still be sampled
+@property(nonatomic) bool ycbcr709;              // a converted copy's matrix: BT.709 (else BT.601), read when it was made
 @property(nonatomic,strong) id<MTLTexture> parent;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
 @property(nonatomic) NSUInteger heapOffset;
+- (void)holdSurface:(IOSurfaceRef)surface;
 @end
 static void ycbcrRefresh(NBTexture *texture);
+static void surfaceHold(IOSurfaceRef surface);
+static void surfaceDrop(IOSurfaceRef surface);
 @implementation NBBuffer
 - (void)dealloc {
  const NSUInteger length=nmb_buffer_length(_handle);nmb_buffer_release(_handle);
@@ -196,6 +232,10 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
 // (1125x1500) and some of its controls failed ("Failed to allocate [1125 x 1500] b3a8 framebuffer"). They are made
 // BGRA8Unorm(_sRGB) over the BGRA plane, the same in every texture, view and pipeline, so the only loss is the range
 // beyond 0..1 and the separate alpha plane.
+// (C2 note: what is lost is the range above 1.0 and the A8 plane's alpha, which reads 1. metal2vulkan 720ef1ce can hold 550/551 over
+// a b3a8 surface's two planes itself (texture/surface_two_planes.rs: an R32G32_UINT image and a shadow of both planes) given the
+// surface's facts, which nmb_texture_new_on_surface now passes; not used: every such layer would be copied in and out per pass, and
+// backboardd's framebuffer stays 8-bit (supportsExtendedXR10Formats answers no there).)
 static uint64_t sweetFormat(uint64_t format) {return format==550?80:format==551?81:format;}
 static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
  if(!d)return false;
@@ -203,7 +243,16 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
  return true;
 }
 @implementation NBTexture
-- (void)dealloc {nmb_texture_release(_handle);if(_surface)CFRelease(_surface);}
+- (void)dealloc {
+ nmb_texture_release(_handle);if(_spareHandle)nmb_texture_release(_spareHandle);
+ if(_surface){surfaceDrop(_surface);CFRelease(_surface);}
+ if(_ycbcrSource)CFRelease(_ycbcrSource);
+}
+// The surface whose memory this texture is (retained; its cache state is kept while any texture holds it: flushSurfaces).
+- (void)holdSurface:(IOSurfaceRef)surface {
+ if(!surface || _surface)return;
+ _surface=(IOSurfaceRef)CFRetain(surface);surfaceHold(_surface);
+}
 - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
 - (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)(_reportedFormat?_reportedFormat:_descriptor.format);}
 - (NSUInteger)width {return _descriptor.width;}
@@ -217,7 +266,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (MTLStorageMode)storageMode {return (MTLStorageMode)((_descriptor.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
 - (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_descriptor.options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
 - (BOOL)isFramebufferOnly {return NO;}
-- (IOSurfaceRef)iosurface {return _surface;}
+- (IOSurfaceRef)iosurface {return _surface?_surface:_ycbcrSource;}
 - (NSUInteger)iosurfacePlane {return _plane;}
 - (id<MTLBuffer>)buffer {return _surface?nil:(id<MTLBuffer>)_buffer;}
 - (NSUInteger)bufferOffset {return _offset;}
@@ -234,7 +283,7 @@ NB_RESOURCE_SPI
  if(!handle){NBLOG(@"native-metal: texture view refused: %@",lastError());return nil;}
  NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
  view.parent=(id<MTLTexture>)self;view.buffer=_buffer;view.offset=_offset;view.rowBytes=_rowBytes;
- if(_surface)view.surface=(IOSurfaceRef)CFRetain(_surface);
+ [view holdSurface:_surface];
  return (id<MTLTexture>)view;
 }
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format {
@@ -261,27 +310,73 @@ NB_RESOURCE_SPI
  [self getBytes:bytes bytesPerRow:row bytesPerImage:row*r.size.height fromRegion:r mipmapLevel:level slice:0];
 }
 @end
-// A command can use many independent imports/views of one IOSurface. Their
-// owners keep the mapping live through this phase. Maintain each exact CPU
-// range once; no address identity or decision is carried into another phase
-// or command, and distinct/partially overlapping ranges retain their calls.
-static void flushSurfaces(NSMutableSet *surfaces) {
+// SweetMetal2 (C3): the A620 does not snoop the CPU's caches, so an IOSurface the GPU uses is cleaned (dc civac) before its
+// command buffer runs and, where the GPU wrote it, cleaned and invalidated again once it completed. Before, every surface of
+// every command buffer was flushed twice (the 11 MB CA frame and each camera picture included). Now:
+// - at commit a surface is cleaned only if its seed (IOSurface's, moved on by every write unlock: the CPU wrote it) differs from
+//   the seed at this process's last clean of it, or it was never cleaned here;
+// - at completion only the surfaces the command buffer wrote (attachments, blit destinations, shader-writable textures) are
+//   flushed, and their seed recorded.
+// A CPU writer that writes without a lock is not seen: /var/local/mtl2-env SWEET_FLUSH=all restores the old flushes.
+// The state lives while a texture holds the surface (surfaceHold/surfaceDrop), keyed by the IOSurfaceRef it retains.
+struct SurfaceState {uint32_t seed=0;bool known=false;uint32_t refs=0;};
+static std::mutex gSurfaceStateLock;
+static std::unordered_map<const void *,SurfaceState> gSurfaceStates;
+static std::atomic<uint64_t> gSurfaceCleanSkips,gSurfaceInvalidates;
+static bool flushAll() {
+ static int all=-1;
+ if(all<0){const char *e=getenv("SWEET_FLUSH");all=e && !strcmp(e,"all");}
+ return all>0;
+}
+static void surfaceHold(IOSurfaceRef surface) {std::lock_guard<std::mutex> l(gSurfaceStateLock);gSurfaceStates[surface].refs++;}
+static void surfaceDrop(IOSurfaceRef surface) {
+ std::lock_guard<std::mutex> l(gSurfaceStateLock);
+ auto it=gSurfaceStates.find(surface);
+ if(it!=gSurfaceStates.end() && --it->second.refs==0)gSurfaceStates.erase(it);
+}
+// completion: false at commit (clean what the CPU wrote since), true at completion (flush what the GPU wrote: `surfaces` holds those).
+static void flushSurfaces(NSSet *surfaces,bool completion) {
  if(!surfaces.count)return;
- std::vector<std::pair<uintptr_t,size_t>> ranges;
- ranges.reserve(surfaces.count);
- for(NBTexture *texture in surfaces)if(texture.surface)
-  ranges.emplace_back(reinterpret_cast<uintptr_t>(IOSurfaceGetBaseAddress(texture.surface)),IOSurfaceGetAllocSize(texture.surface));
- std::sort(ranges.begin(),ranges.end());
- const auto last=std::unique(ranges.begin(),ranges.end());
- gSurfaceFlushDuplicates+=(uint64_t)(ranges.end()-last);
- for(auto it=ranges.begin();it!=last;++it) {
-  const uint64_t began=nowUs();
-  sys_dcache_flush(reinterpret_cast<void *>(it->first),it->second);
-  gSurfaceFlushBytes+=it->second;gTimeSurfaceFlush.add(began);
+ const bool all=flushAll();
+ std::vector<IOSurfaceRef> distinct;
+ distinct.reserve(surfaces.count);
+ for(NBTexture *texture in surfaces)if(texture.surface)distinct.push_back(texture.surface);
+ std::sort(distinct.begin(),distinct.end());
+ const auto last=std::unique(distinct.begin(),distinct.end());
+ gSurfaceFlushDuplicates+=(uint64_t)(distinct.end()-last);
+ for(auto it=distinct.begin();it!=last;++it) {
+  IOSurfaceRef surface=*it;
+  const uint32_t seed=IOSurfaceGetSeed(surface);   // read before the flush: a write after it moves the seed on again
+  if(!completion && !all) {
+   std::lock_guard<std::mutex> l(gSurfaceStateLock);
+   auto state=gSurfaceStates.find(surface);
+   if(state!=gSurfaceStates.end() && state->second.known && state->second.seed==seed){gSurfaceCleanSkips++;continue;}
+  }
+  const uint64_t began=nowUs();const size_t bytes=IOSurfaceGetAllocSize(surface);
+  sys_dcache_flush(IOSurfaceGetBaseAddress(surface),bytes);
+  gSurfaceFlushBytes+=bytes;gTimeSurfaceFlush.add(began);
+  if(completion)gSurfaceInvalidates++;
+  std::lock_guard<std::mutex> l(gSurfaceStateLock);
+  auto state=gSurfaceStates.find(surface);
+  if(state!=gSurfaceStates.end()){state->second.seed=seed;state->second.known=true;}
  }
+}
+// Whether a texture bound to a shader may be written by it (a storage texture): such a surface is flushed at completion too.
+static bool shaderWritable(NBTexture *texture) {return (texture.descriptor.usage&MTLTextureUsageShaderWrite)!=0;}
+// C4: a texture over memory (a buffer, a surface) whose rows are not 64-byte multiples is one Turnip refuses as an explicit layout
+// (the runtime then keeps an image of its own and copies): the first 24 kinds (format, row mod 64, what) are logged, so the makers
+// left can be found.
+static void noteUnalignedRow(uint64_t format,uint64_t width,uint64_t row,const char *what) {
+ if(!(row%64))return;
+ static std::mutex lock;static std::vector<uint64_t> seen;
+ const uint64_t key=(format<<16)^((row%64)<<8)^(uint64_t)what[0];
+ {std::lock_guard<std::mutex> l(lock);if(seen.size()>=24 || std::find(seen.begin(),seen.end(),key)!=seen.end())return;seen.push_back(key);}
+ sm2_logs([NSString stringWithFormat:@"native-metal: %s texture fmt %llu width %llu over rows of %llu bytes (not 64-byte multiples: Turnip copies it)",
+           what,(unsigned long long)format,(unsigned long long)width,(unsigned long long)row].UTF8String);
 }
 static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface) {
  NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
+ if(d.textureType!=MTLTextureTypeTextureBuffer)noteUnalignedRow(descriptor.format,descriptor.width,row,surface?"surface":"buffer");
  NmbTexture *handle=nmb_texture_new_on_buffer(buffer.handle,&descriptor,offset,row,surface);
  if(!handle){NBLOG(@"native-metal: texture over buffer refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
@@ -293,6 +388,7 @@ static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUIn
 }
 - (id<MTLTexture>)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+ noteUnalignedRow(descriptor.format,descriptor.width,row,"linear");
  NmbTexture *handle=nmb_texture_new_linear(self.handle,&descriptor,offset,row,image);
  if(!handle){NBLOG(@"native-metal: linear texture refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
@@ -310,9 +406,29 @@ static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUIn
 @property(nonatomic) MTLFunctionType functionType;
 @property(nonatomic) std::string constantsText;   // name:type:hex of each constant value it was specialized with (the journal's)
 @end
+// SweetMetal2 (C1): iOS 16.7 Metal checks a pipeline descriptor's functions against the MTLFunction protocol and NSLogs
+// "vertexFunction is not a MTLFunction." / "fragmentFunction is not a MTLFunction." on a miss (r18g: 450 lines from backboardd,
+// one per function of each pipeline Core Animation made). NBFunction now conforms (native_bridge_metal_open adds the protocol, as
+// for MTLTextureImplementation) and answers the whole public protocol: no reflection is offered (no vertex/stage-input attributes,
+// no function constants named), which is what a Metal function built without reflection answers. Any other selector Metal's own
+// function protocols declare is answered 0/nil (logged once each) rather than raising, so a validation path that the conformance
+// newly opens cannot take backboardd down.
 @implementation NBFunction
 - (void)dealloc {nmb_function_release(_handle);}
 - (MTLFunctionOptions)options {return MTLFunctionOptionNone;}
+- (MTLPatchType)patchType {return MTLPatchTypeNone;}
+- (NSInteger)patchControlPointCount {return 0;}
+- (NSArray *)vertexAttributes {return @[];}
+- (NSArray *)stageInputAttributes {return @[];}
+- (NSDictionary *)functionConstantsDictionary {return @{};}
+- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)index {
+ if(gMissing)gMissing("NBFunction","newArgumentEncoderWithBufferIndex: (argument buffers)");
+ (void)index;return nil;
+}
+- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)index reflection:(MTLAutoreleasedArgument *)reflection {
+ if(reflection)*reflection=nil;
+ return [self newArgumentEncoderWithBufferIndex:index];
+}
 @end
 // The target's own accessors of MTLFunctionConstantValues (as the offline frontend reads them); their ABI is checked before any call.
 @interface MTLFunctionConstantValues (NBOriginalConstantAccess)
@@ -518,7 +634,8 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic) uint64_t committedUs;
 @property(nonatomic) uint32_t commitIndex;
 @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
-@property(nonatomic,strong) NSMutableSet *surfaces;
+@property(nonatomic,strong) NSMutableSet *surfaces;          // every surface texture it uses (cleaned at commit if the CPU wrote it)
+@property(nonatomic,strong) NSMutableSet *writtenSurfaces;   // those the GPU may write (flushed at completion)
 // Runtime handles retain GPU storage, but only the Objective-C owner retains
 // a no-copy deallocator, its memory owner and texture/heap ancestry.
 @property(nonatomic,strong) NSMutableSet *resourceOwners;
@@ -568,7 +685,10 @@ static void waitForResource(id resource) {
 - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
  if(texture)[_commandBuffer.resourceOwners addObject:texture];
- if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+ if(texture && [(NBTexture *)texture surface]) {
+  [_commandBuffer.surfaces addObject:texture];
+  if(shaderWritable((NBTexture *)texture))[_commandBuffer.writtenSurfaces addObject:texture];
+ }
  if(texture)ycbcrRefresh((NBTexture *)texture);
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
 }
@@ -735,12 +855,18 @@ static void waitForResource(id resource) {
  for(size_t i=0;i<count;i++)[self.commandBuffer.resourceOwners addObject:objects[i]];
  return true;
 }
-- (bool)textures:(__unsafe_unretained id *)objects count:(size_t)count {
+// written: bit i set when the blit writes objects[i] (a destination). A source that is a converted YCbCr copy is filled again first
+// (C2: before, only draws refreshed it, and a blit copied the stale picture).
+- (bool)textures:(__unsafe_unretained id *)objects count:(size_t)count written:(unsigned)written {
  for(size_t i=0;i<count;i++) {
   id o=objects[i];
   if(![o isKindOfClass:[NBTexture class]]){[self.commandBuffer refuse:@"missing or foreign blit texture"];return false;}
   [self.commandBuffer.resourceOwners addObject:o];
-  if([(NBTexture *)o surface])[self.commandBuffer.surfaces addObject:o];
+  if([(NBTexture *)o surface]) {
+   [self.commandBuffer.surfaces addObject:o];
+   if(written&(1u<<i))[self.commandBuffer.writtenSurfaces addObject:o];
+  }
+  if(!(written&(1u<<i)))ycbcrRefresh((NBTexture *)o);
  }
  return true;
 }
@@ -754,12 +880,12 @@ static void waitForResource(id resource) {
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
               toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
- if(![self textures:NB_OBJECTS(s,d) count:2])return;
+ if(![self textures:NB_OBJECTS(s,d) count:2 written:2])return;
  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
  [self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a,size,[(NBTexture *)d handle],ds,dl,b) what:"copyFromTexture:toTexture:"];
 }
 - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
- if(![self textures:NB_OBJECTS(s,d) count:2])return;
+ if(![self textures:NB_OBJECTS(s,d) count:2 written:2])return;
  const NSUInteger levels=MIN(s.mipmapLevelCount,d.mipmapLevelCount),slices=MIN(s.arrayLength,d.arrayLength);
  for(NSUInteger slice=0;slice<slices;slice++)for(NSUInteger level=0;level<levels;level++) {
   MTLSize size=MTLSizeMake(MAX(s.width>>level,(NSUInteger)1),MAX(s.height>>level,(NSUInteger)1),MAX(s.depth>>level,(NSUInteger)1));
@@ -770,18 +896,18 @@ static void waitForResource(id resource) {
 - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
             sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
      destinationOrigin:(MTLOrigin)dO {
- if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1])return;
+ if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1 written:1])return;
  const uint64_t size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
  [self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size,[(NBTexture *)d handle],slice,level,b) what:"copyFromBuffer:toTexture:"];
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
                toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image {
- if(![self textures:NB_OBJECTS(s) count:1] || ![self buffers:NB_OBJECTS(d) count:1])return;
+ if(![self textures:NB_OBJECTS(s) count:1 written:0] || ![self buffers:NB_OBJECTS(d) count:1])return;
  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth};
  [self check:nmb_blit_texture_to_buffer(self.handle,[(NBTexture *)s handle],slice,level,a,size,[(NBBuffer *)d handle],o,row,image) what:"copyFromTexture:toBuffer:"];
 }
 - (void)generateMipmapsForTexture:(id<MTLTexture>)t {
- if(![self textures:NB_OBJECTS(t) count:1])return;
+ if(![self textures:NB_OBJECTS(t) count:1 written:1])return;
  [self check:nmb_blit_generate_mipmaps(self.handle,[(NBTexture *)t handle]) what:"generateMipmapsForTexture"];
 }
 - (void)synchronizeResource:(id<MTLResource>)r {(void)r;}
@@ -789,9 +915,30 @@ static void waitForResource(id resource) {
 
 static void completed(void *context);
 static void scheduled(void *context);
+// SweetMetal2 (C6): a lost Vulkan device (Turnip's: the kernel reported this client's work lost in a GPU reset, or a submit/wait
+// failed) fails every later command buffer of the process: backboardd's screen froze (seen once on r18e). A refused IOSurface import
+// is not that: Turnip answers it VK_ERROR_INVALID_EXTERNAL_HANDLE / OUT_OF_DEVICE_MEMORY, and the texture over it is refused alone
+// (nil, logged), the device stays. When the device is lost all the same, backboardd exits once logged, so launchd starts it again with
+// a new device (at most 3 times a boot, /var/local/mtl2-lost.count; never with /var/local/mtl2-lost-stay). Other processes log it.
+static void noteDeviceLost(const char *why) {
+ if(!why || (!strcasestr(why,"device was lost") && !strcasestr(why,"device lost") && !strcasestr(why,"DEVICE_LOST")))return;
+ static std::atomic<bool> once{false};
+ if(once.exchange(true))return;
+ NBLOG(@"native-metal: the GPU device is lost (%s): every later command buffer fails",why);
+ if(strcmp(getprogname(),"backboardd"))return;
+ if(access("/var/local/mtl2-lost-stay",F_OK)==0){NBLOG(@"native-metal: backboardd stays (/var/local/mtl2-lost-stay)");return;}
+ struct timeval boot={};size_t length=sizeof boot;sysctlbyname("kern.boottime",&boot,&length,nullptr,0);
+ long long bootSeen=0;int restarts=0;
+ if(FILE *f=fopen("/var/local/mtl2-lost.count","r")){if(fscanf(f,"%lld %d",&bootSeen,&restarts)!=2)restarts=0;fclose(f);}
+ if(bootSeen!=(long long)boot.tv_sec)restarts=0;
+ if(restarts>=3){NBLOG(@"native-metal: backboardd stays: 3 restarts for a lost device this boot already");return;}
+ if(FILE *f=fopen("/var/local/mtl2-lost.count","w")){fprintf(f,"%lld %d\n",(long long)boot.tv_sec,restarts+1);fclose(f);}
+ NBLOG(@"native-metal: backboardd exits for a new GPU device (restart %d of 3 this boot)",restarts+1);
+ dispatch_after(dispatch_time(DISPATCH_TIME_NOW,500*NSEC_PER_MSEC),dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0),^{_exit(75);});
+}
 @implementation NBCommandBuffer
 - (instancetype)init {
- if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+ if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_writtenSurfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
  if(self)createdUs=nowUs();
  return self;
 }
@@ -856,7 +1003,7 @@ static void scheduled(void *context);
  auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
-  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
+  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface){[_surfaces addObject:texture];[_writtenSurfaces addObject:texture];}
   [_resourceOwners addObject:texture];
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
   return true;
@@ -910,10 +1057,14 @@ static void scheduled(void *context);
 }
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
- flushSurfaces(_surfaces);
+ if(!self.failedLocally && nmb_command_buffer_status(_handle)==MTLCommandBufferStatusError) {
+  char text[512]={};nmb_command_buffer_error(_handle,text,sizeof text);noteDeviceLost(text);
+ }
+ // C3: what the GPU wrote (every surface with SWEET_FLUSH=all), invalidated for the CPU.
+ flushSurfaces(flushAll()?_surfaces:_writtenSurfaces,true);
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
- [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
+ [_surfaces removeAllObjects];[_writtenSurfaces removeAllObjects];[_resourceOwners removeAllObjects];
  @synchronized(gInFlight){[gInFlight removeObject:self];}
  NSArray *completedHandlers;
  @synchronized(self){
@@ -943,12 +1094,13 @@ static void scheduled(void *context);
  dispatch_group_enter(_schedulingHandlers);
  @synchronized(gInFlight){[gInFlight addObject:self];}
  if(!self.encodeFailure) {
-  flushSurfaces(_surfaces);
+  flushSurfaces(_surfaces,false);
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
   if(nmb_command_buffer_on_completed(_handle,completed,context) &&
      nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle))return;
   (void)CFBridgingRelease(context);   // refused registration/commit cannot call the registered handlers
+  noteDeviceLost(nmb_last_error());
   [self refuse:[@"commit: " stringByAppendingString:lastError()]];
  }
  self.failedLocally=YES;gCommitFailures++;
@@ -1081,6 +1233,25 @@ static void journalRenderPipeline(MTLRenderPipelineDescriptor *d,uint64_t began,
  line+=" | ";line+=quartzCoreCallers();
  for(char &c:line)if(c=='\n')c=' ';
  journal(line);
+}
+// SweetMetal2 (C1): render pipeline outcomes in the log (the journal is a file on the phone): every refused key (vertex | fragment |
+// first colour format) once with the reason, and a count line at the 1st, 10th, 50th, 100th, 200th, ... pipeline made.
+static void notePipeline(MTLRenderPipelineDescriptor *d,const char *refused) {
+ static std::mutex lock;static std::vector<std::string> seen;static uint64_t made,failed;
+ NBFunction *vf=[(id)d.vertexFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.vertexFunction:nil;
+ NBFunction *ff=[(id)d.fragmentFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.fragmentFunction:nil;
+ std::string key=std::string(vf?vf.name.UTF8String?:"?":"-")+" | "+(ff?ff.name.UTF8String?:"?":"-")+" | c0 "+
+     std::to_string((unsigned long)d.colorAttachments[0].pixelFormat);
+ bool log=false;uint64_t m,f;
+ {
+  std::lock_guard<std::mutex> l(lock);
+  if(refused){failed++;if(seen.size()<64 && std::find(seen.begin(),seen.end(),key)==seen.end()){seen.push_back(key);log=true;}}
+  else made++;
+  m=made;f=failed;
+ }
+ if(log)NBLOG(@"native-metal: render pipeline refused (%s): %s",key.c_str(),refused);
+ if(!refused && (m==1 || m==10 || m==50 || m%100==0))sm2_logs([NSString stringWithFormat:@"native-metal: render pipelines made %llu, refused %llu",
+     (unsigned long long)m,(unsigned long long)f].UTF8String);
 }
 // A render pipeline descriptor in the bridge's form; false, with the error, for a function of another device.
 static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDescriptor *p,NSError **error) {
@@ -1427,27 +1598,99 @@ static char sweetMemoryOwnerKey;
 // (Redfin: before this every planar surface was refused, and Camera.app's preview stayed black.)
 static void noteSurfaceTexture(IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,size_t planes,NSUInteger offset,
                                NSUInteger row,const char *what) {
- static std::mutex lock;static std::vector<uint64_t> seen;
- const uint64_t key=((uint64_t)IOSurfaceGetPixelFormat(surface)<<32)^((uint64_t)d.pixelFormat<<8)^(plane<<4)^planes^((uint64_t)(what[0])<<56);
- {std::lock_guard<std::mutex> l(lock);for(uint64_t k:seen)if(k==key)return;if(seen.size()<64)seen.push_back(key);else return;}
+ // Once per distinct (surface format, texture format, plane, planes, outcome with its whole reason): the old key took the reason's
+ // first letter only, so a second reason of the same outcome ("refused (...)") was never logged.
+ static std::mutex lock;static std::vector<std::string> seen;
  const uint32_t f=IOSurfaceGetPixelFormat(surface);
+ char head[96];snprintf(head,sizeof head,"%08x/%lu/%lu/%zu/",f,(unsigned long)d.pixelFormat,(unsigned long)plane,planes);
+ const std::string key=head+std::string(what);
+ {std::lock_guard<std::mutex> l(lock);if(std::find(seen.begin(),seen.end(),key)!=seen.end() || seen.size()>=96)return;seen.push_back(key);}
  NBLOG(@"native-metal: IOSurface texture %s: surface %c%c%c%c %zux%zu, %zu planes; plane %lu as format %lu %lux%lu, offset %lu, %lu bytes a row",
        what,(char)(f>>24),(char)(f>>16),(char)(f>>8),(char)f,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),planes,
        (unsigned long)plane,(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)offset,(unsigned long)row);
 }
-// MTLPixelFormatYCBCR8_420_2P (500) and its sRGB twin (501): Core Animation asks for one texture over both planes of a
-// 420f/420v surface (photographs in Photos, videos, the camera). Turnip has no such format. The texture made instead is
-// an RGBA8 copy of the picture in RGB (sRGB-encoded for 501), filled from the surface when the texture is made and again
-// whenever it is bound for drawing after the surface was written (its seed moved on: the camera's preview, a video).
-// What sampling the YCbCr format gives is RGB, the conversion done by the sampler (r18g: Y, Cb, Cr in r, g, b showed as
-// a teal picture: dark grey with Cb = Cr = 0.5 on top). BT.601 (what camera_device.c attaches), full range for 420f
-// and the like, video range for 420v; 16.16 fixed point.
-static bool ycbcrFill(NmbTexture *handle,IOSurfaceRef surface,size_t w,size_t h) {
+// The surface's YCbCr matrix attachment, as NmbSurfaceFacts names it: 0 none, 1 BT.601, 2 BT.709, 3 BT.2020, 4 SMPTE 240M, 5 another.
+// CoreVideo propagates a pixel buffer's kCVImageBufferYCbCrMatrixKey (camera_device.c attaches ITU_R_601_4) to its IOSurface's values;
+// the key is looked for by name among the values and one level of dictionaries inside them, so the exact key spelling does not matter.
+// The first surface's value keys are logged once (phase 2: which key carries it).
+static uint32_t matrixOfValue(CFTypeRef value) {
+ if(!value || CFGetTypeID(value)!=CFStringGetTypeID())return 5;
+ NSString *text=(__bridge NSString *)value;
+ if([text containsString:@"709"])return 2;
+ if([text containsString:@"601"])return 1;
+ if([text containsString:@"2020"])return 3;
+ if([text containsString:@"240"])return 4;
+ return 5;
+}
+static uint32_t surfaceMatrix(IOSurfaceRef surface) {
+ // (r19: SweetSurface accepts and drops IOSurface values, so this answers 0, read as BT.601 like Metal's "no matrix", until the
+ // kernel keeps them.)
+ // Without an attachment, an HD video-range picture (a decoder's 420v, 1280x720 and up) is taken as BT.709, as CoreVideo tags those;
+ // everything else (the camera's 420f, SD video) as BT.601, Metal's reading of no matrix.
+ const uint32_t guess=(IOSurfaceGetPixelFormat(surface)&0xff)=='v' && IOSurfaceGetWidth(surface)>=1280 && IOSurfaceGetHeight(surface)>=720?2:0;
+ CFDictionaryRef values=IOSurfaceCopyAllValues(surface);
+ if(!values)return guess;
+ NSDictionary *all=(__bridge_transfer NSDictionary *)values;
+ static std::atomic<bool> logged{false};
+ if(!logged.exchange(true)) {
+  NSString *keys=[all.allKeys componentsJoinedByString:@" "];
+  NBLOG(@"native-metal: YCbCr surface values: %@",keys.length>300?[keys substringToIndex:300]:keys);
+ }
+ uint32_t matrix=guess;
+ for(id key in all) {
+  id value=all[key];
+  if([key isKindOfClass:[NSString class]] && [(NSString *)key containsString:@"YCbCrMatrix"])return matrixOfValue((__bridge CFTypeRef)value);
+  if([value isKindOfClass:[NSDictionary class]])for(id inner in (NSDictionary *)value)
+   if([inner isKindOfClass:[NSString class]] && [(NSString *)inner containsString:@"YCbCrMatrix"])matrix=matrixOfValue((__bridge CFTypeRef)((NSDictionary *)value)[inner]);
+ }
+ return matrix;
+}
+// MTLPixelFormatYCBCR8_420_2P (500) and its sRGB twin (501): Core Animation asks for one texture over both planes of a 420f/420v surface
+// (photographs in Photos, videos, the camera preview). C2: the runtime makes it (metal2vulkan's two-plane YCbCr texture, ycbcr.rs: an
+// image the GPU converts the planes into in the command buffer that samples it: chroma filtered 9/3/3/1 as Apple's GPUs do, the
+// surface's matrix (601/709/2020) and range (420f full, 420v video), sRGB-encoded for 501). No CPU work, no copy refilled while a frame
+// may still sample it. The CPU copy below stays as the fallback where the runtime refuses (logged with its reason), or with
+// /var/local/mtl2-env SWEET_YCBCR=cpu.
+static bool ycbcrOnGPU() {
+ static int gpu=-1;
+ if(gpu<0){const char *e=getenv("SWEET_YCBCR");gpu=!(e && !strcmp(e,"cpu"));}
+ return gpu>0;
+}
+static NBTexture *ycbcrSurfaceTexture(IOSurfaceRef surface,MTLTextureDescriptor *d,std::string &why) {
+ if(IOSurfaceGetPlaneCount(surface)!=2){why="not two planes";return nil;}
+ void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
+ if(!base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1)){why="base or size";return nil;}
+ const size_t bytes=(allocation+page-1)&~(page-1);
+ const uint64_t luma=(uint64_t)((uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,0)-(uintptr_t)base);
+ const uint64_t chroma=(uint64_t)((uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,1)-(uintptr_t)base);
+ const uint64_t lumaRow=IOSurfaceGetBytesPerRowOfPlane(surface,0),chromaRow=IOSurfaceGetBytesPerRowOfPlane(surface,1);
+ if(!lumaRow || !chromaRow || luma>=bytes || chroma>=bytes){why="plane geometry";return nil;}
+ NBBuffer *buffer=surfaceBuffer(surface,base,bytes);
+ if(!buffer){why="import";return nil;}
+ NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor)){why="descriptor";return nil;}
+ const NmbSurfaceFacts facts={IOSurfaceGetPixelFormat(surface),surfaceMatrix(surface),0,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chroma,chromaRow};
+ NmbTexture *handle=nmb_texture_new_on_surface(buffer.handle,&descriptor,luma,lumaRow,true,&facts);
+ if(!handle){why=lastError().UTF8String?:"?";return nil;}
+ NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+ texture.buffer=buffer;texture.offset=(NSUInteger)luma;texture.rowBytes=(NSUInteger)lumaRow;texture.plane=0;[texture holdSurface:surface];
+ return texture;
+}
+// The fallback: an RGBA8 copy of the picture in RGB (sRGB-encoded for 501), filled on the CPU from the surface when the texture is
+// made and again when it is used (drawn from or blitted from) after the surface was written (its seed moved on). What sampling the
+// YCbCr format gives is RGB (r18g: Y, Cb, Cr in r, g, b showed as a teal picture). BT.601 or BT.709 by the surface's matrix
+// attachment, full range for 420f and the like, video range for 420v; 16.16 fixed point; nearest chroma. Two textures take turns
+// (C2): a frame still being sampled from one is not overwritten. The copy holds the surface as ycbcrSource, not as `surface`: it
+// is not the surface's memory, so the surface is not flushed for it.
+static bool ycbcrFill(NmbTexture *handle,IOSurfaceRef surface,size_t w,size_t h,bool bt709) {
  const uint8_t *y=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,0),*c=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,1);
  const size_t ys=IOSurfaceGetBytesPerRowOfPlane(surface,0),cs=IOSurfaceGetBytesPerRowOfPlane(surface,1);
  if(!y || !c || !ys || !cs)return false;
  const bool video=(IOSurfaceGetPixelFormat(surface)&0xff)=='v';
- const int32_t ky=video?76309:65536,kr=video?104597:91881,kgb=video?25674:22554,kgr=video?53279:46802,kb=video?132201:116130,y0=video?16:0;
+ // {luma, Cr->R, Cb->G, Cr->G, Cb->B}: BT.601 / BT.709, full / video range (chroma 255/224 and luma 255/219 for video)
+ static const int32_t k[2][2][5]={{{65536,91881,22554,46802,116130},{76309,104597,25674,53279,132201}},
+                                  {{65536,103206,12275,30677,121607},{76309,117489,13973,34923,138438}}};
+ const int32_t *m=k[bt709][video];
+ const int32_t ky=m[0],kr=m[1],kgb=m[2],kgr=m[3],kb=m[4],y0=video?16:0;
  std::vector<uint32_t> row(w*16);
  for(size_t top=0;top<h;top+=16) {
   const size_t rows=std::min<size_t>(16,h-top);
@@ -1476,25 +1719,47 @@ static NBTexture *ycbcrCopy(IOSurfaceRef surface,MTLTextureDescriptor *d) {
  NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);
  if(!handle){NBLOG(@"native-metal: YCbCr copy %zux%zu refused: %@",w,h,lastError());return nil;}
  const uint32_t seed=IOSurfaceGetSeed(surface);
- if(!ycbcrFill(handle,surface,w,h)){nmb_texture_release(handle);return nil;}
+ const bool bt709=surfaceMatrix(surface)==2;
+ if(!ycbcrFill(handle,surface,w,h,bt709)){nmb_texture_release(handle);return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
- texture.reportedFormat=(uint64_t)d.pixelFormat;texture.surfaceSeed=seed;texture.surface=(IOSurfaceRef)CFRetain(surface);
+ texture.reportedFormat=(uint64_t)d.pixelFormat;texture.surfaceSeed=seed;texture.ycbcrSource=(IOSurfaceRef)CFRetain(surface);
+ texture.ycbcr709=bt709;
  return texture;
 }
-// A converted copy is filled again when it is bound for drawing and its surface has been written since (its seed moved
-// on): the camera's preview frames, a video's.
+// Waits until no committed command buffer still uses `handle` (the turn's other texture, two frames back: normally long done).
+static void waitForHandle(NmbTexture *handle) {
+ NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
+ for(NBCommandBuffer *commandBuffer in pending)
+  if(nmb_command_buffer_uses_texture(commandBuffer.handle,handle)!=0)[(id<MTLCommandBuffer>)commandBuffer waitUntilCompleted];
+}
+// A converted copy is filled again when it is used and its surface has been written since (its seed moved on): the camera's preview
+// frames, a video's. The fill goes into the copy's other texture (made at the first refill), which then becomes the one bound.
 static void ycbcrRefresh(NBTexture *texture) {
- if(!texture.reportedFormat || !texture.surface)return;
- const uint32_t seed=IOSurfaceGetSeed(texture.surface);
- if(seed==texture.surfaceSeed)return;
- texture.surfaceSeed=seed;
- (void)ycbcrFill(texture.handle,texture.surface,texture.descriptor.width,texture.descriptor.height);
+ if(!texture.reportedFormat || !texture.ycbcrSource)return;
+ @synchronized(texture) {
+  const uint32_t seed=IOSurfaceGetSeed(texture.ycbcrSource);
+  if(seed==texture.surfaceSeed)return;
+  if(!texture.spareHandle) {
+   NmbTextureDescriptor descriptor=texture.descriptor;
+   texture.spareHandle=nmb_texture_new(gDevice,&descriptor);   // refused: one texture, filled in place as before
+  }
+  NmbTexture *next=texture.spareHandle?texture.spareHandle:texture.handle;
+  if(texture.spareHandle)waitForHandle(next);
+  if(!ycbcrFill(next,texture.ycbcrSource,texture.descriptor.width,texture.descriptor.height,texture.ycbcr709))return;
+  texture.surfaceSeed=seed;
+  if(texture.spareHandle){texture.spareHandle=texture.handle;texture.handle=next;}
+ }
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
  if(!surface || !d)return nil;
  const size_t planes=IOSurfaceGetPlaneCount(surface);
  if(planes?plane>=planes:plane!=0){noteSurfaceTexture(surface,d,plane,planes,0,0,"refused (no such plane)");return nil;}
  if((d.pixelFormat==500 || d.pixelFormat==501) && plane==0) {
+  if(ycbcrOnGPU()) {
+   std::string why;
+   if(NBTexture *texture=ycbcrSurfaceTexture(surface,d,why)){noteSurfaceTexture(surface,d,plane,planes,0,0,"made (YCbCr on the GPU)");return (id<MTLTexture>)texture;}
+   noteSurfaceTexture(surface,d,plane,planes,0,0,("YCbCr on the GPU refused, CPU copy instead: "+why).c_str());
+  }
   NBTexture *copy=ycbcrCopy(surface,d);noteSurfaceTexture(surface,d,plane,planes,0,0,copy?"made (YCbCr copy)":"refused (YCbCr copy)");
   return (id<MTLTexture>)copy;
  }
@@ -1511,7 +1776,7 @@ static void ycbcrRefresh(NBTexture *texture) {
  NBTexture *texture=textureOnBuffer(buffer,d,offset,row,true);
  noteSurfaceTexture(surface,d,plane,planes,offset,row,texture?"made":"refused (texture over the surface)");
  if(!texture)return nil;
- texture.plane=plane;texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
+ texture.plane=plane;[texture holdSurface:surface];return (id<MTLTexture>)texture;
 }
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
@@ -1570,13 +1835,14 @@ static void ycbcrRefresh(NBTexture *texture) {
                                                         reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection error:(NSError **)error {
  if(reflection)*reflection=nil;
  auto *p=new NmbRenderPipelineDescriptor();
- if(!renderDescriptor(d,p,error)){delete p;return nil;}
+ if(!renderDescriptor(d,p,error)){delete p;notePipeline(d,"a function of another device");return nil;}
  std::vector<NmbBinaryArchive *> archives;
  if(!pipelineArchives(d.binaryArchives,archives,error)){delete p;return nil;}
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
+ notePipeline(d,handle?nullptr:nmb_last_error());
  if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
 }
@@ -1621,6 +1887,20 @@ static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
  return value;
 }
 static NSUInteger countArgAnswer(id,SEL cmd,NSUInteger arg) {return (NSUInteger)askAnswer(cmd,arg);}
+// SweetMetal2 (C4): the row alignment the device asks of linear textures. Metal's (and the runtime's) answer is 16 bytes, but Turnip
+// lays a linear image over memory it did not allocate only at 64-byte pitches (pitchalign 6): Core Animation's small A8/RG8/BGRA layers
+// over its own buffers came with 32-byte pitches (96, 160, 224 ...), each refused as an explicit layout and shadow-copied every frame
+// (r18g: ~100 "TU: warning: sweet: explicit layout refused"). Clients that ask lay their rows out at 64 now. /var/local/mtl2-env
+// SWEET_LINEAR_ALIGN=N sets another power of two (16 = Metal's).
+static uint64_t linearAlignment() {
+ static uint64_t align=0;
+ if(!align){const char *e=getenv("SWEET_LINEAR_ALIGN");const uint64_t v=e?strtoull(e,nullptr,0):64;align=v && !(v&(v-1))?v:64;}
+ return align;
+}
+static NSUInteger linearAlignmentAnswer(id,SEL cmd,NSUInteger arg) {
+ const uint64_t value=askAnswer(cmd,arg);
+ return (NSUInteger)(value?std::max(value,linearAlignment()):0);
+}
 static BOOL flagArgAnswer(id,SEL cmd,NSUInteger arg) {return askAnswer(cmd,arg)!=0;}
 static void installAnswers(Class cls) {
  uint32_t kind=0;
@@ -1633,10 +1913,15 @@ static void installAnswers(Class cls) {
    // wide-gamut 64-bit (and Apple-compressed) framebuffer when a device offers them, and the display driver could not show it (int-089: the
    // swap's surface was '&w4a', 8 bytes per pixel, and every swap was refused).
    if(!strcmp(name,"supportsExtendedXR10Formats"))value=0;
+   // C4: linear and IOSurface texture rows 64-byte aligned (linearAlignment).
+   if(value && (!strcmp(name,"deviceLinearTextureAlignmentBytes") || !strcmp(name,"linearTextureAlignmentBytes") ||
+      !strcmp(name,"iosurfaceTextureAlignmentBytes")))value=std::max(value,linearAlignment());
    gAnswers[sel]=value;
    class_addMethod(cls,sel,kind==NMB_ANSWER_COUNT?(IMP)countAnswer:(IMP)flagAnswer,kind==NMB_ANSWER_COUNT?"Q16@0:8":"B16@0:8");
    break;
-  case NMB_ANSWER_COUNT_ARG: class_addMethod(cls,sel,(IMP)countArgAnswer,"Q24@0:8Q16");break;
+  case NMB_ANSWER_COUNT_ARG:
+   class_addMethod(cls,sel,strcmp(name,"minimumLinearTextureAlignmentForPixelFormat:")?(IMP)countArgAnswer:(IMP)linearAlignmentAnswer,"Q24@0:8Q16");
+   break;
   case NMB_ANSWER_FLAG_ARG: class_addMethod(cls,sel,(IMP)flagArgAnswer,"B24@0:8Q16");break;
   }
  }
@@ -1675,6 +1960,25 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  // MTLTextureImplementation." on every miss (~600 lines/s from backboardd while scrolling).
  {Protocol *tp=objc_getProtocol("MTLTextureImplementation");if(tp)class_addProtocol([NBTexture class],tp);
   NBLOG(@"native-metal: MTLTextureImplementation %s",tp?([NBTexture conformsToProtocol:tp]?"adopted":"not adopted"):"missing");}
+ // SweetMetal2 (C1): the same for functions ("vertexFunction is not a MTLFunction." / "fragmentFunction is not a MTLFunction.", 450
+ // NSLog lines a session from backboardd on r18g, one per function of each pipeline Core Animation made) and for the other objects
+ // a descriptor or an encoder hands back to Metal's validation: their public protocols. One line says what was adopted, and whether
+ // Metal has the private classes a subclassing fix would need (phase 2: if the messages persist, the check is a class test).
+ {
+  struct {Class cls;const char *protocol;} adopt[]={{[NBFunction class],"MTLFunction"},{[NBLibrary class],"MTLLibrary"},
+   {[NBRenderPipeline class],"MTLRenderPipelineState"},{[NBComputePipeline class],"MTLComputePipelineState"},
+   {[NBSampler class],"MTLSamplerState"},{[NBDepthStencil class],"MTLDepthStencilState"}};
+  std::string done;
+  for(auto &a:adopt) {
+   Protocol *p=objc_getProtocol(a.protocol);
+   const bool was=p && [a.cls conformsToProtocol:p];
+   if(p && !was)class_addProtocol(a.cls,p);
+   done+=std::string(" ")+class_getName(a.cls)+(p?([a.cls conformsToProtocol:p]?(was?"=":"+"):"!"):"?")+a.protocol;
+  }
+  Class mf=objc_getClass("_MTLFunction");
+  NBLOG(@"native-metal: protocols (+ adopted, = already, ? no such protocol):%s; Metal's _MTLFunction %s (%zu bytes)",done.c_str(),
+        mf?"present":"absent",mf?class_getInstanceSize(mf):(size_t)0);
+ }
  objc_registerClassPair(cls);
  gDeviceObject=[cls new];
  return gDeviceObject;
@@ -1812,6 +2116,8 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceFlush.count.load(),
   (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),
   (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());
+ row("J surface cleans skipped (seed)=%llu invalidates=%llu%s",(unsigned long long)gSurfaceCleanSkips.load(),
+  (unsigned long long)gSurfaceInvalidates.load(),flushAll()?" (SWEET_FLUSH=all)":"");
  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
  // its shader cache: where the driver's compile time goes.
  uint64_t work[10]={};
