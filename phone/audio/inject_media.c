@@ -1163,6 +1163,201 @@ set_format_requirements(id self, SEL selector, id requirements)
 	((void (*)(id, SEL, id))original_set_format_requirements)(self, selector, requirements);
 }
 
+/*
+ * redfin (r20 on the phone, 2026-10-25): a video's stop still trapped in -[BWGraph stop:] after 10 s, and the audio
+ * source's -start:/-stop: (replaced) were never called on 16.7: the movie graph's audio does not come that way.
+ *
+ * 1. What there is, said once at load: every class of CMCapture with "Audio" in its name, its superclasses, and their
+ *    methods about starting, stopping, running, liveness and ends; BWGraph's about stopping and waiting; the
+ *    connection configuration's about media types (say_audio_classes()).
+ * 2. By default a session's connections of audio ('soun') are left out of its configuration
+ *    (-[FigCaptureSessionConfiguration connectionConfigurations]): the graph is built without an audio source, the
+ *    movie has a video track only and can end. /private/var/local/camera-with-audio keeps them.
+ * 3. -[BWGraph stop:]: before it, every audio source node of the graph (an "Audio" class with no inputs) whose output
+ *    is still live is marked ended, so that what waits for its end-of-data does not wait 10 s and trap.
+ */
+static const char *const audio_words[] = { "start", "Start", "stop", "Stop", "run", "Run", "live", "Live", "EndOf", "endOf",
+	"markEnd", "emit", "generate", "Generate", "prepare", "audio", "Audio", "media", "Media", "wait", "Wait", NULL };
+
+static void
+say_matching(Class cls, bool meta)
+{
+	unsigned n = 0;
+	Method *methods = class_copyMethodList(meta ? object_getClass((id)cls) : cls, &n);
+	char line[220];
+	size_t used = 0;
+
+	for (unsigned i = 0; i < n; i++) {
+		const char *name = sel_getName(method_getName(methods[i]));
+		bool match = false;
+
+		for (int w = 0; audio_words[w] != NULL && !match; w++) {
+			match = strstr(name, audio_words[w]) != NULL;
+		}
+		if (!match) {
+			continue;
+		}
+		if (used + strlen(name) + 3 >= sizeof(line) - 1) {
+			say("redwood: mediaserverd:     %s\n", line);
+			used = 0;
+		}
+		used += (size_t)snprintf(line + used, sizeof(line) - used, "%c%s ", meta ? '+' : '-', name);
+	}
+	if (used > 0) {
+		say("redwood: mediaserverd:     %s\n", line);
+	}
+	free(methods);
+}
+
+static void
+say_class(const char *name)
+{
+	Class cls = objc_getClass(name);
+
+	if (cls == Nil) {
+		return;
+	}
+	say("redwood: mediaserverd:   %s : %s\n", name, class_getSuperclass(cls) ? class_getName(class_getSuperclass(cls)) : "-");
+	for (Class c = cls; c != Nil && strcmp(class_getName(c), "NSObject") != 0; c = class_getSuperclass(c)) {
+		if (c != cls) {
+			say("redwood: mediaserverd:    (%s)\n", class_getName(c));
+		}
+		say_matching(c, false);
+		say_matching(c, true);
+	}
+}
+
+static void
+say_audio_classes(const char *const *names, unsigned n)
+{
+	say("redwood: mediaserverd: the capture stack's audio classes and how they start and stop:\n");
+	for (unsigned i = 0; i < n; i++) {
+		if (strstr(names[i], "Audio") != NULL && (strncmp(names[i], "BW", 2) == 0 || strncmp(names[i], "Fig", 3) == 0)) {
+			say_class(names[i]);
+		}
+	}
+	say_class("BWGraph");
+	say_class("FigCaptureConnectionConfiguration");
+	say_class("FigCaptureSessionConfiguration");
+	say("redwood: mediaserverd: (the audio classes said)\n");
+}
+
+/* the configuration's connections without the audio ones (unless camera-with-audio) */
+static IMP original_connection_configurations;
+
+static id
+session_connections(id self, SEL selector)
+{
+	id list = ((id (*)(id, SEL))original_connection_configurations)(self, selector);
+	static int keep = -1;
+	static unsigned said;
+	CFMutableArrayRef kept;
+	CFIndex n, dropped = 0;
+
+	if (keep < 0) {
+		keep = access("/private/var/local/camera-with-audio", F_OK) == 0;
+	}
+	if (keep || list == nil || CFGetTypeID((CFTypeRef)list) != CFArrayGetTypeID() || (n = CFArrayGetCount((CFArrayRef)list)) == 0) {
+		return list;
+	}
+	kept = CFArrayCreateMutable(NULL, n, &kCFTypeArrayCallBacks);
+	for (CFIndex i = 0; i < n; i++) {
+		id c = (id)CFArrayGetValueAtIndex((CFArrayRef)list, i);
+		SEL media = sel_registerName("mediaType");
+
+		if (((BOOL (*)(id, SEL, SEL))objc_msgSend)(c, sel_registerName("respondsToSelector:"), media) &&
+		    ((uint32_t (*)(id, SEL))objc_msgSend)(c, media) == 'soun') {
+			dropped++;
+			continue;
+		}
+		CFArrayAppendValue(kept, c);
+	}
+	if (dropped == 0) {
+		CFRelease(kept);
+		return list;
+	}
+	if (said++ < 5) {
+		say("redwood: mediaserverd: a session's %ld audio connection(s) of %ld left out: no microphone here, the videos "
+		    "silent (camera-with-audio keeps them)\n", (long)dropped, (long)n);
+	}
+	return (id)CFAutorelease(kept);
+}
+
+/* the audio sources of a graph ended before its stop */
+static void
+end_node(id node, unsigned *ended)
+{
+	id inputs, output;
+	const char *name = object_getClassName(node);
+
+	if (strstr(name, "Audio") == NULL || strstr(name, "Source") == NULL) {
+		return;
+	}
+	inputs = send_if(node, "inputs");
+	if (inputs != nil && CFGetTypeID((CFTypeRef)inputs) == CFArrayGetTypeID() && CFArrayGetCount((CFArrayRef)inputs) > 0) {
+		return;
+	}
+	if ((output = send_if(node, "output")) == nil || send_if(output, "liveFormat") == nil ||
+	    !((BOOL (*)(id, SEL, SEL))objc_msgSend)(output, sel_registerName("respondsToSelector:"), sel_registerName("markEndOfLiveOutput"))) {
+		return;
+	}
+	((void (*)(id, SEL))objc_msgSend)(output, sel_registerName("markEndOfLiveOutput"));
+	(*ended)++;
+	say("redwood: mediaserverd: the graph stops: its %s's output, still live, marked ended\n", name);
+}
+
+static void
+end_each(const void *value, void *context)
+{
+	end_node((id)value, context);
+}
+
+static IMP original_graph_stop;
+
+static long
+graph_stop(id self, SEL selector, void *a, void *b, void *c)
+{
+	id nodes = send_if(self, "nodes");
+	unsigned ended = 0;
+	uint64_t began = mach_absolute_time();
+	long result;
+	static mach_timebase_info_data_t tb;
+
+	if (nodes == nil) {
+		Ivar ivar = class_getInstanceVariable(object_getClass(self), "_nodes");
+
+		nodes = ivar != NULL ? object_getIvar(self, ivar) : nil;
+	}
+	if (nodes != nil) {
+		CFTypeID t = CFGetTypeID((CFTypeRef)nodes);
+
+		if (t == CFArrayGetTypeID()) {
+			CFArrayApplyFunction((CFArrayRef)nodes, CFRangeMake(0, CFArrayGetCount((CFArrayRef)nodes)), end_each, &ended);
+		} else if (t == CFSetGetTypeID()) {
+			CFSetApplyFunction((CFSetRef)nodes, end_each, &ended);
+		} else if (t == CFDictionaryGetTypeID()) {
+			CFIndex n = CFDictionaryGetCount((CFDictionaryRef)nodes);
+			const void **values = calloc((size_t)n + 1, sizeof(void *));
+
+			if (values != NULL) {
+				CFDictionaryGetKeysAndValues((CFDictionaryRef)nodes, NULL, values);
+				for (CFIndex i = 0; i < n; i++) {
+					end_node((id)values[i], &ended);
+				}
+				free(values);
+			}
+		}
+	}
+	say("redwood: mediaserverd: -[BWGraph stop:] (%s; %u audio source(s) ended first)\n", nodes == nil ? "its nodes not found" :
+	    object_getClassName(nodes), ended);
+	result = ((long (*)(id, SEL, void *, void *, void *))original_graph_stop)(self, selector, a, b, c);
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	say("redwood: mediaserverd: -[BWGraph stop:] done in %.0f ms\n", (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6);
+	return result;
+}
+
 struct method_spec {
 	const char *selector, *types;
 	IMP imp;
@@ -1235,6 +1430,10 @@ static struct replacement {
 	{ "BWAudioSourceNode", "stop:", 0, (IMP)audio_source_stop, &original_audio_source_stop, true, false, true },
 	{ "FigCaptureMovieFileRecordingSettings", "videoSettings", 0, (IMP)recording_video_settings, &original_video_settings, true, false,
 	  true },
+	/* (redfin: a video's stop, r20 on the phone) */
+	{ "FigCaptureSessionConfiguration", "connectionConfigurations", 0, (IMP)session_connections, &original_connection_configurations,
+	  true, false, true },
+	{ "BWGraph", "stop:", 0, (IMP)graph_stop, &original_graph_stop, true, false, true },
 };
 
 /* ---- the Metal device leaves this process before the capture stack asks for it -------------------- */
@@ -1422,12 +1621,14 @@ prewarm_sweep(void)
 		return;
 	}
 	done = true;
-	if (access("/private/var/local/camera-no-prewarm-fix", F_OK) == 0) {
-		say("redwood: mediaserverd: the capture stack's Core Image prewarms left as they are (camera-no-prewarm-fix)\n");
-		return;
-	}
 	if ((image = class_getImageName(renderer)) == NULL || (names = objc_copyClassNamesForImage(image, &n)) == NULL) {
 		say("redwood: mediaserverd: the capture stack's classes cannot be listed: its prewarms left as they are\n");
+		return;
+	}
+	say_audio_classes(names, n);
+	if (access("/private/var/local/camera-no-prewarm-fix", F_OK) == 0) {
+		say("redwood: mediaserverd: the capture stack's Core Image prewarms left as they are (camera-no-prewarm-fix)\n");
+		free(names);
 		return;
 	}
 	for (unsigned i = 0; i < n; i++) {
