@@ -144,6 +144,26 @@ A5 **(S)** NOTES/port-plan text, CREDITS (HackiOS APSL parts), a `sound_test`/`m
 Exit tests (Fable): `poke a tone` audible; Settings → Sounds plays; Voice Memos records and plays back; no DSP crash;
 amp temperature/current sanity (guard logs).
 
+#### WS-A run book (patches 0952-0955, branch `ws-a-audio`)
+Resolved: QUIN_TDM_RX_0 runs **4 slots x 32 bits** (kona.c `QUIN_TDM_MAX_SLOTS = 4` whenever the codec is a CS35L41;
+the DT has no `qcom,tdm-max-slots`, default 8, and its 12.288 MHz is overridden by `set_sysclk(48000 x 32 x 4)` =
+6.144 MHz); 2 active channels S32_LE at offsets 0/4, port mask 0x3; amps on ASPRX1 slot 0 (L, 0x40) / 1 (R, 0x41).
+PRI_TDM_TX_0 (mics) runs 8 x 32 at 12.288 MHz, mic 1 at slot offset 0 (2nd/3rd: 8/12). Android enables an AFE group
+only for >1 port or PRI_TDM_TX, so the speaker sends no group message.
+
+Boot-args (all default off/old behaviour; all need `adsp=1`): `sound=1..4`, `sndsecs=S`, `sndlpi=0`, `sndbelow=E`
+(1/8 dB under Android's level, default 160; sound=3 never louder), `sndgain=E` (sound=4 guard gain, default 96),
+`sndgpio=1` (allow the PMIC GPIO writes: PM8150L GPIO10/11 amp resets, PM7250B GPIO6 mic LDO), `mic=1`, `micgain=N`.
+Poke (`a`): `a status`, `a tone [MS]`, `a gain DB`, `a off`, `a on`, `a mic SECS`.
+
+Phone order (one image per step): (1) `adsp=1 sound=1` -> `SWEET SOUND: LPASS core vote ... granted`, `LPI gpio6-9 now:`
+(val 0x1c8 dir 0x2 = LPI writes work after the vote), `port 0x9040, started: done`; (2) `sound=2` -> `SMMU: ... IDENTITY`,
+`ADM: COPP n open`, `PATH UP`, `tone over: ... the DSP took ~48000 frames/s`; (3) `sound=3` (+`sndgpio=1` if
+`SWEET AMP: ... NO ANSWER`) -> `SWEET AMP: ... DEVID 0x35a40`, `AMPLIFIERS READY`, `amplifiers ON at 20.000 dB`,
+audible 1 s tone, `amplifiers OFF (2 s of silence)`; `poke a tone 1000`; (4) `sound=4` -> Settings sounds;
+(5) `mic=1` (+`sndgpio=1` for the mic LDO) -> `poke a mic 3`, then `files read /dev/pmem PA LEN` as printed
+(raw S16LE mono 48 kHz; `sox -t raw -r 48000 -e signed -b 16 -c 1 mic.raw mic.wav`), then Voice Memos.
+
 ### WS-P — Power, thermal, charging (branch `ws-p-power`, Opus; mostly independent, first to reach the phone)
 P1 **(S)** 0960 `sweet_thermal.c`: TSENS read-only (tsens0 TM 0x0C263000: 0 aoss, 1-6 cpu0-5, 7-8 cpuss, 9-12 the four
    A76 sensors, 13-14 gpuss; tsens1 TM 0x0C265000: 3 ddr, 6 npu, 7 camera; status `TM+0xA0+4n`, bits 11:0 deci-°C signed,

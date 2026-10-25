@@ -1,0 +1,1132 @@
+From 8ca2c720a4816a41bfe723afc1e3f1994edc9bbe Mon Sep 17 00:00:00 2001
+From: WS-A <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 00:39:19 +0100
+Subject: [PATCH] redfin: speakers' path through the ADSP (sound=1/2: LPASS
+ votes, LPI pins, QUIN TDM, SMMU 0x1401, ADM/ASM, test tone)
+
+---
+ bsd/conf/files        |    1 +
+ bsd/dev/sweet_poke.c  |    6 +
+ bsd/dev/sweet_sound.c | 1081 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1088 insertions(+)
+ create mode 100644 bsd/dev/sweet_sound.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 678d45b..9d43a9b 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@ bsd/dev/sweet_haptic.c			standard
+ bsd/dev/sweet_torch.c			standard
+ bsd/dev/sweet_cam.c			standard
+ bsd/dev/sweet_audio.c			standard
++bsd/dev/sweet_sound.c			standard
+ bsd/dev/sweet_adsp.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_poke.c			standard
+diff --git a/bsd/dev/sweet_poke.c b/bsd/dev/sweet_poke.c
+index 2b423c2..7721f2f 100644
+--- a/bsd/dev/sweet_poke.c
++++ b/bsd/dev/sweet_poke.c
+@@ -131,6 +131,12 @@ poke_line(const char *s, const char *end, unsigned lineno)
+ 		return;
+ 	}
+ 	char op = *s++;
++	if (op == 'a') {
++		/* redfin WS-A (0952): a status | a tone [MS] | ...: the speakers and the microphone (bsd/dev/sweet_sound.c) */
++		extern int sweet_sound_cmd(const char *s, const char *end);
++		printf("POKE: a -> %d\n", sweet_sound_cmd(s, end));
++		return;
++	}
+ 	uint64_t a = 0, b = 0, c = 0, d = 0;
+ 	bool ha = poke_num(&s, end, &a), hb = poke_num(&s, end, &b);
+ 	bool hc = poke_num(&s, end, &c), hd = poke_num(&s, end, &d);
+diff --git a/bsd/dev/sweet_sound.c b/bsd/dev/sweet_sound.c
+new file mode 100644
+index 0000000..8fe05b2
+--- /dev/null
++++ b/bsd/dev/sweet_sound.c
+@@ -0,0 +1,1081 @@
++/*
++ * redfin (Pixel 5, SM7250 lito): the speakers' path through the audio DSP. Patch 0952 (WS-A).
++ *
++ * After HackiOS's bsd/dev/redwood_sound.c (github.com/oosexgang/hackios-xnu-kernel, APSL 2.0; the
++ * POCO X5 Pro, SM7325 "yupik"): the APR messages to the DSP's AFE, ADM and ASM services and their
++ * layouts carry over unchanged; the numbers are lito's, from the phone's live device tree and the
++ * redbull kernel (LineageOS android_kernel_google_redbull: techpack/audio/asoc/kona.c,
++ * techpack/audio/asoc/msm-dai-q6-v2.c, techpack/audio/dsp/q6afe.c, techpack/audio/soc/pinctrl-lpi.c,
++ * lito-redbull-audio.dtsi, lito-redfin-audio.dtsi) and Android's mixer_paths_noextcodec_snd.xml:
++ *
++ *   speaker port  QUIN_TDM_RX_0, AFE port 0x9040 in group 0x9140; the two CS35L41 amplifiers
++ *                 (sweet_cs35l41.c) listen on it, left in slot 0 and right in slot 1
++ *   frame         4 slots of 32 bits at 48 kHz: kona.c's kona_tdm_snd_hw_params() forces
++ *                 QUIN_TDM_MAX_SLOTS = 4 when the codec is a CS35L41, whatever the DT's 8 (no
++ *                 qcom,tdm-max-slots: default 8) says; the mixer's "QUIN_TDM_RX_0 Channels Two" /
++ *                 "Format S32_LE" are the port's 2 active channels; slot offsets 0 and 4 (kona.c
++ *                 quin_tdm_dev_config RX_0); group slot mask 0xf, port slot mask 0x3
++ *   bit clock     QUIN_TDM_IBIT (0x208), internal, rate x 32 x 4 = 6.144 MHz (kona.c sets it with
++ *                 snd_soc_dai_set_sysclk(), which overrides the DT's 12.288 MHz), attribute
++ *                 INVERT_COUPLE_NO (msm-dai-q6-v2.c's default; the DT names none)
++ *   port          sync mode 0 (short), sync source 1 (internal), data out 0, invert 0, delay 1 (DSP_A); no
++ *                 group message: msm-dai-q6-v2.c enables a group only with more than one port (or PRI_TDM_TX)
++ *   pins          LPI GPIO 6-9 (lpi_pinctrl @0x33c0000, 0x1000 stride), func2, 16 mA (redfin's
++ *                 override), no pull, output-high as Android's pinctrl writes them; LPASS registers,
++ *                 so only after AFE_CMD_REMOTE_LPASS_CORE_HW_VOTE_REQUEST for blocks 3 (LPASS_HW_MACRO)
++ *                 and 4 (LPASS_HW_DCODEC): without the votes an APPS access to LPASS is an external
++ *                 abort (HackiOS redwood_mic.c; pinctrl-lpi.c refuses any access without the vote)
++ *   memory        the audio ION stream 0x1401 of the apps SMMU (qcom,msm-audio-ion iommus; its pool
++ *                 0x10000000 and qcom,smmu-sid-mask 0xf): a context bank with translation off, as
++ *                 phone/wifi/radio.c does for the WLAN, so the DSP's addresses are physical (the
++ *                 buffer is GPU-pool RAM below 4 GB); every address the DSP is given carries the
++ *                 stream's low four bits (1) at bit 32, which the DSP takes as the SID and strips
++ *   path          ADM device open v5 (playback, port 0x9040, no processing 0x10312, 2 x 24 bits,
++ *                 48 kHz), ASM session 1 opened for writing PCM16 (no processing 0x10c68), routed to
++ *                 the COPP, media format 2 x 16 bits 48 kHz, run; WRITE_V2 of 8 periods of 960 frames
++ *                 (20 ms), each written again when its WRITE_DONE comes back
++ *
++ * Boot-arg sound=N (needs adsp=1; nothing happens without it, which is today's behaviour):
++ *   sound=1  set up only: the votes, the LPI pins, the clock, the group and the port, started; held
++ *            sndsecs (default 3) seconds, then everything taken back
++ *   sound=2  ... and the stream: a 1 kHz tone at -30 dBFS for one second into the DSP, the amplifiers
++ *            OFF; the path then stays up feeding silence (poke `a tone MS` plays the tone again)
++ * Boot-args: sndsecs=S (sound=1 hold), sndlpi=0 (leave the LPI pins alone: no clock at the amps).
++ * poke (bsd/dev/sweet_poke.c, letter a): `a status`, `a tone [MS]` (default 1000, at most 5000).
++ *
++ * Log lines: "SWEET SOUND: ...". What is started is stopped before the DSP is shut down
++ * (redwood_sound_dsp_down() from sweet_adsp.c's redwood_adsp_stop()).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <libkern/libkern.h>
++#include <libkern/OSAtomic.h>
++#include <mach/mach_types.h>
++#include <mach/vm_param.h>
++#include <vm/memory_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++#include <sys/redwood_audio.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++extern kern_return_t thread_terminate(thread_t thread);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa);
++int sweet_sound_cmd(const char *s, const char *end);
++
++#define SAY(...)                printf("SWEET SOUND: " __VA_ARGS__)
++
++static LCK_GRP_DECLARE(sound_lock_group, "sweet-sound");
++static LCK_MTX_DECLARE(sound_lock, &sound_lock_group);  /* the path being set up or taken down */
++
++static uint32_t level, hold_secs = 3, use_lpi = 1;
++
++static void
++sleep_ms(uint32_t ms)
++{
++	delay_for_interval(ms, NSEC_PER_MSEC);
++}
++
++static uint64_t
++now_us(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++static uint32_t __attribute__((noinline))
++rd(vm_offset_t address)
++{
++	uint32_t value;
++
++	__asm__ volatile ("ldr %w0, [%1]" : "=r" (value) : "r" (address) : "memory");
++	return value;
++}
++
++static void __attribute__((noinline))
++wr(vm_offset_t address, uint32_t value)
++{
++	__asm__ volatile ("dsb sy\n\tstr %w0, [%1]\n\tdsb sy" : : "r" (value), "r" (address) : "memory");
++}
++
++/* ---- APR ------------------------------------------------------------------------------------------- */
++
++#define APR_SVC_AFE             4
++#define APR_SVC_ASM             7
++#define APR_SVC_ADM             8
++#define APR_BASIC_RSP_RESULT    0x000110e8u
++#define APR_WAIT_MS             1000
++
++static const char *
++dsp_error(uint32_t status)
++{
++	static const char *const names[] = { "ok", "failed", "bad parameter", "unsupported", "version", "unexpected", "panic",
++		                             "no resource", "bad handle", "already", "not ready", "pending", "busy", "aborted",
++		                             "preempted", "continue", "immediate", "not implemented", "need more", "no memory",
++		                             "not there" };
++
++	return status < sizeof(names) / sizeof(names[0]) ? names[status] : "unknown error";
++}
++
++/* One command and its answer: true for the basic answer with status 0, or for the opcode `wanted' (then in *answer). */
++static bool
++cmd(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const void *payload, uint32_t length, uint32_t wanted,
++    struct redwood_apr_answer *answer)
++{
++	struct redwood_apr_answer local;
++
++	if (answer == NULL) {
++		answer = &local;
++	}
++	if (!redwood_adsp_apr(service, port, 0, opcode, payload, length, APR_WAIT_MS, answer)) {
++		SAY("%s (opcode %#x, service %u, port %#x): NO ANSWER\n", what, opcode, service, port);
++		return false;
++	}
++	if (answer->opcode == APR_BASIC_RSP_RESULT && answer->words[0] == opcode) {
++		if (answer->words[1] != 0) {
++			SAY("%s: REFUSED: %s (%u)\n", what, dsp_error(answer->words[1]), answer->words[1]);
++		} else {
++			SAY("%s: done\n", what);
++		}
++		return answer->words[1] == 0 && wanted == 0;
++	}
++	if (wanted != 0 && answer->opcode == wanted) {
++		return true;
++	}
++	SAY("%s: unexpected answer: opcode %#x, %u bytes: %#x %#x\n", what, answer->opcode, answer->length, answer->words[0],
++	    answer->words[1]);
++	return false;
++}
++
++/* ---- the LPASS core votes (what makes APPS access to LPASS/LPI registers legal) ---------------------- */
++
++#define AFE_CMD_REMOTE_LPASS_CORE_HW_VOTE_REQUEST       0x000100f4u
++#define AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST   0x000100f5u
++#define AFE_CMD_REMOTE_LPASS_CORE_HW_DEVOTE_REQUEST     0x000100f6u
++#define LPASS_HW_MACRO_BLOCK    3
++#define LPASS_HW_DCODEC_BLOCK   4
++
++static uint32_t vote_handle[5];
++static bool voted[5];
++
++static bool
++vote(uint32_t block, const char *client)
++{
++	struct {
++		uint32_t block;
++		char client[8];
++	} __attribute__((packed)) request = { block, { 0 } };
++	struct redwood_apr_answer answer;
++	char what[64];
++
++	strlcpy(request.client, client, sizeof(request.client));
++	snprintf(what, sizeof(what), "LPASS core vote, block %u (%s)", block, client);
++	if (!cmd(what, APR_SVC_AFE, 0, AFE_CMD_REMOTE_LPASS_CORE_HW_VOTE_REQUEST, &request, sizeof(request),
++	    AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST, &answer)) {
++		return false;
++	}
++	vote_handle[block] = answer.words[0];
++	voted[block] = true;
++	SAY("%s: granted, handle %u\n", what, vote_handle[block]);
++	return true;
++}
++
++static void
++devote(uint32_t block)
++{
++	uint32_t request[2] = { block, vote_handle[block] };
++
++	if (!voted[block]) {
++		return;
++	}
++	(void)cmd("LPASS core vote, given back", APR_SVC_AFE, 0, AFE_CMD_REMOTE_LPASS_CORE_HW_DEVOTE_REQUEST, request,
++	    sizeof(request), 0, NULL);
++	voted[block] = false;
++}
++
++/* ---- the speaker TDM pins: LPI GPIO 6-9 ---------------------------------------------------------------- */
++
++#define LPI_PA                  0x033c0000u
++#define LPI_FIRST               6               /* map gpio6..gpio9 only: 0x033c6000-0x033c9fff */
++#define LPI_COUNT               4
++#define LPI_VAL(n)              (0x1000u * ((n) - LPI_FIRST))           /* [1:0] pull [5:2] func [8:6] drive [9] out value */
++#define LPI_DIR(n)              (0x1000u * ((n) - LPI_FIRST) + 4)       /* bit 1: output enabled */
++#define LPI_ACTIVE              (0u | 2u << 2 | 7u << 6 | 1u << 9)      /* no pull, func2, 16 mA, high */
++
++static vm_offset_t lpi;
++static uint32_t lpi_found_val[LPI_COUNT], lpi_found_dir[LPI_COUNT];
++static bool pins_taken;
++
++static bool
++pins_on(void)
++{
++	if (!use_lpi) {
++		SAY("sndlpi=0: the LPI pins (gpio6-9) are left as they are: no clock reaches the amplifiers\n");
++		return true;
++	}
++	if (!voted[LPASS_HW_MACRO_BLOCK] || !voted[LPASS_HW_DCODEC_BLOCK]) {
++		SAY("the LPASS votes were not both granted: the LPI pins are NOT touched (an access would abort)\n");
++		return false;
++	}
++	if (lpi == 0) {
++		lpi = ml_io_map(LPI_PA + 0x1000u * LPI_FIRST, 0x1000u * LPI_COUNT);
++	}
++	SAY("about to read the LPI pins gpio6-9 at %#x (after the votes)\n", LPI_PA + 0x1000u * LPI_FIRST);
++	for (unsigned i = 0; i < LPI_COUNT; i++) {
++		lpi_found_val[i] = rd(lpi + LPI_VAL(LPI_FIRST + i));
++		lpi_found_dir[i] = rd(lpi + LPI_DIR(LPI_FIRST + i));
++	}
++	SAY("LPI gpio6-9 found: val %#x %#x %#x %#x dir %#x %#x %#x %#x\n", lpi_found_val[0], lpi_found_val[1], lpi_found_val[2],
++	    lpi_found_val[3], lpi_found_dir[0], lpi_found_dir[1], lpi_found_dir[2], lpi_found_dir[3]);
++	pins_taken = true;
++	for (unsigned i = 0; i < LPI_COUNT; i++) {
++		unsigned n = LPI_FIRST + i;
++
++		wr(lpi + LPI_VAL(n), (lpi_found_val[i] & ~0x3ffu) | LPI_ACTIVE);
++		wr(lpi + LPI_DIR(n), 1u << 1);
++	}
++	SAY("LPI gpio6-9 now: val %#x %#x %#x %#x dir %#x %#x %#x %#x (want val %#x dir 0x2)\n", rd(lpi + LPI_VAL(6)),
++	    rd(lpi + LPI_VAL(7)), rd(lpi + LPI_VAL(8)), rd(lpi + LPI_VAL(9)), rd(lpi + LPI_DIR(6)), rd(lpi + LPI_DIR(7)),
++	    rd(lpi + LPI_DIR(8)), rd(lpi + LPI_DIR(9)), LPI_ACTIVE);
++	return true;
++}
++
++static void
++pins_off(void)
++{
++	if (!pins_taken) {
++		return;
++	}
++	for (unsigned i = 0; i < LPI_COUNT; i++) {
++		wr(lpi + LPI_VAL(LPI_FIRST + i), lpi_found_val[i]);
++		wr(lpi + LPI_DIR(LPI_FIRST + i), lpi_found_dir[i] & 2u);
++	}
++	pins_taken = false;
++	SAY("LPI gpio6-9 put back\n");
++}
++
++/* ---- AFE: the clock, the group and the port --------------------------------------------------------------- */
++
++#define AFE_PORT_CMD_DEVICE_START               0x000100e5u
++#define AFE_PORT_CMD_DEVICE_STOP                0x000100e6u
++#define AFE_PORT_CMD_SET_PARAM_V2               0x000100efu
++#define AFE_SVC_CMD_SET_PARAM                   0x000100f3u
++#define AFE_MODULE_AUDIO_DEV_INTERFACE          0x0001020cu
++#define AFE_PARAM_ID_TDM_CONFIG                 0x0001029du
++#define AFE_MODULE_TDM                          0x0001028au
++#define AFE_PARAM_ID_PORT_SLOT_MAPPING_CONFIG   0x00010297u
++#define AFE_MODULE_CLOCK_SET                    0x0001028fu
++#define AFE_PARAM_ID_CLOCK_SET                  0x00010290u
++
++#define PORT                    0x9040          /* QUIN_TDM_RX_0 */
++#define GROUP                   0x9140          /* QUIN_TDM_RX group (one port: not enabled, as Android) */
++#define CLOCK_QUIN_TDM_IBIT     0x208
++#define CLOCK_INVERT_COUPLE_NO  4
++#define RATE                    48000
++#define SLOTS                   4               /* kona.c QUIN_TDM_MAX_SLOTS with CS35L41 */
++#define SLOT_BITS               32
++#define PORT_BITS               32              /* the mixer's S32_LE */
++
++struct afe_param {
++	uint32_t module, param;
++	uint16_t size, reserved;
++} __attribute__((packed));
++
++struct afe_clock_set {
++	uint32_t version, id, hz;
++	uint16_t attribute, root;
++	uint32_t enable;
++} __attribute__((packed));
++
++struct afe_tdm {
++	uint32_t version, channels, rate, bits;
++	uint16_t data_format, sync_mode, sync_source, slots, data_out, invert_sync, data_delay, slot_bits;
++	uint32_t slot_mask;
++} __attribute__((packed));
++
++struct afe_slot_mapping {
++	uint32_t version;
++	uint16_t channels, bits;
++	uint32_t align;
++	uint16_t offsets[8];
++} __attribute__((packed));
++
++/* A parameter of the AFE as a whole (clocks, groups), in band. */
++static bool
++afe_service_param(const char *what, uint32_t module, uint32_t param, const void *data, uint16_t size)
++{
++	uint8_t packet[16 + sizeof(struct afe_param) + 64];
++	uint32_t *head = (uint32_t *)packet;
++	struct afe_param *p = (struct afe_param *)(packet + 16);
++
++	bzero(packet, sizeof(packet));
++	head[0] = (uint32_t)sizeof(*p) + size;
++	p->module = module;
++	p->param = param;
++	p->size = size;
++	memcpy(packet + 16 + sizeof(*p), data, size);
++	return cmd(what, APR_SVC_AFE, 0, AFE_SVC_CMD_SET_PARAM, packet, 16 + (uint32_t)sizeof(*p) + size, 0, NULL);
++}
++
++static bool
++afe_port_param(const char *what, uint16_t port, uint32_t module, uint32_t param, const void *data, uint16_t size)
++{
++	uint8_t packet[16 + sizeof(struct afe_param) + 64];
++	struct afe_param *p = (struct afe_param *)(packet + 16);
++
++	bzero(packet, sizeof(packet));
++	*(uint16_t *)packet = port;
++	*(uint16_t *)(packet + 2) = (uint16_t)(sizeof(*p) + size);
++	p->module = module;
++	p->param = param;
++	p->size = size;
++	memcpy(packet + 16 + sizeof(*p), data, size);
++	return cmd(what, APR_SVC_AFE, 0, AFE_PORT_CMD_SET_PARAM_V2, packet, 16 + (uint32_t)sizeof(*p) + size, 0, NULL);
++}
++
++static bool clock_on, port_on;
++
++static bool
++afe_clock(bool on)
++{
++	struct afe_clock_set clock = { 1, CLOCK_QUIN_TDM_IBIT, RATE * SLOT_BITS * SLOTS, CLOCK_INVERT_COUPLE_NO, 0, on };
++
++	return afe_service_param(on ? "QUIN TDM bit clock 0x208 at 6.144 MHz, on" : "QUIN TDM bit clock, off", AFE_MODULE_CLOCK_SET,
++	           AFE_PARAM_ID_CLOCK_SET, &clock, sizeof(clock));
++}
++
++static bool
++afe_on(void)
++{
++	struct afe_tdm tdm = {
++		.version = 1, .channels = 2, .rate = RATE, .bits = PORT_BITS, .data_format = 0, .sync_mode = 0, .sync_source = 1,
++		.slots = SLOTS, .data_out = 0, .invert_sync = 0, .data_delay = 1, .slot_bits = SLOT_BITS, .slot_mask = 0x3,
++	};
++	struct afe_slot_mapping mapping = { .version = 1, .channels = 2, .bits = PORT_BITS, .align = 0,
++		                            .offsets = { 0, 4, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff } };
++	uint16_t start[2] = { PORT, 0 };
++
++	/*
++	 * msm_dai_q6_tdm_prepare()'s order: the clock, then the group -- which Android enables only for a group of
++	 * more than one port (or PRI_TDM_TX); QUIN_TDM_RX's has one (qcom,msm-cpudai-tdm-group-num-ports 1), so no
++	 * group message at all --, then the port's TDM config, its slot mapping, and its start.
++	 */
++	clock_on = afe_clock(true);
++	if (!clock_on) {
++		return false;
++	}
++	if (!afe_port_param("port 0x9040: 2 ch x 32 bits in 4 slots, sync 0/1, delay 1, mask 0x3", PORT,
++	    AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_TDM_CONFIG, &tdm, sizeof(tdm)) ||
++	    !afe_port_param("port 0x9040 slot mapping: offsets 0 and 4", PORT, AFE_MODULE_TDM,
++	    AFE_PARAM_ID_PORT_SLOT_MAPPING_CONFIG, &mapping, sizeof(mapping))) {
++		return false;
++	}
++	port_on = cmd("port 0x9040, started", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL);
++	return port_on;
++}
++
++static void
++afe_off(void)
++{
++	uint16_t stop[2] = { PORT, 0 };
++
++	if (port_on) {
++		(void)cmd("port 0x9040, stopped", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
++		port_on = false;
++	}
++	if (clock_on) {
++		(void)afe_clock(false);
++		clock_on = false;
++	}
++}
++
++/* ---- the DSP's view of our memory: stream 0x1401 through a bank with translation off ------------------------ */
++
++#define SMMU_PA                 0x15000000u
++#define AUDIO_SID               0x1401u
++#define AUDIO_SID_BITS          (1ull << 32)    /* 0x1401 & 0xf (qcom,smmu-sid-mask 0xf) at bit 32 */
++#define CB_CBAR                 0x0001f000u     /* stage 1 context, stage 2 bypass (radio.c, as ABL's banks) */
++#define CB_CBA2R                0x00000001u     /* AArch64 */
++#define CB_SCTLR                0x000000e0u     /* CFCFG | CFIE | CFRE, M = 0: no translation */
++
++#define PERIODS                 8
++#define PERIOD_FRAMES           960             /* 20 ms */
++#define PERIOD_BYTES            (PERIOD_FRAMES * 4)
++#define PLAY_BYTES              (PERIODS * 4096)        /* a page a period */
++#define MIC_BYTES               (16 * 4096)             /* the microphone's (sweet_mic.c), behind the periods */
++#define SHARED_BYTES            (PLAY_BYTES + MIC_BYTES)
++
++static struct {
++	vm_offset_t g0, gr1, cb;                /* SMMU page 0 (SMR/S2CR), GR1 page (CBAR), our bank's page */
++	uint32_t psize, npage, smr_n, cb_n, smr_old, s2cr_old;
++	bool on, found_ready;
++} sm = { .smr_n = ~0u, .cb_n = ~0u };
++static vm_offset_t buffer;                      /* SHARED_BYTES, write-combining, of GPU-pool RAM below 4 GB */
++static uint64_t buffer_pa;
++static uint32_t space_users;                    /* bit 0 the speakers, bit 1 the microphone */
++static LCK_MTX_DECLARE(space_lock, &sound_lock_group);
++
++static bool
++sid_match(uint32_t smr, uint32_t sid)
++{
++	uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
++
++	return ((id ^ sid) & ~mask & 0x7fff) == 0;
++}
++
++static bool
++smmu_on(void)
++{
++	uint32_t id0, id1, nsmr, ncb, free_smr = ~0u;
++	uint64_t used[4] = { 0 };
++
++	if (sm.on) {
++		return true;
++	}
++	if (sm.g0 == 0) {
++		sm.g0 = ml_io_map(SMMU_PA, 0x1000);
++	}
++	id0 = rd(sm.g0 + 0x20);
++	id1 = rd(sm.g0 + 0x24);
++	nsmr = id0 & 0xff;
++	ncb = id1 & 0xff;
++	sm.psize = (id1 >> 31) ? 0x10000 : 0x1000;
++	sm.npage = 1u << (((id1 >> 28) & 7) + 1);
++	if (sm.psize != 0x1000 || (rd(sm.g0) & (1u << 3))) {
++		SAY("SMMU: page size %#x / 16-bit stream IDs: not handled\n", sm.psize);
++		return false;
++	}
++	if (sm.gr1 == 0) {
++		sm.gr1 = ml_io_map(SMMU_PA + sm.psize, 0x1000);
++	}
++	for (uint32_t i = 0; i < nsmr && i < 256; i++) {
++		uint32_t smr = rd(sm.g0 + 0x800 + 4 * i), s2cr = rd(sm.g0 + 0xc00 + 4 * i);
++
++		if (!(smr >> 31)) {
++			if (free_smr == ~0u) {
++				free_smr = i;
++			}
++			continue;
++		}
++		if (((s2cr >> 16) & 3) == 0) {
++			used[(s2cr & 0xff) / 64] |= 1ull << ((s2cr & 0xff) % 64);
++		}
++		if (sid_match(smr, AUDIO_SID)) {
++			uint32_t type = (s2cr >> 16) & 3, c = s2cr & 0xff;
++
++			SAY("SMMU: SMR%u %#x already matches %#x: S2CR %#x\n", i, smr, AUDIO_SID, s2cr);
++			if (type == 1) {
++				SAY("SMMU: stream %#x bypasses the SMMU already: addresses are physical\n", AUDIO_SID);
++				sm.found_ready = sm.on = true;
++				return true;
++			}
++			if (type == 0) {
++				vm_offset_t cbp = ml_io_map(SMMU_PA + (sm.npage + c) * sm.psize, 0x1000);
++				uint32_t sctlr = rd(cbp);
++
++				SAY("SMMU: ... through CB%u, SCTLR %#x\n", c, sctlr);
++				if (!(sctlr & 1)) {
++					sm.found_ready = sm.on = true;
++					return true;
++				}
++			}
++			SAY("SMMU: stream %#x is translated by somebody else's bank: not touched\n", AUDIO_SID);
++			return false;
++		}
++	}
++	for (uint32_t c = 0; c < ncb && c < 256 && sm.cb_n == ~0u; c++) {
++		vm_offset_t cbp;
++
++		if ((used[c / 64] & (1ull << (c % 64))) || rd(sm.gr1 + 4 * c) != 0) {
++			continue;
++		}
++		cbp = ml_io_map(SMMU_PA + (sm.npage + c) * sm.psize, 0x1000);
++		if (rd(cbp) & 1) {
++			ml_io_unmap(cbp, 0x1000);
++			continue;
++		}
++		sm.cb_n = c;
++		sm.cb = cbp;
++	}
++	if (free_smr == ~0u || sm.cb_n == ~0u) {
++		SAY("SMMU: no free SMR (%d) or bank (%d)\n", (int)free_smr, (int)sm.cb_n);
++		return false;
++	}
++	sm.smr_n = free_smr;
++	sm.smr_old = rd(sm.g0 + 0x800 + 4 * free_smr);
++	sm.s2cr_old = rd(sm.g0 + 0xc00 + 4 * free_smr);
++	SAY("SMMU: stream %#x -> CB%u via SMR%u, translation off (SMR was %#x, S2CR %#x)\n", AUDIO_SID, sm.cb_n, sm.smr_n,
++	    sm.smr_old, sm.s2cr_old);
++	wr(sm.cb + 0x58, 0xffffffffu);          /* FSR */
++	wr(sm.cb + 0x20, 0);                    /* TTBR0 */
++	wr(sm.cb + 0x24, 0);
++	wr(sm.cb + 0x30, 0);                    /* TCR */
++	wr(sm.cb + 0x10, 0);                    /* TCR2 */
++	wr(sm.cb + 0x38, 0);                    /* MAIR */
++	wr(sm.cb + 0x3c, 0);
++	wr(sm.gr1 + 0x800 + 4 * sm.cb_n, CB_CBA2R);
++	wr(sm.gr1 + 4 * sm.cb_n, CB_CBAR);
++	wr(sm.cb, CB_SCTLR);
++	wr(sm.g0 + 0xc00 + 4 * sm.smr_n, sm.cb_n);
++	wr(sm.g0 + 0x800 + 4 * sm.smr_n, (1u << 31) | AUDIO_SID);
++	wr(sm.g0 + 0x70, 0);                    /* sTLBGSYNC */
++	for (unsigned i = 0; i < 1000 && (rd(sm.g0 + 0x74) & 1); i++) {
++		sleep_ms(1);
++	}
++	sm.on = (rd(sm.g0 + 0x800 + 4 * sm.smr_n) >> 31) && (rd(sm.g0 + 0xc00 + 4 * sm.smr_n) & 0x300ff) == sm.cb_n &&
++	    !(rd(sm.cb) & 1);
++	SAY("SMMU: SMR %#x S2CR %#x CBAR %#x SCTLR %#x -> %s\n", rd(sm.g0 + 0x800 + 4 * sm.smr_n), rd(sm.g0 + 0xc00 + 4 * sm.smr_n),
++	    rd(sm.gr1 + 4 * sm.cb_n), rd(sm.cb), sm.on ? "IDENTITY" : "NOT TAKEN");
++	return sm.on;
++}
++
++static void
++smmu_faults(const char *when)
++{
++	uint32_t fsr;
++
++	if (!sm.on || sm.cb == 0) {
++		return;
++	}
++	fsr = rd(sm.cb + 0x58);
++	SAY("SMMU %s: CB%u FSR %#x FAR %#x%08x FSYNR0 %#x, global SGFSR %#x\n", when, sm.cb_n, fsr, rd(sm.cb + 0x64), rd(sm.cb + 0x60),
++	    rd(sm.cb + 0x68), rd(sm.g0 + 0x48));
++}
++
++static void
++smmu_off(void)
++{
++	if (!sm.on || sm.found_ready) {
++		sm.on = false;
++		return;
++	}
++	smmu_faults("at the end");
++	wr(sm.g0 + 0x800 + 4 * sm.smr_n, sm.smr_old);
++	wr(sm.g0 + 0xc00 + 4 * sm.smr_n, sm.s2cr_old);
++	wr(sm.g0 + 0x70, 0);
++	sm.on = false;
++	SAY("SMMU: SMR%u put back (CB%u left configured, unused)\n", sm.smr_n, sm.cb_n);
++}
++
++/* The memory the DSP sees: whoever comes first sets it up, whoever leaves last takes it down. user 0 speakers, 1 mic. */
++static bool
++space_get(unsigned user)
++{
++	bool ok = true;
++
++	lck_mtx_lock(&space_lock);
++	if (buffer == 0) {
++		if (sweet_gpu_pool_alloc(SHARED_BYTES, &buffer_pa) != 0 || buffer_pa + SHARED_BYTES > 0x100000000ull) {
++			SAY("no GPU-pool memory below 4 GB for the DSP's buffers\n");
++			ok = false;
++		} else {
++			buffer = ml_io_map_unmappable(buffer_pa, SHARED_BYTES, VM_WIMG_WCOMB);
++			ok = buffer != 0;
++			if (ok) {
++				bzero((void *)buffer, SHARED_BYTES);
++				SAY("DSP buffers: %u KB at PA %#llx (DSP address %#llx)\n", SHARED_BYTES / 1024, buffer_pa,
++				    buffer_pa | AUDIO_SID_BITS);
++			}
++		}
++	}
++	if (ok && space_users == 0) {
++		ok = smmu_on();
++	}
++	if (ok) {
++		space_users |= 1u << user;
++	}
++	lck_mtx_unlock(&space_lock);
++	return ok;
++}
++
++static void
++space_put(unsigned user)
++{
++	lck_mtx_lock(&space_lock);
++	if (space_users & (1u << user)) {
++		space_users &= ~(1u << user);
++		if (space_users == 0) {
++			smmu_off();
++		}
++	}
++	lck_mtx_unlock(&space_lock);
++}
++
++bool
++redwood_audio_dsp_memory(uintptr_t *memory, uint64_t *dsp_address, uint32_t *bytes)
++{
++	if (!space_get(1)) {
++		return false;
++	}
++	*memory = buffer + PLAY_BYTES;
++	*dsp_address = (buffer_pa + PLAY_BYTES) | AUDIO_SID_BITS;
++	*bytes = MIC_BYTES;
++	return true;
++}
++
++void
++redwood_audio_dsp_memory_put(void)
++{
++	space_put(1);
++}
++
++/* ---- ADM and ASM: the path and the stream ------------------------------------------------------------------- */
++
++#define ADM_CMD_DEVICE_OPEN_V5                  0x00010326u
++#define ADM_CMDRSP_DEVICE_OPEN_V5               0x00010329u
++#define ADM_CMD_DEVICE_CLOSE_V5                 0x00010327u
++#define ADM_CMD_MATRIX_MAP_ROUTINGS_V5          0x00010325u
++#define ADM_PATH_PLAYBACK                       1
++#define ADM_MATRIX_AUDIO_RX                     0
++#define ADM_TOPOLOGY_NONE                       0x00010312u
++#define ADM_BITS                                24
++
++#define ASM_CMD_SHARED_MEM_MAP_REGIONS          0x00010d92u
++#define ASM_CMDRSP_SHARED_MEM_MAP_REGIONS       0x00010d93u
++#define ASM_CMD_SHARED_MEM_UNMAP_REGIONS        0x00010d94u
++#define ASM_STREAM_CMD_OPEN_WRITE_V3            0x00010db3u
++#define ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2        0x00010d98u
++#define ASM_SESSION_CMD_RUN_V2                  0x00010daau
++#define ASM_DATA_CMD_WRITE_V2                   0x00010dabu
++#define ASM_DATA_EVENT_WRITE_DONE_V2            0x00010d99u
++#define ASM_SESSION_EVENT_RX_UNDERFLOW          0x00010c17u
++#define ASM_STREAM_CMD_CLOSE                    0x00010bcdu
++#define ASM_TOPOLOGY_NONE                       0x00010c68u
++#define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2      0x00010da5u
++#define ASM_SHMEM_4K_POOL                       3
++#define SESSION                                 1
++#define STREAM_PORT                             (SESSION << 8 | 1)
++#define WRITE_TOKEN                             0x80000000u     /* | the period */
++#define PCM_CHANNEL_FL                          1
++#define PCM_CHANNEL_FR                          2
++
++static bool mapped, copp_open, stream_open, stream_runs;
++static uint32_t map_handle, copp;
++static volatile uint32_t returned;              /* periods the DSP is done with (a bit each) */
++static volatile uint32_t written_done, underflows, write_errors;
++static int feeder_wake;
++
++/* The DSP's events (on the link's thread): WRITE_DONE and underflows. */
++static bool
++events(uint8_t service, __unused uint16_t port, uint32_t opcode, uint32_t token, const uint32_t *payload, uint32_t length)
++{
++	if (service != APR_SVC_ASM) {
++		return false;
++	}
++	if ((opcode == ASM_DATA_EVENT_WRITE_DONE_V2 || opcode == APR_BASIC_RSP_RESULT) && (token & WRITE_TOKEN) &&
++	    (token & 0xff) < PERIODS) {
++		if (opcode == APR_BASIC_RSP_RESULT || (length >= 16 && payload[3] != 0)) {
++			OSIncrementAtomic((volatile SInt32 *)&write_errors);
++		}
++		OSIncrementAtomic((volatile SInt32 *)&written_done);
++		OSBitOrAtomic(1u << (token & 31), &returned);
++		thread_wakeup(&feeder_wake);
++		return true;
++	}
++	if (opcode == ASM_SESSION_EVENT_RX_UNDERFLOW) {
++		OSIncrementAtomic((volatile SInt32 *)&underflows);
++		return true;
++	}
++	return false;
++}
++
++static bool
++stream_on(void)
++{
++	uint64_t address = buffer_pa | AUDIO_SID_BITS;
++	struct {
++		uint16_t pool, regions;
++		uint32_t property;
++		uint32_t low, high, size;
++	} __attribute__((packed)) map = { ASM_SHMEM_4K_POOL, 1, 0, (uint32_t)address, (uint32_t)(address >> 32), PLAY_BYTES };
++	struct {
++		uint16_t flags, mode, endpoint1, endpoint2;
++		uint32_t topology;
++		uint16_t channels, bits;
++		uint32_t rate;
++		uint8_t map[8];
++	} __attribute__((packed)) open = { 0, ADM_PATH_PLAYBACK, PORT, 0xffff, ADM_TOPOLOGY_NONE, 2, ADM_BITS, RATE,
++		                           { PCM_CHANNEL_FL, PCM_CHANNEL_FR } };
++	struct {
++		uint32_t matrix, sessions;
++		uint16_t session, copps;
++		uint16_t copp[2];
++	} __attribute__((packed)) route = { ADM_MATRIX_AUDIO_RX, 1, SESSION, 1, { 0, 0 } };
++	struct {
++		uint32_t flags;
++		uint16_t sink, bits;
++		uint32_t topology, format;
++	} __attribute__((packed)) write = { 0, 0, 16, ASM_TOPOLOGY_NONE, ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2 };
++	struct {
++		uint32_t size;
++		uint16_t channels, bits;
++		uint32_t rate;
++		uint16_t is_signed, reserved;
++		uint8_t map[8];
++	} __attribute__((packed)) format = { 20, 2, 16, RATE, 1, 0, { PCM_CHANNEL_FL, PCM_CHANNEL_FR } };
++	uint32_t run[3] = { 0, 0, 0 };
++	struct redwood_apr_answer answer;
++
++	if (!cmd("ASM: our periods mapped for the DSP", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_MAP_REGIONS, &map, sizeof(map),
++	    ASM_CMDRSP_SHARED_MEM_MAP_REGIONS, &answer)) {
++		return false;
++	}
++	mapped = true;
++	map_handle = answer.words[0];
++	SAY("ASM: %u KB at %#llx are the DSP's handle %#x\n", PLAY_BYTES / 1024, address, map_handle);
++	if (!cmd("ADM: device open v5, playback to 0x9040, no processing, 2 x 24 bits, 48 kHz", APR_SVC_ADM, PORT,
++	    ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open), ADM_CMDRSP_DEVICE_OPEN_V5, &answer)) {
++		return false;
++	}
++	if (answer.words[0] != 0) {
++		SAY("ADM: device open REFUSED: %s\n", dsp_error(answer.words[0]));
++		return false;
++	}
++	copp_open = true;
++	copp = answer.words[1] & 0xffff;
++	route.copp[0] = (uint16_t)copp;
++	SAY("ADM: COPP %u open\n", copp);
++	if (!cmd("ASM: session 1 opened for writing PCM16, no processing", APR_SVC_ASM, STREAM_PORT, ASM_STREAM_CMD_OPEN_WRITE_V3,
++	    &write, sizeof(write), 0, NULL)) {
++		return false;
++	}
++	stream_open = true;
++	if (!cmd("ADM: session 1 routed to the COPP", APR_SVC_ADM, 0, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &route, sizeof(route), 0,
++	    NULL) ||
++	    !cmd("ASM: media format 2 x 16 bits, 48 kHz", APR_SVC_ASM, STREAM_PORT, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2, &format,
++	    sizeof(format), 0, NULL) ||
++	    !cmd("ASM: session 1, run", APR_SVC_ASM, STREAM_PORT, ASM_SESSION_CMD_RUN_V2, run, sizeof(run), 0, NULL)) {
++		return false;
++	}
++	stream_runs = true;
++	return true;
++}
++
++static void
++stream_off(void)
++{
++	uint32_t handle = map_handle;
++
++	if (stream_open) {
++		(void)cmd("ASM: stream closed", APR_SVC_ASM, STREAM_PORT, ASM_STREAM_CMD_CLOSE, NULL, 0, 0, NULL);
++		stream_open = stream_runs = false;
++	}
++	if (copp_open) {
++		(void)cmd("ADM: COPP closed", APR_SVC_ADM, (uint16_t)copp, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, 0, NULL);
++		copp_open = false;
++	}
++	if (mapped) {
++		(void)cmd("ASM: periods unmapped", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &handle, sizeof(handle), 0, NULL);
++		mapped = false;
++	}
++}
++
++/* ---- the feeder: every period the DSP gives back is filled and written again ------------------------------------ */
++
++/* 1 kHz at 48 kHz, -30 dBFS (peak 1036): one cycle */
++static const int16_t tone[48] = {
++	0, 135, 268, 396, 518, 631, 733, 822, 897, 957, 1001, 1027, 1036, 1027, 1001, 957, 897, 822, 733, 631, 518, 396, 268, 135,
++	0, -135, -268, -396, -518, -631, -733, -822, -897, -957, -1001, -1027, -1036, -1027, -1001, -957, -897, -822, -733, -631,
++	-518, -396, -268, -135,
++};
++static uint32_t tone_at;
++static volatile uint64_t tone_until_us;          /* the tone plays until then */
++static volatile bool stopping, feeder_runs;
++static uint64_t sent_periods, failed_sends, tone_periods, silent_periods;
++
++static void
++period_fill(unsigned period)
++{
++	int16_t *samples = (int16_t *)(buffer + 4096 * period);
++	bool toning = now_us() < tone_until_us;
++
++	for (unsigned frame = 0; frame < PERIOD_FRAMES; frame++) {
++		int16_t sample = toning ? tone[tone_at++ % 48] : 0;
++
++		samples[2 * frame] = sample;
++		samples[2 * frame + 1] = sample;
++	}
++	if (toning) {
++		tone_periods++;
++	} else {
++		silent_periods++;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");       /* (write-combining: out to memory before the DSP is told) */
++}
++
++static bool
++period_write(unsigned period)
++{
++	uint64_t address = (buffer_pa + 4096 * period) | AUDIO_SID_BITS;
++	uint32_t write[8] = { (uint32_t)address, (uint32_t)(address >> 32), map_handle, PERIOD_BYTES, period, 0, 0, 0 };
++
++	return redwood_adsp_apr(APR_SVC_ASM, STREAM_PORT, WRITE_TOKEN | period, ASM_DATA_CMD_WRITE_V2, write, sizeof(write), 0, NULL);
++}
++
++static void
++feeder_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	uint32_t done_before = written_done;
++	uint64_t began = now_us(), last_report = began;
++	bool said_none = false;
++
++	returned = 0;
++	for (unsigned p = 0; p < PERIODS; p++) {
++		period_fill(p);
++		if (period_write(p)) {
++			sent_periods++;
++		} else {
++			failed_sends++;
++		}
++	}
++	SAY("feeder: %u periods of 20 ms queued at the DSP\n", PERIODS);
++	while (!stopping) {
++		uint32_t back = returned;
++		uint64_t now = now_us();
++
++		if (back != 0) {
++			OSBitAndAtomic(~back, &returned);
++			for (unsigned p = 0; p < PERIODS; p++) {
++				if (back & (1u << p)) {
++					period_fill(p);
++					if (period_write(p)) {
++						sent_periods++;
++					} else {
++						failed_sends++;
++					}
++				}
++			}
++		}
++		if (!said_none && written_done == done_before && now - began > 1000000) {
++			SAY("feeder: THE DSP HAS GIVEN NO PERIOD BACK IN A SECOND\n");
++			smmu_faults("(no WRITE_DONE)");
++			said_none = true;
++		}
++		if (now - last_report >= 60000000ull) {
++			last_report = now;
++			SAY("feeder: %llu periods sent (%llu failed), %u done (%u errors), %u underflows; %llu tone, %llu silent\n",
++			    sent_periods, failed_sends, written_done, write_errors, underflows, tone_periods, silent_periods);
++		}
++		if (returned == 0 && !stopping) {
++			/* (a WRITE_DONE between the test and the wait is picked up at the 40 ms timeout: 160 ms are queued) */
++			assert_wait_timeout((event_t)&feeder_wake, THREAD_UNINT, 40, NSEC_PER_MSEC);
++			thread_block(THREAD_CONTINUE_NULL);
++		}
++	}
++	SAY("feeder stops: %llu periods sent (%llu failed), %u done (%u errors), %u underflows; %llu tone, %llu silent\n",
++	    sent_periods, failed_sends, written_done, write_errors, underflows, tone_periods, silent_periods);
++	feeder_runs = false;
++	thread_terminate(current_thread());
++}
++
++/* The tone for ms (into whatever plays). */
++static void
++tone_for(uint32_t ms)
++{
++	uint32_t done = written_done;
++
++	tone_until_us = now_us() + 1000ull * ms;
++	SAY("tone: 1 kHz at -30 dBFS for %u ms into the DSP (amplifiers off: nothing to hear)\n", ms);
++	sleep_ms(ms + 200);
++	SAY("tone over: %u periods came back meanwhile (%u errors, %u underflows): the DSP took %u frames/s\n", written_done - done,
++	    write_errors, underflows, (written_done - done) * PERIOD_FRAMES * 1000 / (ms + 200));
++}
++
++/* ---- the whole ------------------------------------------------------------------------------------------------ */
++
++static bool running, path_up, taken_down;
++
++static void
++take_down(void)
++{
++	stopping = true;
++	thread_wakeup(&feeder_wake);
++	for (unsigned ms = 0; ms < 2000 && feeder_runs; ms++) {
++		sleep_ms(1);
++	}
++	lck_mtx_lock(&sound_lock);
++	if (running && !taken_down) {
++		taken_down = true;
++		stream_off();
++		afe_off();
++		pins_off();
++		devote(LPASS_HW_DCODEC_BLOCK);
++		devote(LPASS_HW_MACRO_BLOCK);
++		redwood_adsp_apr_events(NULL);
++		space_put(0);
++		path_up = false;
++		SAY("everything of the speakers' path is stopped and put back\n");
++	}
++	lck_mtx_unlock(&sound_lock);
++}
++
++static void
++sound_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	bool ok = false;
++	thread_t feeder;
++
++	lck_mtx_lock(&sound_lock);
++	SAY("sound=%u: %s\n", level, level == 1 ? "votes, LPI pins, QUIN TDM clock/group/port only" :
++	    "the port and a stream with a -30 dBFS test tone, amplifiers OFF");
++	if (!vote(LPASS_HW_MACRO_BLOCK, "LPASS_HW_MACRO") || !vote(LPASS_HW_DCODEC_BLOCK, "LPASS_HW_DCODEC")) {
++		SAY("the LPASS votes were not granted\n");
++	}
++	if (level >= 2) {
++		if (!space_get(0)) {
++			goto out;
++		}
++		redwood_adsp_apr_events(events);
++	}
++	(void)pins_on();
++	if (!afe_on()) {
++		goto out;
++	}
++	if (level == 1) {
++		SAY("QUIN TDM port up: holding %u s\n", hold_secs);
++		sleep_ms(hold_secs * 1000);
++		ok = true;
++		goto out;
++	}
++	if (!stream_on()) {
++		goto out;
++	}
++	feeder_runs = true;
++	if (kernel_thread_start(feeder_thread, NULL, &feeder) != KERN_SUCCESS) {
++		feeder_runs = false;
++		SAY("no feeder thread\n");
++		goto out;
++	}
++	thread_deallocate(feeder);
++	path_up = true;
++	lck_mtx_unlock(&sound_lock);
++	SAY("PATH UP: QUIN_TDM_RX_0 0x9040, COPP %u, ASM session 1 running; poke `a tone MS` plays the test tone\n", copp);
++	tone_for(1000);
++	smmu_faults("after the tone");
++	SAY("sound=%u: LEVEL DONE (the path stays up feeding silence)\n", level);
++	thread_terminate(current_thread());
++out:
++	lck_mtx_unlock(&sound_lock);
++	take_down();
++	SAY("sound=%u: %s\n", level, ok ? "LEVEL DONE" : "STOPPED SHORT");
++	thread_terminate(current_thread());
++}
++
++void
++redwood_sound_dsp_up(void)
++{
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("sound", &level, sizeof(level)) || level == 0) {
++		return;
++	}
++	if (level > 2) {
++		SAY("sound=%u: this kernel knows levels 1-2; doing 2\n", level);
++		level = 2;
++	}
++	PE_parse_boot_argn("sndsecs", &hold_secs, sizeof(hold_secs));
++	PE_parse_boot_argn("sndlpi", &use_lpi, sizeof(use_lpi));
++	running = true;
++	if (kernel_thread_start(sound_thread, NULL, &thread) != KERN_SUCCESS) {
++		running = false;
++		SAY("no thread\n");
++		return;
++	}
++	thread_deallocate(thread);
++}
++
++void
++redwood_sound_dsp_down(void)
++{
++	if (running) {
++		take_down();
++	}
++}
++
++void
++redwood_sound_quiesce(void)
++{
++}
++
++/* ---- poke `a ...` (bsd/dev/sweet_poke.c) -------------------------------------------------------------------------- */
++
++static const char *
++word(const char **p, const char *end, size_t *len)
++{
++	const char *s = *p, *w;
++
++	while (s < end && (*s == ' ' || *s == '\t')) {
++		s++;
++	}
++	w = s;
++	while (s < end && *s != ' ' && *s != '\t' && *s != '\n' && *s != '#') {
++		s++;
++	}
++	*len = (size_t)(s - w);
++	*p = s;
++	return w;
++}
++
++static bool
++is(const char *w, size_t len, const char *name)
++{
++	return len == strlen(name) && strncmp(w, name, len) == 0;
++}
++
++static uint32_t
++number(const char **p, const char *end, uint32_t otherwise)
++{
++	size_t len;
++	const char *w = word(p, end, &len);
++	uint32_t v = 0;
++
++	if (len == 0) {
++		return otherwise;
++	}
++	for (size_t i = 0; i < len; i++) {
++		if (w[i] < '0' || w[i] > '9') {
++			return otherwise;
++		}
++		v = v * 10 + (uint32_t)(w[i] - '0');
++	}
++	return v;
++}
++
++int
++sweet_sound_cmd(const char *s, const char *end)
++{
++	size_t len;
++	const char *w = word(&s, end, &len);
++
++	if (len == 0 || is(w, len, "status")) {
++		SAY("status: sound=%u path %s, votes %d/%d, pins %s, port %s, stream %s; %llu periods sent, %u done (%u errors), "
++		    "%u underflows\n", level, path_up ? "UP" : "down", voted[LPASS_HW_MACRO_BLOCK], voted[LPASS_HW_DCODEC_BLOCK],
++		    pins_taken ? "taken" : "-", port_on ? "on" : "off", stream_runs ? "running" : "-", sent_periods, written_done,
++		    write_errors, underflows);
++		smmu_faults("(status)");
++		return 0;
++	}
++	if (is(w, len, "tone")) {
++		uint32_t ms = number(&s, end, 1000);
++
++		if (!path_up) {
++			SAY("tone: the path is not up (sound=2 needed)\n");
++			return -1;
++		}
++		ms = ms > 5000 ? 5000 : ms;
++		tone_until_us = now_us() + 1000ull * ms;
++		SAY("tone: 1 kHz -30 dBFS for %u ms (amplifiers off)\n", ms);
++		return 0;
++	}
++	SAY("poke a: unknown command (status, tone [MS])\n");
++	return -1;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.43.0
+

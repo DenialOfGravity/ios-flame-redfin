@@ -18,6 +18,11 @@ what you need to fetch yourself.
   interfaces for this phone. Patch 0915 (`bsd/dev/sweet_adsp.c`, `bsd/sys/redwood_audio.h`) is HackiOS's kernel
   `redwood_adsp.c` and `sys/redwood_audio.h` (<https://github.com/oosexgang/hackios-xnu-kernel>, APSL 2.0) with the
   Pixel 5's numbers; the commit message lists what changed.
+  Patches 0952-0955 (`bsd/dev/sweet_sound.c`, `sweet_mic.c`, `sweet_guard.c`) carry over HackiOS's kernel
+  `redwood_sound.c`/`redwood_mic.c` APR message layouts and its `redwood_guard.c` speaker guard (unchanged but for
+  names), APSL 2.0. The CS35L41, ALC5513 (rt5514) and LPASS register sequences in `sweet_cs35l41.c`/`sweet_mic.c`
+  were written from the redbull kernel's `sound/soc/codecs/cs35l41*.c`, `rt5514.c`, `rl6231.c` and
+  `techpack/audio` (GPL-2.0; LineageOS android_kernel_google_redbull) and the phone's device tree.
 
 - **ios-sweet** (dipa-studio, <https://github.com/dipa-studio/ios-sweet>, MIT): the XNU port to the Redmi
   Note 10 Pro this is forked from. Patches 0001-0081, the shim and most of `tools/` started there.
