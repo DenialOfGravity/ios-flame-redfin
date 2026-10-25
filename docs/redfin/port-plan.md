@@ -425,6 +425,29 @@ Stopped there because the battery ran down (13% at boot to 5%, -640 mA with Came
 phone was sent to fastboot mode to charge. Camera.app was also behind alerts it cannot get past without a tap
 (location services, then "Low Battery"), which make it inactive, so its session does not run.
 
+**Camera.app works (2026-10-25 evening, r18f-r18g + SweetMetal2 m4 + RedwoodAudio r18f-user):** live preview in natural
+colours on both cameras, photographs saved (back 4032x3024, front 3088x2320, JPEG). What it took after r18e:
+- 0927: IOSurface.framework (16.7) reads a plane's bytes per row at +0x10 of its lock-result entry; SweetSurface only
+  wrote +0x08, so every 420f/420v plane had 0 bytes per row: pictures drawn into their first row (green photographs),
+  VideoToolbox transfers failing (-12902). `vt_test` (phone/audio) checks VT's software transfer: works without Metal or
+  the M2 scaler now.
+- SweetMetal2: textures over the planes of planar IOSurfaces; MTLPixelFormatYCBCR8_420_2P(_sRGB) (500/501, what Core
+  Animation asks for to show 420f/420v: the preview, Photos) as an RGBA8 copy converted to RGB (BT.601; the sampler of
+  that format converts) and filled again when the surface's seed moves on; RGB10A8_2P_XR10 (550/551, deep b3a8 layers)
+  as BGRA8. Every refused IOSurface texture is logged once per kind (`MTL2[...]: native-metal: IOSurface texture ...`).
+- RedwoodAudio: the preview sink's input asks for BGRA (not honoured by the graph so far: the sink still gets 420f);
+  the front camera turned half round (its pictures were upside down); filter thumbnails off (Metal).
+- 0928: refused v2 GPU calls logged (the first 40 per client; method 6 timeouts are normal polling).
+- Builds: `metal2.yml` now publishes to branch builds-metal2; install by putting SweetMetal2, libvulkan_freedreno.dylib
+  and _CodeSignature/CodeResources into a copy of the bundle and swapping it into /System/Library/Extensions, then
+  `psx -k backboardd` (the previous bundles are kept in /var/local).
+- Seen once with r18e's old driver: backboardd's Turnip device lost while camera surfaces were refused (screen frozen);
+  not seen since the YCbCr formats are handled.
+- Still wrong: leaving Camera.app with Live Photo on, mediaserverd's graph stop waits 10 s for the Live Photo movie
+  pipeline (its audio converter and movie sink inputs never see end-of-data) and traps in -[BWGraph stop:]; launchd
+  restarts it. backboardd's GPU load with the preview is high (76% busy, ~22 fps), the YCbCr copy is CPU work.
+  `flamereboot=1800` restarts the phone every 30 minutes (to fastboot: `boot r18g` again).
+
 **Next for the cameras:**
 1. Charged, boot r18e, dismiss the alerts once (Cancel on the location one), open Camera: the preview should show the
    back camera (no colour tuning yet: identity matrix). Check mediaserverd stays up (`klog`, `CRASH` lines), then a
