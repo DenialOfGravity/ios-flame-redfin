@@ -1,4 +1,4 @@
-From 39aa02ee53663ee3f724b48fe84de1dc4effc4db Mon Sep 17 00:00:00 2001
+From 03ba48ae11cb3ed6c16a60aa73fce0fbbd6553ec Mon Sep 17 00:00:00 2001
 From: WS-P <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 00:34:59 +0100
 Subject: [PATCH] redfin: sweetbig=2 prefers the gold core (CPU6) over prime

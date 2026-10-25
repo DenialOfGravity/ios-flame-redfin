@@ -1,4 +1,4 @@
-From ee9ff0d3925f47aca60782f31b30ea7b775f5381 Mon Sep 17 00:00:00 2001
+From 9a1ca20b853b4d65e298df8af7ea1302abbfa83f Mon Sep 17 00:00:00 2001
 From: WS-P <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 00:38:57 +0100
 Subject: [PATCH] redfin: thermal caps (sweettcap) from TSENS, GPU level cap
@@ -9,11 +9,11 @@ cpuss and camera cap gold/prime (1.8/1.2 GHz/lowest), silver (1.5/1.0 GHz)
 and, with sweettcap=3, the GPU level through sweet_gpu_level_cap() /
 a6_perf_vote(). w cap N forces a level, w gpu N tests the GPU hook.
 ---
- bsd/dev/sweet_a6xx.c    | 19 ++++++++
- bsd/dev/sweet_cpufreq.c | 51 +++++++++++++++++++--
- bsd/dev/sweet_gpu.c     | 21 +++++++++
- bsd/dev/sweet_thermal.c | 98 +++++++++++++++++++++++++++++++++++++++--
- 4 files changed, 183 insertions(+), 6 deletions(-)
+ bsd/dev/sweet_a6xx.c    |  19 ++++++++
+ bsd/dev/sweet_cpufreq.c |  51 +++++++++++++++++--
+ bsd/dev/sweet_gpu.c     |  21 ++++++++
+ bsd/dev/sweet_thermal.c | 105 ++++++++++++++++++++++++++++++++++++++--
+ 4 files changed, 190 insertions(+), 6 deletions(-)
 
 diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
 index b16dab2..abd1429 100644
@@ -46,7 +46,7 @@ index b16dab2..abd1429 100644
  {
  	static uint32_t msg[256];
 diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
-index 492c3a7..5c295ee 100644
+index 96db959..631b0a3 100644
 --- a/bsd/dev/sweet_cpufreq.c
 +++ b/bsd/dev/sweet_cpufreq.c
 @@ -33,6 +33,9 @@
@@ -96,7 +96,7 @@ index 492c3a7..5c295ee 100644
  }
  
  /* Position of the current request in ch[] (the nearest frequency at or below it). */
-@@ -308,7 +320,7 @@ cf_gov_tick(struct cf_load *ld)
+@@ -309,7 +321,7 @@ cf_gov_tick(struct cf_load *ld)
  		if (util >= 95) {
  			target *= 2;            /* saturated: the real demand is unknown, ramp fast */
  		}
@@ -105,7 +105,7 @@ index 492c3a7..5c295ee 100644
  		while (want < ceil && d->khz[d->ch[want]] < target) {
  			want++;
  		}
-@@ -387,6 +399,39 @@ sweet_cpufreq_gov(int on, unsigned period_ms)
+@@ -388,6 +400,39 @@ sweet_cpufreq_gov(int on, unsigned period_ms)
  	return 0;
  }
  
@@ -178,7 +178,7 @@ index 8abc525..fdf6012 100644
  
  /*
 diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
-index 045c655..ca27e93 100644
+index 045c655..ff1dfdf 100644
 --- a/bsd/dev/sweet_thermal.c
 +++ b/bsd/dev/sweet_thermal.c
 @@ -23,6 +23,16 @@
@@ -198,7 +198,15 @@ index 045c655..ca27e93 100644
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <sys/param.h>
-@@ -41,6 +51,8 @@ extern int sweet_cpufreq_set(unsigned dom, unsigned idx, const char *why);
+@@ -31,6 +41,7 @@
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++#include <kern/locks.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include "sweet_spmi.h"
+@@ -41,6 +52,8 @@ extern int sweet_cpufreq_set(unsigned dom, unsigned idx, const char *why);
  extern void sweet_cpufreq_table_log(unsigned dom);
  extern int sweet_cpufreq_gov(int on, unsigned period_ms);
  extern void sweet_cpufreq_manual(unsigned dom);
@@ -207,7 +215,7 @@ index 045c655..ca27e93 100644
  void sweet_power_cmd(const char *s, const char *end);
  extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
  extern void thread_deallocate(thread_t);
-@@ -54,7 +66,10 @@ void sweet_thermal_start(void);
+@@ -54,7 +67,12 @@ void sweet_thermal_start(void);
  #define TS_NONE         (-9999)
  
  static vm_offset_t ts_tm[2];
@@ -216,10 +224,12 @@ index 045c655..ca27e93 100644
 +static unsigned ts_tcap = 1;            /* sweettcap */
 +static int ts_level;                    /* 0964 thermal level 0-3 */
 +static int ts_forced = -1;              /* "w cap N" */
++static LCK_GRP_DECLARE(ts_grp, "sweet_thermal");
++static LCK_MTX_DECLARE(ts_lock, &ts_grp);       /* sampling + policy: thread vs "w" commands */
  
  /* Published values, deci-degC (TS_NONE = not read). */
  static int t_aoss = TS_NONE, t_silver = TS_NONE, t_gold = TS_NONE, t_prime = TS_NONE;
-@@ -226,20 +241,82 @@ sweet_thermal_pmic_dump(const char *why)
+@@ -226,20 +244,84 @@ sweet_thermal_pmic_dump(const char *why)
  	}
  }
  
@@ -288,8 +298,10 @@ index 045c655..ca27e93 100644
 +	unsigned elapsed = 0, ticks = 0;
  	bool dumped = false;
  	for (;;) {
++		lck_mtx_lock(&ts_lock);
  		ts_sample();
 +		ts_policy();
++		lck_mtx_unlock(&ts_lock);
 +		if ((ticks++ % 5) != 0) {
 +			goto next_tick;
 +		}
@@ -303,7 +315,7 @@ index 045c655..ca27e93 100644
  		uint64_t deadline;
  		clock_interval_to_deadline(ts_period_ms, NSEC_PER_MSEC, &deadline);
  		(void)assert_wait_deadline(&ts_chan, THREAD_UNINT, deadline);
-@@ -346,10 +423,24 @@ sweet_power_cmd(const char *s, const char *end)
+@@ -346,10 +428,26 @@ sweet_power_cmd(const char *s, const char *end)
  		if (sweet_cpufreq_gov(on != 0, ms) < 0) {
  			printf("SWEET POWER: governor unavailable\n");
  		}
@@ -314,8 +326,10 @@ index 045c655..ca27e93 100644
 +		} else {
 +			ts_forced = -1;
 +		}
++		lck_mtx_lock(&ts_lock);
 +		ts_sample();
 +		ts_policy();
++		lck_mtx_unlock(&ts_lock);
 +		printf("SWEET POWER: thermal level %d (%s)\n", ts_level, ts_forced >= 0 ? "forced" : "sensors");
 +	} else if (pc_is(w, "gpu")) {
 +		unsigned n = 0;
@@ -329,7 +343,7 @@ index 045c655..ca27e93 100644
  	}
  }
  
-@@ -358,6 +449,7 @@ sweet_thermal_start(void)
+@@ -358,6 +456,7 @@ sweet_thermal_start(void)
  {
  	uint32_t on = 1;
  	PE_parse_boot_argn("sweettherm", &on, sizeof(on));

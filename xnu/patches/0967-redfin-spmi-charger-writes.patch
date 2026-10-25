@@ -1,4 +1,4 @@
-From 079ad93e47c20bd2fd6540e3923432203a684413 Mon Sep 17 00:00:00 2001
+From 627749553ba2467cad5bf254e665433b599cdc2c Mon Sep 17 00:00:00 2001
 From: WS-P <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 00:40:52 +0100
 Subject: [PATCH] redfin: SPMI charger write path (sweetchg=1, allow-list,
@@ -170,7 +170,7 @@ index 45565d1..a04a1c5 100644
  }
  #endif
 diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
-index ca27e93..a8db03f 100644
+index ff1dfdf..48b285e 100644
 --- a/bsd/dev/sweet_thermal.c
 +++ b/bsd/dev/sweet_thermal.c
 @@ -23,6 +23,7 @@
@@ -181,7 +181,7 @@ index ca27e93..a8db03f 100644
   *   w cap N             force thermal level N (0-3) for a test, "w cap auto" back to the sensors
   *   w gpu N             GPU level cap N (0 = none) through sweet_gpu_level_cap()
   *
-@@ -360,6 +361,26 @@ pc_num(const char **p, const char *end, unsigned *out)
+@@ -365,6 +366,26 @@ pc_num(const char **p, const char *end, unsigned *out)
  	return true;
  }
  
@@ -208,7 +208,7 @@ index ca27e93..a8db03f 100644
  /* DOM: 0/1/2 or s(ilver)/g(old)/p(rime) */
  static bool
  pc_dom(const char **p, const char *end, unsigned *out)
-@@ -438,6 +459,17 @@ sweet_power_cmd(const char *s, const char *end)
+@@ -445,6 +466,17 @@ sweet_power_cmd(const char *s, const char *end)
  		(void)pc_num(&s, end, &n);
  		printf("SWEET POWER: gpu level cap %u -> %d\n", n, sweet_gpu_level_cap(n));
  	} else if (pc_is(w, "chg")) {

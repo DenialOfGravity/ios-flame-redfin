@@ -1,4 +1,4 @@
-From 0f3e48fa05b95efa665e59f75a1cdb76ee37e85d Mon Sep 17 00:00:00 2001
+From 5608ab76cb5800d1fad24fdac7fd9752efcdbcb1 Mon Sep 17 00:00:00 2001
 From: WS-P <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 00:42:28 +0100
 Subject: [PATCH] redfin: USB ud_thread polls every 10 ms when quiet

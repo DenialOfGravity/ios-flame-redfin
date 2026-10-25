@@ -232,6 +232,11 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   <= 1.8 GHz), 2 > 85 C (gold/prime 1.2, silver 1.5 GHz, GPU level 2), 3 > 100 C (gold/prime lowest row, silver 1.0 GHz,
   GPU 1), each released 10 C lower, logged once per change. `sweettcap` bit 0 CPU (default 1), bit 1 GPU (runtime GMU
   HFI perf vote via sweet_gpu_level_cap()/a6_perf_vote(), off by default), 0 = log only. `w cap N|auto`, `w gpu N`.
+- 0965 PSCI idle, `sweetidle=1` (default off): CPUs 1-7 call PSCI CPU_SUSPEND 0x40000003 (lpm "pc"; never the
+  notify-rpm cluster states) instead of WFI when the next timer is beyond 1774/2207 us; resume via resume_idle_cpu ->
+  arm_init_idle_cpu + sweet_idle_resume() (GIC ICC regs, timer re-arm). Broadcast wake = arm,armv7-timer-mem frame 0
+  (0x17c21000, SPI 8 on CPU0) armed at the earliest sleeper deadline minus exit latency, IPIs the sleepers. Probes
+  PSCI_FEATURES first; a PSCI error turns it off. `SWEET IDLE:` at boot; counters in the `SWEET CPUFREQ:` line.
 - 0966 battery: 4000 mAh, 5 s poll, SOC seeded from QG SDAM 0xb147 (if 0xb146 valid and within 15 % of the voltage
   estimate) then coulomb-counted from QG LAST_ADC_I with a 0.2 %/poll pull to the voltage estimate at |I| < 100 mA;
   1 %/poll slew; IsCharging = I > +50 mA; Temperature from the JEITA zone (0x100d). `SWEET BATTERY: SOC seeded ...`.

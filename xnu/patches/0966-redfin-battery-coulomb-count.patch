@@ -1,4 +1,4 @@
-From 050c265325b4c01311ba4968589eaefe2ddd5ce1 Mon Sep 17 00:00:00 2001
+From 8c94b47c0fd0d7e88c5c81ce6d8b289344935a5c Mon Sep 17 00:00:00 2001
 From: WS-P <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 00:40:04 +0100
 Subject: [PATCH] redfin: battery 4000 mAh, 5 s poll, SDAM-seeded coulomb

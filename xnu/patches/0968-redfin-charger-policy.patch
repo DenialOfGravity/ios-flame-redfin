@@ -1,4 +1,4 @@
-From df482af4cfd8e65b5bda06b537413405e3ec5d00 Mon Sep 17 00:00:00 2001
+From 82923c09c491a0eeb5cc1c15df91b4f38f2568b1 Mon Sep 17 00:00:00 2001
 From: WS-P <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 00:42:09 +0100
 Subject: [PATCH] redfin: SMB5 charger policy (APSD/Rp -> HC ICL, FCC 2 A, FV
@@ -259,7 +259,7 @@ index 0000000..06c9143
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
-index a8db03f..6d27e1a 100644
+index 48b285e..27b5a03 100644
 --- a/bsd/dev/sweet_thermal.c
 +++ b/bsd/dev/sweet_thermal.c
 @@ -24,6 +24,7 @@
@@ -270,7 +270,7 @@ index a8db03f..6d27e1a 100644
   *   w cap N             force thermal level N (0-3) for a test, "w cap auto" back to the sensors
   *   w gpu N             GPU level cap N (0 = none) through sweet_gpu_level_cap()
   *
-@@ -54,6 +55,9 @@ extern int sweet_cpufreq_gov(int on, unsigned period_ms);
+@@ -55,6 +56,9 @@ extern int sweet_cpufreq_gov(int on, unsigned period_ms);
  extern void sweet_cpufreq_manual(unsigned dom);
  extern int sweet_cpufreq_cap(unsigned dom, uint32_t max_khz);
  extern int sweet_gpu_level_cap(unsigned max_lvl);
@@ -280,15 +280,15 @@ index a8db03f..6d27e1a 100644
  void sweet_power_cmd(const char *s, const char *end);
  extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
  extern void thread_deallocate(thread_t);
-@@ -71,6 +75,7 @@ static unsigned ts_period_ms = 1000;    /* sample (0964 caps); log every 5th */
- static unsigned ts_tcap = 1;            /* sweettcap */
- static int ts_level;                    /* 0964 thermal level 0-3 */
+@@ -74,6 +78,7 @@ static int ts_level;                    /* 0964 thermal level 0-3 */
  static int ts_forced = -1;              /* "w cap N" */
+ static LCK_GRP_DECLARE(ts_grp, "sweet_thermal");
+ static LCK_MTX_DECLARE(ts_lock, &ts_grp);       /* sampling + policy: thread vs "w" commands */
 +static unsigned ts_chg = 1;             /* 0968 charger policy (sweetchgpol=0: off; writes need sweetchg=1) */
  
  /* Published values, deci-degC (TS_NONE = not read). */
  static int t_aoss = TS_NONE, t_silver = TS_NONE, t_gold = TS_NONE, t_prime = TS_NONE;
-@@ -317,6 +322,9 @@ ts_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -322,6 +327,9 @@ ts_thread(void *arg __unused, wait_result_t wr __unused)
  			dumped = true;
  			sweet_thermal_pmic_dump("boot");
  		}
@@ -298,7 +298,7 @@ index a8db03f..6d27e1a 100644
  next_tick:;
  		uint64_t deadline;
  		clock_interval_to_deadline(ts_period_ms, NSEC_PER_MSEC, &deadline);
-@@ -470,7 +478,18 @@ sweet_power_cmd(const char *s, const char *end)
+@@ -477,7 +485,18 @@ sweet_power_cmd(const char *s, const char *end)
  			printf("SWEET POWER: w chg wr %04x %02x -> %d\n", addr, val, sweet_spmi_write(2, addr, (uint8_t)val));
  			return;
  		}
@@ -318,7 +318,7 @@ index a8db03f..6d27e1a 100644
  	} else {
  		printf("SWEET POWER: unknown \"w %s\" (stat, freq, table, gov, cap, gpu, chg)\n", w);
  	}
-@@ -482,6 +501,7 @@ sweet_thermal_start(void)
+@@ -489,6 +508,7 @@ sweet_thermal_start(void)
  	uint32_t on = 1;
  	PE_parse_boot_argn("sweettherm", &on, sizeof(on));
  	PE_parse_boot_argn("sweettcap", &ts_tcap, sizeof(ts_tcap));

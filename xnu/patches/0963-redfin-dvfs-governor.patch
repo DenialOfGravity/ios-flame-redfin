@@ -1,4 +1,4 @@
-From 02231ef24e65a11fd5823af01c70c30783647e8e Mon Sep 17 00:00:00 2001
+From 681c271e15f82c36eb8eeb24143c4953d231b013 Mon Sep 17 00:00:00 2001
 From: WS-P <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 00:37:41 +0100
 Subject: [PATCH] redfin: DVFS governor (flamecpufreq=2, w gov)
@@ -12,7 +12,7 @@ down after 3 ticks. flamecpufreq=1 (default) keeps the pinned maximum.
  2 files changed, 201 insertions(+), 3 deletions(-)
 
 diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
-index 86bbe99..492c3a7 100644
+index 67668bc..96db959 100644
 --- a/bsd/dev/sweet_cpufreq.c
 +++ b/bsd/dev/sweet_cpufreq.c
 @@ -18,10 +18,21 @@
@@ -130,7 +130,7 @@ index 86bbe99..492c3a7 100644
  /* Per-CPU busy % since the previous call with the same state. */
  struct cf_load {
  	uint64_t idle[CF_NCPU];
-@@ -210,9 +282,120 @@ sweet_cpufreq_log(void)
+@@ -211,9 +283,120 @@ sweet_cpufreq_log(void)
  		len += snprintf(line + len, sizeof(line) - len, " %s %u=%u MHz (cyc %u, lmh %u)", d->name, idx,
  		    idx < d->n ? d->khz[idx] / 1000 : 0, cyc_mhz, lmh);
  	}
@@ -251,7 +251,7 @@ index 86bbe99..492c3a7 100644
  void
  sweet_cpufreq_init(void)
  {
-@@ -231,6 +414,7 @@ sweet_cpufreq_init(void)
+@@ -232,6 +415,7 @@ sweet_cpufreq_init(void)
  		d->cyc_prev = cf_rd(d->base, CF_CYCLES);
  		d->cyc_t = mach_absolute_time();
  		cf_ready = true;
@@ -259,7 +259,7 @@ index 86bbe99..492c3a7 100644
  		sweet_cpufreq_table_log(c);
  		printf("SWEET CPUFREQ: %s enable %x perf %u volt[0] %x lmh raw %x (%u MHz) skip %d\n", d->name,
  		    cf_rd(d->base, CF_ENABLE), d->boot_idx, cf_rd(d->base, CF_VOLT), d->lmh ? cf_rd(d->lmh, 0) : 0,
-@@ -260,6 +444,9 @@ sweet_cpufreq_init(void)
+@@ -261,6 +445,9 @@ sweet_cpufreq_init(void)
  		}
  		(void)sweet_cpufreq_set(c, best, want == 1 ? "boot max" : "boot cap");
  	}

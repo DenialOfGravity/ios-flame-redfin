@@ -1,4 +1,4 @@
-From 00bead5acbe7f1e6108359c0d15f9138f43eb1d0 Mon Sep 17 00:00:00 2001
+From e4b97b175e399e4fe391d30d9827613a9e4491a8 Mon Sep 17 00:00:00 2001
 From: WS-P <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 00:34:41 +0100
 Subject: [PATCH] redfin: CPU busy %, perf-state/cycle/LMh readback, "w" power
@@ -11,17 +11,17 @@ readback, cycle-counter MHz, LMh ceiling). sched_prim.c exports
 sweet_cpu_idle_abs(). sweet_poke.c routes "w WORD ..." to
 sweet_power_cmd() (stat, freq, table, gov, chg).
 ---
- bsd/dev/sweet_cpufreq.c | 276 ++++++++++++++++++++++++++++++++--------
+ bsd/dev/sweet_cpufreq.c | 277 ++++++++++++++++++++++++++++++++--------
  bsd/dev/sweet_poke.c    |  12 ++
  bsd/dev/sweet_thermal.c | 109 ++++++++++++++++
  osfmk/kern/sched_prim.c |  19 +++
- 4 files changed, 362 insertions(+), 54 deletions(-)
+ 4 files changed, 363 insertions(+), 54 deletions(-)
 
 diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
-index aa80269..86bbe99 100644
+index aa80269..67668bc 100644
 --- a/bsd/dev/sweet_cpufreq.c
 +++ b/bsd/dev/sweet_cpufreq.c
-@@ -1,96 +1,264 @@
+@@ -1,96 +1,265 @@
  /*
 - * flame (SM8150) CPU frequency: the OSM hardware DCVS keeps a frequency
 - * table per cluster and takes a desired table index per cluster; voltage
@@ -220,7 +220,8 @@ index aa80269..86bbe99 100644
 +	for (unsigned c = 0; c < CF_NCPU; ++c) {
 +		uint64_t idle = sweet_cpu_idle_abs((int)c);
 +		uint64_t di = idle - ld->idle[c];
-+		busy[c] = (ld->t && dt && di <= dt) ? (unsigned)(100 - (di * 100) / dt) : 0;
++		/* idle 0: no such CPU (cpus=N) or not started yet: not busy */
++		busy[c] = (idle && ld->t && dt && di <= dt) ? (unsigned)(100 - (di * 100) / dt) : 0;
 +		ld->idle[c] = idle;
 +	}
 +	ld->t = now;
