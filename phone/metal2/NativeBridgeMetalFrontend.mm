@@ -131,10 +131,12 @@ static void waitForResource(id resource);
 @property(nonatomic) IOSurfaceRef surface;
 @property(nonatomic) NSUInteger offset,rowBytes,plane;
 @property(nonatomic) uint64_t reportedFormat;   // non-zero: the format the client asked for (a converted copy's)
+@property(nonatomic) uint32_t surfaceSeed;      // a converted copy's: the surface's seed when it was filled
 @property(nonatomic,strong) id<MTLTexture> parent;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
 @property(nonatomic) NSUInteger heapOffset;
 @end
+static void ycbcrRefresh(NBTexture *texture);
 @implementation NBBuffer
 - (void)dealloc {
  const NSUInteger length=nmb_buffer_length(_handle);nmb_buffer_release(_handle);
@@ -567,6 +569,7 @@ static void waitForResource(id resource) {
  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
  if(texture)[_commandBuffer.resourceOwners addObject:texture];
  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+ if(texture)ycbcrRefresh((NBTexture *)texture);
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
 }
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
@@ -1437,6 +1440,22 @@ static void noteSurfaceTexture(IOSurfaceRef surface,MTLTextureDescriptor *d,NSUI
 // an RGBA8 copy holding Y, Cb, Cr, 1 in r, g, b, a (what sampling the YCbCr format gives: the colour matrix is the
 // shader's), filled from the surface when the texture is made. It does not follow later writes to the surface, which is
 // right for pictures and wrong for moving ones (the camera's preview is asked for in BGRA, inject_media.c).
+static bool ycbcrFill(NmbTexture *handle,IOSurfaceRef surface,size_t w,size_t h) {
+ const uint8_t *y=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,0),*c=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,1);
+ const size_t ys=IOSurfaceGetBytesPerRowOfPlane(surface,0),cs=IOSurfaceGetBytesPerRowOfPlane(surface,1);
+ if(!y || !c || !ys || !cs)return false;
+ std::vector<uint32_t> row(w*16);
+ for(size_t top=0;top<h;top+=16) {
+  const size_t rows=std::min<size_t>(16,h-top);
+  for(size_t j=0;j<rows;j++) {
+   const uint8_t *yl=y+(top+j)*ys,*cl=c+((top+j)/2)*cs;uint32_t *o=row.data()+j*w;
+   for(size_t x=0;x<w;x++) o[x]=0xff000000u|((uint32_t)cl[(x&~(size_t)1)+1]<<16)|((uint32_t)cl[x&~(size_t)1]<<8)|yl[x];
+  }
+  const uint64_t region[6]={0,top,0,w,rows,1};
+  if(!nmb_texture_replace(handle,region,0,0,row.data(),w*4,w*4*rows,w*4*rows)){NBLOG(@"native-metal: YCbCr copy fill refused: %@",lastError());return false;}
+ }
+ return true;
+}
 static NBTexture *ycbcrCopy(IOSurfaceRef surface,MTLTextureDescriptor *d) {
  if(IOSurfaceGetPlaneCount(surface)!=2)return nil;
  const size_t w=d.width,h=d.height;
@@ -1447,23 +1466,20 @@ static NBTexture *ycbcrCopy(IOSurfaceRef surface,MTLTextureDescriptor *d) {
  NmbTextureDescriptor descriptor;if(!textureDescriptor(rgba,&descriptor))return nil;
  NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);
  if(!handle){NBLOG(@"native-metal: YCbCr copy %zux%zu refused: %@",w,h,lastError());return nil;}
- const uint8_t *y=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,0),*c=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,1);
- const size_t ys=IOSurfaceGetBytesPerRowOfPlane(surface,0),cs=IOSurfaceGetBytesPerRowOfPlane(surface,1);
- std::vector<uint32_t> row(w*16);
- for(size_t top=0;top<h;top+=16) {
-  const size_t rows=std::min<size_t>(16,h-top);
-  for(size_t j=0;j<rows;j++) {
-   const uint8_t *yl=y+(top+j)*ys,*cl=c+((top+j)/2)*cs;uint32_t *o=row.data()+j*w;
-   for(size_t x=0;x<w;x++) o[x]=0xff000000u|((uint32_t)cl[(x&~(size_t)1)+1]<<16)|((uint32_t)cl[x&~(size_t)1]<<8)|yl[x];
-  }
-  const uint64_t region[6]={0,top,0,w,rows,1};
-  if(!nmb_texture_replace(handle,region,0,0,row.data(),w*4,w*4*rows,w*4*rows)){
-   NBLOG(@"native-metal: YCbCr copy fill refused: %@",lastError());nmb_texture_release(handle);return nil;
-  }
- }
+ const uint32_t seed=IOSurfaceGetSeed(surface);
+ if(!ycbcrFill(handle,surface,w,h)){nmb_texture_release(handle);return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
- texture.reportedFormat=(uint64_t)d.pixelFormat;texture.surface=(IOSurfaceRef)CFRetain(surface);
+ texture.reportedFormat=(uint64_t)d.pixelFormat;texture.surfaceSeed=seed;texture.surface=(IOSurfaceRef)CFRetain(surface);
  return texture;
+}
+// A converted copy is filled again when it is bound for drawing and its surface has been written since (its seed moved
+// on): the camera's preview frames, a video's.
+static void ycbcrRefresh(NBTexture *texture) {
+ if(!texture.reportedFormat || !texture.surface)return;
+ const uint32_t seed=IOSurfaceGetSeed(texture.surface);
+ if(seed==texture.surfaceSeed)return;
+ texture.surfaceSeed=seed;
+ (void)ycbcrFill(texture.handle,texture.surface,texture.descriptor.width,texture.descriptor.height);
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
  if(!surface || !d)return nil;
