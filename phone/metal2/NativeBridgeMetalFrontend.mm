@@ -1588,6 +1588,14 @@ static char sweetMemoryOwnerKey;
  if(!row){NBLOG(@"native-metal: newTextureLayoutWithDescriptor: no linear pitch for fmt %lu: %@",(unsigned long)d.pixelFormat,lastError());return nil;}
  return [[SweetTextureLayout alloc] initWithRow:row height:d.height texel:sweetTexelBytes(d.pixelFormat)];
 }
+// C4: the offset/row alignment of a texture over a buffer (Metal's: 16; the base class answers it from Apple's tables). CA's
+// 194-wide BGRA linear texture still came at 784-byte rows on r19a with every other alignment answer at 64; the first call is logged.
+- (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(MTLPixelFormat)format {
+ static std::atomic<bool> logged{false};
+ if(!logged.exchange(true))sm2_logs([NSString stringWithFormat:@"native-metal: minimumTextureBufferAlignmentForPixelFormat:%lu asked: %llu",
+     (unsigned long)format,(unsigned long long)linearAlignment()].UTF8String);
+ return (NSUInteger)linearAlignment();
+}
 - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count {(void)count;return [(id<MTLDevice>)self newCommandQueue];}
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
  NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,nullptr);
@@ -1981,6 +1989,9 @@ static uint64_t sweetLinearRow(uint64_t format,uint64_t width) {
 }
 static NSUInteger linearAlignmentAnswer(id,SEL cmd,NSUInteger arg) {
  const uint64_t value=askAnswer(cmd,arg);
+ static std::atomic<bool> logged{false};
+ if(!logged.exchange(true))sm2_logs([NSString stringWithFormat:@"native-metal: %s%lu asked: %llu",sel_getName(cmd),(unsigned long)arg,
+     (unsigned long long)(value?std::max(value,linearAlignment()):0)].UTF8String);
  return (NSUInteger)(value?std::max(value,linearAlignment()):0);
 }
 static BOOL flagArgAnswer(id,SEL cmd,NSUInteger arg) {return askAnswer(cmd,arg)!=0;}
