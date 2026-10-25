@@ -26,6 +26,10 @@ struct isp_stats {
 	 */
 	double          grey[2], neutral[2];
 	uint32_t        grey_cells, neutral_cells;
+	/* redfin: the same in the part AE meters on (isp->ae_roi; roi_cells 0: none set) */
+	double          roi_mean[3];
+	double          roi_bright;
+	uint32_t        roi_cells;
 };
 
 /*
@@ -80,7 +84,31 @@ struct isp {
 	bool            asked;
 	uint32_t        max_frame_lines;        /* the longest frame AE may ask for (0: twice the shortest) */
 	struct isp_tuning *tuning;              /* isp_load_tuning()'s, or none */
+	/*
+	 * redfin: what the capture stack asks of AE and AWB (camera_device.c sets these from the stream's properties;
+	 * all zero after isp_init(): AE and AWB as before).
+	 */
+	uint32_t        min_frame_lines;        /* the shortest frame AE may ask for (the highest frame rate allowed; 0: the mode's) */
+	bool            ae_locked;              /* LockAENow: the exposure stays as it is */
+	float           ae_bias;                /* ExposureBias, in EV (stops): the target's brightness times 2^bias */
+	float           ae_roi[4];              /* where AE meters most (x0, y0, x1, y1, fractions of the frame); x1 <= x0: the whole frame */
+	float           ae_max_gain;            /* the most gain (analog x digital) AE may use (AEMaxGain; 0: all there is) */
+	uint32_t        ae_max_exposure_us;     /* the longest exposure AE may use (MaxIntegrationTime; 0: the frame's) */
+	bool            manual;                 /* a custom exposure (AVCaptureExposureModeCustom): manual_us at manual_gain */
+	uint32_t        manual_us;
+	float           manual_gain;
+	float           sensor_digital;         /* the sensor's own digital gain as last set (1: none) */
+	uint32_t        asked_digital;          /* ... and as asked (EXPOSURE.d, 256 = 1x; 0: not asked) */
+	uint32_t        asked_frames;           /* frames seen since AE asked (it waits at most AE_PATIENCE for them) */
+	bool            ae_stable;              /* (AE's answer) the exposure is where AE wants it */
+	bool            awb_locked;             /* LockAWBNow: the white balance stays as it is */
+	bool            awb_manual;             /* the white balance's gains are wb_manual's (green 1) */
+	float           wb_manual[3];
+	bool            awb_stable;             /* (AWB's answer) the white balance has stopped moving */
 };
+
+/* frames AE waits for the exposure it asked for before it takes what the frames say (a clamped or lost request) */
+#define AE_PATIENCE     6
 
 void isp_init(struct isp *isp);
 /*
