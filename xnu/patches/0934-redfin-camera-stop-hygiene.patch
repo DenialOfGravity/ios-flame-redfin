@@ -1,0 +1,238 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sun, 25 Oct 2026 21:17:11 +0100
+Subject: [PATCH] 0934 redfin: /dev/redwood-camera stop and fault hygiene
+
+- A session (and a mode switch) stops at a frame's end: the write master off
+  at a WM0 done and RDI 0 halted at its frame boundary, then the next start of
+  frame waited for, then the sensor's "off" (it was halted mid-frame).
+- The SMMU fault line only for FSR & 0x800001fe (r18g's "FSR 0x400" at every
+  stop is the FORMAT field), cleared after it is logged.
+- The place given to the write master for the next frame is QUEUED, never
+  read (the oldest READY place could be read while being overwritten).
+- read() waits at most 1 s (was 3 s streaming, 15 s while starting) and
+  returns EAGAIN at a close or SENSOR, so the program's stream stop does not
+  wait 3-15 s for its reading thread.
+- 100 ms before a session powers up (SENSOR asked for in the vendor's start
+  burst is taken first), and a close followed by an open within 300 ms keeps
+  the frames going.
+---
+ bsd/dev/sweet_cam.c | 93 ++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 87 insertions(+), 6 deletions(-)
+
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index ddf3be4..9c29268 100644
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -1222,6 +1222,8 @@ cap_smmu_up(void)
+ 	return true;
+ }
+ 
++static unsigned cam_step_ms;            /* (below) */
++
+ static void
+ cap_smmu_faults(void)
+ {
+@@ -1229,8 +1231,19 @@ cap_smmu_faults(void)
+ 		return;
+ 	}
+ 	uint32_t fsr = rd(cap.smmu_cb, 0x58), gfsr = rd(cap.smmu, 0x48);
+-	printf("SWEET CAM: SMMU CB%u FSR %#x FAR %#x%08x FSYNR0 %#x; global FSR %#x FSYNR1 %#x\n", cap.cb_n, fsr,
++	/*
++	 * 0934: only the fault bits count (FSR [8:1] TF AFF PF EF TLBMCF TLBLKF ASF UUT, [31] MULTI = 0x800001fe): r18g's
++	 * "FSR 0x400" at every stop is [10:9], the FORMAT field (HANDOFF.md), not a fault.
++	 */
++	if (!(fsr & 0x800001feu)) {
++		if (cam_step_ms) {
++			printf("SWEET CAM: SMMU CB%u: no fault (FSR %#x)\n", cap.cb_n, fsr);
++		}
++		return;
++	}
++	printf("SWEET CAM: SMMU CB%u fault: FSR %#x FAR %#x%08x FSYNR0 %#x; global FSR %#x FSYNR1 %#x\n", cap.cb_n, fsr,
+ 	    rd(cap.smmu_cb, 0x64), rd(cap.smmu_cb, 0x60), rd(cap.smmu_cb, 0x68), gfsr, rd(cap.smmu, 0x54));
++	wr(cap.smmu_cb, 0x58, fsr);     /* (write 1 to clear: the next look sees only new ones) */
+ }
+ 
+ static void
+@@ -2690,7 +2703,7 @@ struct redwood_camera_command { uint32_t command, bytes, a, b, c, d; };
+ #define RDI0_SOF                (1u << 27)      /* IFE_IRQ_STATUS0 (r17: 0x08000220 after frames) */
+ #define WM0_DONE                1u              /* BUS_IRQ_STATUS1 */
+ 
+-enum { PLACE_FREE, PLACE_WRITING, PLACE_READY, PLACE_READING };
++enum { PLACE_FREE, PLACE_WRITING, PLACE_READY, PLACE_READING, PLACE_QUEUED };    /* 0934: QUEUED: the next frame's */
+ 
+ /* HackiOS's sensor numbers -> ours (sensors[]); ~0u: none */
+ static const unsigned ios_to_ours[4] = { ~0u, 0, 2, 1 };
+@@ -2717,6 +2730,10 @@ static struct tab_mode ios_mode_buf;   /* (a copy: the table file is loaded only
+ static const struct tab_mode *ios_mode = &ios_mode_buf;
+ static volatile bool ios_open, ios_streaming, ios_wanted, ios_broken;
+ static uint64_t ios_last_read, ios_given, ios_frames_done, ios_writes_late;
++static volatile uint32_t ios_epoch;    /* 0934: +1 at each close and SENSOR: waiting reads return */
++#define READ_WAIT_MS            1000    /* 0934: (was 3 s streaming, 15 s while the sensor starts) */
++#define START_DEBOUNCE_MS       100
++#define CLOSE_LINGER_MS         300
+ static struct { uint32_t lines, gain, frame_lines, dgain; bool pending; } ios_ask;     /* 0931: dgain 0 = as it is */
+ static struct { uint32_t lines, gain, frame_lines; uint64_t from; } ios_now, ios_next;
+ static uint32_t ios_dgain;      /* 0931: the digital gain last asked for (256 = 1x; 0 = never: the tables' own), kept for new sessions */
+@@ -2991,6 +3008,8 @@ places_reset(void)
+  * size, the receive path and "on" again. Power, PLL2, refgen, the SMMU, the sensor's init and the lens stay (r18g: a
+  * full stop and start is ~0.35 s). false: it did not work, the old mode is set again and the session ends.
+  */
++static void ios_halt(void);
++
+ static bool
+ ios_warm_switch(uint32_t mode_n)
+ {
+@@ -3006,6 +3025,7 @@ ios_warm_switch(uint32_t mode_n)
+ 	}
+ 	lck_mtx_unlock(&ios_lock);
+ 	wakeup(&ios_frames_done);
++	ios_halt();             /* 0934 */
+ 	(void)sensor_table("off");
+ 	sleep_ms(frame_ms > 200 ? 200 : frame_ms);
+ 	paths_down();
+@@ -3049,6 +3069,34 @@ ios_warm_switch(uint32_t mode_n)
+ /* one session: from the first read that wants frames to the close, the idle time, a fault or another sensor */
+ static unsigned ios_start_failures;
+ 
++/*
++ * 0934: the frames stopped at a frame's end, not in the middle of one (r18g halted RDI 0 at once, the write master
++ * in the middle of a frame): at a write-master done the write master is switched off (taken at the next start of
++ * frame) and the CSID's RDI 0 told to halt at its frame boundary; then the next start of frame is waited for, so
++ * nothing is written after this, and the sensor's "off" follows.
++ */
++static void
++ios_halt(void)
++{
++	uint32_t frame_ms = (uint32_t)((uint64_t)ios_line_ns * (ios_now.frame_lines ? ios_now.frame_lines : ios_mode->frame_length) /
++	    1000000u) + 1;
++	uint64_t end = ios_ms() + 2 * frame_ms + 20;
++	while (ios_ms() < end && !(rd(cap.ife, BUS_IRQ_STATUS1) & WM0_DONE)) {
++		sleep_ms(1);
++	}
++	wr(cap.ife, IFE_IRQ_CLEAR0, RDI0_SOF);
++	wr(cap.ife, IFE_IRQ_GLOBAL_CLEAR, 1);
++	wr(cap.ife, BUS_IRQ_CLEAR1, WM0_DONE);
++	wr(cap.ife, BUS_IRQ_GLOBAL_CLEAR, 1);
++	wr(cap.ife, WM0_CFG, 0);
++	wr(cap.ife, IFE_REG_UPDATE, 0x2);
++	wr(cap.csid, CSID_RDI0_CTRL, rd(cap.csid, CSID_RDI0_CTRL) & ~3u);      /* halt at the frame boundary */
++	end = ios_ms() + frame_ms + 20;
++	while (ios_ms() < end && !(rd(cap.ife, IFE_IRQ_STATUS0) & RDI0_SOF)) {
++		sleep_ms(1);
++	}
++}
++
+ static void
+ ios_session(void)
+ {
+@@ -3103,15 +3151,23 @@ ios_session(void)
+ 	ios_next.from = 0;
+ 	printf("SWEET CAM: /dev/redwood-camera: streaming the %s, mode %u %ux%u; exposure %u lines, gain %u/256, frame %u lines\n",
+ 	    sensors[ios_sensor].name, ios_mode_n, ios_mode->width, ios_mode->height, lines, gain, frame_lines);
+-	uint64_t last_frame = ios_ms();
++	uint64_t last_frame = ios_ms(), closed_at = 0;
+ 	lck_mtx_lock(&ios_lock);
+ 	ios_streaming = true;
+ 	ios_last_read = ios_ms();
+ 	lck_mtx_unlock(&ios_lock);
+ 	for (;;) {
+ 		if (!ios_open) {
+-			why = "closed";
+-			break;
++			/* 0934: a close followed by an open (the vendor's stop and start) keeps the frames going */
++			if (closed_at == 0) {
++				closed_at = ios_ms();
++			}
++			if (ios_ms() - closed_at > CLOSE_LINGER_MS) {
++				why = "closed";
++				break;
++			}
++		} else {
++			closed_at = 0;
+ 		}
+ 		if (ios_switch_to != 0) {
+ 			/* 0932: another mode of this sensor: switched here; the same mode: nothing; another sensor: the session ends */
+@@ -3224,6 +3280,11 @@ ios_session(void)
+ 				}
+ 			}
+ 			if (next >= 0) {
++				/*
++				 * 0934: the place the write master gets next is no longer READY: a read starting now would take a place
++				 * the next frame is written into (r18g: the oldest READY place could be read while overwritten)
++				 */
++				place[next].state = PLACE_QUEUED;
+ 				wr(cap.ife, WM0_IMAGE_ADDR, (uint32_t)(ring_pa + (uint64_t)next * place_bytes));
+ 				wr(cap.ife, IFE_REG_UPDATE, 0x2);
+ 			}
+@@ -3311,6 +3372,9 @@ ios_session(void)
+ 	}
+ 	lck_mtx_unlock(&ios_lock);
+ 	wakeup(&ios_frames_done);
++	if (!ios_broken) {
++		ios_halt();     /* 0934 */
++	}
+ 	(void)sensor_table("off");
+ 	sleep_ms(40);
+ 	stream_down(powered);
+@@ -3364,6 +3428,14 @@ ios_thread(void *arg __unused, wait_result_t w __unused)
+ 			}
+ 			continue;
+ 		}
++		/*
++		 * 0934: a moment before powering up: the vendor's capture graph reserves and starts its stream, and asks for its
++		 * camera, in a burst (r18g: three or four full starts and stops a camera start); a SENSOR in it is taken first
++		 */
++		sleep_ms(START_DEBOUNCE_MS);
++		if (ios_switch_to != 0 || !ios_open) {
++			continue;
++		}
+ 		ios_session();
+ 	}
+ 	wakeup(&ios_frames_done);
+@@ -3387,7 +3459,9 @@ camdev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused
+ {
+ 	ios_open = false;
+ 	ios_wanted = false;
++	ios_epoch++;            /* 0934 */
+ 	wakeup(&ios_open);
++	wakeup(&ios_frames_done);
+ 	return 0;
+ }
+ 
+@@ -3396,6 +3470,7 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+ 	struct redwood_camera_frame f;
+ 	uint64_t since = ios_ms();
++	uint32_t epoch = ios_epoch;
+ 	int b = -1, error = 0;
+ 
+ 	lck_mtx_lock(&ios_lock);
+@@ -3414,7 +3489,11 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		if (b >= 0) {
+ 			break;
+ 		}
+-		if (ios_ms() - since > (ios_streaming ? 3000u : 15000u)) {
++		/*
++		 * 0934: a reader waits at most READ_WAIT_MS (and not past a close or SENSOR): the program's stream stop joins
++		 * the thread that reads, which r18g kept 3-15 s; it reads again on EAGAIN, and a start in progress goes on
++		 */
++		if (ios_ms() - since > READ_WAIT_MS || ios_epoch != epoch) {
+ 			lck_mtx_unlock(&ios_lock);
+ 			return EAGAIN;
+ 		}
+@@ -3538,9 +3617,11 @@ camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		lck_mtx_lock(&ios_lock);
+ 		ios_switch_mode = c.b;
+ 		ios_switch_class = c.c;         /* 0932: the mode's class when b is ~0 */
++		ios_epoch++;                    /* 0934 */
+ 		ios_switch_to = ios_to_ours[c.a] + 1;
+ 		lck_mtx_unlock(&ios_lock);
+ 		wakeup(&ios_open);
++		wakeup(&ios_frames_done);
+ 		return 0;
+ 	case REDWOOD_CAMERA_FLASH:
+ 		/* 0933: a mA per channel (0 = off; the torch driver caps it), b frames (0 = 1), c = 1 metering pre-flash */
+-- 
+2.43.0
+

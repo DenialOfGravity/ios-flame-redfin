@@ -1,0 +1,469 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sun, 25 Oct 2026 21:08:35 +0100
+Subject: [PATCH] 0929 redfin: the rear camera's lens (LC898129) and FOCUS for
+ /dev/redwood-camera
+
+The IMX363 module's lens motor is driven by an ON Semiconductor LC898129
+(AF + OIS controller with its own flash). Found in metric_imx363_lito2's
+module file with tools/redfin-camsensor.py -a: actuatorName, oisName and
+eepromName are all "lc898129dp", slave 0x76 (7-bit 0x3b), 16-bit registers,
+32-bit data; the live DT's qcom,actuator@0 / qcom,ois@0 sit on CCI 0 master 0
+(the IMX363's own lines) with cam_vaf (PM8150L GPIO 8) as supply.
+
+After the sensor's tables in stream_up() (IMX363 only): VAF settle 8 ms, the
+controller probed (status 0xF100, retried 50 ms), polled until ready, servos
+on (0xF01F <- 0, 0xF010 <- 7), the lens to the last position. A position is
+0xF01A <- 0x00020000 | code; positions 0 (infinity) .. 1023 (macro) map onto
+the module file's codes 400 .. 725 (boot-args sweetcam_af_inf/_mac change
+them; the per-unit calibration in the controller's flash is not read yet).
+The table also has AK737x and DW98xx-class VCM drivers for other modules
+(sweetcam_af=NAME forces one, sweetcam_af=none disables the lens).
+
+/dev/redwood-camera: FOCUS (a position, b = 1 park) is written at the next
+frame's end on the held bus, like the exposure; frames carry the position in
+`focus` (REDWOOD_CAMERA_NO_FOCUS without a lens motor) and LENS_MOVING in
+reserved[0] when the lens moved while any of their lines were exposed
+(10 ms + distance/32 ms of settling). Before VAF goes off the lens is parked
+in steps and the servos switched off (0xF010 <- 0x70000, 0xF01F <- 2).
+---
+ bsd/dev/sweet_cam.c | 353 +++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 351 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index 1f4f6f9..f07399a 100644
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -2036,12 +2036,305 @@ sensor_exposure(uint32_t lines, uint32_t gain, uint32_t frame_lines)
+ 	return ok;
+ }
+ 
++/* ==== 0929: the rear camera's lens ==== */
++
++/*
++ * The IMX363 module's lens motor is driven by an ON Semiconductor LC898129, the module's AF and OIS controller
++ * (with its own flash: no firmware download). Found 2026-10-25 in metric_imx363_lito2's module file
++ * (tools/redfin-camsensor.py -a): actuatorName, oisName and eepromName are all "lc898129dp"; the live DT's
++ * qcom,actuator@0 and qcom,ois@0 are on CCI 0 master 0 -- the IMX363's own lines -- with the supply cam_vaf
++ * (camera_ldo, PM8150L GPIO 8, switched on in the IMX363's power-up, VAF +8 ms in the actuator's own). The
++ * ultra-wide (IMX481) and the front camera (IMX355) are fixed-focus: their module files name no actuator.
++ *
++ * LC898129: slave 0x76 (7-bit 0x3b), 16-bit registers, 32-bit data sent most significant byte first. As the module
++ * file's actuator and OIS settings use it:
++ *   init      poll 0xF100 (status) until 0 (CamX gives it 100 ms) -- the controller is ready
++ *   servo on  0xF01F <- 0, poll, 0xF010 <- 7, poll (the OIS part's init and centering-on lists; OIS itself, 0xF012,
++ *             stays off here: no gyro)
++ *   position  0xF01A <- 0x00020000 | code, code 12 bits; the module file's tuning: initial code 400, one region of
++ *             325 steps of 1 code (so 400 ..725 until the per-unit calibration in the controller's flash is read;
++ *             boot-args sweetcam_af_inf / sweetcam_af_mac set the codes of positions 0 and 1023)
++ *   servo off 0xF010 <- 0x70000, poll, 0xF01F <- 2 (the OIS disable list's last writes)
++ * The table below also has the usual single-coil VCM drivers, for a module that has one (boot-arg sweetcam_af=NAME
++ * forces one, sweetcam_af=none none; by default the ones a sensor's module names are probed by a read of their
++ * status/ID register). Positions for iOS: 0 (infinity) to 1023 (macro), REDWOOD_CAMERA_NO_FOCUS without a lens motor.
++ */
++struct lens_write { uint16_t reg; uint32_t val; };
++struct lens_chip {
++	const char *name;
++	uint8_t slave;                  /* 7-bit */
++	uint8_t reg_bytes, data_bytes;
++	uint16_t probe_reg;             /* read to see it answers (and, with status_poll, polled until 0) */
++	bool status_poll;
++	uint16_t pos_reg;
++	uint32_t pos_or;                /* OR'ed into every position write */
++	uint8_t pos_shift;
++	uint16_t code_max, inf, mac;    /* the codes of positions 0 and 1023 by default */
++	struct lens_write on[4], off[4];        /* after the init / before the power goes; reg 0xffff ends */
++};
++#define LENS_END        { 0xffff, 0 }
++static const struct lens_chip lens_chips[] = {
++	{ "lc898129", 0x3b, 2, 4, 0xf100, true, 0xf01a, 0x00020000u, 0, 0xfff, 400, 725,
++	  { { 0xf01f, 0 }, { 0xf010, 7 }, LENS_END }, { { 0xf010, 0x70000 }, { 0xf01f, 2 }, LENS_END } },
++	/* AKM AK7375/AK7377: 10 bits at 0x00 (data shifted up 6), 0x02 = 0 active, 0x02 = 0x20 standby */
++	{ "ak737x", 0x0c, 1, 2, 0x02, false, 0x00, 0, 6, 0x3ff, 0, 1023, { { 0x02, 0x00 }, LENS_END },
++	  { { 0x02, 0x20 }, LENS_END } },
++	/* Dongwoon DW9800-class: 0x02 control (0 = on), 10 bits at 0x03 */
++	{ "dw98xx", 0x0c, 1, 2, 0x00, false, 0x03, 0, 0, 0x3ff, 0, 1023, { { 0x02, 0x00 }, LENS_END },
++	  { { 0x02, 0x01 }, LENS_END } },
++};
++/* the ones each sensor's module names, in probe order (sensors[] order: IMX363, IMX481, IMX355) */
++static const int8_t lens_of_sensor[3] = { 0, -1, -1 };
++
++#define LENS_MAX        1023u
++#define LENS_PARK_STEP  64u             /* positions per step when parking ... */
++#define LENS_PARK_MS    4               /* ... and the time between steps */
++
++static struct {
++	const struct lens_chip *chip;   /* the one found at the last power-up; NULL: none */
++	bool up, forced_none, args_read;
++	char forced[16];
++	uint32_t inf, mac;              /* codes of positions 0 and 1023 */
++	uint32_t pos;                   /* the position last written (kept between sessions: the next power-up goes back there) */
++	uint64_t moving_from, moving_until;     /* mach time: a frame exposed in between carries LENS_MOVING */
++} lens = { .pos = 0 };
++
++static void
++lens_args(void)
++{
++	if (lens.args_read) {
++		return;
++	}
++	lens.args_read = true;
++	char b[16] = { 0 };
++	if (PE_parse_boot_argn("sweetcam_af", b, sizeof(b))) {
++		b[sizeof(b) - 1] = 0;
++		if (b[0] == 0 || strcmp(b, "none") == 0) {     /* (sweetcam_af=0 comes as the number 0: an empty string) */
++			lens.forced_none = true;
++		} else {
++			strlcpy(lens.forced, b, sizeof(lens.forced));
++		}
++	}
++}
++
++/* a register write of the lens chip's: reg_bytes of address, data_bytes of data, most significant first */
++static bool
++lens_put(const struct lens_chip *c, uint16_t reg, uint32_t val)
++{
++	uint8_t b[6];
++	unsigned n = 0;
++	if (c->reg_bytes == 2) {
++		b[n++] = (uint8_t)(reg >> 8);
++	}
++	b[n++] = (uint8_t)reg;
++	for (int k = (int)c->data_bytes - 1; k >= 0; k--) {
++		b[n++] = (uint8_t)(val >> (8 * k));
++	}
++	return sensor_write(c->slave, b, n);
++}
++
++/* a register read of the lens chip's (data_bytes, most significant first); false if nobody answered */
++static bool
++lens_get(const struct lens_chip *c, uint16_t reg, uint32_t *val)
++{
++	const struct sensor *s = cm.s;
++	bool ok = false;
++	bus_take();
++	if (level(s->sda) && level(s->scl)) {
++		i2c_start(s->sda, s->scl);
++		ok = i2c_byte(s->sda, s->scl, (uint8_t)(c->slave << 1));
++		if (ok && c->reg_bytes == 2) {
++			ok = i2c_byte(s->sda, s->scl, (uint8_t)(reg >> 8));
++		}
++		ok = ok && i2c_byte(s->sda, s->scl, (uint8_t)reg);
++		if (ok) {
++			i2c_start(s->sda, s->scl);
++			ok = i2c_byte(s->sda, s->scl, (uint8_t)(c->slave << 1 | 1));
++		}
++		if (ok) {
++			uint32_t v = 0;
++			for (unsigned k = 0; k < c->data_bytes; k++) {
++				uint8_t byte = 0;
++				for (int i = 7; i >= 0; i--) {
++					byte = (uint8_t)(byte << 1 | i2c_bit(s->sda, s->scl, true));
++				}
++				(void)i2c_bit(s->sda, s->scl, k + 1 == c->data_bytes);   /* ACK all but the last */
++				v = v << 8 | byte;
++			}
++			*val = v;
++		}
++		i2c_stop(s->sda, s->scl);
++	}
++	bus_give();
++	return ok;
++}
++
++/* status_poll chips: the status register back to 0 within ms */
++static bool
++lens_ready(const struct lens_chip *c, unsigned ms)
++{
++	if (!c->status_poll) {
++		return true;
++	}
++	uint32_t st = ~0u;
++	for (unsigned t = 0; t <= ms; t++) {
++		if (lens_get(c, c->probe_reg, &st) && st == 0) {
++			return true;
++		}
++		delay(1000);
++	}
++	printf("SWEET CAM: lens %s: status %#x after %u ms\n", c->name, st, ms);
++	return false;
++}
++
++static bool
++lens_list(const struct lens_chip *c, const struct lens_write *w)
++{
++	for (; w->reg != 0xffff; w++) {
++		if (!lens_ready(c, 100) || !lens_put(c, w->reg, w->val)) {
++			printf("SWEET CAM: lens %s: %#x <- %#x not taken\n", c->name, w->reg, w->val);
++			return false;
++		}
++	}
++	return lens_ready(c, 100);
++}
++
++static uint32_t
++lens_code(uint32_t pos)
++{
++	pos = pos > LENS_MAX ? LENS_MAX : pos;
++	int64_t code = (int64_t)lens.inf + ((int64_t)lens.mac - (int64_t)lens.inf) * pos / LENS_MAX;
++	return code < 0 ? 0 : code > lens.chip->code_max ? lens.chip->code_max : (uint32_t)code;
++}
++
++static bool
++lens_write_pos(uint32_t pos)
++{
++	const struct lens_chip *c = lens.chip;
++	uint32_t code = lens_code(pos);
++	return lens_put(c, c->pos_reg, c->pos_or | code << c->pos_shift);
++}
++
++/* the frames exposed while it moves: from now for a VCM's settling time, longer the further it goes */
++static void
++lens_moving(uint32_t from, uint32_t to)
++{
++	uint32_t d = from > to ? from - to : to - from;
++	uint64_t span;
++	nanoseconds_to_absolutetime((uint64_t)(10 + d / 32) * NSEC_PER_MSEC, &span);
++	lens.moving_from = mach_absolute_time();
++	lens.moving_until = lens.moving_from + span;
++}
++
++/* after the sensor's tables (the bus held, VAF on): find the sensor's lens chip, start it, the lens where it was */
++static void
++lens_up(unsigned si)
++{
++	lens.up = false;
++	lens.chip = NULL;
++	lens_args();
++	if (lens.forced_none || si >= sizeof(lens_of_sensor) || (lens_of_sensor[si] < 0 && !lens.forced[0])) {
++		return;
++	}
++	sleep_ms(8);            /* VAF's settling (the actuator's power-up: VAF +8 ms) */
++	for (unsigned i = 0; i < sizeof(lens_chips) / sizeof(lens_chips[0]) && !lens.chip; i++) {
++		const struct lens_chip *c = &lens_chips[i];
++		uint32_t v = 0;
++		if (lens.forced[0] ? strcmp(lens.forced, c->name) != 0 : (int)i != lens_of_sensor[si]) {
++			continue;
++		}
++		bool there = false;
++		for (unsigned t = 0; t < 10 && !there; t++) {  /* (a controller still starting from its flash may not answer yet) */
++			there = lens_get(c, c->probe_reg, &v);
++			if (!there) {
++				sleep_ms(5);
++			}
++		}
++		if (!there) {
++			printf("SWEET CAM: lens %s: nothing at 0x%02x\n", c->name, c->slave);
++			continue;
++		}
++		lens.chip = c;
++	}
++	const struct lens_chip *c = lens.chip;
++	if (!c) {
++		return;
++	}
++	uint32_t inf = c->inf, mac = c->mac;
++	(void)PE_parse_boot_argn("sweetcam_af_inf", &inf, sizeof(inf));
++	(void)PE_parse_boot_argn("sweetcam_af_mac", &mac, sizeof(mac));
++	lens.inf = inf > c->code_max ? c->code_max : inf;
++	lens.mac = mac > c->code_max ? c->code_max : mac;
++	if (!lens_ready(c, 200) || !lens_list(c, c->on) || !lens_write_pos(lens.pos)) {
++		printf("SWEET CAM: lens %s did not start: no focus this session\n", c->name);
++		lens.chip = NULL;
++		return;
++	}
++	lens.up = true;
++	lens_moving(0, lens.pos);
++	printf("SWEET CAM: lens %s at 0x%02x ready: position %u (code %u; 0..1023 = codes %u..%u)\n", c->name, c->slave, lens.pos,
++	    lens_code(lens.pos), lens.inf, lens.mac);
++}
++
++/* to position pos (0..1023) now; false if the chip did not take it (the lens is given up for the session) */
++static bool
++lens_move(uint32_t pos)
++{
++	if (!lens.up) {
++		return false;
++	}
++	pos = pos > LENS_MAX ? LENS_MAX : pos;
++	if (pos == lens.pos) {
++		return true;
++	}
++	if (!lens_write_pos(pos)) {
++		printf("SWEET CAM: lens %s: position %u not taken: no focus this session\n", lens.chip->name, pos);
++		lens.up = false;
++		return false;
++	}
++	lens_moving(lens.pos, pos);
++	lens.pos = pos;
++	return true;
++}
++
++/* back to infinity a step at a time (no knock at the end stop) */
++static void
++lens_park(void)
++{
++	while (lens.up && lens.pos > 0) {
++		uint32_t to = lens.pos > LENS_PARK_STEP ? lens.pos - LENS_PARK_STEP : 0;
++		if (!lens_move(to)) {
++			break;
++		}
++		delay(LENS_PARK_MS * 1000);
++	}
++}
++
++/* before VAF goes: parked, the servos off; lens.pos keeps the position asked for (the next power-up goes back to it) */
++static void
++lens_down(void)
++{
++	if (!lens.chip) {
++		return;
++	}
++	if (lens.up) {
++		uint32_t keep = lens.pos;
++		lens_park();
++		(void)lens_list(lens.chip, lens.chip->off);
++		lens.pos = keep;        /* the next session goes back to it */
++		printf("SWEET CAM: lens %s parked\n", lens.chip->name);
++	}
++	lens.up = false;
++	lens.chip = NULL;
++}
++
+ static void
+ sensor_down(void)
+ {
+ 	const struct sensor *s = cm.s;
+ 	bool was = cm.broken;
+ 	cm.broken = false;
++	lens_down();            /* 0929: on the held bus, VAF still on */
+ 	bus.held = false;
+ 	bus_give();
+ 	run_steps(s->down, false);
+@@ -2115,6 +2408,9 @@ stream_up(unsigned si, unsigned mode_n, unsigned pattern, unsigned settle, uint3
+ 		ok = sensor_table("init") && sensor_table(res) && sensor_exposure(lines, gain, frame_lines) &&
+ 		    (!pattern || sensor_table(tpg));
+ 	}
++	if (ok) {
++		lens_up(si);    /* 0929: the lens motor, where the module has one (a failure there only means no focus) */
++	}
+ 	if (ok) {
+ 		cstep("CSID reset");
+ 		ok = csid_reset();
+@@ -2285,6 +2581,13 @@ struct redwood_camera_frame {
+ };
+ #define REDWOOD_CAMERA_NO_FOCUS         0xffffffffu
+ enum { REDWOOD_CAMERA_EXPOSURE = 1, REDWOOD_CAMERA_KEEP = 2, REDWOOD_CAMERA_SENSOR = 3, REDWOOD_CAMERA_FOCUS = 4 };
++/* 0929-0933 (the shared contract with phone/audio/redwood_camera.h): reserved[0] flags, [1]/[2] start of frame (mach
++ * time, low/high 32 bits), [3] digital gain (unity | max << 16; 0 none), [4] the mode's frames a second x 1000 */
++#define REDWOOD_CAMERA_FLAG_FLASH_LIT           (1u << 0)
++#define REDWOOD_CAMERA_FLAG_LENS_MOVING         (1u << 1)
++#define REDWOOD_CAMERA_FLAG_MODE_CHANGED        (1u << 2)
++#define REDWOOD_CAMERA_FOCUS_MOVE               0
++#define REDWOOD_CAMERA_FOCUS_PARK               1
+ struct redwood_camera_command { uint32_t command, bytes, a, b, c, d; };
+ 
+ #define RING                    3
+@@ -2309,6 +2612,8 @@ static struct {
+ 	uint8_t         state;
+ 	uint64_t        sequence, time;
+ 	uint32_t        exposure_lines, gain, frame_lines;
++	uint64_t        sof;            /* 0929: its start of frame (mach time) */
++	uint32_t        focus, flags;   /* 0929: the lens's position (or REDWOOD_CAMERA_NO_FOCUS), REDWOOD_CAMERA_FLAG_* */
+ } place[RING];
+ static uint64_t ring_pa, ring_bytes, place_bytes;
+ static vm_offset_t ring_va;
+@@ -2323,6 +2628,7 @@ static struct { uint32_t lines, gain, frame_lines; bool pending; } ios_ask;
+ static struct { uint32_t lines, gain, frame_lines; uint64_t from; } ios_now, ios_next;
+ static volatile unsigned ios_switch_to;        /* 1 + ours */
+ static uint32_t ios_switch_mode = ~0u;
++static struct { uint32_t pos; bool pending, park; } ios_focus;     /* 0929: FOCUS, done after the next frame's end */
+ 
+ static uint64_t
+ ios_ms(void)
+@@ -2552,6 +2858,15 @@ ios_session(void)
+ 			place[writing].exposure_lines = ios_now.lines;
+ 			place[writing].gain = ios_now.gain;
+ 			place[writing].frame_lines = ios_now.frame_lines;
++			/* 0929: the lens; moving if it moved while any of the frame's lines were exposed (first line: SOF - exposure) */
++			place[writing].focus = lens.up ? lens.pos : REDWOOD_CAMERA_NO_FOCUS;
++			place[writing].flags = 0;
++			uint64_t exposed;
++			nanoseconds_to_absolutetime((uint64_t)ios_now.lines * ios_line_ns, &exposed);
++			if (lens.up && lens.moving_until > place[writing].sof - MIN(exposed, place[writing].sof) &&
++			    lens.moving_from < place[writing].time) {
++				place[writing].flags |= REDWOOD_CAMERA_FLAG_LENS_MOVING;
++			}
+ 		}
+ 		if (top & RDI0_SOF) {
+ 			if (next >= 0) {
+@@ -2561,6 +2876,7 @@ ios_session(void)
+ 				ios_writes_late++;      /* no address waiting: this frame goes where the last one went */
+ 			}
+ 			place[writing].state = PLACE_WRITING;
++			place[writing].sof = mach_absolute_time();
+ 			for (int i = 0; i < RING; i++) {
+ 				int c = (writing + 1 + i) % RING;
+ 				if (c != writing && place[c].state != PLACE_READING && (next < 0 || place[c].sequence < place[next].sequence)) {
+@@ -2575,7 +2891,29 @@ ios_session(void)
+ 		bool ask = (bus_st & WM0_DONE) && ios_ask.pending;
+ 		uint32_t al = ios_ask.lines, ag = ios_ask.gain, af = ios_ask.frame_lines;
+ 		ios_ask.pending = ios_ask.pending && !ask;
++		/* 0929: a lens move, written at a frame's end like the exposure (on the same held bus) */
++		bool focus = (bus_st & WM0_DONE) && ios_focus.pending;
++		uint32_t fpos = ios_focus.pos;
++		bool fpark = ios_focus.park;
++		ios_focus.pending = ios_focus.pending && !focus;
+ 		lck_mtx_unlock(&ios_lock);
++		if (focus && lens.up) {
++			if (fpark) {
++				/* a step a frame back to infinity, the next step asked for again until it is there */
++				uint32_t to = lens.pos > 4 * LENS_PARK_STEP ? lens.pos - 4 * LENS_PARK_STEP : 0;
++				(void)lens_move(to);
++				if (lens.up && lens.pos > 0) {
++					lck_mtx_lock(&ios_lock);
++					if (!ios_focus.pending) {
++						ios_focus.pending = true;
++						ios_focus.park = true;
++					}
++					lck_mtx_unlock(&ios_lock);
++				}
++			} else {
++				(void)lens_move(fpos);
++			}
++		}
+ 		if (bus_st & WM0_DONE) {
+ 			wakeup(&ios_frames_done);
+ 		}
+@@ -2737,7 +3075,8 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 	f.frame_lines_max = FRAME_LINES_MAX;
+ 	f.margin = EXPOSURE_MARGIN;
+ 	f.sensor = ours_to_ios[ios_sensor];
+-	f.focus = REDWOOD_CAMERA_NO_FOCUS;
++	f.focus = place[b].focus;                       /* 0929 */
++	f.reserved[0] = place[b].flags;
+ 	vm_offset_t at = ring_va + (uint64_t)b * place_bytes;
+ 	uint32_t frame_bytes = ring_frame_bytes;
+ 	lck_mtx_unlock(&ios_lock);
+@@ -2792,7 +3131,17 @@ camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		lck_mtx_unlock(&ios_lock);
+ 		return 0;
+ 	case REDWOOD_CAMERA_FOCUS:
+-		return 0;               /* (no lens motor driver yet: the frames say REDWOOD_CAMERA_NO_FOCUS) */
++		/* 0929: a position 0 (infinity) .. 1023 (macro), b = 1 park; taken at the next frame's end (the frames say
++		 * REDWOOD_CAMERA_NO_FOCUS where there is no lens motor, and then this does nothing) */
++		if (c.b > REDWOOD_CAMERA_FOCUS_PARK) {
++			return EINVAL;
++		}
++		lck_mtx_lock(&ios_lock);
++		ios_focus.pos = c.a > LENS_MAX ? LENS_MAX : c.a;
++		ios_focus.park = c.b == REDWOOD_CAMERA_FOCUS_PARK;
++		ios_focus.pending = true;
++		lck_mtx_unlock(&ios_lock);
++		return 0;
+ 	case REDWOOD_CAMERA_SENSOR:
+ 		if (c.a >= 4 || ios_to_ours[c.a] == ~0u) {
+ 			return EINVAL;
+-- 
+2.43.0
+
