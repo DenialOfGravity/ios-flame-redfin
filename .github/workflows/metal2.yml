@@ -10,6 +10,9 @@ on:
     branches: [sunfish, redfin]
     paths: [.github/workflows/metal2.yml, "phone/metal2/**", "phone/turnip/**"]
 
+permissions:
+  contents: write
+
 env:
   MESA_COMMIT: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
   UNIXNU_COMMIT: e95b37d97875bd8b30c976fcdef44d35d9c27bf3
@@ -77,3 +80,20 @@ jobs:
             phone/turnip/out/
             work/turnip/*.log
             work/m2v-bridge/*.log
+
+      # Also to branch builds-metal2 (one force-pushed commit): artifact downloads are blocked where Claude works
+      - name: Publish to the builds-metal2 branch
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          P=$RUNNER_TEMP/publish
+          rm -rf "$P" && mkdir -p "$P" && cd "$P"
+          git init -q -b builds-metal2
+          cp -R "$GITHUB_WORKSPACE"/phone/metal2/out/SweetMetal2.bundle .
+          printf 'source %s\nref %s\nrun %s\n' "$GITHUB_SHA" "$GITHUB_REF_NAME" "$GITHUB_RUN_ID" > BUILD.txt
+          git add -A
+          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com \
+            commit -qm "SweetMetal2.bundle from $GITHUB_REF_NAME ${GITHUB_SHA::12} (run $GITHUB_RUN_ID)"
+          git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-metal2

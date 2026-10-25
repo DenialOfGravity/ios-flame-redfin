@@ -129,7 +129,7 @@ static void waitForResource(id resource);
 @property(nonatomic) NmbTextureDescriptor descriptor;
 @property(nonatomic,strong) NBBuffer *buffer;
 @property(nonatomic) IOSurfaceRef surface;
-@property(nonatomic) NSUInteger offset,rowBytes;
+@property(nonatomic) NSUInteger offset,rowBytes,plane;
 @property(nonatomic,strong) id<MTLTexture> parent;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
 @property(nonatomic) NSUInteger heapOffset;
@@ -209,7 +209,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_descriptor.options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
 - (BOOL)isFramebufferOnly {return NO;}
 - (IOSurfaceRef)iosurface {return _surface;}
-- (NSUInteger)iosurfacePlane {return 0;}
+- (NSUInteger)iosurfacePlane {return _plane;}
 - (id<MTLBuffer>)buffer {return _surface?nil:(id<MTLBuffer>)_buffer;}
 - (NSUInteger)bufferOffset {return _offset;}
 - (NSUInteger)bufferBytesPerRow {return _rowBytes;}
@@ -1412,14 +1412,34 @@ static char sweetMemoryOwnerKey;
 }
 // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
 // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
+// A plane of a planar surface (the camera's 420f/420v pictures: an R8 texture over the luma plane, an RG8 one over the
+// chroma plane, as Core Animation asks for them) is a texture at that plane's offset with that plane's rows.
+// (Redfin: before this every planar surface was refused, and Camera.app's preview stayed black.)
+static void noteSurfaceTexture(IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,size_t planes,NSUInteger offset,
+                               NSUInteger row,const char *what) {
+ static std::mutex lock;static std::vector<uint64_t> seen;
+ const uint64_t key=((uint64_t)IOSurfaceGetPixelFormat(surface)<<32)^((uint64_t)d.pixelFormat<<8)^(plane<<4)^planes^((uint64_t)(what[0])<<56);
+ {std::lock_guard<std::mutex> l(lock);for(uint64_t k:seen)if(k==key)return;if(seen.size()<64)seen.push_back(key);else return;}
+ const uint32_t f=IOSurfaceGetPixelFormat(surface);
+ NBLOG(@"native-metal: IOSurface texture %s: surface %c%c%c%c %zux%zu, %zu planes; plane %lu as format %lu %lux%lu, offset %lu, %lu bytes a row",
+       what,(char)(f>>24),(char)(f>>16),(char)(f>>8),(char)f,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),planes,
+       (unsigned long)plane,(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)offset,(unsigned long)row);
+}
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
- if(!surface || !d || plane || IOSurfaceGetPlaneCount(surface))return nil;
+ if(!surface || !d)return nil;
+ const size_t planes=IOSurfaceGetPlaneCount(surface);
+ if(planes?plane>=planes:plane!=0){noteSurfaceTexture(surface,d,plane,planes,0,0,"refused (no such plane)");return nil;}
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
  if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1))return nil;
  const size_t bytes=(allocation+page-1)&~(page-1);
+ const NSUInteger offset=planes?(NSUInteger)((uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,plane)-(uintptr_t)base):0;
+ const NSUInteger row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
+ if(planes && (!row || offset>=bytes)){noteSurfaceTexture(surface,d,plane,planes,offset,row,"refused (plane geometry)");return nil;}
  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer)return nil;
- NBTexture *texture=textureOnBuffer(buffer,d,0,IOSurfaceGetBytesPerRow(surface),true);if(!texture)return nil;
- texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
+ NBTexture *texture=textureOnBuffer(buffer,d,offset,row,true);
+ if(planes)noteSurfaceTexture(surface,d,plane,planes,offset,row,texture?"made":"refused");
+ if(!texture)return nil;
+ texture.plane=plane;texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
 }
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
