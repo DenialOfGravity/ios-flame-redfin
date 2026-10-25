@@ -367,9 +367,34 @@ test_integer_pictures(void)
 	compare("full CbCr", fuv[0], fuv[1], (size_t)w * h / 2);
 }
 
-int
-main(void)
+/* isp_hosttest tuning FILE LUX CCT: the file as isp_load_tuning() reads it, and what isp_tune() makes of it there */
+static int
+show_tuning(const char *path, float lux, float cct)
 {
+	struct isp isp;
+
+	isp_init(&isp);
+	if (!isp_load_tuning(&isp, path)) {
+		printf("not a tuning file\n");
+		return 1;
+	}
+	isp_tune(&isp, lux, cct);
+	printf("lights %u %u refs %u\n", isp.tuning->ccm.lights, isp.tuning->lsc.lights, isp.tuning->refs);
+	printf("ccm %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n", isp.ccm[0][0], isp.ccm[0][1], isp.ccm[0][2], isp.ccm[1][0],
+	    isp.ccm[1][1], isp.ccm[1][2], isp.ccm[2][0], isp.ccm[2][1], isp.ccm[2][2]);
+	printf("lsc %.4f %.4f %.4f %.4f\n", isp.lsc.gain[0][6][8], isp.lsc.gain[0][0][0], isp.lsc.gain[1][0][0], isp.lsc.gain[2][12][16]);
+	isp.wb[0] = 1 / isp.tuning->ref[0][0];
+	isp.wb[2] = 1 / isp.tuning->ref[0][1];
+	printf("cct %.0f\n", isp_cct(&isp));
+	return 0;
+}
+
+int
+main(int argc, char **argv)
+{
+	if (argc == 5 && strcmp(argv[1], "tuning") == 0) {
+		return show_tuning(argv[2], (float)atof(argv[3]), (float)atof(argv[4]));
+	}
 	test_integer_pictures();
 	test_ae_dark_does_not_freeze();
 	test_ae_bright();

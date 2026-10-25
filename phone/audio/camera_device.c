@@ -1875,7 +1875,7 @@ af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const 
 	}
 }
 
-/* the sensor's colour tuning, when the image has one (fw/camera-<sensor>.isp, tools/camtuning.py) */
+/* the sensor's colour tuning, when the image has one (fw/camera-<sensor>.isp, tools/redfin-camtune.py) */
 static void
 load_tuning(struct isp *isp, uint32_t sensor)
 {

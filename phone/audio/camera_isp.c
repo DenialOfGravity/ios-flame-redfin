@@ -1160,7 +1160,7 @@ isp_lsc_from_flat(struct isp *isp, const struct redwood_camera_frame *f, const u
 	return true;
 }
 
-/* one module's part of a tuning file (tools/camtuning.py): its ranges, and where each range's values are */
+/* one module's part of a tuning file (tools/redfin-camtune.py): its ranges, and where each range's values are */
 static bool
 tune_set(const uint8_t **p, const uint8_t *end, struct isp_tune_set *set, size_t floats)
 {
