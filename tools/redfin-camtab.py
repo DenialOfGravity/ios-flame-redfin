@@ -28,6 +28,12 @@ OUT.tab ("RFCTAB01", all little-endian u32 unless said):
   tables x { name[8], count, count x { address u16, data u16, address bytes u8, data bytes u8,
              operation u8, 0 u8, delay in us } }
 The modes' own tables are res0, res1, ...; the others init, on, off, holdon, holdoff, tpg0, tpg1, ...
+and "info" (2026-10-25, kernel 0931; older kernels ignore it): the sensor driver's exposure facts as { key, value }
+entries (address = key, data = value): 1 the exposure margin in lines (verticalOffset: lines <= frame - margin),
+2 the black level (10-bit), 3 the most analog gain x 256, 4 the most digital gain x 256, 5 the digital gain
+register (Sony: 0x020e, then 0x0210, 0x0212, 0x0214 for the four colours). Found in the driver data's words
+(sensorDriverData as u64s): [43] maxAnalogGain, [44] maxDigitalGain (doubles), [47] verticalOffset, [75] the
+first black level (after [74], the white level 1023); the register in the symbol digitalGlobalGainAddr.
 """
 import struct
 import sys
@@ -101,6 +107,18 @@ def main():
         elif n < len(roles.get(after, [])):
             tables.append((roles[after][n], regsetting(sid)))
         # (the EEPROM's and others' settings are not the sensor's)
+
+    # the exposure facts (kernel 0931's "info" table)
+    dbl = lambda x: struct.unpack('<d', struct.pack('<Q', x))[0]
+    dw = struct.unpack_from('<80Q', data, 0)
+    dgr = next((s for s in order if syms[s][0] == 'digitalGlobalGainAddr' and syms[s][2] >= 8), None)
+    info = [(1, dw[47]), (2, dw[75]), (3, int(round(dbl(dw[43]) * 256))), (4, int(round(dbl(dw[44]) * 256)))]
+    if dgr is not None:
+        info.append((5, words(dgr)[0]))
+    if all(0 < v <= 0xffff for _, v in info) and dw[74] == 1023:
+        tables.append(('info', [(k, v, 2, 2, 0, 0) for k, v in info]))
+    else:
+        print(f'  (no info table: driver data words {[hex(x) for x in (dw[43], dw[44], dw[47], dw[74], dw[75])]})')
 
     print(f'{sys.argv[1]}: slave {slave:#x}, lane assignment {lane_assign:#x}')
     cfa = {0: 'BGGR', 1: 'GBRG', 2: 'GRBG', 3: 'RGGB', 4: 'mono'}
