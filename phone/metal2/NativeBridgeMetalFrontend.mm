@@ -232,6 +232,10 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
 // (1125x1500) and some of its controls failed ("Failed to allocate [1125 x 1500] b3a8 framebuffer"). They are made
 // BGRA8Unorm(_sRGB) over the BGRA plane, the same in every texture, view and pipeline, so the only loss is the range
 // beyond 0..1 and the separate alpha plane.
+// (C2 note: what is lost is the range above 1.0 and the A8 plane's alpha, which reads 1. metal2vulkan 720ef1ce can hold 550/551 over
+// a b3a8 surface's two planes itself (texture/surface_two_planes.rs: an R32G32_UINT image and a shadow of both planes) given the
+// surface's facts, which nmb_texture_new_on_surface now passes; not used: every such layer would be copied in and out per pass, and
+// backboardd's framebuffer stays 8-bit (supportsExtendedXR10Formats answers no there).)
 static uint64_t sweetFormat(uint64_t format) {return format==550?80:format==551?81:format;}
 static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
  if(!d)return false;
