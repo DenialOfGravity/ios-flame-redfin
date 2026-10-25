@@ -222,6 +222,21 @@ B4 (decide after B2) 0982 stand-in transport (kctl `com.apple.uart.bluetooth`, `
    btd faking the Broadcom init/vendor commands; or the honest fallback (BLE for a test app/CLI only). Stage 3 is not
    started until B2's answers are in this doc.
 
+**WS-B tools (phase 1, CI only).** `phone/bt/btd` (userland.yml; host test `tlv_test.c` runs first: TLV segmenter,
+NVM edits, the whole bring-up against a fake controller; its log ships as `tlv_test.log`). Install to
+`/var/local/bin/btd`; firmware `crbtfw32.tlv`, `crnv32.bin`, `crnv32u.bin` from Android's `/vendor/firmware` to
+`/private/var/local/fw/` (never in git). `btd --probe` | `--up` | `--scan [S]` | `--raw [PORT]`; options `--baud`
+(default 3000000: 96 MHz source at CX LOW; 3.2 M needs 102.4 MHz = NOMINAL), `--os 16|32`, `--pmem`, `--fw/--nvm/--fwdir`,
+`--ibs` (keep the NVM's in-band/deep sleep; default off so the host needs no IBS), `--bdaddr`, `--noinit`, `-v/-q`.
+Backend `/dev/btuart` (0981, `btuart=1`) if present, else SE5 polled over `/dev/pmem`. Result lines `BTD PROBE`,
+`BTD UP`, `BTD ADV`, `BTD SCAN`, `BTD RAW`, failures `BTD FAIL <step>: <meaning>`; exit 0 ok, 1 failure, 3 up but
+no advertisement. `--raw`: `ssh -L 2225:127.0.0.1:2225 phone`, then on Linux
+`socat PTY,link=/tmp/btpty,raw,echo=0 TCP:127.0.0.1:2225 & btattach -P h4 -B /tmp/btpty` (or any H4 client).
+0980 `sweetbtlog=1` (grep `SWEET BTLOG` and `IOK bluetoothd|IOK BlueTool|IOK wirelessproxd`), 0981 `btuart=1`
+(`SWEET BTUART`, poke `b 0|1|2`). `tools-claude/bt-spike.sh ROOT [--adt DT] [--kc KC]` in WSL: launchd jobs,
+binaries + linked libraries + entitlements, strings by topic in the daemons and the shared cache, firmware dirs,
+ADT uart/bluetooth nodes, kernelcache kexts; report in `bt-spike-report.txt`.
+
 ## 5. Phase plan and phone schedule
 
 Phase 1 (now, CI only, all five in parallel): D1-D5, A1-A5, P1-P8 + P10, S1-S4, B1-B3. Each worker ends with a report

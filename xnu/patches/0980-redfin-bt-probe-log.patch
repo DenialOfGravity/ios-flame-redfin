@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WS-B <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 00:49:16 +0100
+Subject: [PATCH 1/2] 0980 redfin: Bluetooth probe logging (sweetbtlog=1)
+
+What iOS 16's Bluetooth daemons look for on a phone with no Apple
+Bluetooth hardware, for one probe boot (default off; nothing changes
+without the boot-arg):
+- bsd/kern/kern_control.c: every kernel-control name asked for with
+  CTLIOCGINFO (BlueTool historically used com.apple.uart.bluetooth),
+  with the caller and found/ENOENT.
+- bsd/vfs/vfs_syscalls.c: every failing open() of a /dev node named
+  bt..., uart..., cu.... or containing "bluetooth" (/dev/btwake,
+  /dev/btreset, /dev/btpoweroff, /dev/cu.bluetooth, /dev/uart.bluetooth).
+- iokit/Kernel/IOUserClient.cpp: the existing sweetiolog trace (matching
+  dictionaries, notifications, registry paths, user-client opens) now
+  follows bluetoothd, BlueTool, wirelessproxd, bluetoothuserd and
+  BTLEServer (added to sweetiolog= when given, else instead of the
+  backboardd/SpringBoard default), up to 1000 lines.
+Log lines "SWEET BTLOG:" (at most 300 of each kind) and "IOK <process>:".
+---
+ bsd/kern/kern_control.c       | 42 +++++++++++++++++++++++++++++++++++
+ bsd/vfs/vfs_syscalls.c        | 36 +++++++++++++++++++++++++++++-
+ iokit/Kernel/IOUserClient.cpp | 10 +++++++--
+ 3 files changed, 85 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/kern/kern_control.c b/bsd/kern/kern_control.c
+index 539730e..aa93b93 100644
+--- a/bsd/kern/kern_control.c
++++ b/bsd/kern/kern_control.c
+@@ -56,6 +56,8 @@
+ #include <mach/vm_types.h>
+ 
+ #include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include <sys/proc.h>
+ 
+ struct kctl {
+ 	TAILQ_ENTRY(kctl)       next;           /* controller chain */
+@@ -1418,6 +1420,43 @@ out:
+ 	return error;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * redfin 0980, boot-arg sweetbtlog=1: what iOS's Bluetooth daemons look for. Every kernel-control name
++ * asked for with CTLIOCGINFO (BlueTool historically opened com.apple.uart.bluetooth this way), every
++ * failing open() of a /dev node named bt..., uart..., cu.... or containing "bluetooth"
++ * (bsd/vfs/vfs_syscalls.c), and the
++ * IOKit trace (IOUserClient.cpp sweet_iolog) extended to bluetoothd, BlueTool, wirelessproxd,
++ * bluetoothuserd and BTLEServer. "SWEET BTLOG:" lines, at most 300 of each kind per boot.
++ */
++int sweet_btlog_on(void);
++
++int
++sweet_btlog_on(void)
++{
++	static int on = -1;
++	if (on < 0) {
++		int v = 0;
++		on = PE_parse_boot_argn("sweetbtlog", &v, sizeof(v)) && v;
++	}
++	return on;
++}
++
++static void
++sweet_btlog_kctl(const char *name, int found)
++{
++	static uint32_t lines;
++	if (!sweet_btlog_on() || lines >= 300) {
++		return;
++	}
++	lines++;
++	char pname[32];
++	proc_selfname(pname, sizeof(pname));
++	printf("SWEET BTLOG: kctl CTLIOCGINFO \"%.96s\" by %s[%d] -> %s\n", name, pname, proc_selfpid(),
++	    found ? "found" : "ENOENT");
++}
++#endif
++
+ static int
+ ctl_ioctl(struct socket *so, u_long cmd, caddr_t data,
+     struct ifnet *ifp, struct proc *p)
+@@ -1455,6 +1494,9 @@ ctl_ioctl(struct socket *so, u_long cmd, caddr_t data,
+ 		lck_mtx_lock(&ctl_mtx);
+ 		kctl = ctl_find_by_name(ctl_info.ctl_name);
+ 		lck_mtx_unlock(&ctl_mtx);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		sweet_btlog_kctl(ctl_info.ctl_name, kctl != 0);
++#endif
+ 		if (kctl == 0) {
+ 			error = ENOENT;
+ 			break;
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 6b27234..20d92fa 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -5030,7 +5030,36 @@ open_dprotected_np(__unused proc_t p, struct open_dprotected_np_args *uap, int32
+ 	           uap->class, uap->dpflags, AT_FDCWD, AUTH_OPEN_NOAUTHFD, UIO_USERSPACE, retval);
+ }
+ 
+-static int
++static #if defined(ARM64_BOARD_CONFIG_SWEET)
++/* redfin 0980 (sweetbtlog=1, bsd/kern/kern_control.c): failing opens of Bluetooth-looking device nodes */
++extern int sweet_btlog_on(void);
++
++static void
++sweet_btlog_open(user_addr_t upath, int error)
++{
++	static uint32_t lines;
++	char p[96];
++	size_t len = 0;
++	if (!sweet_btlog_on() || lines >= 300 || copyinstr(upath, p, sizeof(p), &len) || strncmp(p, "/dev/", 5)) {
++		return;
++	}
++	const char *n = p + 5;
++	bool bt = !strncmp(n, "bt", 2) || !strncmp(n, "uart", 4) || !strncmp(n, "cu.", 3);
++	for (const char *q = n; !bt && *q; q++) {
++		bt = !strncmp(q, "bluetooth", 9);
++	}
++	if (!bt) {
++		return;
++	}
++	lines++;
++	char pname[32];
++	proc_selfname(pname, sizeof(pname));
++	printf("SWEET BTLOG: open %s by %s[%d] -> %s (%d)\n", p, pname, proc_selfpid(),
++	    error == ENOENT ? "ENOENT" : "error", error);
++}
++#endif
++
++int
+ openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
+     int fd, enum uio_seg segflg, int *retval)
+ {
+@@ -5060,6 +5089,11 @@ openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
+ 
+ 	kfree_type(typeof(*__open_data), __open_data);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (error && segflg == UIO_USERSPACE) {
++		sweet_btlog_open(path, error);
++	}
++#endif
+ 	return error;
+ }
+ 
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index 163fce1..56c0ad5 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -2610,17 +2610,23 @@ static
+ static char sweet_iolog_names[128];
+ static int sweet_iolog_parsed;
+ static uint32_t sweet_iolog_lines;
++/* redfin 0980: sweetbtlog=1 traces the Bluetooth daemons (instead of the default pair), up to 1000 lines */
++extern "C" int sweet_btlog_on(void);
++#define SWEET_BT_PROCS "bluetoothd,BlueTool,wirelessproxd,bluetoothuserd,BTLEServer"
+ 
+ static bool
+ sweet_iolog(char *name, size_t len)
+ {
+ 	if (!sweet_iolog_parsed) {
+ 		if (!PE_parse_boot_argn("sweetiolog", sweet_iolog_names, sizeof(sweet_iolog_names))) {
+-			strlcpy(sweet_iolog_names, "backboardd,SpringBoard", sizeof(sweet_iolog_names));
++			strlcpy(sweet_iolog_names, sweet_btlog_on() ? SWEET_BT_PROCS : "backboardd,SpringBoard",
++			    sizeof(sweet_iolog_names));
++		} else if (sweet_btlog_on()) {
++			strlcat(sweet_iolog_names, "," SWEET_BT_PROCS, sizeof(sweet_iolog_names));
+ 		}
+ 		sweet_iolog_parsed = 1;
+ 	}
+-	if (sweet_iolog_lines >= 400) {
++	if (sweet_iolog_lines >= (sweet_btlog_on() ? 1000u : 400u)) {
+ 		return false;
+ 	}
+ 	proc_selfname(name, (int)len);
+-- 
+2.43.0
+
