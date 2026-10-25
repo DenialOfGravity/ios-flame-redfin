@@ -175,9 +175,12 @@ def build(seed=None, qemu=False, highmem=False, camera=False, flash=False):
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # SMP: all eight cores in physical-core order (flame: 0-3 Cortex-A55,
-    # 4-6 Cortex-A76, 7 the A76 prime core), one homogeneous cluster. The
-    # kernel defaults to one and uses cpus=N to select an initial prefix.
+    # SMP: all eight cores in physical-core order (redfin/lito: 0-5 Cortex-A55
+    # "silver", 6 the A76 "gold", 7 the A76 "prime"), one homogeneous cluster.
+    # The kernel defaults to one and uses cpus=N to select an initial prefix.
+    # cluster-type stays 0: this kernel has MAX_CPU_CLUSTERS 1 and no
+    # __ARM_AMP__, and ml_parse_cpu_topology() would give a 'P' core cluster
+    # id 1 (out of range). Big-core placement is patch 0147/0962 (sweetbig).
     # QEMU retains its original single-CPU tree: its MPIDRs differ.
     cpu_nodes = []
     for core in range(1 if qemu else 8):
@@ -195,7 +198,8 @@ def build(seed=None, qemu=False, highmem=False, camera=False, flash=False):
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2841600000 if core == 7 else 2419200000 if core >= 4 else 1785600000)),
+            # redfin cpufreq-hw top rows (0962): silver 1804.8, gold 2208, prime 2400 MHz
+            ('clock-frequency', u32(2400000000 if core == 7 else 2208000000 if core == 6 else 1804800000)),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
