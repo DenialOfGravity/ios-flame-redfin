@@ -434,9 +434,9 @@ static const struct camera {
 } cameras[2] = {
 	{ 1, "Back Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:0", false, 4.0, 1.8, 1.22, 65.0,
 	  { { 4032, 3024, 30 }, { 4224, 2376, 60 } } },        /* "Photo", "Video-60" */
-	/* redfin: the front IMX355 is mounted as the back IMX363 is turned (DT sensor-position-roll 270 and 90), as an
-	 * iPhone's are: not turned (HackiOS's phone's was); the optics are still HackiOS's numbers */
-	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", false, 2.87, 2.2, 1.0, 70.0,
+	/* redfin: the front IMX355's pictures came out upside down untouched (r18g, Camera.app's own thumbnail): turned,
+	 * as HackiOS's phone's was; the optics are still HackiOS's numbers */
+	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", true, 2.87, 2.2, 1.0, 70.0,
 	  { { 3088, 2320, 30 }, { 3840, 2160, 30 } } },        /* "Photo", "Video-30" */
 };
 

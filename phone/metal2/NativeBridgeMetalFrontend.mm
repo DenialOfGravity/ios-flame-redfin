@@ -130,6 +130,7 @@ static void waitForResource(id resource);
 @property(nonatomic,strong) NBBuffer *buffer;
 @property(nonatomic) IOSurfaceRef surface;
 @property(nonatomic) NSUInteger offset,rowBytes,plane;
+@property(nonatomic) uint64_t reportedFormat;   // non-zero: the format the client asked for (a converted copy's)
 @property(nonatomic,strong) id<MTLTexture> parent;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
 @property(nonatomic) NSUInteger heapOffset;
@@ -202,7 +203,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 @implementation NBTexture
 - (void)dealloc {nmb_texture_release(_handle);if(_surface)CFRelease(_surface);}
 - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
-- (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)_descriptor.format;}
+- (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)(_reportedFormat?_reportedFormat:_descriptor.format);}
 - (NSUInteger)width {return _descriptor.width;}
 - (NSUInteger)height {return _descriptor.height;}
 - (NSUInteger)depth {return _descriptor.depth;}
@@ -1431,19 +1432,59 @@ static void noteSurfaceTexture(IOSurfaceRef surface,MTLTextureDescriptor *d,NSUI
        what,(char)(f>>24),(char)(f>>16),(char)(f>>8),(char)f,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),planes,
        (unsigned long)plane,(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)offset,(unsigned long)row);
 }
+// MTLPixelFormatYCBCR8_420_2P (500) and its sRGB twin (501): Core Animation asks for one texture over both planes of a
+// 420f/420v surface (photographs in Photos, videos, the camera). Turnip has no such format. The texture made instead is
+// an RGBA8 copy holding Y, Cb, Cr, 1 in r, g, b, a (what sampling the YCbCr format gives: the colour matrix is the
+// shader's), filled from the surface when the texture is made. It does not follow later writes to the surface, which is
+// right for pictures and wrong for moving ones (the camera's preview is asked for in BGRA, inject_media.c).
+static NBTexture *ycbcrCopy(IOSurfaceRef surface,MTLTextureDescriptor *d) {
+ if(IOSurfaceGetPlaneCount(surface)!=2)return nil;
+ const size_t w=d.width,h=d.height;
+ if(!w || !h || IOSurfaceGetWidthOfPlane(surface,0)<w || IOSurfaceGetHeightOfPlane(surface,0)<h ||
+    IOSurfaceGetWidthOfPlane(surface,1)*2<w || IOSurfaceGetHeightOfPlane(surface,1)*2<h)return nil;
+ MTLTextureDescriptor *rgba=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:w height:h mipmapped:NO];
+ rgba.usage=MTLTextureUsageShaderRead;rgba.storageMode=MTLStorageModeShared;
+ NmbTextureDescriptor descriptor;if(!textureDescriptor(rgba,&descriptor))return nil;
+ NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);
+ if(!handle){NBLOG(@"native-metal: YCbCr copy %zux%zu refused: %@",w,h,lastError());return nil;}
+ const uint8_t *y=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,0),*c=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,1);
+ const size_t ys=IOSurfaceGetBytesPerRowOfPlane(surface,0),cs=IOSurfaceGetBytesPerRowOfPlane(surface,1);
+ std::vector<uint32_t> row(w*16);
+ for(size_t top=0;top<h;top+=16) {
+  const size_t rows=std::min<size_t>(16,h-top);
+  for(size_t j=0;j<rows;j++) {
+   const uint8_t *yl=y+(top+j)*ys,*cl=c+((top+j)/2)*cs;uint32_t *o=row.data()+j*w;
+   for(size_t x=0;x<w;x++) o[x]=0xff000000u|((uint32_t)cl[(x&~(size_t)1)+1]<<16)|((uint32_t)cl[x&~(size_t)1]<<8)|yl[x];
+  }
+  const uint64_t region[6]={0,top,0,w,rows,1};
+  if(!nmb_texture_replace(handle,region,0,0,row.data(),w*4,w*4*rows,w*4*rows)){
+   NBLOG(@"native-metal: YCbCr copy fill refused: %@",lastError());nmb_texture_release(handle);return nil;
+  }
+ }
+ NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+ texture.reportedFormat=(uint64_t)d.pixelFormat;texture.surface=(IOSurfaceRef)CFRetain(surface);
+ return texture;
+}
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
  if(!surface || !d)return nil;
  const size_t planes=IOSurfaceGetPlaneCount(surface);
  if(planes?plane>=planes:plane!=0){noteSurfaceTexture(surface,d,plane,planes,0,0,"refused (no such plane)");return nil;}
+ if((d.pixelFormat==500 || d.pixelFormat==501) && plane==0) {
+  NBTexture *copy=ycbcrCopy(surface,d);noteSurfaceTexture(surface,d,plane,planes,0,0,copy?"made (YCbCr copy)":"refused (YCbCr copy)");
+  return (id<MTLTexture>)copy;
+ }
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
- if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1))return nil;
+ if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1)) {
+  noteSurfaceTexture(surface,d,plane,planes,(NSUInteger)((uintptr_t)base&(page-1)),allocation,"refused (base or size)");return nil;
+ }
  const size_t bytes=(allocation+page-1)&~(page-1);
  const NSUInteger offset=planes?(NSUInteger)((uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,plane)-(uintptr_t)base):0;
  const NSUInteger row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
  if(planes && (!row || offset>=bytes)){noteSurfaceTexture(surface,d,plane,planes,offset,row,"refused (plane geometry)");return nil;}
- NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer)return nil;
+ NBBuffer *buffer=surfaceBuffer(surface,base,bytes);
+ if(!buffer){noteSurfaceTexture(surface,d,plane,planes,offset,row,"refused (import)");return nil;}
  NBTexture *texture=textureOnBuffer(buffer,d,offset,row,true);
- if(planes)noteSurfaceTexture(surface,d,plane,planes,offset,row,texture?"made":"refused");
+ noteSurfaceTexture(surface,d,plane,planes,offset,row,texture?"made":"refused (texture over the surface)");
  if(!texture)return nil;
  texture.plane=plane;texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
 }
