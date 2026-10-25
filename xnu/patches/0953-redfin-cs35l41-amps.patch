@@ -1,4 +1,4 @@
-From ab29e64cea2095a6726818f2600f585501f23d59 Mon Sep 17 00:00:00 2001
+From 2f7f9a2958fe282ecd17fc4f4b60f1599075bf85 Mon Sep 17 00:00:00 2001
 From: WS-A <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 00:43:03 +0100
 Subject: [PATCH] redfin: CS35L41 amplifiers in ASP bypass + HackiOS speaker
@@ -28,7 +28,7 @@ index 9d43a9b..9779f28 100644
  bsd/dev/sweet_poke.c			standard
 diff --git a/bsd/dev/sweet_cs35l41.c b/bsd/dev/sweet_cs35l41.c
 new file mode 100644
-index 0000000..42b4386
+index 0000000..8179d25
 --- /dev/null
 +++ b/bsd/dev/sweet_cs35l41.c
 @@ -0,0 +1,665 @@
@@ -466,7 +466,7 @@ index 0000000..42b4386
 +
 +	err = cs_read(a, CS_DEVID, &devid);
 +	if (err) {
-+		SAY("%s: NO ANSWER on SE9 (%d)\n", a->name, err);
++		SAY("%s: NO ANSWER on SE9 (%d%s)\n", a->name, err, err == ENXIO ? ": NACK, or the SE9 bus is not up (sweethaptic=1)" : "");
 +		return false;
 +	}
 +	(void)cs_read(a, CS_REVID, &a->revid);

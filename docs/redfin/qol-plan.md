@@ -157,7 +157,7 @@ Boot-args (all default off/old behaviour; all need `adsp=1`): `sound=1..4`, `snd
 Poke (`a`): `a status`, `a tone [MS]`, `a gain DB`, `a off`, `a on`, `a mic SECS`.
 
 Phone order (one image per step): (1) `adsp=1 sound=1` -> `SWEET SOUND: LPASS core vote ... granted`, `LPI gpio6-9 now:`
-(val 0x1c8 dir 0x2 = LPI writes work after the vote), `port 0x9040, started: done`; (2) `sound=2` -> `SMMU: ... IDENTITY`,
+(val 0x3c8 dir 0x2 = LPI writes work after the vote), `port 0x9040, started: done`; (2) `sound=2` -> `SMMU: ... IDENTITY`,
 `ADM: COPP n open`, `PATH UP`, `tone over: ... the DSP took ~48000 frames/s`; (3) `sound=3` (+`sndgpio=1` if
 `SWEET AMP: ... NO ANSWER`) -> `SWEET AMP: ... DEVID 0x35a40`, `AMPLIFIERS READY`, `amplifiers ON at 20.000 dB`,
 audible 1 s tone, `amplifiers OFF (2 s of silence)`; `poke a tone 1000`; (4) `sound=4` -> Settings sounds;

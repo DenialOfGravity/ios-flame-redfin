@@ -1,4 +1,4 @@
-From 6d87c35fd49012f4090ee1a0425f939715c4dbab Mon Sep 17 00:00:00 2001
+From 2a0f1bb35640e99ee50bee9dc1208312639d2257 Mon Sep 17 00:00:00 2001
 From: WS-A <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 00:48:41 +0100
 Subject: [PATCH] redfin: microphones (mic=1): ALC5513 on SE7, PRI_TDM_TX

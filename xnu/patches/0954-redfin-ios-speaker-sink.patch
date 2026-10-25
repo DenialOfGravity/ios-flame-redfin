@@ -1,4 +1,4 @@
-From 8dd3b04016df3c26a0f833d65f2e5d8034b0b590 Mon Sep 17 00:00:00 2001
+From 9a283804c4bd39347e8afc2dd525e0f93b1537cb Mon Sep 17 00:00:00 2001
 From: WS-A <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 00:44:21 +0100
 Subject: [PATCH] redfin: /dev/redwood-audio to the speakers (sound=4: sink
