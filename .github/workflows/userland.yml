@@ -91,6 +91,7 @@ jobs:
           cd repo
           sh phone/wifi/build.sh
           cp phone/wifi/out/wland ../out/
+          sh phone/bt/build.sh && cp phone/bt/out/btd phone/bt/out/tlv_test.log ../out/
           bash phone/tools/build.sh || echo "::warning::some phone tools failed"
           sh phone/haptics/build.sh && cp phone/haptics/out/SweetHaptics.dylib ../out/ || echo "::warning::SweetHaptics.dylib failed"
           # (the build's output goes out with the files: the run's own logs cannot be fetched from Claude's container)
