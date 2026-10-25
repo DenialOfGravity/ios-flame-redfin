@@ -690,6 +690,57 @@ time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
  */
 static IMP original_emit_sample_buffer;
 
+/*
+ * redfin (plan B8): why the preview's sink gets 420f when its input asked for BGRA (set_format_requirements below).
+ * The first picture that reaches the image queue sink is said, with the node that gives it and what that node's own
+ * input was asked for: the node that does not pass the BGRA on is the one to look at. (Only the first 3000 buffers
+ * are looked at.)
+ */
+static const char *
+format_list(id requirements)
+{
+	static char text[160];
+	id formats = requirements != nil ? send_if(requirements, "supportedPixelFormats") : nil;
+	id description = formats != nil ? send_if(formats, "description") : nil;
+	const char *t = description != nil ? ((const char *(*)(id, SEL))objc_msgSend)(description, sel_registerName("UTF8String")) : "(none)";
+
+	snprintf(text, sizeof(text), "%s", t != NULL ? t : "(none)");
+	for (char *c = text; *c; c++) {
+		*c = *c == '\n' ? ' ' : *c;
+	}
+	return text;
+}
+
+static void
+preview_format(id output, CMSampleBufferRef sample_buffer)
+{
+	static unsigned looked;
+	static bool said;
+	CVImageBufferRef image;
+	id connection, input, node, source_input;
+
+	if (said || looked >= 3000) {
+		return;
+	}
+	looked++;
+	connection = send_if(output, "connection");
+	input = connection != nil ? send_if(connection, "input") : nil;
+	if (input == nil || !is_node(send_if(input, "node"), "BWImageQueueSinkNode") ||
+	    (image = CMSampleBufferGetImageBuffer(sample_buffer)) == NULL) {
+		return;
+	}
+	said = true;
+	OSType pf = CVPixelBufferGetPixelFormatType(image);
+	node = send_if(output, "node");
+	source_input = node != nil ? send_if(node, "input") : nil;
+	say("redwood: mediaserverd: the preview's sink gets %c%c%c%c %zux%zu from a %s (asked: %s)\n", pf >> 24, pf >> 16 & 255,
+	    pf >> 8 & 255, pf & 255, CVPixelBufferGetWidth(image), CVPixelBufferGetHeight(image),
+	    node != nil ? object_getClassName(node) : "?", format_list(send_if(input, "formatRequirements")));
+	if (source_input != nil) {
+		say("redwood: mediaserverd:   whose own input was asked for %s\n", format_list(send_if(source_input, "formatRequirements")));
+	}
+}
+
 static void
 emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 {
@@ -703,6 +754,7 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 		return;
 	}
 	time_photo_encoder(self, sample_buffer);
+	preview_format(self, sample_buffer);
 	((void (*)(id, SEL, CMSampleBufferRef))original_emit_sample_buffer)(self, selector, sample_buffer);
 }
 
@@ -1086,6 +1138,10 @@ set_format_requirements(id self, SEL selector, id requirements)
 		((void (*)(id, SEL, id))objc_msgSend)(requirements, sel_registerName("setPreferredPixelFormats:"), (id)only);
 		CFRelease(only);
 		CFRelease(bgra);
+		((void (*)(id, SEL, id))original_set_format_requirements)(self, selector, requirements);
+		/* (redfin, B8: what the input holds after it took them) */
+		say("redwood: mediaserverd:   the sink's input now asks for %s\n", format_list(send_if(self, "formatRequirements")));
+		return;
 	}
 	((void (*)(id, SEL, id))original_set_format_requirements)(self, selector, requirements);
 }
