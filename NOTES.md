@@ -225,3 +225,22 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   `w stat|freq DOM IDX|table|gov|chg` (sweet_poke.c hands "w WORD" to sweet_power_cmd; "w ADDR VAL" unchanged).
 - 0962 `sweetbig=2`: foreground threads try CPU6 (gold) first, CPU7 (prime) only while CPU6 is busy (1 = old order,
   default). tools/mkadt.py: redfin clock values (1804.8/2208/2400 MHz); cluster-type stays 0 (no AMP in this kernel).
+- 0963 DVFS governor, `flamecpufreq=2` (default 1 = pinned max as before): 30 ms per-domain tick, util = busiest CPU of
+  the domain, target = cur * util / 80 % (x2 at >= 95 %), lowest valid row above it; up at once, down after 3 ticks;
+  silver floor 1.1 GHz; perf-state writes only. `w gov 0|1 [MS]`; `w freq` takes a domain out until `w gov 1`.
+- 0964 thermal caps (sweet_thermal.c, 1 s sampling): hot = max(gold, prime, cpuss, camera); level 1 > 75 C (gold/prime
+  <= 1.8 GHz), 2 > 85 C (gold/prime 1.2, silver 1.5 GHz, GPU level 2), 3 > 100 C (gold/prime lowest row, silver 1.0 GHz,
+  GPU 1), each released 10 C lower, logged once per change. `sweettcap` bit 0 CPU (default 1), bit 1 GPU (runtime GMU
+  HFI perf vote via sweet_gpu_level_cap()/a6_perf_vote(), off by default), 0 = log only. `w cap N|auto`, `w gpu N`.
+- 0966 battery: 4000 mAh, 5 s poll, SOC seeded from QG SDAM 0xb147 (if 0xb146 valid and within 15 % of the voltage
+  estimate) then coulomb-counted from QG LAST_ADC_I with a 0.2 %/poll pull to the voltage estimate at |I| < 100 mA;
+  1 %/poll slew; IsCharging = I > +50 mA; Temperature from the JEITA zone (0x100d). `SWEET BATTERY: SOC seeded ...`.
+- 0967 SPMI write path (sweet_spmi_write): APID channel EXT_WRITEL (Linux pmic-arb v5), owner EE 0 checked, only SID 2
+  0x1061/0x1070/0x1341/0x1342/0x1365/0x1366/0x1370, read back + `SWEET CHG: write ...`; nothing unless `sweetchg=1`.
+  `w chg wr ADDR VAL`.
+- 0968 charger policy (bsd/dev/sweet_charger.c, every 5 s after the 20 s register dump): DCP/CDP/Rp1.5 -> 1500 mA,
+  Rp3.0 -> 2000 mA ICL in HC mode (0x1370, 0x1366.0=1, 0x1342.0=0, 0x1365.4=1), FCC 2000 mA (1000 when JEITA soft or
+  SMB die over bound), FV lowered to 4.45 V only if higher; SDP/float left to the hardware; dry run unless `sweetchg=1`;
+  `sweetchgpol=0` off; <= 200 writes/boot. `w chg` (decoded state), `w chg apsd`, `w chg pol 0|1`.
+- 0969 USB `ud_thread`: 10 ms polls after 200 quiet 1 ms polls (no event, no TX in flight), 1 ms again on the next event;
+  `sweetudpoll=1` = always 1 ms.

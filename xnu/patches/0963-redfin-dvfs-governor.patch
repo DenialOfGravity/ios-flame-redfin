@@ -1,0 +1,321 @@
+From 02231ef24e65a11fd5823af01c70c30783647e8e Mon Sep 17 00:00:00 2001
+From: WS-P <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 00:37:41 +0100
+Subject: [PATCH] redfin: DVFS governor (flamecpufreq=2, w gov)
+
+30 ms per-domain utilisation governor writing only the cpufreq-hw perf
+state; silver floor 1.1 GHz, gold/prime from their lowest row, up at once,
+down after 3 ticks. flamecpufreq=1 (default) keeps the pinned maximum.
+---
+ bsd/dev/sweet_cpufreq.c | 189 +++++++++++++++++++++++++++++++++++++++-
+ bsd/dev/sweet_thermal.c |  15 +++-
+ 2 files changed, 201 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 86bbe99..492c3a7 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -18,10 +18,21 @@
+  *
+  * Boot-arg flamecpufreq: 0 leave as is, 1 (default) highest all-core
+  * frequency (the old rule: rows with fewer cores than the domain are boost
+- * rows), N > 2 the highest entry at or below N MHz.
++ * rows), 2 the DVFS governor (0963), N > 2 the highest entry at or below N MHz.
+  * 0961: every 5 s (called from sweet_thermal.c) one "SWEET CPUFREQ:" line with
+  * per-CPU busy %, the perf-state readback, the cycle-counter MHz and the LMh
+  * ceiling; "w freq DOM IDX" writes one domain (bsd/dev/sweet_thermal.c).
++ *
++ * 0963: flamecpufreq=2 runs a DVFS governor instead of pinning: every 30 ms
++ * (w gov 1 MS: 10-200) per domain, utilisation = the busiest CPU's busy share
++ * of the tick; target = current frequency * util / 80 % (doubled when util
++ * >= 95 %, so a saturated core ramps in a few ticks); the lowest valid row
++ * at or above it (skip and boost rows are never chosen). Up at once, down only
++ * after 3 ticks in a row want lower (then the highest of those wishes).
++ * Floors: silver the lowest row >= 1.1 GHz, gold/prime their lowest row. Only
++ * the perf-state register is written (no RPMh). "w gov 0" stops it (clocks stay
++ * where they are), "w gov 1" starts it; "w freq" takes that domain out of the
++ * governor until the next "w gov 1".
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -31,9 +42,15 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <mach/mach_time.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern uint64_t sweet_cpu_idle_abs(int cpu);    /* osfmk/kern/sched_prim.c (0961) */
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++int sweet_cpufreq_gov(int on, unsigned period_ms);
++void sweet_cpufreq_manual(unsigned dom);
+ void sweet_cpufreq_init(void);
+ void sweet_cpufreq_log(void);
+ int sweet_cpufreq_set(unsigned dom, unsigned idx, const char *why);
+@@ -67,6 +84,13 @@ struct cf_dom {
+ 	unsigned req;           /* last index written (or boot_idx) */
+ 	uint32_t cyc_prev;
+ 	uint64_t cyc_t;
++	/* 0963 governor */
++	uint8_t ch[CF_ROWS];    /* choosable rows (valid, not the skip row), ascending frequency */
++	unsigned nch;
++	unsigned floor_pos;     /* position in ch[] */
++	unsigned down, wish;    /* consecutive "lower" ticks, highest lower wish (position) */
++	bool manual;            /* "w freq" took it out of the governor */
++	unsigned changes;
+ };
+ 
+ static struct cf_dom cf[CF_NDOM] = {
+@@ -79,6 +103,10 @@ static struct cf_dom cf[CF_NDOM] = {
+ 	  .lmh_pa = 0x18350800u + LMH_REQ },
+ };
+ static bool cf_ready;
++static volatile int cf_gov_on;
++static unsigned cf_gov_ms = 30;
++static bool cf_gov_thread;
++static int cf_gov_chan;
+ 
+ static LCK_GRP_DECLARE(cf_grp, "sweet_cpufreq");
+ static LCK_MTX_DECLARE(cf_lock, &cf_grp);
+@@ -162,6 +190,50 @@ sweet_cpufreq_set(unsigned dom, unsigned idx, const char *why)
+ 	return rb;
+ }
+ 
++/* Choosable rows sorted by frequency (normally the LUT is already ascending). */
++static void
++cf_build_choices(struct cf_dom *d)
++{
++	d->nch = 0;
++	for (unsigned i = 0; i < d->n; ++i) {
++		if (!cf_valid(d, i) || (int)i == d->skip) {
++			continue;
++		}
++		unsigned j = d->nch++;
++		while (j > 0 && d->khz[d->ch[j - 1]] > d->khz[i]) {
++			d->ch[j] = d->ch[j - 1];
++			j--;
++		}
++		d->ch[j] = (uint8_t)i;
++	}
++	uint32_t floor_khz = d->first == 0 ? 1100000u : 0;
++	d->floor_pos = 0;
++	while (d->floor_pos + 1 < d->nch && d->khz[d->ch[d->floor_pos]] < floor_khz) {
++		d->floor_pos++;
++	}
++}
++
++/* Highest position the governor may pick. */
++static unsigned
++cf_ceiling(const struct cf_dom *d)
++{
++	return d->nch ? d->nch - 1 : 0;
++}
++
++/* Position of the current request in ch[] (the nearest frequency at or below it). */
++static unsigned
++cf_pos(const struct cf_dom *d)
++{
++	unsigned p = 0;
++	uint32_t cur = d->req < d->n ? d->khz[d->req] : 0;
++	for (unsigned k = 0; k < d->nch; ++k) {
++		if (d->khz[d->ch[k]] <= cur) {
++			p = k;
++		}
++	}
++	return p;
++}
++
+ /* Per-CPU busy % since the previous call with the same state. */
+ struct cf_load {
+ 	uint64_t idle[CF_NCPU];
+@@ -210,9 +282,120 @@ sweet_cpufreq_log(void)
+ 		len += snprintf(line + len, sizeof(line) - len, " %s %u=%u MHz (cyc %u, lmh %u)", d->name, idx,
+ 		    idx < d->n ? d->khz[idx] / 1000 : 0, cyc_mhz, lmh);
+ 	}
++	if (cf_gov_thread) {
++		len += snprintf(line + len, sizeof(line) - len, "; gov %s %u/%u/%u changes", cf_gov_on ? "on" : "off",
++		    cf[0].changes, cf[1].changes, cf[2].changes);
++	}
+ 	printf("%s\n", line);
+ }
+ 
++static void
++cf_gov_tick(struct cf_load *ld)
++{
++	unsigned busy[CF_NCPU];
++	cf_busy(ld, busy);
++	for (unsigned i = 0; i < CF_NDOM; ++i) {
++		struct cf_dom *d = &cf[i];
++		if (!d->base || d->nch == 0 || d->manual) {
++			continue;
++		}
++		unsigned util = 0;
++		for (unsigned c = d->first; c < d->first + d->ncpu; ++c) {
++			util = busy[c] > util ? busy[c] : util;
++		}
++		unsigned cur = cf_pos(d), ceil = cf_ceiling(d);
++		uint64_t target = (uint64_t)d->khz[d->ch[cur]] * util / 80;
++		if (util >= 95) {
++			target *= 2;            /* saturated: the real demand is unknown, ramp fast */
++		}
++		unsigned want = d->floor_pos;
++		while (want < ceil && d->khz[d->ch[want]] < target) {
++			want++;
++		}
++		if (want > ceil) {
++			want = ceil;
++		}
++		if (cur > ceil) {
++			d->down = 0;            /* above the ceiling (a new cap): down now */
++		} else if (want < cur) {
++			d->wish = (d->down == 0 || want > d->wish) ? want : d->wish;
++			if (++d->down < 3) {
++				continue;
++			}
++			want = d->wish;
++			d->down = 0;
++		} else {
++			d->down = 0;
++		}
++		if (d->ch[want] != d->req) {
++			(void)sweet_cpufreq_set(i, d->ch[want], NULL);
++			d->changes++;
++		}
++	}
++}
++
++static void
++cf_gov_thread_fn(void *arg __unused, wait_result_t wr __unused)
++{
++	struct cf_load ld = { { 0 }, 0 };
++	for (;;) {
++		if (!cf_gov_on) {
++			assert_wait((event_t)&cf_gov_on, THREAD_UNINT);
++			if (!cf_gov_on) {
++				thread_block(THREAD_CONTINUE_NULL);
++			} else {
++				clear_wait(current_thread(), THREAD_AWAKENED);
++			}
++			ld.t = 0;
++			continue;
++		}
++		cf_gov_tick(&ld);
++		uint64_t deadline;
++		clock_interval_to_deadline(cf_gov_ms, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&cf_gov_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++/* on: 0 stop, 1 start (and give "w freq" domains back); period_ms 0 = keep. Returns 0 or -1. */
++int
++sweet_cpufreq_gov(int on, unsigned period_ms)
++{
++	if (!cf_ready) {
++		return -1;
++	}
++	if (period_ms >= 10 && period_ms <= 200) {
++		cf_gov_ms = period_ms;
++	}
++	if (on) {
++		for (unsigned i = 0; i < CF_NDOM; ++i) {
++			cf[i].manual = false;
++			cf[i].down = 0;
++		}
++	}
++	if (on && !cf_gov_thread) {
++		thread_t t;
++		if (kernel_thread_start(cf_gov_thread_fn, NULL, &t) != KERN_SUCCESS) {
++			return -1;
++		}
++		thread_deallocate(t);
++		cf_gov_thread = true;
++	}
++	cf_gov_on = on ? 1 : 0;
++	thread_wakeup((event_t)&cf_gov_on);
++	printf("SWEET CPUFREQ: governor %s, %u ms\n", on ? "on" : "off", cf_gov_ms);
++	return 0;
++}
++
++/* "w freq": the governor leaves this domain alone until the next "w gov 1". */
++void
++sweet_cpufreq_manual(unsigned dom)
++{
++	if (dom < CF_NDOM) {
++		cf[dom].manual = true;
++	}
++}
++
+ void
+ sweet_cpufreq_init(void)
+ {
+@@ -231,6 +414,7 @@ sweet_cpufreq_init(void)
+ 		d->cyc_prev = cf_rd(d->base, CF_CYCLES);
+ 		d->cyc_t = mach_absolute_time();
+ 		cf_ready = true;
++		cf_build_choices(d);
+ 		sweet_cpufreq_table_log(c);
+ 		printf("SWEET CPUFREQ: %s enable %x perf %u volt[0] %x lmh raw %x (%u MHz) skip %d\n", d->name,
+ 		    cf_rd(d->base, CF_ENABLE), d->boot_idx, cf_rd(d->base, CF_VOLT), d->lmh ? cf_rd(d->lmh, 0) : 0,
+@@ -260,6 +444,9 @@ sweet_cpufreq_init(void)
+ 		}
+ 		(void)sweet_cpufreq_set(c, best, want == 1 ? "boot max" : "boot cap");
+ 	}
++	if (want == 2) {
++		(void)sweet_cpufreq_gov(1, 0);
++	}
+ 	extern void sweet_thermal_start(void);
+ 	sweet_thermal_start();  /* 0960: TSENS sampling, bsd/dev/sweet_thermal.c */
+ }
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+index 382b20e..045c655 100644
+--- a/bsd/dev/sweet_thermal.c
++++ b/bsd/dev/sweet_thermal.c
+@@ -21,7 +21,7 @@
+  *   w stat              temperatures + CPU busy/frequency/LMh now
+  *   w freq DOM IDX      write a domain's perf state (DOM 0/s silver, 1/g gold, 2/p prime)
+  *   w table [DOM]       print the frequency table(s)
+- *   w gov 0|1           DVFS governor off/on (0963)
++ *   w gov 0|1 [MS]      DVFS governor off/on, tick MS (0963)
+  *   w chg               charger/gauge registers now
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -39,6 +39,8 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_cpufreq_log(void);
+ extern int sweet_cpufreq_set(unsigned dom, unsigned idx, const char *why);
+ extern void sweet_cpufreq_table_log(unsigned dom);
++extern int sweet_cpufreq_gov(int on, unsigned period_ms);
++extern void sweet_cpufreq_manual(unsigned dom);
+ void sweet_power_cmd(const char *s, const char *end);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+@@ -322,6 +324,7 @@ sweet_power_cmd(const char *s, const char *end)
+ 			printf("SWEET POWER: usage: w freq DOM(0-2|s|g|p) IDX\n");
+ 			return;
+ 		}
++		sweet_cpufreq_manual(dom);
+ 		if (sweet_cpufreq_set(dom, idx, "w freq") < 0) {
+ 			printf("SWEET POWER: w freq %u %u refused (no such domain/index)\n", dom, idx);
+ 		}
+@@ -334,7 +337,15 @@ sweet_power_cmd(const char *s, const char *end)
+ 			}
+ 		}
+ 	} else if (pc_is(w, "gov")) {
+-		printf("SWEET POWER: no DVFS governor in this kernel\n");
++		unsigned on = 0, ms = 0;
++		if (!pc_num(&s, end, &on)) {
++			printf("SWEET POWER: usage: w gov 0|1 [MS]\n");
++			return;
++		}
++		(void)pc_num(&s, end, &ms);
++		if (sweet_cpufreq_gov(on != 0, ms) < 0) {
++			printf("SWEET POWER: governor unavailable\n");
++		}
+ 	} else if (pc_is(w, "chg")) {
+ 		sweet_thermal_pmic_dump("now");
+ 	} else {
+-- 
+2.43.0
+
