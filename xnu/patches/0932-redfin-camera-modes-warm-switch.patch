@@ -1,0 +1,469 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sun, 25 Oct 2026 21:13:27 +0100
+Subject: [PATCH] 0932 redfin: /dev/redwood-camera mode classes, warm mode
+ switch, table files kept, fallback
+
+SENSOR's c picks the mode when b is ~0: 0 auto / 1 photo (the most pixels at
+4:3, <= 31 fps, <= 13 MP), 2 video (16:9, <= 4096 wide, >= 1600x900, >= 29.5
+fps: the lowest frame rate, then the fewest pixels), 3 video60 (the same from
+59 fps; video where there is none). From the module files: IMX363 photo 0
+4032x3024, video 10 2016x1136@30, video60 9 2016x1136@60; IMX355 photo 0
+3280x2464, video 2 1640x924@30 (no 60); IMX481 photo 7 2328x1746, video and
+video60 3 2328x1310@60.
+
+The same sensor and mode asked for again changes nothing; another mode of the
+streaming sensor is switched without a power cycle (frames stopped at a
+frame's end, receive path down; the new mode's table, the exposure clamped to
+it, the places re-made if larger -- not while a read copies -- the receive
+path and "on" again); the first frame after a sensor or mode change carries
+MODE_CHANGED (reserved[0] bit 2). A sensor that cannot be selected leaves the
+previous one selected instead of giving the device up. The table files are
+read once and kept ("c 23" forgets them).
+---
+ bsd/dev/sweet_cam.c | 284 +++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 251 insertions(+), 33 deletions(-)
+
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index 10f544e..61afa7c 100644
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -1696,10 +1696,26 @@ static struct {
+ static void
+ tab_free(void)
+ {
+-	if (sc.data) {
+-		redwood_adsp_fw_free(sc.data, sc.size);
+-		sc.data = NULL;
++	sc.data = NULL;         /* 0932: the file stays in tab_cache[] */
++}
++
++/*
++ * 0932: each sensor's table file is read once and kept (12-16 KB each; r18g read it again for every session, three or
++ * four times a camera start). "c 23" forgets them, after a new file was put on the phone.
++ */
++static struct { const uint8_t *data; uint64_t size; } tab_cache[3];
++
++static void
++tab_flush(void)
++{
++	for (unsigned i = 0; i < sizeof(tab_cache) / sizeof(tab_cache[0]); i++) {
++		if (tab_cache[i].data) {
++			redwood_adsp_fw_free(tab_cache[i].data, tab_cache[i].size);
++			tab_cache[i].data = NULL;
++		}
+ 	}
++	sc.data = NULL;
++	printf("SWEET CAM: the table files will be read again\n");
+ }
+ 
+ static const struct tab_entry *tab_find(const char *name, uint32_t *count);
+@@ -1726,7 +1742,16 @@ tab_info(void)
+ static bool
+ tab_load(const char *name)
+ {
+-	sc.data = redwood_adsp_fw_file(name, &sc.size);
++	unsigned slot = 0;
++	while (slot < sizeof(sensor_capture) / sizeof(sensor_capture[0]) && strcmp(sensor_capture[slot].file, name) != 0) {
++		slot++;
++	}
++	if (slot < sizeof(tab_cache) / sizeof(tab_cache[0]) && tab_cache[slot].data) {
++		sc.data = tab_cache[slot].data;
++		sc.size = tab_cache[slot].size;
++	} else {
++		sc.data = redwood_adsp_fw_file(name, &sc.size);
++	}
+ 	if (sc.data == NULL) {
+ 		printf("SWEET CAM: no /private/var/local/fw/%s (tools/redfin-camtab.py makes it)\n", name);
+ 		return false;
+@@ -1735,9 +1760,17 @@ tab_load(const char *name)
+ 	if (sc.size < 24 || memcmp(sc.data, "RFCTAB01", 8) != 0 || h[2] == 0 || h[2] > 32 ||
+ 	    24 + (uint64_t)h[2] * sizeof(struct tab_mode) > sc.size) {
+ 		printf("SWEET CAM: %s: not a table file of the kind known here\n", name);
+-		tab_free();
++		if (slot < sizeof(tab_cache) / sizeof(tab_cache[0]) && tab_cache[slot].data == sc.data) {
++			tab_cache[slot].data = NULL;
++		}
++		redwood_adsp_fw_free(sc.data, sc.size);
++		sc.data = NULL;
+ 		return false;
+ 	}
++	if (slot < sizeof(tab_cache) / sizeof(tab_cache[0])) {
++		tab_cache[slot].data = sc.data;
++		tab_cache[slot].size = sc.size;
++	}
+ 	sc.slave = h[0];
+ 	sc.lane_assign = h[1];
+ 	sc.modes = h[2];
+@@ -2670,8 +2703,10 @@ static struct {
+ 	uint32_t        exposure_lines, gain, frame_lines;
+ 	uint64_t        sof;            /* 0929: its start of frame (mach time) */
+ 	uint32_t        focus, flags;   /* 0929: the lens's position (or REDWOOD_CAMERA_NO_FOCUS), REDWOOD_CAMERA_FLAG_* */
++	uint32_t        gen;            /* 0932: ios_gen when it was written */
+ } place[RING];
+ static uint64_t ring_pa, ring_bytes, place_bytes;
++static volatile unsigned ios_copying;  /* 0932: reads copying out of the places now */
+ static vm_offset_t ring_va;
+ static uint32_t ring_frame_bytes;
+ static unsigned ios_sensor = 0, ios_mode_n;    /* ours */
+@@ -2686,6 +2721,7 @@ static struct { uint32_t lines, gain, frame_lines; uint64_t from; } ios_now, ios
+ static uint32_t ios_dgain;      /* 0931: the digital gain last asked for (256 = 1x; 0 = never: the tables' own), kept for new sessions */
+ static volatile unsigned ios_switch_to;        /* 1 + ours */
+ static uint32_t ios_switch_mode = ~0u;
++static unsigned ios_switch_class;      /* 0932: SENSOR's c */
+ static struct { uint32_t pos; bool pending, park; } ios_focus;     /* 0929: FOCUS, done after the next frame's end */
+ 
+ static uint64_t
+@@ -2746,6 +2782,14 @@ ring_alloc(uint32_t bytes)
+ 		return true;
+ 	}
+ 	if (ring_va) {
++		/* 0932: not while a read copies out of it (a mode switch to a larger one happens with a reader waiting) */
++		for (unsigned t = 0; ios_copying && t < 1000; t++) {
++			sleep_ms(1);
++		}
++		if (ios_copying) {
++			printf("SWEET CAM: /dev/redwood-camera: a read still copies a frame: the places are kept\n");
++			return false;
++		}
+ 		ml_io_unmap(ring_va, ring_bytes);
+ 		sweet_gpu_pool_free(ring_pa, ring_bytes);
+ 		ring_va = 0;
+@@ -2772,40 +2816,116 @@ ring_alloc(uint32_t bytes)
+ 	return true;
+ }
+ 
+-/* the sensor (ours) and its mode for the next sessions: its table file kept loaded */
++/*
++ * 0932: the mode for a class (SENSOR's c, when its b is ~0), from the loaded table file:
++ *   auto, photo   the most pixels at 4:3, at most 31 frames a second and 13 megapixels (HackiOS's choice: IMX363 mode 0
++ *                 4032x3024, IMX355 0 3280x2464, IMX481 7 2328x1746)
++ *   video         16:9 (within 2 %), at most 4096 wide, at least 1600x900's pixels, at least 29.5 frames a second: the
++ *                 lowest frame rate (rounded to whole frames), then the fewest pixels (IMX363 10 2016x1136 at 30, IMX355 2
++ *                 1640x924 at 30, IMX481 3 2328x1310 at 60: its only one)
++ *   video60       as video from 59 frames a second (IMX363 9 2016x1136 at 60, IMX481 3; IMX355 has none: its video mode)
++ * (the module files' modes, 2026-10-25: tools/redfin-camtab.py lists them)
++ */
++enum { CLASS_AUTO, CLASS_PHOTO, CLASS_VIDEO, CLASS_VIDEO60 };
++
+ static bool
+-ios_select(unsigned si, uint32_t mode_n)
++mode_usable(unsigned si, const struct tab_mode *m)
++{
++	return sc.slave == sensors[si].slave && m->lanes >= 1 && m->lanes <= 4 && !m->cphy && m->dt == RAW10_DT && m->width % 4 == 0 &&
++	       m->fps_milli != 0 && m->frame_length != 0;
++}
++
++static uint32_t
++mode_pick(unsigned si, unsigned cls)
++{
++	uint32_t best = ~0u;
++	if (cls == CLASS_VIDEO || cls == CLASS_VIDEO60) {
++		uint32_t least_fps = cls == CLASS_VIDEO60 ? 59000 : 29500;
++		for (uint32_t k = 0; k < sc.modes; k++) {
++			const struct tab_mode *o = &sc.mode[k];
++			uint64_t pixels = (uint64_t)o->width * o->height, a = (uint64_t)o->width * 9, b = (uint64_t)o->height * 16;
++			if (!mode_usable(si, o) || (a > b ? a - b : b - a) * 50 > b || o->width > 4096 || pixels < 1600 * 900 ||
++			    o->fps_milli < least_fps) {
++				continue;
++			}
++			if (best == ~0u) {
++				best = k;
++				continue;
++			}
++			const struct tab_mode *x = &sc.mode[best];
++			uint32_t fo = (o->fps_milli + 500) / 1000, fx = (x->fps_milli + 500) / 1000;
++			if (fo < fx || (fo == fx && pixels < (uint64_t)x->width * x->height)) {
++				best = k;
++			}
++		}
++		if (best == ~0u) {
++			return mode_pick(si, cls == CLASS_VIDEO60 ? CLASS_VIDEO : CLASS_AUTO);
++		}
++		return best;
++	}
++	uint64_t most = 0;
++	for (uint32_t k = 0; k < sc.modes; k++) {
++		const struct tab_mode *o = &sc.mode[k];
++		uint64_t pixels = (uint64_t)o->width * o->height;
++		if (mode_usable(si, o) && o->width * 3 == o->height * 4 && o->fps_milli <= 31000 && pixels <= 13000000 && pixels > most) {
++			most = pixels;
++			best = k;
++		}
++	}
++	return best == ~0u ? 0 : best;
++}
++
++static uint32_t ios_gen, ios_gen_given;        /* 0932: a new sensor or mode (MODE_CHANGED on its first frame read) */
++static bool ios_selected;
++
++/* the mode's numbers for the frames (the table file loaded; the mode checked) */
++static void
++ios_mode_set(unsigned si, uint32_t mode_n)
++{
++	const struct tab_mode *m = &sc.mode[mode_n];
++	ios_sensor = si;
++	ios_mode_n = mode_n;
++	ios_mode_buf = *m;
++	ios_stride = (m->width / 4 * 5 + 15) & ~15u;
++	ios_line_ns = (uint32_t)(1000000000000ull / ((uint64_t)m->fps_milli * m->frame_length));
++	ios_gen++;
++	printf("SWEET CAM: /dev/redwood-camera: the %s (camera %u): mode %u, %ux%u, %u.%03u frames/s at the most, lines of %u ns\n",
++	    sensors[si].name, ours_to_ios[si], mode_n, m->width, m->height, m->fps_milli / 1000, m->fps_milli % 1000, ios_line_ns);
++}
++
++/*
++ * the sensor (ours) and its mode for the next sessions: mode_n, or (~0) the class's (0932); the same sensor and mode
++ * again changes nothing (r18g: the vendor's capture graph asks for the camera it has three or four times a start)
++ */
++static bool
++ios_select(unsigned si, uint32_t mode_n, unsigned cls)
+ {
+ 	tab_free();
+ 	if (si >= sizeof(sensor_capture) / sizeof(sensor_capture[0]) || !tab_load(sensor_capture[si].file)) {
+ 		return false;
+ 	}
+ 	if (mode_n >= sc.modes) {
+-		uint64_t best = 0;
+-		mode_n = 0;
+-		for (uint32_t m = 0; m < sc.modes; m++) {
+-			const struct tab_mode *o = &sc.mode[m];
+-			uint64_t pixels = (uint64_t)o->width * o->height;
+-			if (o->width * 3 == o->height * 4 && o->fps_milli <= 31000 && pixels <= 13000000 && pixels > best) {
+-				best = pixels;
+-				mode_n = m;
+-			}
+-		}
++		mode_n = mode_pick(si, cls);
+ 	}
+ 	const struct tab_mode *m = &sc.mode[mode_n];
+-	if (sc.slave != sensors[si].slave || m->lanes < 1 || m->lanes > 4 || m->cphy || m->dt != RAW10_DT || m->width % 4 ||
+-	    m->fps_milli == 0 || m->frame_length == 0) {
++	if (!mode_usable(si, m)) {
+ 		printf("SWEET CAM: /dev/redwood-camera: %s mode %u is not what this is written for\n", sensors[si].name, mode_n);
+ 		tab_free();
+ 		return false;
+ 	}
+-	ios_sensor = si;
+-	ios_mode_n = mode_n;
+-	ios_mode_buf = *m;
++	if (ios_selected && si == ios_sensor && mode_n == ios_mode_n) {
++		tab_free();
++		return true;
++	}
++	bool same_sensor = ios_selected && si == ios_sensor;
++	ios_mode_set(si, mode_n);
++	ios_selected = true;
+ 	tab_free();
+ 	m = ios_mode;
+-	ios_stride = (m->width / 4 * 5 + 15) & ~15u;
+-	ios_line_ns = (uint32_t)(1000000000000ull / ((uint64_t)m->fps_milli * m->frame_length));
++	if (same_sensor) {
++		ios_ask.lines = ios_ask.lines < m->frame_length - ios_margin ? ios_ask.lines : m->frame_length - ios_margin;
++		return true;    /* the exposure asked for stays (clamped to the new mode at the session's start) */
++	}
+ 	ios_gain_max = (si == 0 ? 8u : 16u) * GAIN_UNITY;
+ 	/* 0931: the module file's limits where the table file has them (IMX363: 8x analog, margin 16; IMX481/355: 16x, 16/10) */
+ 	ios_margin = sc.margin ? sc.margin : EXPOSURE_MARGIN;
+@@ -2820,8 +2940,6 @@ ios_select(unsigned si, uint32_t mode_n)
+ 	ios_ask.dgain = 0;
+ 	ios_ask.pending = false;
+ 	ios_dgain = 0;          /* (a new sensor starts with its tables' digital gain) */
+-	printf("SWEET CAM: /dev/redwood-camera: the %s (camera %u): mode %u, %ux%u, %u.%03u frames/s at the most, lines of %u ns\n",
+-	    sensors[si].name, ours_to_ios[si], mode_n, m->width, m->height, m->fps_milli / 1000, m->fps_milli % 1000, ios_line_ns);
+ 	return true;
+ }
+ 
+@@ -2836,6 +2954,66 @@ places_reset(void)
+ 	lck_mtx_unlock(&ios_lock);
+ }
+ 
++/*
++ * 0932: another mode of the sensor that streams, without powering it down: the frames stopped at a frame's end ("off",
++ * then a frame's time), the receive path down; the new mode's table, the exposure clamped to it, the places for its
++ * size, the receive path and "on" again. Power, PLL2, refgen, the SMMU, the sensor's init and the lens stay (r18g: a
++ * full stop and start is ~0.35 s). false: it did not work, the old mode is set again and the session ends.
++ */
++static bool
++ios_warm_switch(uint32_t mode_n)
++{
++	unsigned old_n = ios_mode_n, phy = sensor_capture[ios_sensor].phy;
++	uint32_t frame_ms = (uint32_t)((uint64_t)ios_line_ns * ios_now.frame_lines / 1000000u) + 5;
++	uint64_t t0 = ios_ms();
++	lck_mtx_lock(&ios_lock);
++	ios_streaming = false;
++	for (int i = 0; i < RING; i++) {
++		place[i].state = PLACE_FREE;    /* (a read copying out of one now gives it back as it finds it: free) */
++		place[i].sequence = 0;
++	}
++	lck_mtx_unlock(&ios_lock);
++	wakeup(&ios_frames_done);
++	(void)sensor_table("off");
++	sleep_ms(frame_ms > 200 ? 200 : frame_ms);
++	paths_down();
++	csiphy_down();
++	ios_mode_set(ios_sensor, mode_n);
++	const struct tab_mode *m = ios_mode;
++	uint32_t lines = ios_now.lines, gain = ios_now.gain, frame_lines = 0;
++	exposure_limits(&lines, &gain, &frame_lines);
++	char res[8];
++	snprintf(res, sizeof(res), "res%u", mode_n);
++	bool ok = ring_alloc(ios_stride * m->height) && sensor_table(res) &&
++	    sensor_exposure(lines, gain_code(gain), frame_lines, dgain_limit(ios_dgain)) && csid_reset() &&
++	    csid_config((int)phy, m->lanes, sc.lane_assign & ((1u << (4 * m->lanes)) - 1), 0, m->width, m->height) &&
++	    ife_config((uint32_t)ring_pa, 0) && csiphy_up(phy, m->lanes, sc.lane_assign, m->settle);
++	if (ok) {
++		wr(cap.ife, IFE_IRQ_CLEAR0, 0xffffffffu);
++		wr(cap.ife, IFE_IRQ_GLOBAL_CLEAR, 1);
++		wr(cap.ife, BUS_IRQ_CLEAR1, 0xffffffffu);
++		wr(cap.ife, BUS_IRQ_GLOBAL_CLEAR, 1);
++		ok = sensor_table("on");
++	}
++	if (!ok) {
++		printf("SWEET CAM: /dev/redwood-camera: mode %u did not start: mode %u again from the next session\n", mode_n, old_n);
++		ios_mode_set(ios_sensor, old_n);
++		return false;
++	}
++	ios_now.lines = ios_next.lines = lines;
++	ios_now.gain = ios_next.gain = gain;
++	ios_now.frame_lines = ios_next.frame_lines = frame_lines;
++	ios_next.from = 0;
++	lck_mtx_lock(&ios_lock);
++	place[0].state = PLACE_WRITING;
++	ios_streaming = true;
++	ios_last_read = ios_ms();
++	lck_mtx_unlock(&ios_lock);
++	printf("SWEET CAM: /dev/redwood-camera: mode %u -> %u without a power cycle in %llu ms\n", old_n, mode_n,
++	    (unsigned long long)(ios_ms() - t0));
++	return true;
++}
++
+ /* one session: from the first read that wants frames to the close, the idle time, a fault or another sensor */
+ static unsigned ios_start_failures;
+ 
+@@ -2904,8 +3082,29 @@ ios_session(void)
+ 			break;
+ 		}
+ 		if (ios_switch_to != 0) {
+-			why = "another sensor asked for";
+-			break;
++			/* 0932: another mode of this sensor: switched here; the same mode: nothing; another sensor: the session ends */
++			lck_mtx_lock(&ios_lock);
++			unsigned to = ios_switch_to, cls = ios_switch_class;
++			uint32_t want = ios_switch_mode;
++			if (to - 1 == ios_sensor) {
++				ios_switch_to = 0;
++			}
++			lck_mtx_unlock(&ios_lock);
++			if (to - 1 != ios_sensor) {
++				why = "another sensor asked for";
++				break;
++			}
++			uint32_t mn = want < sc.modes ? want : mode_pick(ios_sensor, cls);
++			if (mn != ios_mode_n && mode_usable(ios_sensor, &sc.mode[mn])) {
++				if (!ios_warm_switch(mn)) {
++					why = "a mode switch that failed";
++					break;
++				}
++				writing = 0;
++				next = 0;
++				last_frame = ios_ms();
++			}
++			continue;
+ 		}
+ 		sleep_ms(1);
+ 		uint64_t now = ios_ms();
+@@ -2944,6 +3143,7 @@ ios_session(void)
+ 			/* 0929: the lens; moving if it moved while any of the frame's lines were exposed (first line: SOF - exposure) */
+ 			place[writing].focus = lens.up ? lens.pos : REDWOOD_CAMERA_NO_FOCUS;
+ 			place[writing].flags = 0;
++			place[writing].gen = ios_gen;
+ 			uint64_t exposed;
+ 			nanoseconds_to_absolutetime((uint64_t)ios_now.lines * ios_line_ns, &exposed);
+ 			if (lens.up && lens.moving_until > place[writing].sof - MIN(exposed, place[writing].sof) &&
+@@ -3046,7 +3246,7 @@ ios_thread(void *arg __unused, wait_result_t w __unused)
+ 	(void)PE_parse_boot_argn("sweetcam_mode", &mode_n, sizeof(mode_n));
+ 	(void)PE_parse_boot_argn("sweetcam_sensor", &which, sizeof(which));
+ 	lck_mtx_lock(&sweet_cam_lock);
+-	if (!ios_select(ios_to_ours[which & 3] == ~0u ? 0 : ios_to_ours[which & 3], mode_n)) {
++	if (!ios_select(ios_to_ours[which & 3] == ~0u ? 0 : ios_to_ours[which & 3], mode_n, CLASS_AUTO)) {
+ 		ios_broken = true;
+ 	}
+ 	lck_mtx_unlock(&sweet_cam_lock);
+@@ -3055,7 +3255,8 @@ ios_thread(void *arg __unused, wait_result_t w __unused)
+ 		while (!ios_broken && !(ios_open && ios_wanted) && ios_switch_to == 0) {
+ 			(void)msleep(&ios_open, &ios_lock, PZERO, "redwood-camera-idle", NULL);
+ 		}
+-		unsigned to = ios_switch_to;
++		unsigned to = ios_switch_to, cls = ios_switch_class;
++		uint32_t want = ios_switch_mode;
+ 		ios_switch_to = 0;
+ 		if (!to) {
+ 			ios_wanted = false;
+@@ -3066,7 +3267,15 @@ ios_thread(void *arg __unused, wait_result_t w __unused)
+ 		}
+ 		if (to != 0) {
+ 			lck_mtx_lock(&sweet_cam_lock);
+-			bool ok = ios_select(to - 1, ios_switch_mode);
++			unsigned prev = ios_sensor;
++			uint32_t prev_mode = ios_mode_n;
++			bool had = ios_selected, ok = ios_select(to - 1, want, cls);
++			if (!ok && had) {
++				/* 0932: the camera before stays (r18g: a failed select gave the device up for the boot) */
++				printf("SWEET CAM: /dev/redwood-camera: the %s cannot be had: the %s stays\n", sensors[to - 1].name,
++				    sensors[prev].name);
++				ok = ios_select(prev, prev_mode, CLASS_AUTO);
++			}
+ 			lck_mtx_unlock(&sweet_cam_lock);
+ 			if (!ok) {
+ 				ios_broken = true;
+@@ -3167,8 +3376,13 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 	f.sensor = ours_to_ios[ios_sensor];
+ 	f.focus = place[b].focus;                       /* 0929 */
+ 	f.reserved[0] = place[b].flags;
++	if (place[b].gen != ios_gen_given) {            /* 0932 */
++		f.reserved[0] |= REDWOOD_CAMERA_FLAG_MODE_CHANGED;
++		ios_gen_given = place[b].gen;
++	}
+ 	vm_offset_t at = ring_va + (uint64_t)b * place_bytes;
+ 	uint32_t frame_bytes = ring_frame_bytes;
++	ios_copying++;          /* 0932: the places are not given back while it copies */
+ 	lck_mtx_unlock(&ios_lock);
+ 
+ 	error = uiomove((caddr_t)&f, (int)MIN(sizeof(f), (size_t)uio_resid(uio)), uio);
+@@ -3194,6 +3408,7 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		}
+ 	}
+ 	lck_mtx_lock(&ios_lock);
++	ios_copying--;
+ 	if (place[b].state == PLACE_READING) {
+ 		place[b].state = PLACE_READY;
+ 	}
+@@ -3234,11 +3449,12 @@ camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		lck_mtx_unlock(&ios_lock);
+ 		return 0;
+ 	case REDWOOD_CAMERA_SENSOR:
+-		if (c.a >= 4 || ios_to_ours[c.a] == ~0u) {
++		if (c.a >= 4 || ios_to_ours[c.a] == ~0u || c.c > CLASS_VIDEO60) {
+ 			return EINVAL;
+ 		}
+ 		lck_mtx_lock(&ios_lock);
+ 		ios_switch_mode = c.b;
++		ios_switch_class = c.c;         /* 0932: the mode's class when b is ~0 */
+ 		ios_switch_to = ios_to_ours[c.a] + 1;
+ 		lck_mtx_unlock(&ios_lock);
+ 		wakeup(&ios_open);
+@@ -3329,7 +3545,9 @@ sweet_cam_cmd_args(unsigned what, uint64_t a, uint64_t b, uint64_t c)
+ 	}
+ 	lck_mtx_lock(&sweet_cam_lock);
+ 	int err = 0;
+-	if (what == 9) {
++	if (what == 23) {
++		tab_flush();    /* 0932 */
++	} else if (what == 9) {
+ 		look();
+ 	} else if (what == 10) {
+ 		look_pmic();
+-- 
+2.43.0
+

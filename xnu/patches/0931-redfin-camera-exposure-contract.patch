@@ -1,0 +1,305 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sun, 25 Oct 2026 21:11:00 +0100
+Subject: [PATCH] 0931 redfin: /dev/redwood-camera exposure contract
+
+EXPOSURE's d is the sensor's digital gain (256 = 1x, 0 = as it is), written
+in the group hold to the four colour registers from 0x020e (Sony, 8.8) and
+kept for the sensor's next sessions; frames report its range in reserved[3]
+(unity | max << 16, 0 without one) and the mode's frames a second x 1000 in
+reserved[4].
+
+The group hold is the table file's "holdon"/"holdoff" (0x0104 where a file
+has none). The exposure margin, the black level and the analog gain limit
+come from the table file's new "info" table (tools/redfin-camtab.py now
+writes it from the module file: margin 16/16/10 instead of 40, black 64,
+analog 8x IMX363 and 16x IMX481/IMX355, digital 16x capped at 0xfff); older
+table files keep the old values. Frames keep reporting what the sensor was
+given (the request clamped by gain_max, frame_lines_min/_max and margin), so
+a program clamping its request the same way sees it taken.
+---
+ bsd/dev/sweet_cam.c | 135 ++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 113 insertions(+), 22 deletions(-)
+
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index f07399a..10f544e 100644
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -1688,6 +1688,9 @@ static struct {
+ 	const struct tab_mode *mode;
+ 	vm_offset_t csiphy, refgen, csiphy_map[4];    /* csiphy: the one in use (r17f: one mapping kept for all, the first PHY's) */
+ 	bool pll2_on, csiphy_on, refgen_switched;
++	/* 0931: the table file's "info" (tools/redfin-camtab.py, 2026-10-25), else 0: margin in lines, black level, the most
++	 * analog and digital gain (x 256), the first digital gain register (Sony: four 16-bit ones, 8.8, from 0x020e) */
++	uint32_t margin, black, again_max, dgain_max, dgain_reg;
+ } sc;
+ 
+ static void
+@@ -1699,6 +1702,27 @@ tab_free(void)
+ 	}
+ }
+ 
++static const struct tab_entry *tab_find(const char *name, uint32_t *count);
++
++/* 0931: the "info" table's { key, value } entries (none in table files made before it: then all 0) */
++static void
++tab_info(void)
++{
++	uint32_t n = 0;
++	const struct tab_entry *e = tab_find("info", &n);
++	sc.margin = sc.black = sc.again_max = sc.dgain_max = sc.dgain_reg = 0;
++	for (uint32_t i = 0; e && i < n; i++) {
++		switch (e[i].address) {
++		case 1: sc.margin = e[i].data; break;
++		case 2: sc.black = e[i].data; break;
++		case 3: sc.again_max = e[i].data; break;
++		case 4: sc.dgain_max = e[i].data; break;
++		case 5: sc.dgain_reg = e[i].data; break;
++		default: break;
++		}
++	}
++}
++
+ static bool
+ tab_load(const char *name)
+ {
+@@ -1719,6 +1743,7 @@ tab_load(const char *name)
+ 	sc.modes = h[2];
+ 	sc.tables = h[3];
+ 	sc.mode = (const struct tab_mode *)(const void *)(sc.data + 24);
++	tab_info();
+ 	return true;
+ }
+ 
+@@ -2011,14 +2036,42 @@ csiphy_down(void)
+ 	sc.csiphy_on = false;
+ }
+ 
+-/* the sensor's exposure (SMIA: 0x0202 coarse integration in lines, 0x0204 analog gain), in its group hold */
++/* 0931: one of the table file's tables, quietly (for the group hold, at every exposure change); *found: it has it */
++static bool
++sensor_table_quiet(const char *name, bool *found)
++{
++	uint32_t count = 0;
++	const struct tab_entry *e = sc.data ? tab_find(name, &count) : NULL;
++	*found = e != NULL;
++	for (uint32_t i = 0; e && i < count; i++) {
++		if (e[i].operation != 0 || e[i].address_bytes < 1 || e[i].address_bytes > 2 || e[i].data_bytes < 1 ||
++		    e[i].data_bytes > 2 || !sensor_put(e[i].address, e[i].address_bytes, e[i].data, e[i].data_bytes)) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/* 0931: the group hold from the module file's "holdon"/"holdoff" tables, SMIA 0x0104 where the file has none */
+ static bool
+-sensor_exposure(uint32_t lines, uint32_t gain, uint32_t frame_lines)
++group_hold(bool on)
+ {
+-	if (lines == 0 && gain == 0 && frame_lines == 0) {
++	bool found = false, ok = sensor_table_quiet(on ? "holdon" : "holdoff", &found);
++	return found ? ok : sensor_put(0x0104, 2, on ? 1 : 0, 1);
++}
++
++/*
++ * the sensor's exposure (SMIA: 0x0202 coarse integration in lines, 0x0204 analog gain), in its group hold; 0931: and
++ * the digital gain (dgain, 256 = 1x, 0 = as it is) into the four colours' registers (Sony 0x020e, 0x0210, 0x0212,
++ * 0x0214, 8.8) where the table file names the first
++ */
++static bool
++sensor_exposure(uint32_t lines, uint32_t gain, uint32_t frame_lines, uint32_t dgain)
++{
++	if (lines == 0 && gain == 0 && frame_lines == 0 && (dgain == 0 || !sc.dgain_reg)) {
+ 		return true;
+ 	}
+-	bool ok = sensor_put(0x0104, 2, 1, 1);
++	bool ok = group_hold(true);
+ 	if (ok && frame_lines) {
+ 		ok = sensor_put(0x0340, 2, (uint16_t)frame_lines, 2);
+ 	}
+@@ -2028,10 +2081,13 @@ sensor_exposure(uint32_t lines, uint32_t gain, uint32_t frame_lines)
+ 	if (ok && gain) {
+ 		ok = sensor_put(0x0204, 2, (uint16_t)gain, 2);
+ 	}
+-	ok = sensor_put(0x0104, 2, 0, 1) && ok;
++	for (unsigned k = 0; ok && dgain && sc.dgain_reg && k < 4; k++) {
++		ok = sensor_put((uint16_t)(sc.dgain_reg + 2 * k), 2, (uint16_t)dgain, 2);
++	}
++	ok = group_hold(false) && ok;
+ 	if (!ok || cam_step_ms) {
+-		printf("SWEET CAM: exposure %u lines, analog gain code %#x, frame %u lines: %s\n", lines, gain, frame_lines,
+-		    ok ? "written" : "NOT acknowledged");
++		printf("SWEET CAM: exposure %u lines, analog gain code %#x, frame %u lines, digital gain %#x: %s\n", lines, gain,
++		    frame_lines, dgain, ok ? "written" : "NOT acknowledged");
+ 	}
+ 	return ok;
+ }
+@@ -2360,7 +2416,7 @@ sensor_down(void)
+  */
+ static bool
+ stream_up(unsigned si, unsigned mode_n, unsigned pattern, unsigned settle, uint32_t lines, uint32_t gain, uint32_t frame_lines,
+-    uint32_t frame_pa, bool *powered)
++    uint32_t dgain, uint32_t frame_pa, bool *powered)
+ {
+ 	const struct sensor *s = &sensors[si];
+ 	const struct tab_mode *m = &sc.mode[mode_n];
+@@ -2405,7 +2461,7 @@ stream_up(unsigned si, unsigned mode_n, unsigned pattern, unsigned settle, uint3
+ 	snprintf(tpg, sizeof(tpg), "tpg%u", pattern);
+ 	if (ok) {
+ 		cstep("the sensor's tables");
+-		ok = sensor_table("init") && sensor_table(res) && sensor_exposure(lines, gain, frame_lines) &&
++		ok = sensor_table("init") && sensor_table(res) && sensor_exposure(lines, gain, frame_lines, dgain) &&
+ 		    (!pattern || sensor_table(tpg));
+ 	}
+ 	if (ok) {
+@@ -2487,7 +2543,7 @@ capture_sensor(unsigned si, unsigned mode_n, uint64_t options)
+ 		return ENOMEM;
+ 	}
+ 	frames_mark(bytes);
+-	if (stream_up(si, mode_n, pattern, settle, lines, gain, 0, (uint32_t)cap.frames_pa, &powered)) {
++	if (stream_up(si, mode_n, pattern, settle, lines, gain, 0, 0, (uint32_t)cap.frames_pa, &powered)) {
+ 		show_paths("configured");
+ 		cstep("streaming");
+ 		bool ok = sensor_table("on");
+@@ -2620,12 +2676,14 @@ static vm_offset_t ring_va;
+ static uint32_t ring_frame_bytes;
+ static unsigned ios_sensor = 0, ios_mode_n;    /* ours */
+ static uint32_t ios_line_ns, ios_stride, ios_gain_max;
++static uint32_t ios_margin = EXPOSURE_MARGIN, ios_black = 64, ios_dgain_max;  /* 0931: from the table file's "info" where it has one */
+ static struct tab_mode ios_mode_buf;   /* (a copy: the table file is loaded only while it is used) */
+ static const struct tab_mode *ios_mode = &ios_mode_buf;
+ static volatile bool ios_open, ios_streaming, ios_wanted, ios_broken;
+ static uint64_t ios_last_read, ios_given, ios_frames_done, ios_writes_late;
+-static struct { uint32_t lines, gain, frame_lines; bool pending; } ios_ask;
++static struct { uint32_t lines, gain, frame_lines, dgain; bool pending; } ios_ask;     /* 0931: dgain 0 = as it is */
+ static struct { uint32_t lines, gain, frame_lines; uint64_t from; } ios_now, ios_next;
++static uint32_t ios_dgain;      /* 0931: the digital gain last asked for (256 = 1x; 0 = never: the tables' own), kept for new sessions */
+ static volatile unsigned ios_switch_to;        /* 1 + ours */
+ static uint32_t ios_switch_mode = ~0u;
+ static struct { uint32_t pos; bool pending, park; } ios_focus;     /* 0929: FOCUS, done after the next frame's end */
+@@ -2652,14 +2710,29 @@ exposure_limits(uint32_t *lines, uint32_t *gain, uint32_t *frame_lines)
+ {
+ 	uint32_t shortest = ios_mode->frame_length;
+ 	*gain = *gain < GAIN_UNITY ? GAIN_UNITY : *gain > ios_gain_max ? ios_gain_max : *gain;
+-	*lines = *lines < 4 ? 4 : *lines > FRAME_LINES_MAX - EXPOSURE_MARGIN ? FRAME_LINES_MAX - EXPOSURE_MARGIN : *lines;
++	*lines = *lines < 4 ? 4 : *lines > FRAME_LINES_MAX - ios_margin ? FRAME_LINES_MAX - ios_margin : *lines;
+ 	if (*frame_lines == 0) {
+-		*frame_lines = *lines + EXPOSURE_MARGIN > shortest ? *lines + EXPOSURE_MARGIN : shortest;
++		*frame_lines = *lines + ios_margin > shortest ? *lines + ios_margin : shortest;
+ 	}
+ 	*frame_lines = *frame_lines < shortest ? shortest : *frame_lines > FRAME_LINES_MAX ? FRAME_LINES_MAX : *frame_lines;
+-	if (*lines > *frame_lines - EXPOSURE_MARGIN) {
+-		*lines = *frame_lines - EXPOSURE_MARGIN;
++	if (*lines > *frame_lines - ios_margin) {
++		*lines = *frame_lines - ios_margin;
++	}
++}
++
++/*
++ * 0931: the digital gain asked for (256 = 1x), within what the sensor has (0: none, or nothing asked). The frames report
++ * the analog gain, lines and frame lines as clamped here and in exposure_limits(): what the sensor was given, so a
++ * program that compares what it asked for (clamped the same way: gain_max, frame_lines_min/_max, margin) with what the
++ * frames say sees its request taken.
++ */
++static uint32_t
++dgain_limit(uint32_t d)
++{
++	if (d == 0 || ios_dgain_max == 0) {
++		return 0;
+ 	}
++	return d < GAIN_UNITY ? GAIN_UNITY : d > ios_dgain_max ? ios_dgain_max : d;
+ }
+ 
+ /* the places, for frames of `bytes': kept between sessions, made anew only for larger frames */
+@@ -2734,10 +2807,19 @@ ios_select(unsigned si, uint32_t mode_n)
+ 	ios_stride = (m->width / 4 * 5 + 15) & ~15u;
+ 	ios_line_ns = (uint32_t)(1000000000000ull / ((uint64_t)m->fps_milli * m->frame_length));
+ 	ios_gain_max = (si == 0 ? 8u : 16u) * GAIN_UNITY;
+-	ios_ask.lines = m->frame_length - EXPOSURE_MARGIN;
++	/* 0931: the module file's limits where the table file has them (IMX363: 8x analog, margin 16; IMX481/355: 16x, 16/10) */
++	ios_margin = sc.margin ? sc.margin : EXPOSURE_MARGIN;
++	ios_black = sc.black ? sc.black : 64;
++	if (sc.again_max >= GAIN_UNITY && sc.again_max < ios_gain_max) {
++		ios_gain_max = sc.again_max;
++	}
++	ios_dgain_max = sc.dgain_reg ? (sc.dgain_max > 0xfff || sc.dgain_max < GAIN_UNITY ? 0xfffu : sc.dgain_max) : 0;
++	ios_ask.lines = m->frame_length - ios_margin;
+ 	ios_ask.gain = 8 * GAIN_UNITY;
+ 	ios_ask.frame_lines = 0;
++	ios_ask.dgain = 0;
+ 	ios_ask.pending = false;
++	ios_dgain = 0;          /* (a new sensor starts with its tables' digital gain) */
+ 	printf("SWEET CAM: /dev/redwood-camera: the %s (camera %u): mode %u, %ux%u, %u.%03u frames/s at the most, lines of %u ns\n",
+ 	    sensors[si].name, ours_to_ios[si], mode_n, m->width, m->height, m->fps_milli / 1000, m->fps_milli % 1000, ios_line_ns);
+ 	return true;
+@@ -2785,7 +2867,8 @@ ios_session(void)
+ 		lck_mtx_unlock(&sweet_cam_lock);
+ 		return;
+ 	}
+-	bool ok = stream_up(ios_sensor, ios_mode_n, 0, 0, lines, gain_code(gain), frame_lines, (uint32_t)ring_pa, &powered);
++	bool ok = stream_up(ios_sensor, ios_mode_n, 0, 0, lines, gain_code(gain), frame_lines, dgain_limit(ios_dgain), (uint32_t)ring_pa,
++	    &powered);
+ 	if (ok) {
+ 		wr(cap.ife, IFE_IRQ_CLEAR0, 0xffffffffu);
+ 		wr(cap.ife, IFE_IRQ_GLOBAL_CLEAR, 1);
+@@ -2889,7 +2972,7 @@ ios_session(void)
+ 			}
+ 		}
+ 		bool ask = (bus_st & WM0_DONE) && ios_ask.pending;
+-		uint32_t al = ios_ask.lines, ag = ios_ask.gain, af = ios_ask.frame_lines;
++		uint32_t al = ios_ask.lines, ag = ios_ask.gain, af = ios_ask.frame_lines, ad = ios_ask.dgain;
+ 		ios_ask.pending = ios_ask.pending && !ask;
+ 		/* 0929: a lens move, written at a frame's end like the exposure (on the same held bus) */
+ 		bool focus = (bus_st & WM0_DONE) && ios_focus.pending;
+@@ -2919,12 +3002,17 @@ ios_session(void)
+ 		}
+ 		if (ask) {
+ 			exposure_limits(&al, &ag, &af);
+-			if (al != ios_now.lines || ag != ios_now.gain || af != ios_now.frame_lines) {
+-				if (!sensor_exposure(al, gain_code(ag), af)) {
++			uint32_t dg = dgain_limit(ad);
++			bool dchange = dg != 0 && dg != ios_dgain;
++			if (al != ios_now.lines || ag != ios_now.gain || af != ios_now.frame_lines || dchange) {
++				if (!sensor_exposure(al, gain_code(ag), af, dchange ? dg : 0)) {
+ 					why = "an exposure the sensor did not take";
+ 					ios_broken = true;
+ 					break;
+ 				}
++				if (dchange) {
++					ios_dgain = dg;
++				}
+ 				ios_next.lines = al;
+ 				ios_next.gain = ag;
+ 				ios_next.frame_lines = af;
+@@ -3062,7 +3150,7 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 	f.stride = ios_stride;
+ 	f.format = 1;
+ 	f.bayer = ios_mode->cfa == 0 ? 3 : ios_mode->cfa == 1 ? 2 : ios_mode->cfa == 2 ? 1 : 0;      /* CamX's order -> the header's */
+-	f.black = 64;
++	f.black = ios_black;                            /* 0931 */
+ 	f.sequence = place[b].sequence;
+ 	f.time = place[b].time;
+ 	f.exposure_lines = place[b].exposure_lines;
+@@ -3073,7 +3161,9 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 	f.frame_lines = place[b].frame_lines;
+ 	f.frame_lines_min = ios_mode->frame_length;
+ 	f.frame_lines_max = FRAME_LINES_MAX;
+-	f.margin = EXPOSURE_MARGIN;
++	f.margin = ios_margin;                          /* 0931 */
++	f.reserved[3] = ios_dgain_max ? ios_dgain_max << 16 | GAIN_UNITY : 0;
++	f.reserved[4] = ios_mode->fps_milli;
+ 	f.sensor = ours_to_ios[ios_sensor];
+ 	f.focus = place[b].focus;                       /* 0929 */
+ 	f.reserved[0] = place[b].flags;
+@@ -3127,6 +3217,7 @@ camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		ios_ask.lines = c.a;
+ 		ios_ask.gain = c.b;
+ 		ios_ask.frame_lines = c.c;
++		ios_ask.dgain = c.d;    /* 0931: digital gain, 256 = 1x, 0 = as it is */
+ 		ios_ask.pending = true;
+ 		lck_mtx_unlock(&ios_lock);
+ 		return 0;
+-- 
+2.43.0
+

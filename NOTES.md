@@ -190,3 +190,20 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
 - 0927 IOSurface lock result: a plane's bytes per row also at +0x10 of its entry, where IOSurface.framework (16.7)
   reads it. Bi-planar surfaces had 0 bytes per row per plane: green photographs, black camera preview, VT -12902.
 - 0928 SweetAccelerator: every refused v2 call logged (first 40 per client), refused imports/maps with details.
+- 0929 the rear camera's lens: the IMX363 module's AF motor is driven by its OIS controller, an ON Semi LC898129
+  (module file: actuator/OIS/EEPROM "lc898129dp", slave 0x3b, 16-bit registers, 32-bit data; live DT actuator@0/ois@0 on
+  CCI 0 master 0 with VAF): status 0xF100 polled, servos on (0xF010 <- 7), position 0xF01A <- 0x20000 | code (codes
+  400..725 for 0..1023 until the per-unit calibration is read; `sweetcam_af_inf`/`_mac`, `sweetcam_af=none|NAME`);
+  FOCUS works, frames carry `focus` and LENS_MOVING; parked before VAF goes off. (0930 is kept for the calibration.)
+- 0931 /dev/redwood-camera exposure contract: EXPOSURE.d digital gain (0x020e.., 256 = 1x), reserved[3] its range,
+  reserved[4] fps x 1000; group hold from the "holdon"/"holdoff" tables; margin/black/analog cap from the table file's
+  new "info" table (tools/redfin-camtab.py; old files keep 40/64/8x-16x); frames report the clamped values.
+- 0932 /dev/redwood-camera modes: SENSOR.c class (auto/photo, video 16:9 >= 30 fps, video60) when b is ~0; the same
+  sensor+mode again is a no-op, another mode of the streaming sensor switches without a power cycle, MODE_CHANGED on the
+  first frame after; a failed select keeps the previous sensor; table files read once ("c 23" forgets them).
+- 0933 flash for camera frames: sweet_torch_flash() with the PM8150L module's safety timer (<= 300 mA/channel,
+  <= 100 ms; pre-flash at torch current <= 500 ms); FLASH lights at the SOF before the frame, off after its end,
+  FLASH_LIT on the lit frames; SOF time in reserved[1]/[2].
+- 0934 /dev/redwood-camera stop/fault hygiene: halt at a frame boundary, SMMU fault only for FSR & 0x800001fe, the
+  write master's next place never read, read() waits <= 1 s (EAGAIN at close/SENSOR), 100 ms start debounce, 300 ms
+  close linger.

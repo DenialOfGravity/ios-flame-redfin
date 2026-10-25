@@ -1,0 +1,404 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sun, 25 Oct 2026 21:15:35 +0100
+Subject: [PATCH] 0933 redfin: flash strobe for camera frames, FLASH_LIT,
+ start-of-frame time
+
+sweet_torch.c: sweet_torch_flash() lights the rear LED at once (from the
+camera's frame loop) with the module's own safety timer (SAFETY_TMR(ch) =
+0x80 | (ms / 10 - 1), as leds-qpnp-flash-v2.c for a flash), at most
+sweettorch_flash_ma (default and cap 300 mA per channel) for at most 100 ms,
+a metering pre-flash at the torch's current for at most 500 ms;
+sweet_torch_flash_off() ends it. Not while the torch is on (EBUSY). A lock
+keeps these and the torch thread apart.
+
+/dev/redwood-camera: FLASH (a mA, b frames, c 1 = pre-flash) asked for at the
+end of frame k is lit at the start of frame k + 1 (rolling shutter: frame
+k + 2's first line starts its exposure after that) and switched off after the
+end of frame k + 1 + b; those frames carry FLASH_LIT (reserved[0] bit 0) if
+the light was still on when they ended. Every frame carries its start of
+frame (mach time) in reserved[1] (low) / reserved[2] (high).
+---
+ bsd/dev/sweet_cam.c   |  97 ++++++++++++++++++++++++++++++++++++-
+ bsd/dev/sweet_torch.c | 110 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 206 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index 61afa7c..ddf3be4 100644
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -2669,7 +2669,8 @@ struct redwood_camera_frame {
+ 	    margin, sensor, focus, reserved[5];
+ };
+ #define REDWOOD_CAMERA_NO_FOCUS         0xffffffffu
+-enum { REDWOOD_CAMERA_EXPOSURE = 1, REDWOOD_CAMERA_KEEP = 2, REDWOOD_CAMERA_SENSOR = 3, REDWOOD_CAMERA_FOCUS = 4 };
++enum { REDWOOD_CAMERA_EXPOSURE = 1, REDWOOD_CAMERA_KEEP = 2, REDWOOD_CAMERA_SENSOR = 3, REDWOOD_CAMERA_FOCUS = 4,
++       REDWOOD_CAMERA_FLASH = 5 };
+ /* 0929-0933 (the shared contract with phone/audio/redwood_camera.h): reserved[0] flags, [1]/[2] start of frame (mach
+  * time, low/high 32 bits), [3] digital gain (unity | max << 16; 0 none), [4] the mode's frames a second x 1000 */
+ #define REDWOOD_CAMERA_FLAG_FLASH_LIT           (1u << 0)
+@@ -2724,6 +2725,36 @@ static uint32_t ios_switch_mode = ~0u;
+ static unsigned ios_switch_class;      /* 0932: SENSOR's c */
+ static struct { uint32_t pos; bool pending, park; } ios_focus;     /* 0929: FOCUS, done after the next frame's end */
+ 
++/*
++ * 0933: FLASH (a mA per channel, b frames, c 1 = a metering pre-flash at the torch's current). Asked for at the end of
++ * frame k, the LED is lit at the start of frame k + 1 -- the start of its read-out: the sensor's shutter rolls, and the
++ * first line of frame k + 2 begins its exposure after that -- and switched off at the end of frame k + 1 + b; frames
++ * k + 2 .. k + 1 + b carry FLASH_LIT if the light was still on (the module's safety timer, set to the frames' time,
++ * at most 100 ms for a flash, 500 ms for a pre-flash) when they ended. 0 mA: off now.
++ */
++extern int sweet_torch_flash(unsigned ma, unsigned *ms, bool pre);
++extern void sweet_torch_flash_off(void);
++#define FLASH_FRAMES_MAX        8u
++static struct { uint32_t ma, frames; bool pre, pending; } ios_flash_ask;
++enum { FL_IDLE, FL_ARMED, FL_LIT };
++static struct {
++	unsigned state;
++	uint32_t ma, frames;
++	bool pre;
++	uint64_t first, last;           /* the frames to be lit (sequence numbers) */
++	uint64_t until;                 /* mach time the safety timer ends it */
++	unsigned refused;
++} fl;
++
++static void
++flash_stop(void)
++{
++	if (fl.state == FL_LIT) {
++		sweet_torch_flash_off();
++	}
++	fl.state = FL_IDLE;
++}
++
+ static uint64_t
+ ios_ms(void)
+ {
+@@ -2966,6 +2997,7 @@ ios_warm_switch(uint32_t mode_n)
+ 	unsigned old_n = ios_mode_n, phy = sensor_capture[ios_sensor].phy;
+ 	uint32_t frame_ms = (uint32_t)((uint64_t)ios_line_ns * ios_now.frame_lines / 1000000u) + 5;
+ 	uint64_t t0 = ios_ms();
++	flash_stop();           /* 0933 */
+ 	lck_mtx_lock(&ios_lock);
+ 	ios_streaming = false;
+ 	for (int i = 0; i < RING; i++) {
+@@ -3144,6 +3176,11 @@ ios_session(void)
+ 			place[writing].focus = lens.up ? lens.pos : REDWOOD_CAMERA_NO_FOCUS;
+ 			place[writing].flags = 0;
+ 			place[writing].gen = ios_gen;
++			/* 0933: lit, the light on from before its first line's exposure to its end */
++			if (fl.state == FL_LIT && ios_frames_done >= fl.first && ios_frames_done <= fl.last &&
++			    place[writing].time <= fl.until) {
++				place[writing].flags |= REDWOOD_CAMERA_FLAG_FLASH_LIT;
++			}
+ 			uint64_t exposed;
+ 			nanoseconds_to_absolutetime((uint64_t)ios_now.lines * ios_line_ns, &exposed);
+ 			if (lens.up && lens.moving_until > place[writing].sof - MIN(exposed, place[writing].sof) &&
+@@ -3151,6 +3188,26 @@ ios_session(void)
+ 				place[writing].flags |= REDWOOD_CAMERA_FLAG_LENS_MOVING;
+ 			}
+ 		}
++		/* 0933: the flash: off after the last lit frame's end; a new one armed at a frame's end */
++		bool flash_off = false, flash_on = false;
++		if (bus_st & WM0_DONE) {
++			if (fl.state == FL_LIT && ios_frames_done >= fl.last) {
++				flash_off = true;
++			}
++			if (ios_flash_ask.pending && ios_flash_ask.ma == 0) {
++				ios_flash_ask.pending = false;
++				flash_off = fl.state == FL_LIT;
++				fl.state = fl.state == FL_ARMED ? FL_IDLE : fl.state;
++			} else if (ios_flash_ask.pending && (fl.state == FL_IDLE || flash_off)) {
++				ios_flash_ask.pending = false;
++				fl.ma = ios_flash_ask.ma;
++				fl.frames = ios_flash_ask.frames;
++				fl.pre = ios_flash_ask.pre;
++				fl.first = ios_frames_done + 2;
++				fl.last = ios_frames_done + 1 + fl.frames;
++				flash_on = true;        /* lit at the next SOF (frame k + 1's) */
++			}
++		}
+ 		if (top & RDI0_SOF) {
+ 			if (next >= 0) {
+ 				writing = next;         /* (the address given at the last SOF, taken at this one) */
+@@ -3171,6 +3228,7 @@ ios_session(void)
+ 				wr(cap.ife, IFE_REG_UPDATE, 0x2);
+ 			}
+ 		}
++		uint64_t sof_now = place[writing].sof;
+ 		bool ask = (bus_st & WM0_DONE) && ios_ask.pending;
+ 		uint32_t al = ios_ask.lines, ag = ios_ask.gain, af = ios_ask.frame_lines, ad = ios_ask.dgain;
+ 		ios_ask.pending = ios_ask.pending && !ask;
+@@ -3180,6 +3238,28 @@ ios_session(void)
+ 		bool fpark = ios_focus.park;
+ 		ios_focus.pending = ios_focus.pending && !focus;
+ 		lck_mtx_unlock(&ios_lock);
++		/* 0933: the flash's writes, outside the lock (each a few SPMI writes, read back) */
++		if (flash_off) {
++			flash_stop();
++		}
++		if (flash_on) {
++			fl.state = FL_ARMED;
++		}
++		if (fl.state == FL_ARMED && (top & RDI0_SOF)) {
++			uint64_t frame_ns = (uint64_t)ios_line_ns * ios_now.frame_lines, span;
++			unsigned ms = (unsigned)((frame_ns * (fl.frames + 1) + 16 * NSEC_PER_MSEC - 1) / NSEC_PER_MSEC);
++			int err = sweet_torch_flash(fl.ma, &ms, fl.pre);
++			if (err == 0) {
++				nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &span);
++				fl.until = sof_now + span;
++				fl.state = FL_LIT;
++			} else {
++				if (fl.refused++ < 10) {
++					printf("SWEET CAM: /dev/redwood-camera: no flash (%d)\n", err);
++				}
++				fl.state = FL_IDLE;
++			}
++		}
+ 		if (focus && lens.up) {
+ 			if (fpark) {
+ 				/* a step a frame back to infinity, the next step asked for again until it is there */
+@@ -3223,6 +3303,7 @@ ios_session(void)
+ 			show_paths("streaming");
+ 		}
+ 	}
++	flash_stop();           /* 0933 */
+ 	lck_mtx_lock(&ios_lock);
+ 	ios_streaming = false;
+ 	for (int i = 0; i < RING; i++) {
+@@ -3371,6 +3452,8 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 	f.frame_lines_min = ios_mode->frame_length;
+ 	f.frame_lines_max = FRAME_LINES_MAX;
+ 	f.margin = ios_margin;                          /* 0931 */
++	f.reserved[1] = (uint32_t)place[b].sof;        /* 0933: the start of frame, mach time */
++	f.reserved[2] = (uint32_t)(place[b].sof >> 32);
+ 	f.reserved[3] = ios_dgain_max ? ios_dgain_max << 16 | GAIN_UNITY : 0;
+ 	f.reserved[4] = ios_mode->fps_milli;
+ 	f.sensor = ours_to_ios[ios_sensor];
+@@ -3459,6 +3542,18 @@ camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		lck_mtx_unlock(&ios_lock);
+ 		wakeup(&ios_open);
+ 		return 0;
++	case REDWOOD_CAMERA_FLASH:
++		/* 0933: a mA per channel (0 = off; the torch driver caps it), b frames (0 = 1), c = 1 metering pre-flash */
++		if (c.c > 1) {
++			return EINVAL;
++		}
++		lck_mtx_lock(&ios_lock);
++		ios_flash_ask.ma = c.a;
++		ios_flash_ask.frames = c.b == 0 ? 1 : c.b > FLASH_FRAMES_MAX ? FLASH_FRAMES_MAX : c.b;
++		ios_flash_ask.pre = c.c == 1;
++		ios_flash_ask.pending = true;
++		lck_mtx_unlock(&ios_lock);
++		return 0;
+ 	case REDWOOD_CAMERA_KEEP:
+ 		return ENOTSUP;
+ 	}
+diff --git a/bsd/dev/sweet_torch.c b/bsd/dev/sweet_torch.c
+index e0c3115..0858c85 100644
+--- a/bsd/dev/sweet_torch.c
++++ b/bsd/dev/sweet_torch.c
+@@ -32,6 +32,14 @@
+  * Limits whatever asks: at most sweettorch_ma per channel (default 100, never above 200: Android's own
+  * torch is 300 mA per channel, its maximum 500); on for at most sweettorch_secs at a time (default 120,
+  * never above 600), then off until asked again; ten checks a second for the faults above while lit.
++ *
++ * 0933: the flash for a camera frame (sweet_torch_flash(), /dev/redwood-camera's FLASH): lit at once from the
++ * camera's frame loop, with the module's own safety timer (SAFETY_TMR(ch) = 0x80 | (ms / 10 - 1), as
++ * leds-qpnp-flash-v2.c sets it for a flash: the LED goes off by itself when the time is up, whatever the software
++ * does). At most sweettorch_flash_ma per channel (default 300, never above 300 until there are thermal and VPH
++ * droop numbers) for at most 100 ms; a metering pre-flash at the torch's current (<= sweettorch_ma) may last 500 ms.
++ * Not while the light is on as a torch (EBUSY). One lock (torch_lock) keeps the camera's calls and this thread's
++ * apart.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -51,6 +59,8 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ void sweet_torch_init(void);
+ int sweet_torch_set(unsigned ma, unsigned ms);
++int sweet_torch_flash(unsigned ma, unsigned *ms, bool pre);
++void sweet_torch_flash_off(void);
+ 
+ #define SP_CORE_PA      0x0c440000u
+ #define SP_CHNLS_PA     0x0c600000u
+@@ -84,6 +94,10 @@ int sweet_torch_set(unsigned ma, unsigned ms);
+ #define TORCH_MA_CAP     200u
+ #define TORCH_S_DEFAULT  120u
+ #define TORCH_S_CAP      600u
++#define FLASH_MA_DEFAULT 300u            /* 0933 */
++#define FLASH_MA_CAP     300u
++#define FLASH_MS_CAP     100u
++#define PREFLASH_MS_CAP  500u
+ 
+ struct tc_chan {
+ 	vm_offset_t obs, chnl;  /* read (observer) and write channel of one peripheral */
+@@ -95,6 +109,8 @@ static struct {
+ 	bool alarm_gen2;
+ 	unsigned max_ma, max_s;
+ 	bool ready, dead, lit, on_the_fly;
++	bool flash;                     /* 0933: lit as a flash (the safety timer running) */
++	unsigned flash_ma, flashes;
+ 	unsigned lit_ma;
+ 	uint64_t lit_since;
+ 	unsigned writes;
+@@ -104,6 +120,8 @@ static int torch_sleep_chan;
+ static volatile uint32_t torch_req;     /* bit 31 = new; [15:0] mA per channel; 0 = off */
+ static volatile uint32_t torch_req_ms;  /* 0 = until max_s */
+ static volatile unsigned torch_level;   /* last sysctl level */
++static LCK_GRP_DECLARE(torch_grp, "sweet_torch");
++static LCK_MTX_DECLARE(torch_lock, &torch_grp);        /* 0933: the camera's flash calls and this thread */
+ 
+ static uint32_t
+ tc_rd32(vm_offset_t base, uint32_t off)
+@@ -331,6 +349,7 @@ tc_off(const char *why)
+ 		printf("SWEET TORCH: switching off did not read back (%s)\n", why);
+ 	}
+ 	tc.lit = false;
++	tc.flash = false;
+ 	tc.lit_ma = 0;
+ 	if (was) {
+ 		uint64_t ns;
+@@ -355,6 +374,9 @@ tc_on(unsigned ma)
+ {
+ 	uint8_t ires, code;
+ 	tc_code(ma, &ires, &code);
++	if (tc.lit && tc.flash) {
++		tc_off("the torch after a flash");      /* 0933: (the flash's safety timer would cut the torch short) */
++	}
+ 	if (tc.lit && tc.on_the_fly) {
+ 		int err = tc_write(FL_IRES, 0x0f, ires);
+ 		err |= tc_write(FL_TGR(0), 0x7f, code);
+@@ -391,6 +413,41 @@ tc_on(unsigned ma)
+ 	return 0;
+ }
+ 
++/* 0933: lit as a flash: ma per channel, the module's safety timer at ms (10 ms steps) */
++static int
++tc_flash_on(unsigned ma, unsigned ms)
++{
++	uint8_t ires, code, tmr = (uint8_t)(0x80u | (ms / 10u - 1u));
++	tc_code(ma, &ires, &code);
++	if (tc.lit) {
++		tc_off("a new flash");
++	}
++	int err = tc_write(FL_IRES, 0x0f, ires);
++	for (unsigned ch = 0; ch < 2 && !err; ch++) {
++		err |= tc_write(FL_STROBE(ch), FL_SW_STROBE, 0);
++		err |= tc_write(FL_TGR(ch), 0x7f, code);
++		err |= tc_write(FL_SAFETY(ch), 0xff, tmr);
++	}
++	if (!err) {
++		err |= tc_write(FL_MOD_CTRL, FL_MOD_EN, FL_MOD_EN);
++	}
++	if (!err) {
++		err |= tc_write(FL_EN_LED, FL_CHANNELS, FL_CHANNELS);
++	}
++	if (err) {
++		tc_off("flash write failed");
++		return -1;
++	}
++	tc.lit = true;
++	tc.flash = true;
++	tc.lit_ma = ma;
++	tc.lit_since = mach_absolute_time();
++	if (tc.flashes++ < 20) {
++		printf("SWEET TORCH: flash, %u mA per channel for at most %u ms (safety timer %#x)\n", ma, ms, tmr);
++	}
++	return 0;
++}
++
+ /* faults while lit: true = keep going */
+ static bool
+ tc_check(void)
+@@ -443,6 +500,9 @@ torch_thread(void *arg __unused, wait_result_t wr __unused)
+ 	PE_parse_boot_argn("sweettorch_ma", &tc.max_ma, sizeof(tc.max_ma));
+ 	PE_parse_boot_argn("sweettorch_secs", &tc.max_s, sizeof(tc.max_s));
+ 	tc.max_ma = tc.max_ma == 0 ? TORCH_MA_DEFAULT : tc.max_ma > TORCH_MA_CAP ? TORCH_MA_CAP : tc.max_ma;
++	tc.flash_ma = FLASH_MA_DEFAULT;
++	PE_parse_boot_argn("sweettorch_flash_ma", &tc.flash_ma, sizeof(tc.flash_ma));
++	tc.flash_ma = tc.flash_ma == 0 ? FLASH_MA_DEFAULT : tc.flash_ma > FLASH_MA_CAP ? FLASH_MA_CAP : tc.flash_ma;
+ 	tc.max_s = tc.max_s == 0 ? TORCH_S_DEFAULT : tc.max_s > TORCH_S_CAP ? TORCH_S_CAP : tc.max_s;
+ 	tc_sleep(6000);
+ 	tc.core = ml_io_map(SP_CORE_PA, 0x2000);
+@@ -497,6 +557,7 @@ torch_thread(void *arg __unused, wait_result_t wr __unused)
+ 		} else {
+ 			thread_block(THREAD_CONTINUE_NULL);
+ 		}
++		lck_mtx_lock(&torch_lock);
+ 		uint32_t req = __atomic_exchange_n(&torch_req, 0, __ATOMIC_ACQ_REL);
+ 		uint64_t now = mach_absolute_time();
+ 		if (req & (1u << 31)) {
+@@ -524,13 +585,18 @@ torch_thread(void *arg __unused, wait_result_t wr __unused)
+ 				    raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14],
+ 				    raw[15], raw[16], raw[17], raw[18], raw[19], raw[20], raw[21]);
+ 				tc_dump("after fault");
++			} else if (tc.flash) {
++				/* 0933: a flash ends by itself (its safety timer); the camera switches it off */
+ 			} else if (now >= off_at) {
+ 				tc_off(torch_req_ms ? "time" : "time limit");
+ 				torch_level = 0;
+ 			}
+ 		}
++		lck_mtx_unlock(&torch_lock);
+ 	}
++	lck_mtx_lock(&torch_lock);
+ 	tc_off("stopped");
++	lck_mtx_unlock(&torch_lock);
+ out:
+ 	tc.ready = false;
+ 	(void)thread_terminate(current_thread());
+@@ -550,6 +616,50 @@ sweet_torch_set(unsigned ma, unsigned ms)
+ 	return 0;
+ }
+ 
++/*
++ * 0933: the flash for a camera frame, lit now (synchronously, from the camera's frame loop): ma per channel (at most
++ * sweettorch_flash_ma; pre: a metering pre-flash, at most the torch's current), for at most *ms (10..100 ms, a
++ * pre-flash 10..500), which the module's safety timer enforces; *ms says what was set. 0 lit; EBUSY while the torch
++ * is on; ENXIO without the driver; EIO a write that failed (the driver stops).
++ */
++int
++sweet_torch_flash(unsigned ma, unsigned *ms, bool pre)
++{
++	if (!tc.ready || tc.dead) {
++		return ENXIO;
++	}
++	unsigned cap_ma = pre ? tc.max_ma : tc.flash_ma, cap_ms = pre ? PREFLASH_MS_CAP : FLASH_MS_CAP;
++	ma = ma == 0 ? 1 : ma > cap_ma ? cap_ma : ma;
++	unsigned t = *ms < 10 ? 10 : *ms > cap_ms ? cap_ms : *ms;
++	*ms = t / 10 * 10;
++	lck_mtx_lock(&torch_lock);
++	int err = 0;
++	if (tc.lit && !tc.flash) {
++		err = EBUSY;
++	} else if (tc.dead || tc_flash_on(ma, *ms) != 0) {
++		err = EIO;
++	}
++	lck_mtx_unlock(&torch_lock);
++	if (!err) {
++		thread_wakeup(&torch_chan);     /* (the fault checks while lit) */
++	}
++	return err;
++}
++
++/* 0933: the flash off (after the lit frame's end); nothing if it is not lit as a flash */
++void
++sweet_torch_flash_off(void)
++{
++	if (!tc.ready) {
++		return;
++	}
++	lck_mtx_lock(&torch_lock);
++	if (tc.lit && tc.flash) {
++		tc_off("flash done");
++	}
++	lck_mtx_unlock(&torch_lock);
++}
++
+ static int
+ sysctl_sweet_torch SYSCTL_HANDLER_ARGS
+ {
+-- 
+2.43.0
+
