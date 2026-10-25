@@ -41,10 +41,24 @@ struct redwood_camera_frame {
 	uint32_t        sensor;         /* which: 0 the macro, 1 the wide, 2 the front, 3 the ultra-wide camera */
 	uint32_t        focus;          /* the lens's position as last set, 0 (the furthest) to 1023: REDWOOD_CAMERA_NO_FOCUS where it
 	                                 * has no motor (or it does not answer) */
-	uint32_t        reserved[5];    /* redfin: see REDWOOD_CAMERA_R_* below */
+	uint32_t        reserved[5];    /* (kernel 0929-0934) [0] REDWOOD_CAMERA_FLAG_*; [1]/[2] the start of frame, mach time, low/high
+	                                 * 32 bits; [3] the sensor's digital gain: unity | max << 16 (0: none); [4] the mode's frames a
+	                                 * second x 1000 */
 };
 
 #define REDWOOD_CAMERA_NO_FOCUS 0xffffffffu
+#define REDWOOD_CAMERA_FOCUS_MAX        1023u   /* focus: 0 infinity .. 1023 macro */
+
+/* reserved[] by index */
+#define REDWOOD_CAMERA_R_FLAGS          0
+#define REDWOOD_CAMERA_R_SOF_LO         1
+#define REDWOOD_CAMERA_R_SOF_HI         2
+#define REDWOOD_CAMERA_R_DGAIN          3
+#define REDWOOD_CAMERA_R_FPS_MILLI      4
+/* reserved[REDWOOD_CAMERA_R_FLAGS] */
+#define REDWOOD_CAMERA_FLAG_FLASH_LIT   (1u << 0)       /* exposed with the flash (or the FLASH pre-flash) on */
+#define REDWOOD_CAMERA_FLAG_LENS_MOVING (1u << 1)       /* the lens moved while some of its lines were exposed */
+#define REDWOOD_CAMERA_FLAG_MODE_CHANGED (1u << 2)      /* the first frame read after a sensor or mode change */
 
 enum {
 	REDWOOD_CAMERA_EXPOSURE = 1,    /* a: lines, b: gain, c: frame lines (0: the shortest that holds the exposure) */
@@ -53,7 +67,23 @@ enum {
 	REDWOOD_CAMERA_SENSOR = 3,      /* another sensor: a which (as in the frames' header), b its mode (~0: the usual one);
 	                                 * the frames stop, everything goes down, and the next read starts the other one */
 	REDWOOD_CAMERA_FOCUS = 4,       /* the lens to a: 0 (the furthest) to 1023, from the next frame or so */
+	REDWOOD_CAMERA_FLASH = 5,       /* (0933) a mA per channel (0: off; the kernel caps it), b frames to light (0: 1; the next full
+	                                 * frame on), c 1 = a metering pre-flash at the torch's current; lit frames carry FLASH_LIT */
 };
+
+/*
+ * (0931-0932) EXPOSURE's d: the sensor's digital gain, 256 = 1x, 0 = as it is (range in reserved[R_DGAIN]).
+ * SENSOR's c, the mode's class when b is ~0 (REDWOOD_CAMERA_MODE_ANY); the same sensor and mode again changes nothing.
+ * FOCUS's b: REDWOOD_CAMERA_FOCUS_MOVE, or _PARK (back to infinity a step at a time). No lens motor: focus stays NO_FOCUS.
+ */
+#define REDWOOD_CAMERA_MODE_ANY         0xffffffffu
+enum {
+	REDWOOD_CAMERA_CLASS_AUTO = 0,  /* the most pixels at 4:3, <= 31 fps, <= 13 MP */
+	REDWOOD_CAMERA_CLASS_PHOTO = 1, /* (the same) */
+	REDWOOD_CAMERA_CLASS_VIDEO = 2, /* 16:9, <= 4096 wide, >= 1600x900, >= 30 fps: the lowest rate, then the fewest pixels */
+	REDWOOD_CAMERA_CLASS_VIDEO60 = 3, /* the same from 60 fps (video where the sensor has none) */
+};
+enum { REDWOOD_CAMERA_FOCUS_MOVE = 0, REDWOOD_CAMERA_FOCUS_PARK = 1 };
 
 struct redwood_camera_command {
 	uint32_t        command;
@@ -61,37 +91,13 @@ struct redwood_camera_command {
 	uint32_t        a, b, c, d;
 };
 
-/*
- * redfin: the camera ABI contract of the 2026-10-25 camera/GPU plan (kernel bsd/dev/sweet_cam.c <-> this plug-in),
- * additions only: the frame's size is unchanged, reserved[5] is given meanings, and the commands take more.
- *
- *   EXPOSURE 1: a lines, b analog gain (256 = 1x), c frame lines (0: the shortest), d digital gain (256 = 1x,
- *               0: unchanged). The kernel clamps what it cannot do and reports what it set (the frames' header).
- *   SENSOR   3: a camera (1 back IMX363, 2 front IMX355, 3 ultra-wide IMX481), b mode index or ~0, c (with b ~0) the
- *               kind of mode the kernel picks: REDWOOD_CAMERA_MODE_*.
- *   FOCUS    4: a position 0 (infinity) to 1023 (macro), b 0 move now / 1 park. No actuator: focus stays NO_FOCUS.
- *   FLASH    5: a current in mA (the kernel caps it), b frames to light (1: the next full frame), c 1: a pre-flash at
- *               torch level first (for metering). The lit frame carries REDWOOD_CAMERA_FLASH_LIT.
- */
-enum {
-	REDWOOD_CAMERA_FLASH = 5,
-};
-
-/* SENSOR's c, with b = ~0 */
-#define REDWOOD_CAMERA_MODE_AUTO        0u
-#define REDWOOD_CAMERA_MODE_PHOTO       1u      /* the most pixels at 4:3 */
-#define REDWOOD_CAMERA_MODE_VIDEO       2u      /* 16:9, >= 30 fps, <= 4K */
-#define REDWOOD_CAMERA_MODE_VIDEO60     3u      /* >= 60 fps */
-
-/* reserved[]'s meanings */
-#define REDWOOD_CAMERA_R_FLAGS          0       /* REDWOOD_CAMERA_FLASH_LIT | LENS_MOVING | MODE_CHANGED */
-#define REDWOOD_CAMERA_R_SOF_LO         1       /* start of frame, mach_absolute_time(), low 32 bits ... */
-#define REDWOOD_CAMERA_R_SOF_HI         2       /* ... high 32 bits (0 and 0: not given) */
-#define REDWOOD_CAMERA_R_DGAIN          3       /* the sensor's digital gain: lo16 unity, hi16 max (0: it has none) */
-#define REDWOOD_CAMERA_R_FPS_MILLI      4       /* the current mode's frames a second, in thousandths (0: not given) */
-
-#define REDWOOD_CAMERA_FLASH_LIT        (1u << 0)       /* this frame was exposed with the flash on */
-#define REDWOOD_CAMERA_LENS_MOVING      (1u << 1)       /* the lens moved while this frame was exposed */
-#define REDWOOD_CAMERA_MODE_CHANGED     (1u << 2)       /* the first frame after a SENSOR/mode change */
+/* (the camera plug-in's names for the same: WS-B wrote against the plan's contract before 0929-0934) */
+#define REDWOOD_CAMERA_MODE_AUTO        REDWOOD_CAMERA_CLASS_AUTO
+#define REDWOOD_CAMERA_MODE_PHOTO       REDWOOD_CAMERA_CLASS_PHOTO
+#define REDWOOD_CAMERA_MODE_VIDEO       REDWOOD_CAMERA_CLASS_VIDEO
+#define REDWOOD_CAMERA_MODE_VIDEO60     REDWOOD_CAMERA_CLASS_VIDEO60
+#define REDWOOD_CAMERA_FLASH_LIT        REDWOOD_CAMERA_FLAG_FLASH_LIT
+#define REDWOOD_CAMERA_LENS_MOVING      REDWOOD_CAMERA_FLAG_LENS_MOVING
+#define REDWOOD_CAMERA_MODE_CHANGED     REDWOOD_CAMERA_FLAG_MODE_CHANGED
 
 #endif /* _SYS_REDWOOD_CAMERA_H_ */

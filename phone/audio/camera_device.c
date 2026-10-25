@@ -723,14 +723,15 @@ af_window(struct stream *s, CFTypeRef value)
 }
 
 /*
- * The lens's travel focus uses (the kernel's positions: 0 infinity, 1023 macro). TODO(WS-A's actuator report): these are
- * HackiOS's phone's; the Pixel 5's IMX363 actuator's infinity and macro DACs (and whether its OIS controller owns the
- * coil) are for WS-A to find, and these follow.
+ * The lens's travel focus uses (the kernel's positions: 0 infinity, 1023 macro). redfin (WS-A, kernel 0929): the back
+ * camera's actuator is an ON Semi LC898129 (AF, OIS and EEPROM in one chip); the kernel maps 0..1023 onto its codes
+ * 400..725 for now (to be widened from the EEPROM's calibration), so the whole of it is safe to use -- HackiOS's phone
+ * stopped at 768 (an over-current on its LDO) and had a hard stop at 0. The IMX355 and IMX481 are fixed focus.
  */
-#define AF_NEAR         16              /* (off the stop at 0) */
-#define AF_FAR          768             /* (its module file's actuator region goes to 700; near 1023 the PM8008i's LDO5 said over-current) */
-#define AF_STEP         48
-#define AF_FINE         12
+#define AF_NEAR         0               /* (infinity) */
+#define AF_FAR          REDWOOD_CAMERA_FOCUS_MAX        /* (macro) */
+#define AF_STEP         64
+#define AF_FINE         16
 
 /* ---- redfin (plan B4-B7): the controls' values ------------------------------------------------------------------- */
 
@@ -1683,6 +1684,7 @@ struct af {
 	/* redfin (B5) */
 	bool            hold;           /* a one-off search (AF_MODE_AUTO) done: the lens stays until focus is asked for again */
 	int32_t         manual_at;      /* the ManualFocusNow position being gone to or held (-1: none) */
+	bool            started;        /* at and target are the kernel's */
 };
 
 /* whether focus is looking for the sharpest, or the lens is on its way somewhere (AFStatus; a photograph waits for it) */
@@ -1724,7 +1726,8 @@ af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const 
 	if (f->focus == REDWOOD_CAMERA_NO_FOCUS) {
 		return;
 	}
-	if (af->at == 0 && af->target == 0) {
+	if (!af->started) {
+		af->started = true;
 		af->at = af->target = f->focus;         /* (where the kernel put it) */
 		af->manual_at = -1;
 	}
@@ -2048,7 +2051,7 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 		if (f->sensor != s->camera->sensor) {
 			/* another camera's frames (the kernel's last sensor): changed, and the next ones are this one's */
 			if (!switched) {
-				struct redwood_camera_command c = { .command = REDWOOD_CAMERA_SENSOR, .a = s->camera->sensor, .b = ~0u,
+				struct redwood_camera_command c = { .command = REDWOOD_CAMERA_SENSOR, .a = s->camera->sensor, .b = REDWOOD_CAMERA_MODE_ANY,
 					.c = s->camera->formats[s->format_index & 1].kind };
 
 				switched = mode_asked = true;
@@ -2087,7 +2090,7 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 		}
 		/* the format's kind of mode (B3): asked once a format, if the frames are not of it */
 		if (s->mode_wanted || (!mode_asked && !mode_fits(f, s->camera->formats[s->format_index & 1].kind))) {
-			struct redwood_camera_command c = { .command = REDWOOD_CAMERA_SENSOR, .a = s->camera->sensor, .b = ~0u,
+			struct redwood_camera_command c = { .command = REDWOOD_CAMERA_SENSOR, .a = s->camera->sensor, .b = REDWOOD_CAMERA_MODE_ANY,
 				.c = s->camera->formats[s->format_index & 1].kind };
 
 			s->mode_wanted = false;
