@@ -187,3 +187,5 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   ("-[__NSCFNumber objectForKey:]") each time Camera.app's capture session started.
 - 0926 /dev/redwood-camera: PMIC GPIO writes tried three times; a session whose sensor did not start is tried again
   (three failures in a row before EIO for the boot). r18d gave the device up after one gpio8 read-back of 0.
+- 0927 IOSurface lock result: a plane's bytes per row also at +0x10 of its entry, where IOSurface.framework (16.7)
+  reads it. Bi-planar surfaces had 0 bytes per row per plane: green photographs, black camera preview, VT -12902.

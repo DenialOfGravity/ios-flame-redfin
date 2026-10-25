@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Sun, 25 Oct 2026 19:20:00 +0100
+Subject: [PATCH] 0927 redfin: IOSurface planes' bytes per row where iOS 16.7 reads them
+
+IOSurface.framework takes a plane's bytes per row from +0x10 of the
+plane's entry in the lock result (IOSurfaceGetBytesPerRowOfPlane reads
+client + 0xe0 + 0x80 * plane; width +0x00, height +0x04, offset +0x0c,
+size +0x14, bytes per element +0x18). SweetSurface put it at +0x08 only,
+so every bi-planar surface (420f/420v) had 0 bytes per row per plane:
+the camera's pictures were drawn into their first row only (Camera.app's
+photographs pure green, its preview black) and VideoToolbox's pixel
+transfers failed with -12902 (vt_test). Written at +0x10 too.
+
+---
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -660,6 +660,14 @@
+ 		put32(p, 0x04, pl->height);
+ 		put32(p, 0x08, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
++		/*
++		 * 0927: IOSurface.framework (16.7) reads a plane's bytes per row at +0x10
++		 * (IOSurfaceGetBytesPerRowOfPlane: client + 0xe0 + 0x80 * plane, the lock result
++		 * being at + 0x68). Without it every plane had 0 bytes per row: the camera's
++		 * pictures were drawn all into their first row (green photographs, a black
++		 * preview) and VideoToolbox refused its transfers (-12902).
++		 */
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+ 		p[0x1a] = pl->elementWidth;
+-- 
+2.43.0
