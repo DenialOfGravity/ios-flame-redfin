@@ -1064,8 +1064,11 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 	}
 	/* ---- redfin (plan B4): exposure ---- */
 	if (key_is(key, "LockAENow") || key_is(key, "UnlockAENow")) {
+		double on = 1;
+
+		number_of(value, &on);          /* (LockAENow false: unlocked) */
 		pthread_mutex_lock(&s->ctl_lock);
-		s->ae_locked = key_is(key, "LockAENow");
+		s->ae_locked = key_is(key, "LockAENow") && on != 0;
 		if (!s->ae_locked) {
 			s->ae_manual = false;
 		}
@@ -1147,8 +1150,11 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 	}
 	/* ---- redfin (plan B7): white balance ---- */
 	if (key_is(key, "LockAWBNow") || key_is(key, "UnlockAWBNow")) {
+		double on = 1;
+
+		number_of(value, &on);          /* (LockAWBNow false: unlocked) */
 		pthread_mutex_lock(&s->ctl_lock);
-		s->awb_locked = key_is(key, "LockAWBNow");
+		s->awb_locked = key_is(key, "LockAWBNow") && on != 0;
 		if (!s->awb_locked) {
 			s->awb_manual = false;
 		}
@@ -1199,7 +1205,10 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		if (key_is(key, "AFWindowParams")) {
 			af_window(s, value);
 		} else if (key_is(key, "LockAFNow")) {
-			s->af_locked = true;
+			double on = 1;
+
+			number_of(value, &on);
+			s->af_locked = on != 0;
 		} else if (key_is(key, "ManualFocusNow")) {
 			int32_t at = focus_of(value);
 
