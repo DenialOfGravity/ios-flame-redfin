@@ -7,6 +7,9 @@
  *                                and its unslid address (llvm-objdump -D -b binary -m aarch64 --adjust-vma=ADDR)
  *   imgdump read ADDR LEN OUT    LEN bytes at the unslid shared-cache address ADDR into OUT
  *   imgdump grep TEXT [LIB...]   where TEXT is in the __TEXT sections of the loaded images (after loading LIBs too)
+ *   imgdump methods CLASS...     each class's methods (+ class, - instance; unslid address, type encoding), its
+ *                                superclass and its instance variables (offset, type)
+ *   imgdump classes TEXT         the Objective-C classes whose names contain TEXT (in the loaded images)
  *   imgdump imp ADDR...          the Objective-C method whose code holds each unslid ADDR (the nearest
  *                                implementation at or below it in the same image; the runtime's own names, where
  *                                a2s's dladdr only has "<redacted>")
@@ -158,6 +161,44 @@ main(int argc, char **argv)
 
 		return write_out(argv[4], (const void *)a, n);
 	}
+	if (argc >= 3 && strcmp(argv[1], "methods") == 0) {
+		for (int i = 2; i < argc; i++) {
+			Class c = objc_getClass(argv[i]);
+			if (c == Nil) {
+				printf("%s: no such class\n", argv[i]);
+				continue;
+			}
+			printf("%s : %s\n", argv[i], class_getSuperclass(c) ? class_getName(class_getSuperclass(c)) : "(root)");
+			unsigned n = 0;
+			Ivar *iv = class_copyIvarList(c, &n);
+			for (unsigned k = 0; k < n; k++) {
+				printf("  ivar %#lx %s %s\n", (long)ivar_getOffset(iv[k]), ivar_getName(iv[k]), ivar_getTypeEncoding(iv[k]));
+			}
+			free(iv);
+			for (int meta = 1; meta >= 0; meta--) {
+				Class k = meta ? object_getClass((id)c) : c;
+				Method *ms = class_copyMethodList(k, &n);
+				for (unsigned j = 0; j < n; j++) {
+					printf("  %c%s %#lx %s\n", meta ? '+' : '-', sel_getName(method_getName(ms[j])),
+					    (uintptr_t)method_getImplementation(ms[j]) - s, method_getTypeEncoding(ms[j]));
+				}
+				free(ms);
+			}
+		}
+		return 0;
+	}
+	if (argc == 3 && strcmp(argv[1], "classes") == 0) {
+		int n = objc_getClassList(NULL, 0);
+		Class *all = n > 0 ? malloc(sizeof(Class) * (size_t)n) : NULL;
+		n = all ? objc_getClassList(all, n) : 0;
+		for (int i = 0; i < n; i++) {
+			if (strstr(class_getName(all[i]), argv[2]) != NULL) {
+				printf("%s\n", class_getName(all[i]));
+			}
+		}
+		free(all);
+		return 0;
+	}
 	if (argc >= 3 && strcmp(argv[1], "imp") == 0) {
 		for (int i = 2; i < argc; i++) {
 			imp_lookup(strtoul(argv[i], NULL, 16) + s, s);
@@ -206,6 +247,6 @@ main(int argc, char **argv)
 		}
 		return 0;
 	}
-	fprintf(stderr, "usage: imgdump sym NAME... | text IMAGE OUT | read ADDR LEN OUT | grep TEXT [LIB...] | imp ADDR...\n");
+	fprintf(stderr, "usage: imgdump sym NAME... | text IMAGE OUT | read ADDR LEN OUT | grep TEXT [LIB...] | imp ADDR... | methods CLASS... | classes TEXT\n");
 	return 2;
 }
