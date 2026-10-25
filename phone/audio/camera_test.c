@@ -25,6 +25,7 @@
  *   noise (how much whole lines move together); for one sensor (0 to 3) or all four.
  */
 #include <dispatch/dispatch.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -428,6 +429,24 @@ int
 main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	if (argc >= 2 && strcmp(argv[1], "load") == 0) {
+		/*
+		 * redfin: camera_test load [PATH]: the HAL plug-in loaded as mediaserverd would load it (its camera code acts only
+		 * in mediaserverd: nothing else of it runs here), to check a new RedwoodAudio.driver without crashing mediaserverd.
+		 * A code signature the kernel does not accept shows here as a failed dlopen or a cs_invalid_page line in klog.
+		 */
+		const char *path = argc >= 3 ? argv[2] : "/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver/RedwoodAudio";
+		void *image = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+
+		if (image == NULL) {
+			printf("camera_test: load %s: %s\n", path, dlerror());
+			return 1;
+		}
+		printf("camera_test: load %s: loaded; RedwoodAudio_Create %s, redwood_camera_device_create %s\n", path,
+		    dlsym(image, "RedwoodAudio_Create") != NULL ? "found" : "NOT FOUND",
+		    dlsym(image, "redwood_camera_device_create") != NULL ? "found" : "NOT FOUND");
+		return 0;
+	}
 	if (argc >= 2 && strcmp(argv[1], "raw") == 0) {
 		bool ae = true, awb = true, keep_raw = false, full = false;
 		int sensor = -1;

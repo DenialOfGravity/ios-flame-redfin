@@ -14,6 +14,11 @@ mkdir -p out/RedwoodAudio.driver
 	-o out/RedwoodAudio.driver/RedwoodAudio audio_plugin.c inject_media.c camera_device.c camera_isp.c
 cp audio_plugin.plist out/RedwoodAudio.driver/Info.plist
 codesign -f -s - out/RedwoodAudio.driver/RedwoodAudio
+# (redfin: signed last, nothing touches it after; what the signature covers, for comparing builds: codelimit is where
+# the signature starts, one 4 KB hash slot per page up to it)
+codesign -vvv out/RedwoodAudio.driver 2>&1 || echo "RedwoodAudio.driver: SIGNATURE NOT VALID"
+codesign -dvvv out/RedwoodAudio.driver/RedwoodAudio 2>&1 | grep -E 'CDHash=|Hash type|CodeDirectory|Format|flags' || true
+otool -l out/RedwoodAudio.driver/RedwoodAudio | grep -A3 LC_CODE_SIGNATURE || true
 # sound_test (HackiOS, MIT, unchanged): plays tones, system sounds and CoreHaptics patterns the way an app does
 ../../work/userland/bin/ios-cc -O2 -Wall -Wno-unused-parameter -framework CoreFoundation -framework AudioToolbox \
 	-framework AVFoundation -lobjc -o out/sound_test sound_test.c

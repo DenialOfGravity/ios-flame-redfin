@@ -15,6 +15,10 @@ $F mkdir /System/Library/Audio/Plug-Ins 755 || true
 $F mkdir $H 755 || true
 $F mkdir $H/RedwoodAudio.driver 755 || true
 $F put "$D/Info.plist" $H/RedwoodAudio.driver/Info.plist 644
+# (removed first, so that the new binary is a new file: written over in place, the kernel kept the code signature it
+# had read for the old one on the file and every page of the new one failed it -- cs_invalid_page, mediaserverd
+# crash-looping, r19a 2026-10-25 -- until the next boot)
+$F rm $H/RedwoodAudio.driver/RedwoodAudio || true
 $F put "$D/RedwoodAudio" $H/RedwoodAudio.driver/RedwoodAudio 755
 if [ -f "$D/_CodeSignature/CodeResources" ]; then
 	$F mkdir $H/RedwoodAudio.driver/_CodeSignature 755 || true
