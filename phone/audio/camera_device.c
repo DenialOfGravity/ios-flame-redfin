@@ -543,6 +543,9 @@ stream_of(CMBaseObjectRef o)
 	return derived_storage(o);
 }
 
+static void stream_want(CMBaseObjectRef o, const char *why);
+static bool consumer(const struct stream *s);
+
 static int
 output_index(CFStringRef name)
 {
@@ -1032,6 +1035,8 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		free(keys);
 		free(values);
 		pthread_mutex_unlock(&s->lock);
+		/* (redfin: frames only while an output can take them) */
+		stream_want(o, "no output to give pictures to");
 		return 0;
 	}
 	if (key_is(key, "StillImageCaptureNow")) {
@@ -1992,8 +1997,6 @@ worker_pause(const struct stream *s, unsigned generation, unsigned ms)
 	}
 }
 
-/* one worker has the kernel's camera open at a time: the next waits for the last to close it */
-static pthread_mutex_t device_owner = PTHREAD_MUTEX_INITIALIZER;
 
 /* redfin (B6): a photograph with the flash, on its way */
 enum { SHOT_IDLE, SHOT_EXPOSING, SHOT_FIRING };
@@ -2027,7 +2030,7 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 	float lux = -1, cct = -1;
 	struct af af = { 0 };
 	struct shot shot = { 0 };
-	unsigned failures = 0;
+	unsigned failures = 0, unwanted = 0;
 	const char *why = "stopped";
 
 	isp_init(&isp);
@@ -2090,6 +2093,27 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 			width = f->width;
 			height = f->height;
 		}
+		/*
+		 * redfin: nobody to give the frame to (the graph not running the stream, no output with a handler and a pool):
+		 * nothing is done with it, and after 150 such frames the worker stops itself (the kernel's camera closed).
+		 */
+		pthread_mutex_lock(&s->lock);
+		bool someone = consumer(s);
+
+		pthread_mutex_unlock(&s->lock);
+		if (!someone) {
+			if (++unwanted >= 150) {
+				if (s->generation == generation) {
+					s->running = false;
+					s->generation++;
+				}
+				why = "150 frames with nobody to give them to: the worker stops itself";
+				say("the %s: %s", s->camera->name, why);
+				break;
+			}
+			continue;
+		}
+		unwanted = 0;
 		/* the format's kind of mode (B3): asked once a format, if the frames are not of it */
 		if (s->mode_wanted || (!mode_asked && !mode_fits(f, s->camera->formats[s->format_index & 1].kind))) {
 			struct redwood_camera_command c = { .command = REDWOOD_CAMERA_SENSOR, .a = s->camera->sensor, .b = REDWOOD_CAMERA_MODE_ANY,
@@ -2354,8 +2378,43 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 }
 
 /*
- * The worker: the kernel's camera opened, its frames (frames()), and opened again after a fault or a run of
- * failed reads, a little later each time (redfin, B8: it used to give up after five failed reads, for good).
+ * redfin (r20 on the phone, 2026-10-25): who has the kernel's camera, for the whole process. A worker started from a
+ * reservation (RequestStreams) of the front stream at mediaserverd's start read 10 MB frames for the rest of the boot
+ * -- nothing stopped it (a reservation given back stopped nothing, and its stream need not be in the latest device's
+ * list), it held the camera, and the session's back camera waited behind it for ever: a blank preview, an overheated
+ * phone. Now:
+ *   - a worker runs only for a stream the graph has started (its start method) with an output to give pictures to
+ *     (stream_want()); reservations touch no sensor, and a stream given back is stopped;
+ *   - every stream ever made is in `registry', and starting one stops every other stream's worker first;
+ *   - a stop is deterministic: the worker's generation is done with, the kernel's read returns within a second
+ *     (EAGAIN on close or SENSOR, kernel 0934), the worker closes the camera and goes; the stop waits up to 2.5 s, and
+ *     a worker that is late still goes at its read's end without giving anything;
+ *   - a worker waits for the camera 2 s at a time (said each time), and goes as soon as it is not wanted;
+ *   - a worker that has had 150 frames with nobody to give them to stops itself (frames(), said).
+ */
+#define REGISTRY        8
+static CMBaseObjectRef registry[REGISTRY];
+static pthread_mutex_t cam_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cam_changed = PTHREAD_COND_INITIALIZER;
+static bool device_open;                /* a worker has the kernel's camera open */
+
+static void
+deadline(struct timespec *until, unsigned ms)
+{
+	struct timeval now;
+
+	gettimeofday(&now, NULL);
+	until->tv_sec = now.tv_sec + (time_t)(ms / 1000);
+	until->tv_nsec = now.tv_usec * 1000L + (long)(ms % 1000) * 1000000L;
+	if (until->tv_nsec >= 1000000000L) {
+		until->tv_sec++;
+		until->tv_nsec -= 1000000000L;
+	}
+}
+
+/*
+ * The worker: the kernel's camera opened once no other worker has it, its frames (frames()), and opened again after a
+ * fault or a run of failed reads, a little later each time.
  */
 static void *
 worker(void *context)
@@ -2366,18 +2425,38 @@ worker(void *context)
 
 	free(context);
 	pthread_setname_np("redwood-camera");
-	pthread_mutex_lock(&device_owner);
 	while (worker_wanted(s, start.generation)) {
-		int device = open(REDWOOD_CAMERA_DEVICE, O_RDWR);
+		int device;
 		const char *why;
-		unsigned pause;
+		unsigned pause, waited = 0;
 
+		pthread_mutex_lock(&cam_lock);
+		while (device_open && worker_wanted(s, start.generation)) {
+			struct timespec until;
+
+			deadline(&until, 2000);
+			if (pthread_cond_timedwait(&cam_changed, &cam_lock, &until) != 0) {
+				waited += 2;
+				say("the %s waits for the kernel's camera: another worker still has it (%u s)", s->camera->name, waited);
+			}
+		}
+		if (!worker_wanted(s, start.generation)) {
+			pthread_mutex_unlock(&cam_lock);
+			break;
+		}
+		device_open = true;
+		pthread_mutex_unlock(&cam_lock);
+		device = open(REDWOOD_CAMERA_DEVICE, O_RDWR);
 		if (device < 0) {
 			why = strerror(errno);
 		} else {
 			why = frames(start.o, start.generation, device);
 			close(device);
 		}
+		pthread_mutex_lock(&cam_lock);
+		device_open = false;
+		pthread_cond_broadcast(&cam_changed);
+		pthread_mutex_unlock(&cam_lock);
 		if (!worker_wanted(s, start.generation)) {
 			break;
 		}
@@ -2387,8 +2466,7 @@ worker(void *context)
 		}
 		worker_pause(s, start.generation, pause);
 	}
-	pthread_mutex_unlock(&device_owner);
-	say("the frames stopped (%llu)", (unsigned long long)s->frames);
+	say("the %s's frames stopped (%llu): the kernel's camera closed", s->camera->name, (unsigned long long)s->frames);
 	pthread_mutex_lock(&s->worker_lock);
 	s->workers--;
 	pthread_cond_broadcast(&s->worker_gone);
@@ -2397,30 +2475,16 @@ worker(void *context)
 	return NULL;
 }
 
-/*
- * Reading frames from the kernel and giving them to the graph are two things: the first begins when
- * the capture graph reserves the stream (`graph` false, from the device's RequestStreams: the sensor
- * takes a moment to settle and the exposure longer), the second only when the graph starts the
- * stream itself (`graph` true, the FigCaptureStream start method).
- */
-static CMBaseObjectRef all_streams[CAMERAS];    /* the device's, back, front (and ultra-wide) */
-static OSStatus stream_stop(CMBaseObjectRef o);
+static CMBaseObjectRef all_streams[CAMERAS];    /* the latest device's, back, front (and ultra-wide) */
 
 /* the stream's workers gone, or `ms' passed: whether they are */
 static bool
 workers_gone(struct stream *s, unsigned ms)
 {
 	struct timespec until;
-	struct timeval now;
 	bool gone;
 
-	gettimeofday(&now, NULL);
-	until.tv_sec = now.tv_sec + (time_t)(ms / 1000);
-	until.tv_nsec = now.tv_usec * 1000L + (long)(ms % 1000) * 1000000L;
-	if (until.tv_nsec >= 1000000000L) {
-		until.tv_sec++;
-		until.tv_nsec -= 1000000000L;
-	}
+	deadline(&until, ms);
 	pthread_mutex_lock(&s->worker_lock);
 	while (s->workers > 0 && pthread_cond_timedwait(&s->worker_gone, &s->worker_lock, &until) == 0) {
 	}
@@ -2429,29 +2493,60 @@ workers_gone(struct stream *s, unsigned ms)
 	return gone;
 }
 
+/* the stream's worker told to go, and waited for (2.5 s at most: the kernel's read returns within one) */
+static void
+halt(struct stream *s, const char *why)
+{
+	if (!s->running && s->workers == 0) {
+		return;
+	}
+	s->running = false;
+	s->generation++;
+	if (!workers_gone(s, 2500)) {
+		say("stream: the %s's worker is still in the kernel's read (%s): it goes at that read's end, giving nothing",
+		    s->camera->name, why);
+	} else {
+		say("stream: the %s's frames stopped (%s)", s->camera->name, why);
+	}
+}
+
+/* whether the stream has somewhere to give pictures (the graph started it; an output with a handler and a pool) */
+static bool
+consumer(const struct stream *s)
+{
+	bool some = false;
+
+	for (int i = 0; s->graph_running && i < OUTPUTS && !some; i++) {
+		some = s->out[i].handler != NULL && s->out[i].config != NULL && (s->out[i].enabled || i == 0);
+	}
+	return some;
+}
+
 static OSStatus
-stream_begin(CMBaseObjectRef o, bool graph)
+stream_begin(CMBaseObjectRef o)
 {
 	struct stream *s = stream_of(o);
 	struct worker_start *start;
 	pthread_attr_t attributes;
 	pthread_t thread;
+	CMBaseObjectRef others[REGISTRY];
+	int n = 0;
 
-	if (graph) {
-		pthread_mutex_lock(&s->lock);
-		s->graph_running = true;
-		pthread_mutex_unlock(&s->lock);
-		say("stream: the graph starts the stream (format %d)", s->format_index);
-	}
 	if (s->running) {
 		return 0;
 	}
-	/* one camera at a time: the kernel gives one sensor's frames (the other stream's worker stopped first) */
-	for (int i = 0; i < CAMERAS; i++) {
-		if (all_streams[i] != NULL && all_streams[i] != o && stream_of(all_streams[i])->running) {
-			say("stream: the %s's frames stop for the %s's", stream_of(all_streams[i])->camera->name, s->camera->name);
-			(void)stream_stop(all_streams[i]);
+	/* one camera at a time: the kernel gives one sensor's frames (every other stream's worker stopped first) */
+	pthread_mutex_lock(&cam_lock);
+	for (int i = 0; i < REGISTRY; i++) {
+		if (registry[i] != NULL && registry[i] != o && (stream_of(registry[i])->running || stream_of(registry[i])->workers > 0)) {
+			others[n++] = (CMBaseObjectRef)CFRetain(registry[i]);
 		}
+	}
+	pthread_mutex_unlock(&cam_lock);
+	for (int i = 0; i < n; i++) {
+		say("stream: the %s's frames stop for the %s's", stream_of(others[i])->camera->name, s->camera->name);
+		halt(stream_of(others[i]), "another camera");
+		CFRelease(others[i]);
 	}
 	if ((start = malloc(sizeof(*start))) == NULL) {
 		return ERR_UNSUPPORTED;
@@ -2465,7 +2560,8 @@ stream_begin(CMBaseObjectRef o, bool graph)
 	s->workers++;
 	pthread_mutex_unlock(&s->worker_lock);
 	CFRetain(o);                    /* (the worker's, until it goes) */
-	say("stream: frames begin (format %d, a %s mode)", s->format_index, mode_name(s->camera->formats[s->format_index & 1].kind));
+	say("stream: frames begin for the %s (format %d, a %s mode)", s->camera->name, s->format_index,
+	    mode_name(s->camera->formats[s->format_index & 1].kind));
 	pthread_attr_init(&attributes);
 	pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
 	if (pthread_create(&thread, &attributes, worker, start) != 0) {
@@ -2482,10 +2578,37 @@ stream_begin(CMBaseObjectRef o, bool graph)
 	return 0;
 }
 
+/* a worker while the graph runs the stream and has an output for it; none otherwise */
+static void
+stream_want(CMBaseObjectRef o, const char *why)
+{
+	struct stream *s = stream_of(o);
+	bool wanted;
+
+	pthread_mutex_lock(&s->lock);
+	wanted = consumer(s);
+	pthread_mutex_unlock(&s->lock);
+	if (wanted && !s->running) {
+		(void)stream_begin(o);
+	} else if (!wanted && (s->running || s->workers > 0)) {
+		halt(s, why);
+	}
+}
+
 static OSStatus
 stream_start(CMBaseObjectRef o)
 {
-	return stream_begin(o, true);
+	struct stream *s = stream_of(o);
+
+	pthread_mutex_lock(&s->lock);
+	s->graph_running = true;
+	pthread_mutex_unlock(&s->lock);
+	say("stream: the graph starts the %s's stream (format %d)", s->camera->name, s->format_index);
+	stream_want(o, "no output to give pictures to");
+	if (!s->running) {
+		say("stream: the %s has no output with a handler and a pool yet: no frames until it has", s->camera->name);
+	}
+	return 0;
 }
 
 static OSStatus
@@ -2493,7 +2616,7 @@ stream_stop(CMBaseObjectRef o)
 {
 	struct stream *s = stream_of(o);
 
-	say("stream: stop (%llu frames, %llu pictures given)", (unsigned long long)s->frames,
+	say("stream: stop the %s (%llu frames, %llu pictures given)", s->camera->name, (unsigned long long)s->frames,
 	    (unsigned long long)s->out[0].delivered);
 	pthread_mutex_lock(&s->lock);
 	s->graph_running = false;
@@ -2502,12 +2625,7 @@ stream_stop(CMBaseObjectRef o)
 		let_go(&s->out[i]);
 	}
 	pthread_mutex_unlock(&s->lock);
-	s->running = false;
-	s->generation++;
-	/* (redfin, B8: not for ever: the worker may be in the kernel's read while the sensor starts or stops; it goes when that returns) */
-	if (!workers_gone(s, 1500)) {
-		say("stream: its worker is still in the kernel: left to finish on its own");
-	}
+	halt(s, "stopped");
 	return 0;
 }
 
@@ -2581,6 +2699,11 @@ stream_finalize(CMBaseObjectRef o)
 	struct stream *s = stream_of(o);
 
 	(void)stream_stop(o);
+	pthread_mutex_lock(&cam_lock);
+	for (int i = 0; i < REGISTRY; i++) {
+		registry[i] = registry[i] == o ? NULL : registry[i];
+	}
+	pthread_mutex_unlock(&cam_lock);
 	for (int i = 0; i < OUTPUTS; i++) {
 		if (s->out[i].config) {
 			CFRelease(s->out[i].config);
@@ -2634,6 +2757,14 @@ stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef
 	pthread_mutex_init(&s->lock, NULL);
 	pthread_mutex_init(&s->metadata_lock, NULL);
 	pthread_mutex_init(&s->worker_lock, NULL);
+	pthread_mutex_lock(&cam_lock);
+	for (int i = 0; i < REGISTRY; i++) {
+		if (registry[i] == NULL) {
+			registry[i] = o;        /* (not retained: taken out at finalize) */
+			break;
+		}
+	}
+	pthread_mutex_unlock(&cam_lock);
 	pthread_mutex_init(&s->ctl_lock, NULL);
 	s->af_mode = AF_MODE_CONTINUOUS;
 	s->manual_focus = -1;
@@ -2728,23 +2859,11 @@ device_request_streams(CMBaseObjectRef o, CFArrayRef streams, CFDictionaryRef op
 		}
 	}
 	/*
-	 * Requesting a stream is this device's cue to begin producing: mediaserverd's capture graph
-	 * configures the stream (it installs the PrimaryScaler PixelBufferHandler) and then reserves the
-	 * streams through here, but it never calls the FigCaptureStream start method, so start the stream's
-	 * frame worker from the reservation. stream_start is idempotent (it no-ops when already running),
-	 * and relinquish does not stop the worker, so the reservation thrash does not tear it down.
+	 * redfin: a reservation is not a start. (HackiOS started the frames here, the graph then never calling the
+	 * stream's start; on 16.7 it does: r20, "the graph starts the stream". Started here, the vendor's probe at
+	 * mediaserverd's start ran the front camera for the rest of the boot.) Nothing of the sensor is touched.
 	 */
-	if (streams != NULL) {
-		CFIndex n = CFArrayGetCount(streams);
-
-		for (CFIndex i = 0; i < n; i++) {
-			CMBaseObjectRef st = (CMBaseObjectRef)CFArrayGetValueAtIndex(streams, i);
-
-			if (st != NULL) {
-				(void)stream_begin(st, false);
-			}
-		}
-	}
+	(void)streams;
 	return 0;
 }
 
@@ -2757,6 +2876,17 @@ device_relinquish_streams(CMBaseObjectRef o, CFArrayRef streams, CFDictionaryRef
 		say("device: streams given back (%ld)", streams ? (long)CFArrayGetCount(streams) : 0L);
 	} else if (relinquishes % 1000 == 0) {
 		say("device: streams given back %u times", relinquishes);
+	}
+	/* redfin: given back, a stream's frames stop (were they still running) */
+	for (CFIndex i = 0; streams != NULL && i < CFArrayGetCount(streams); i++) {
+		CMBaseObjectRef st = (CMBaseObjectRef)CFArrayGetValueAtIndex(streams, i);
+
+		if (st != NULL && (stream_of(st)->running || stream_of(st)->workers > 0)) {
+			pthread_mutex_lock(&stream_of(st)->lock);
+			stream_of(st)->graph_running = false;
+			pthread_mutex_unlock(&stream_of(st)->lock);
+			halt(stream_of(st), "given back");
+		}
 	}
 	return 0;
 }
