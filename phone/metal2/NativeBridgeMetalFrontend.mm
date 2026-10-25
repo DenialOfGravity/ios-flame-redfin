@@ -163,8 +163,9 @@ static void waitForResource(id resource);
 @property(nonatomic) uint64_t reportedFormat;   // non-zero: the format the client asked for (a converted copy's)
 @property(nonatomic) uint32_t surfaceSeed;      // a converted copy's: the surface's seed when it was filled
 @property(nonatomic) IOSurfaceRef ycbcrSource;   // a converted copy's surface (retained); not `surface`: the copy is no surface memory
-@property(nonatomic) NmbTexture *spareHandle;    // a converted copy's second texture: filled while the other may still be sampled
-@property(nonatomic,strong) NBBuffer *spareBuffer; // ... and the memory under it (the copies are linear textures over buffers)
+@property(nonatomic,strong) NSMutableArray *turns; // a converted copy's pictures (textures over buffers of their own, up to 3): the one
+                                                   // bound is borrowed from one of them, filled while the others may still be sampled
+@property(nonatomic) bool borrowedHandle;        // `handle` is a turn's: not released here
 @property(nonatomic) bool ycbcrGPU;              // a two-plane YCbCr texture the runtime converts (its planes' generation set at use)
 @property(nonatomic) bool ycbcr709;              // a converted copy's matrix: BT.709 (else BT.601), read when it was made
 @property(nonatomic,strong) id<MTLTexture> parent;
@@ -249,7 +250,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 }
 @implementation NBTexture
 - (void)dealloc {
- nmb_texture_release(_handle);if(_spareHandle)nmb_texture_release(_spareHandle);
+ if(!_borrowedHandle)nmb_texture_release(_handle);
  if(_surface){surfaceDrop(_surface);CFRelease(_surface);}
  if(_ycbcrSource)CFRelease(_ycbcrSource);
 }
@@ -1752,30 +1753,49 @@ static NBTexture *copyTexture(MTLPixelFormat format,size_t w,size_t h,uint64_t r
  rgba.usage=MTLTextureUsageShaderRead;rgba.storageMode=MTLStorageModeShared;
  return textureOnBuffer(buffer,rgba,0,(NSUInteger)row,false);
 }
+static std::atomic<uint64_t> gYCbCrFills,gYCbCrSkips,gYCbCrFillUs,gYCbCrFillMaxUs;
+// A picture into `turn`, timed; every 300th fill a J line in the log (/dev/console, so the klog has it).
+static bool ycbcrFillTurn(NBTexture *turn,IOSurfaceRef surface,size_t w,size_t h,bool bt709) {
+ const uint64_t began=nowUs();
+ if(!ycbcrFill(turn.buffer,turn.rowBytes,surface,w,h,bt709))return false;
+ const uint64_t took=nowUs()-began;gYCbCrFillUs+=took;
+ uint64_t seen=gYCbCrFillMaxUs.load();while(took>seen && !gYCbCrFillMaxUs.compare_exchange_weak(seen,took)){}
+ const uint64_t n=++gYCbCrFills;
+ if(n<=2 || n%300==0)sm2_logs([NSString stringWithFormat:@"native-metal: J ycbcr cpu fills=%llu skips=%llu fill mean %llu us max %llu us",
+     (unsigned long long)n,(unsigned long long)gYCbCrSkips.load(),(unsigned long long)(gYCbCrFillUs.load()/n),
+     (unsigned long long)gYCbCrFillMaxUs.load()].UTF8String);
+ return true;
+}
 static NBTexture *ycbcrCopy(IOSurfaceRef surface,MTLTextureDescriptor *d) {
  if(IOSurfaceGetPlaneCount(surface)!=2)return nil;
  const size_t w=d.width,h=d.height;
  if(!w || !h || IOSurfaceGetWidthOfPlane(surface,0)<w || IOSurfaceGetHeightOfPlane(surface,0)<h ||
     IOSurfaceGetWidthOfPlane(surface,1)*2<w || IOSurfaceGetHeightOfPlane(surface,1)*2<h)return nil;
  const uint64_t row=((uint64_t)w*4+63)&~63ull;
- NBTexture *texture=copyTexture(d.pixelFormat==501?MTLPixelFormatRGBA8Unorm_sRGB:MTLPixelFormatRGBA8Unorm,w,h,row);
- if(!texture)return nil;
+ NBTexture *turn=copyTexture(d.pixelFormat==501?MTLPixelFormatRGBA8Unorm_sRGB:MTLPixelFormatRGBA8Unorm,w,h,row);
+ if(!turn)return nil;
  const uint32_t seed=IOSurfaceGetSeed(surface);
  const bool bt709=surfaceMatrix(surface)==2;
- if(!ycbcrFill(texture.buffer,row,surface,w,h,bt709))return nil;
+ if(!ycbcrFillTurn(turn,surface,w,h,bt709))return nil;
+ NBTexture *texture=[NBTexture new];
+ texture.handle=turn.handle;texture.borrowedHandle=true;texture.descriptor=turn.descriptor;texture.buffer=turn.buffer;
+ texture.rowBytes=turn.rowBytes;texture.turns=[NSMutableArray arrayWithObject:turn];
  texture.reportedFormat=(uint64_t)d.pixelFormat;texture.surfaceSeed=seed;texture.ycbcrSource=(IOSurfaceRef)CFRetain(surface);
  texture.ycbcr709=bt709;
  return texture;
 }
-// Waits until no committed command buffer still uses `buffer` (the turn's other picture, two frames back: normally long done).
-static std::atomic<uint64_t> gYCbCrFills,gYCbCrWaits;
-static void waitForBuffer(NBBuffer *buffer) {
+// Whether a committed command buffer that has not completed uses `buffer` (an unknown answer counts as yes).
+static bool bufferInFlight(NBBuffer *buffer) {
  NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
  for(NBCommandBuffer *commandBuffer in pending)
-  if(nmb_command_buffer_uses_buffer(commandBuffer.handle,buffer.handle)!=0){gYCbCrWaits++;[(id<MTLCommandBuffer>)commandBuffer waitUntilCompleted];}
+  if(nmb_command_buffer_uses_buffer(commandBuffer.handle,buffer.handle)!=0)return true;
+ return false;
 }
 // At each use of a YCbCr texture (a draw's or a blit's): the GPU texture is told its surface's seed (converted again only when it
-// moved); the CPU copy is filled again when the seed moved, into the other buffer, which then becomes the one bound.
+// moved); the CPU copy is filled again when the seed moved, into a turn no committed command buffer still uses (up to 3 turns), which
+// then becomes the one bound. Nothing waits here: cb08d35 waited for the other turn's command buffer with -waitUntilCompleted, which
+// also waits for its completed handlers, and those can be queued behind the very thread that waits (r19a+cb08d35: the preview froze
+// on its first picture). With every turn busy the picture is filled at the next use.
 static void ycbcrRefresh(NBTexture *texture) {
  if(texture.ycbcrGPU) {
   if(texture.surface)nmb_texture_set_converted_generation(texture.handle,(uint64_t)IOSurfaceGetSeed(texture.surface)+1);
@@ -1786,18 +1806,16 @@ static void ycbcrRefresh(NBTexture *texture) {
   const uint32_t seed=IOSurfaceGetSeed(texture.ycbcrSource);
   if(seed==texture.surfaceSeed)return;
   const NmbTextureDescriptor current=texture.descriptor;
-  if(!texture.spareBuffer) {
-   NBTexture *spare=copyTexture((MTLPixelFormat)current.format,current.width,current.height,texture.rowBytes);
-   if(!spare)return;
-   texture.spareHandle=spare.handle;spare.handle=nullptr;texture.spareBuffer=spare.buffer;
+  NBTexture *next=nil;
+  for(NBTexture *turn in texture.turns)if(turn.handle!=texture.handle && !bufferInFlight(turn.buffer)){next=turn;break;}
+  if(!next && texture.turns.count<3) {
+   next=copyTexture((MTLPixelFormat)current.format,current.width,current.height,texture.rowBytes);
+   if(next)[texture.turns addObject:next];
   }
-  waitForBuffer(texture.spareBuffer);
-  if(!ycbcrFill(texture.spareBuffer,texture.rowBytes,texture.ycbcrSource,current.width,current.height,texture.ycbcr709))return;
-  gYCbCrFills++;
+  if(!next){gYCbCrSkips++;return;}
+  if(!ycbcrFillTurn(next,texture.ycbcrSource,current.width,current.height,texture.ycbcr709))return;
   texture.surfaceSeed=seed;
-  NmbTexture *handle=texture.handle;NBBuffer *buffer=texture.buffer;
-  texture.handle=texture.spareHandle;texture.buffer=texture.spareBuffer;
-  texture.spareHandle=handle;texture.spareBuffer=buffer;
+  texture.handle=next.handle;texture.buffer=next.buffer;
  }
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
@@ -1806,6 +1824,11 @@ static void ycbcrRefresh(NBTexture *texture) {
  if(planes?plane>=planes:plane!=0){noteSurfaceTexture(surface,d,plane,planes,0,0,"refused (no such plane)");return nil;}
  if((d.pixelFormat==500 || d.pixelFormat==501) && plane==0) {
   const NSUInteger lumaAt=(NSUInteger)((uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,0)-(uintptr_t)IOSurfaceGetBaseAddress(surface));
+  static std::atomic<unsigned> asked{0};
+  const unsigned askedNow=++asked;
+  if(askedNow<=3)sm2_logs([NSString stringWithFormat:@"native-metal: YCbCr texture %lu asked (#%u, %s): surface id %u %zux%zu, rows %zu/%zu",
+      (unsigned long)d.pixelFormat,askedNow,ycbcrOnGPU()?"gpu":"cpu copy",IOSurfaceGetID(surface),IOSurfaceGetWidth(surface),
+      IOSurfaceGetHeight(surface),IOSurfaceGetBytesPerRowOfPlane(surface,0),IOSurfaceGetBytesPerRowOfPlane(surface,1)].UTF8String);
   if(ycbcrOnGPU()) {
    std::string why;uint64_t lumaRow=0;
    if(NBTexture *texture=ycbcrSurfaceTexture(surface,d,why,&lumaRow)){
@@ -2177,7 +2200,7 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());
  row("J surface cleans skipped (seed)=%llu invalidates=%llu%s",(unsigned long long)gSurfaceCleanSkips.load(),
   (unsigned long long)gSurfaceInvalidates.load(),flushAll()?" (SWEET_FLUSH=all)":"");
- row("J ycbcr %s fills=%llu waits=%llu",ycbcrOnGPU()?"gpu":"cpu",(unsigned long long)gYCbCrFills.load(),(unsigned long long)gYCbCrWaits.load());
+ row("J ycbcr %s fills=%llu skips=%llu",ycbcrOnGPU()?"gpu":"cpu",(unsigned long long)gYCbCrFills.load(),(unsigned long long)gYCbCrSkips.load());
  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
  // its shader cache: where the driver's compile time goes.
  uint64_t work[10]={};

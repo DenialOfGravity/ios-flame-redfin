@@ -241,7 +241,7 @@ static bool listed(void)
 						continue;
 					static char text[8192];
 					native_bridge_metal_telemetry(text, sizeof(text));
-					int fd = open("/var/local/mtl2.log", O_WRONLY | O_APPEND);
+					int fd = open("/var/local/mtl2.log", O_WRONLY | O_APPEND | O_CREAT, 0666);	/* made if missing (r19a had none) */
 					if (fd >= 0) {
 						dprintf(fd, "MTL2[%d %s]: telemetry\n%s", getpid(), getprogname(), text);
 						close(fd);
