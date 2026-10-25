@@ -26,6 +26,10 @@ struct isp_stats {
 	 */
 	double          grey[2], neutral[2];
 	uint32_t        grey_cells, neutral_cells;
+	/* redfin: the same in the part AE meters on (isp->ae_roi; roi_cells 0: none set) */
+	double          roi_mean[3];
+	double          roi_bright;
+	uint32_t        roi_cells;
 };
 
 /*
@@ -40,7 +44,7 @@ struct isp_lsc {
 };
 
 /*
- * A camera's colour tuning, as tools/camtuning.py makes it out of the camera's tuning file of Android's
+ * A camera's colour tuning, as tools/redfin-camtune.py makes it out of the camera's tuning file of Android's
  * camera stack: colour matrices and lens shading grids, each per range of the scene's light (a lux
  * index, Qualcomm's measure: higher is darker) and within that per range of the light's colour
  * temperature.
@@ -61,7 +65,7 @@ struct isp_tuning {
 	/*
 	 * The white balance's reference lights, from the bluest to the reddest: each as the sensor sees a
 	 * grey under it (red over green, blue over green), and the colour temperature its tables are
-	 * picked by (tools/camtuning.py). Between them, the line the white balance keeps to.
+	 * picked by (tools/redfin-camtune.py). Between them, the line the white balance keeps to.
 	 */
 	uint32_t        refs;
 	float           ref[16][3];
@@ -80,7 +84,32 @@ struct isp {
 	bool            asked;
 	uint32_t        max_frame_lines;        /* the longest frame AE may ask for (0: twice the shortest) */
 	struct isp_tuning *tuning;              /* isp_load_tuning()'s, or none */
+	/*
+	 * redfin: what the capture stack asks of AE and AWB (camera_device.c sets these from the stream's properties;
+	 * all zero after isp_init(): AE and AWB as before).
+	 */
+	uint32_t        min_frame_lines;        /* the shortest frame AE may ask for (the highest frame rate allowed; 0: the mode's) */
+	bool            ae_locked;              /* LockAENow: the exposure stays as it is */
+	float           ae_bias;                /* ExposureBias, in EV (stops): the target's brightness times 2^bias */
+	float           ae_roi[4];              /* where AE meters most (x0, y0, x1, y1, fractions of the frame); x1 <= x0: the whole frame */
+	float           ae_max_gain;            /* the most gain (analog x digital) AE may use (AEMaxGain; 0: all there is) */
+	uint32_t        ae_max_exposure_us;     /* the longest exposure AE may use (MaxIntegrationTime; 0: the frame's) */
+	bool            manual;                 /* a custom exposure (AVCaptureExposureModeCustom): manual_us at manual_gain */
+	uint32_t        manual_us;
+	float           manual_gain;
+	float           sensor_digital;         /* the sensor's own digital gain as last set (1: none) */
+	uint32_t        asked_digital;          /* ... and as asked (EXPOSURE.d, 256 = 1x; 0: not asked) */
+	uint32_t        asked_frames;           /* frames seen since AE asked (it waits at most AE_PATIENCE for them) */
+	bool            ae_stable;              /* (AE's answer) the exposure is where AE wants it */
+	bool            awb_locked;             /* LockAWBNow: the white balance stays as it is */
+	bool            awb_manual;             /* the white balance's gains are wb_manual's (green 1) */
+	float           wb_manual[3];
+	bool            awb_stable;             /* (AWB's answer) the white balance has stopped moving */
+	bool            reference;              /* the pictures by the float code (the integer code's reference: tests) */
 };
+
+/* frames AE waits for the exposure it asked for before it takes what the frames say (a clamped or lost request) */
+#define AE_PATIENCE     6
 
 void isp_init(struct isp *isp);
 /*
@@ -128,7 +157,7 @@ void isp_render_full_nv12(const struct isp *isp, const struct redwood_camera_fra
  */
 bool isp_lsc_from_flat(struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw, float *min_ratio);
 void isp_set_ccm(struct isp *isp, const float m[9]);
-/* the tuning in PATH (tools/camtuning.py's) in place of the one there was: false, and none, if it is not one */
+/* the tuning in PATH (tools/redfin-camtune.py's) in place of the one there was: false, and none, if it is not one */
 bool isp_load_tuning(struct isp *isp, const char *path);
 /* the colour matrix and lens shading for a scene of this lux index and colour temperature, from the tuning */
 void isp_tune(struct isp *isp, float lux_index, float cct);

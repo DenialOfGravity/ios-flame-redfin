@@ -23,6 +23,7 @@ isp_init(struct isp *isp)
 	memset(isp, 0, sizeof(*isp));
 	isp->wb[0] = isp->wb[1] = isp->wb[2] = 1;
 	isp->digital = 1;
+	isp->sensor_digital = 1;
 	isp->zoom = 1;
 	for (int i = 0; i < 3; i++) {
 		isp->ccm[i][i] = 1;
@@ -126,11 +127,23 @@ void
 isp_measure(const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw, struct isp_stats *s)
 {
 	uint32_t cells_w = f->width / 2, cells_h = f->height / 2;
-	double sum[3] = { 0, 0, 0 }, grey[2] = { 0, 0 }, neutral[2] = { 0, 0 };
+	double sum[3] = { 0, 0, 0 }, grey[2] = { 0, 0 }, neutral[2] = { 0, 0 }, roi_sum[3] = { 0, 0, 0 };
 	float gains[3] = { 1, 1, 1 };
+	uint32_t roi_hist[64], rx0 = 0, rx1 = 0, ry0 = 0, ry1 = 0;
+	bool roi = isp != NULL && isp->ae_roi[2] > isp->ae_roi[0] && isp->ae_roi[3] > isp->ae_roi[1];
 	int r, b;
 
 	memset(s, 0, sizeof(*s));
+	memset(roi_hist, 0, sizeof(roi_hist));
+	if (roi) {
+		/* (redfin: AE's metering window, in cells; at least a 16th of the frame each way) */
+		rx0 = (uint32_t)(isp->ae_roi[0] * cells_w);
+		rx1 = (uint32_t)(isp->ae_roi[2] * cells_w);
+		ry0 = (uint32_t)(isp->ae_roi[1] * cells_h);
+		ry1 = (uint32_t)(isp->ae_roi[3] * cells_h);
+		rx1 = rx1 < rx0 + cells_w / 16 ? rx0 + cells_w / 16 : rx1;
+		ry1 = ry1 < ry0 + cells_h / 16 ? ry0 + cells_h / 16 : ry1;
+	}
 	cell_places(f->bayer, &r, &b);
 	for (uint32_t cy = 0; cy < cells_h; cy += 4) {
 		const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
@@ -148,6 +161,13 @@ isp_measure(const struct isp *isp, const struct redwood_camera_frame *f, const u
 			sum[0] += v[r];
 			sum[1] += g;
 			sum[2] += v[b];
+			if (roi && cx >= rx0 && cx < rx1 && cy >= ry0 && cy < ry1) {
+				roi_sum[0] += v[r];
+				roi_sum[1] += g;
+				roi_sum[2] += v[b];
+				roi_hist[g >> 4 > 63 ? 63 : g >> 4]++;
+				s->roi_cells++;
+			}
 			/*
 			 * The white balance leaves out a cell with a colour near white -- a lamp, a screen:
 			 * green, the most sensitive, stops there first and the cell would count as magenta --
@@ -207,65 +227,161 @@ isp_measure(const struct isp *isp, const struct redwood_camera_frame *f, const u
 			break;
 		}
 	}
+	for (int c = 0; c < 3 && s->roi_cells; c++) {
+		s->roi_mean[c] = roi_sum[c] / s->roi_cells;
+	}
+	for (int i = 63, above = 0; s->roi_cells && i >= 0; i--) {
+		above += roi_hist[i];
+		if (above * 100 >= (int)s->roi_cells) {
+			s->roi_bright = i * 16 + 8;
+			break;
+		}
+	}
 }
 
 /*
- * Green's mean towards 15 % of white, unless that would put 1 % of the picture into white. The
- * exposure, longest first: the frame's lines at the shortest frame, then gain to 16x, then frames up
- * to max_frame_lines, then gain to the most; beyond that, digital gain (up to 4x).
+ * Green's mean towards 15 % of white (times 2^ExposureBias), unless that would put 1 % of the picture into white;
+ * metered mostly on AE's window when there is one (a tap: RegionOfInterestForCameraControls). The exposure,
+ * longest first: the frame's lines at the shortest frame, then gain to the knee (16x, or the sensor's most if less),
+ * then frames up to max_frame_lines, then gain to the most; beyond the sensor's analog gain, its own digital gain
+ * (where it has one, EXPOSURE.d), then the processor's (up to 4x). Within the limits the capture stack set: the
+ * longest exposure (MaxIntegrationTime), the most gain (AEMaxGain), the frame rate (min/max_frame_lines). Locked,
+ * nothing changes; custom (manual), the exposure asked for is the one set.
+ *
+ * redfin: the kernel clamps what it cannot do (the IMX363's analog gain at 8x, where this used to ask up to 16x) and
+ * reports what it set: AE waited for ever for a frame with the gain it asked for (`asked' never cleared: the
+ * exposure froze). It takes the clamped values as the answer now, and after AE_PATIENCE frames whatever the
+ * frames say.
  */
+static bool
+ae_got(const struct isp *isp, const struct redwood_camera_frame *f)
+{
+	uint32_t lines = isp->asked_lines, gain = isp->asked_gain;
+
+	if (f->frame_lines_max > f->margin && lines > f->frame_lines_max - f->margin) {
+		lines = f->frame_lines_max - f->margin;
+	}
+	gain = gain > f->gain_max && f->gain_max != 0 ? f->gain_max : gain;
+	gain = gain < f->gain_unity ? f->gain_unity : gain;
+	return (f->exposure_lines + 1 >= lines && f->exposure_lines <= lines + 1) &&
+	    (uint64_t)f->gain * 100 >= (uint64_t)gain * 99 && (uint64_t)f->gain * 99 <= (uint64_t)gain * 100;
+}
+
 bool
 isp_ae(struct isp *isp, const struct redwood_camera_frame *f, const struct isp_stats *s, struct redwood_camera_command *c)
 {
-	double now = (double)f->exposure_lines * f->gain / f->gain_unity * isp->digital, ratio, want;
-	double target = 0.15 * WHITE, mean = s->mean[1] * isp->digital > 0.5 ? s->mean[1] * isp->digital : 0.5;
-	double bright = s->bright * isp->digital;
-	uint32_t fast = f->frame_lines_min - f->margin, longest = isp->max_frame_lines ? isp->max_frame_lines : 2 * f->frame_lines_min;
-	uint32_t lines, gain, frame_lines = 0;
-	double digital = 1;
+	double unity = f->gain_unity ? f->gain_unity : 256, analog_max = f->gain_max > f->gain_unity ? f->gain_max / unity : 1;
+	uint32_t dg_unity = f->reserved[REDWOOD_CAMERA_R_DGAIN] & 0xffff, dg_top = f->reserved[REDWOOD_CAMERA_R_DGAIN] >> 16;
+	double digital_max = dg_unity != 0 && dg_top > dg_unity ? (double)dg_top / dg_unity : 1;
+	double now, ratio, want, gain_total, target, mean, bright, line_us = f->line_ns ? f->line_ns / 1000.0 : 10;
+	uint32_t floor_lines = f->frame_lines_min > isp->min_frame_lines ? f->frame_lines_min : isp->min_frame_lines;
+	uint32_t ceiling = isp->max_frame_lines ? isp->max_frame_lines : 2 * f->frame_lines_min;
+	uint32_t fast, longest, cap, lines, frame_lines = 0;
+	double knee, analog, sensor_digital = 1, digital = 1;
 
-	if (isp->asked && (f->exposure_lines != isp->asked_lines || f->gain != isp->asked_gain)) {
-		return false;                   /* (the last change not in the frames yet) */
+	if (isp->asked) {
+		if (!ae_got(isp, f) && ++isp->asked_frames < AE_PATIENCE) {
+			isp->ae_stable = false;
+			return false;           /* (the last change not in the frames yet) */
+		}
+		isp->asked = false;
+		if (isp->asked_digital != 0) {
+			isp->sensor_digital = isp->asked_digital / 256.0f;
+		}
 	}
-	/* (the measured levels are the sensor's: digital gain is applied to the picture only) */
+	if (f->frame_lines_max != 0 && ceiling > f->frame_lines_max) {
+		ceiling = f->frame_lines_max;
+	}
+	ceiling = ceiling < floor_lines ? floor_lines : ceiling;
+	fast = floor_lines > f->margin + 4 ? floor_lines - f->margin : 4;
+	longest = ceiling > f->margin + 4 ? ceiling - f->margin : 4;
+	cap = isp->ae_max_exposure_us ? (uint32_t)(isp->ae_max_exposure_us / line_us) : longest;
+	cap = cap < 4 ? 4 : cap;
+	fast = fast > cap ? cap : fast;
+	longest = longest > cap ? cap : longest;
+	longest = longest < fast ? fast : longest;
+	if (isp->ae_locked) {
+		isp->ae_stable = true;
+		return false;
+	}
+	if (isp->manual) {
+		/* a custom exposure: as asked, within what the sensor and the frame rate can do */
+		uint32_t most = (f->frame_lines_max > ceiling ? f->frame_lines_max : ceiling);
+
+		most = most > f->margin + 4 ? most - f->margin : 4;
+		lines = (uint32_t)(isp->manual_us / line_us);
+		lines = lines < 4 ? 4 : lines > most ? most : lines;
+		gain_total = isp->manual_gain < 1 ? 1 : isp->manual_gain;
+		goto split;
+	}
+	now = (double)f->exposure_lines * f->gain / unity * isp->sensor_digital * isp->digital;
+	target = 0.15 * WHITE * pow(2, isp->ae_bias < -8 ? -8 : isp->ae_bias > 8 ? 8 : isp->ae_bias);
+	target = target > 0.8 * WHITE ? 0.8 * WHITE : target;
+	/* (the measured levels are the sensor's, its digital gain in them: the processor's is applied to the picture only) */
+	mean = s->mean[1];
+	bright = s->bright;
+	if (s->roi_cells != 0) {
+		mean = 0.75 * s->roi_mean[1] + 0.25 * s->mean[1];
+		bright = s->roi_bright;
+	}
+	mean = mean * isp->digital > 0.5 ? mean * isp->digital : 0.5;
+	bright *= isp->digital;
 	ratio = target / mean;
-	if (bright * ratio > 0.9 * WHITE && bright > 0) {
+	if (isp->ae_bias <= 0.5f && bright * ratio > 0.9 * WHITE && bright > 0) {
 		ratio = 0.9 * WHITE / bright > target / mean * 0.5 ? 0.9 * WHITE / bright : target / mean * 0.5;
 	}
 	ratio = ratio < 0.25 ? 0.25 : ratio > 4 ? 4 : ratio;
 	if (ratio > 0.94 && ratio < 1.06) {
+		isp->ae_stable = true;
 		return false;
 	}
+	isp->ae_stable = false;
 	want = now * pow(ratio, 0.7);
+	knee = analog_max < 16 ? analog_max : 16;
 	if (want <= fast) {
 		lines = want < 4 ? 4 : (uint32_t)want;
-		gain = f->gain_unity;
-	} else if (want <= (double)fast * 16) {
+		gain_total = 1;
+	} else if (want <= (double)fast * knee) {
 		lines = fast;
-		gain = (uint32_t)(want / fast * f->gain_unity);
+		gain_total = want / fast;
 	} else {
-		lines = (uint32_t)(want / 16);
-		lines = lines > longest - f->margin ? longest - f->margin : lines < fast ? fast : lines;
-		frame_lines = lines + f->margin;
-		double g = want / lines;
-
-		if (g > (double)f->gain_max / f->gain_unity) {
-			digital = g / ((double)f->gain_max / f->gain_unity);
-			digital = digital > 4 ? 4 : digital;
-			g = (double)f->gain_max / f->gain_unity;
-		}
-		gain = (uint32_t)(g * f->gain_unity);
+		lines = (uint32_t)(want / knee);
+		lines = lines > longest ? longest : lines < fast ? fast : lines;
+		gain_total = want / lines;
+	}
+split:
+	if (isp->ae_max_gain >= 1 && gain_total > isp->ae_max_gain) {
+		gain_total = isp->ae_max_gain;
+	}
+	/* the gain: the sensor's analog, then its digital, then the processor's (at most 4x) */
+	analog = gain_total < analog_max ? gain_total : analog_max;
+	analog = analog < 1 ? 1 : analog;
+	if (gain_total > analog && digital_max > 1) {
+		sensor_digital = gain_total / analog < digital_max ? gain_total / analog : digital_max;
+	}
+	digital = gain_total / analog / sensor_digital;
+	digital = digital < 1 ? 1 : digital > 4 ? 4 : digital;
+	if (lines + f->margin > floor_lines || isp->min_frame_lines > f->frame_lines_min) {
+		frame_lines = lines + f->margin > floor_lines ? lines + f->margin : floor_lines;
+	}
+	if (isp->manual && f->exposure_lines + 1 >= lines && f->exposure_lines <= lines + 1 &&
+	    fabs(f->gain / unity - analog) < 0.01 * analog && fabsf(isp->digital - (float)digital) < 0.01f) {
+		isp->ae_stable = true;
+		return false;           /* (the custom exposure is there already) */
 	}
 	isp->digital = (float)digital;
 	isp->asked_lines = lines;
-	isp->asked_gain = gain;
+	isp->asked_gain = (uint32_t)(analog * unity + 0.5);
 	isp->asked_frame_lines = frame_lines;
+	isp->asked_digital = digital_max > 1 ? (uint32_t)(sensor_digital * 256 + 0.5) : 0;
 	isp->asked = true;
+	isp->asked_frames = 0;
 	memset(c, 0, sizeof(*c));
 	c->command = REDWOOD_CAMERA_EXPOSURE;
 	c->a = lines;
-	c->b = gain;
+	c->b = isp->asked_gain;
 	c->c = frame_lines;
+	c->d = isp->asked_digital;
 	return true;
 }
 
@@ -318,6 +434,18 @@ isp_awb(struct isp *isp, const struct isp_stats *s)
 	 */
 	float r, b;
 
+	/* redfin: locked, it stays; manual (the capture stack's gains), it is those */
+	if (isp->awb_manual) {
+		isp->wb[0] = isp->wb_manual[0] / (isp->wb_manual[1] > 0 ? isp->wb_manual[1] : 1);
+		isp->wb[1] = 1;
+		isp->wb[2] = isp->wb_manual[2] / (isp->wb_manual[1] > 0 ? isp->wb_manual[1] : 1);
+		isp->awb_stable = true;
+		return;
+	}
+	if (isp->awb_locked) {
+		isp->awb_stable = true;
+		return;
+	}
 	if (s->neutral_cells * 32 >= s->cells && s->neutral[0] > 0.01 && s->neutral[1] > 0.01) {
 		r = (float)(1 / s->neutral[0]);
 		b = (float)(1 / s->neutral[1]);
@@ -349,6 +477,7 @@ isp_awb(struct isp *isp, const struct isp_stats *s)
 	}
 	r = r < 0.5f ? 0.5f : r > 4 ? 4 : r;
 	b = b < 0.5f ? 0.5f : b > 4 ? 4 : b;
+	isp->awb_stable = fabsf(r - isp->wb[0]) < 0.03f * isp->wb[0] && fabsf(b - isp->wb[2]) < 0.03f * isp->wb[2];
 	isp->wb[0] = isp->wb[0] * 0.9f + r * 0.1f;
 	isp->wb[2] = isp->wb[2] * 0.9f + b * 0.1f;
 }
@@ -443,6 +572,79 @@ lsc_at(const struct isp *isp, float u, float v, float g[3])
 	}
 }
 
+/*
+ * redfin (plan B8): the same arithmetic in integers for the pictures' inner loops (the float code above stays for the
+ * magnified picture and as the reference, isp->reference): values above black in 1/16ths, the lens shading's gains
+ * in 1/4096ths (a row's grid columns interpolated once a row, then along it), the colour matrix in 1/1024ths, 64-bit
+ * sums; rounded where the float code rounds (isp_hosttest compares the two).
+ */
+struct ipipe {
+	int64_t         m[3][3];
+};
+
+static void
+ipipe_init(const struct pipe *p, struct ipipe *q)
+{
+	for (int c = 0; c < 3; c++) {
+		for (int j = 0; j < 3; j++) {
+			q->m[c][j] = (int64_t)llroundf(p->m[c][j] * 1024);
+		}
+	}
+}
+
+/* v: R, G, B in 1/16ths of a 10-bit step */
+static inline void
+ipixel(const struct isp *isp, const struct ipipe *q, int64_t r, int64_t g, int64_t b, uint8_t *rgb)
+{
+	for (int c = 0; c < 3; c++) {
+		int64_t o = (q->m[c][0] * r + q->m[c][1] * g + q->m[c][2] * b + (1 << 13)) >> 14;
+
+		rgb[c] = isp->gamma[o < 0 ? 0 : o > 4095 ? 4095 : o];
+	}
+}
+
+/* a row's lens shading: each colour's gain at each grid column (1/4096ths), at v (0 to 1 down the sensor) */
+struct lsc_row {
+	int32_t         g[3][LSC_W];
+	uint64_t        step;           /* grid columns a pixel, in 1/2^32ths */
+};
+
+static void
+lsc_row_init(const struct isp *isp, float v, uint32_t width, struct lsc_row *r)
+{
+	float gy = v * (LSC_H - 1);
+	int y = (int)gy;
+
+	y = y < 0 ? 0 : y > LSC_H - 2 ? LSC_H - 2 : y;
+	float fy = gy - y;
+
+	for (int c = 0; c < 3; c++) {
+		for (int x = 0; x < LSC_W; x++) {
+			float g = isp->lsc.on ? isp->lsc.gain[c][y][x] * (1 - fy) + isp->lsc.gain[c][y + 1][x] * fy : 1;
+
+			r->g[c][x] = (int32_t)lroundf(g * 4096);
+		}
+	}
+	r->step = ((uint64_t)(LSC_W - 1) << 32) / (width > 1 ? width - 1 : 1);
+}
+
+/* the gains at x (of the row's width) */
+static inline void
+lsc_row_at(const struct lsc_row *r, uint32_t x, int32_t g[3])
+{
+	uint64_t at = ((uint64_t)x * r->step + 32768) >> 16;
+	uint32_t gx = (uint32_t)(at >> 16);
+	int64_t t = (int64_t)(at & 0xffff);
+
+	if (gx > LSC_W - 2) {
+		gx = LSC_W - 2;
+		t = 65536;
+	}
+	for (int c = 0; c < 3; c++) {
+		g[c] = r->g[c][gx] + (int32_t)(((int64_t)(r->g[c][gx + 1] - r->g[c][gx]) * t + 32768) >> 16);
+	}
+}
+
 /* one line of the picture as 8-bit R, G, B */
 static void
 render_line(const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw, uint32_t width, uint32_t height,
@@ -504,6 +706,28 @@ render_line(const struct isp *isp, const struct redwood_camera_frame *f, const u
 	uint64_t step = ((uint64_t)cw << 16) / width, at = (uint64_t)x0 << 16;
 	float v_pos = cells_h > 1 ? (float)cy / (cells_h - 1) : 0, gains[3] = { 1, 1, 1 };
 
+	if (!isp->reference) {
+		/* (redfin, B8: integers) */
+		struct ipipe q;
+		struct lsc_row lr;
+
+		ipipe_init(&p, &q);
+		lsc_row_init(isp, v_pos, cells_w, &lr);
+		for (uint32_t x = 0; x < width; x++, at += step) {
+			uint32_t cx = (uint32_t)(at >> 16);
+			int v[4], g = 0;
+			int32_t gn[3];
+
+			cell(top, f->stride, cx, v);
+			for (int j = 0; j < 4; j++) {
+				g += j != r && j != b ? v[j] : 0;
+			}
+			lsc_row_at(&lr, cx, gn);
+			ipixel(isp, &q, ((int64_t)v[r] * gn[0] + 128) >> 8, ((int64_t)g * gn[1] + 256) >> 9, ((int64_t)v[b] * gn[2] + 128) >> 8,
+			    rgb + 3 * (isp->turned ? width - 1 - x : x));
+		}
+		return;
+	}
 	for (uint32_t x = 0; x < width; x++, at += step) {
 		uint32_t cx = (uint32_t)(at >> 16);
 		int v[4], g = 0;
@@ -641,6 +865,66 @@ full_line(const struct isp *isp, const struct redwood_camera_frame *f, const int
 	int w = (int)f->width;
 	float v_pos = f->height > 1 ? (float)y / (f->height - 1) : 0, gains[3] = { 1, 1, 1 };
 
+	if (!isp->reference) {
+		/*
+		 * (redfin, B8: integers; inside the frame the same means written out -- at a red or blue site green from the
+		 * four beside it and the other colour from the four corners, at a green site each colour from the two of it
+		 * beside it -- and the general loop only at the frame's edges, where it counts clamped neighbours as it does)
+		 */
+		struct ipipe q;
+		struct lsc_row lr;
+		bool inner = y >= 1 && y + 1 < f->height;
+		const int *l0 = l[0], *l1 = l[1], *l2 = l[2];
+
+		ipipe_init(p, &q);
+		lsc_row_init(isp, v_pos, (uint32_t)w, &lr);
+		for (int x = 0; x < w; x++) {
+			int64_t val[3];
+			int32_t gn[3];
+
+			if (inner && x > 0 && x + 1 < w) {
+				int c0 = colour[(y & 1) * 2 + (x & 1)];
+
+				if (c0 == 1) {
+					val[1] = (int64_t)l1[x] * 4;
+					val[colour[(y & 1) * 2 + ((x + 1) & 1)]] = (int64_t)(l1[x - 1] + l1[x + 1]) * 2;
+					val[colour[((y + 1) & 1) * 2 + (x & 1)]] = (int64_t)(l0[x] + l2[x]) * 2;
+				} else {
+					val[c0] = (int64_t)l1[x] * 4;
+					val[1] = l0[x] + l2[x] + l1[x - 1] + l1[x + 1];
+					val[2 - c0] = l0[x - 1] + l0[x + 1] + l2[x - 1] + l2[x + 1];
+				}
+			} else {
+				float sum[3] = { 0, 0, 0 };
+				int n[3] = { 0, 0, 0 };
+
+				for (int dy = -1; dy <= 1; dy++) {
+					const int *line = l[dy + 1];
+					int yy = (int)y + dy;
+
+					yy = yy < 0 ? 0 : yy >= (int)f->height ? (int)f->height - 1 : yy;
+					for (int dx = -1; dx <= 1; dx++) {
+						int xx = x + dx < 0 ? 0 : x + dx >= w ? w - 1 : x + dx;
+						int c = colour[(yy & 1) * 2 + (xx & 1)];
+
+						if (dx == 0 && dy == 0) {
+							sum[c] = (float)line[xx] * 64;
+							n[c] = 64;
+						} else if (n[c] < 64) {
+							sum[c] += (float)line[xx];
+							n[c]++;
+						}
+					}
+				}
+				for (int c = 0; c < 3; c++) {
+					val[c] = (int64_t)lroundf(sum[c] / (n[c] ? n[c] : 1) * 4);
+				}
+			}
+			lsc_row_at(&lr, (uint32_t)x, gn);
+			ipixel(isp, &q, (val[0] * gn[0] + 512) >> 10, (val[1] * gn[1] + 512) >> 10, (val[2] * gn[2] + 512) >> 10, rgb + 3 * x);
+		}
+		return;
+	}
 	for (int x = 0; x < w; x++) {
 		float sum[3] = { 0, 0, 0 };
 		int n[3] = { 0, 0, 0 };
@@ -876,7 +1160,7 @@ isp_lsc_from_flat(struct isp *isp, const struct redwood_camera_frame *f, const u
 	return true;
 }
 
-/* one module's part of a tuning file (tools/camtuning.py): its ranges, and where each range's values are */
+/* one module's part of a tuning file (tools/redfin-camtune.py): its ranges, and where each range's values are */
 static bool
 tune_set(const uint8_t **p, const uint8_t *end, struct isp_tune_set *set, size_t floats)
 {
