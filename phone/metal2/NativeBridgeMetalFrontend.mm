@@ -188,9 +188,15 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  }
  return buffer;
 }
+// Core Animation's extended-range "deep" layers (b3a8 surfaces: BGRA plane + A8 plane) are asked for as
+// MTLPixelFormatRGB10A8_2P_XR10(_sRGB), 550/551, which Turnip has no format for: Camera.app's preview area
+// (1125x1500) and some of its controls failed ("Failed to allocate [1125 x 1500] b3a8 framebuffer"). They are made
+// BGRA8Unorm(_sRGB) over the BGRA plane, the same in every texture, view and pipeline, so the only loss is the range
+// beyond 0..1 and the separate alpha plane.
+static uint64_t sweetFormat(uint64_t format) {return format==550?80:format==551?81:format;}
 static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
  if(!d)return false;
- *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
+ *out={(uint64_t)d.textureType,sweetFormat((uint64_t)d.pixelFormat),d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
  return true;
 }
 @implementation NBTexture
@@ -229,11 +235,11 @@ NB_RESOURCE_SPI
  return (id<MTLTexture>)view;
 }
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format {
- return [self view:nmb_texture_new_view(_handle,format,0,nullptr,nullptr,true)];
+ return [self view:nmb_texture_new_view(_handle,sweetFormat(format),0,nullptr,nullptr,true)];
 }
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices {
  const uint64_t l[2]={levels.location,levels.length},s[2]={slices.location,slices.length};
- return [self view:nmb_texture_new_view(_handle,format,type,l,s,false)];
+ return [self view:nmb_texture_new_view(_handle,sweetFormat(format),type,l,s,false)];
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
@@ -1080,7 +1086,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
  p->vertex=[(NBFunction *)d.vertexFunction handle];p->fragment=d.fragmentFunction?[(NBFunction *)d.fragmentFunction handle]:nullptr;
  for(unsigned i=0;i<8;i++) {
   MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];
-  p->colors[i]={(uint64_t)a.pixelFormat,(uint64_t)a.writeMask,(uint64_t)a.blendingEnabled,(uint64_t)a.sourceRGBBlendFactor,(uint64_t)a.destinationRGBBlendFactor,
+  p->colors[i]={sweetFormat((uint64_t)a.pixelFormat),(uint64_t)a.writeMask,(uint64_t)a.blendingEnabled,(uint64_t)a.sourceRGBBlendFactor,(uint64_t)a.destinationRGBBlendFactor,
       (uint64_t)a.rgbBlendOperation,(uint64_t)a.sourceAlphaBlendFactor,(uint64_t)a.destinationAlphaBlendFactor,(uint64_t)a.alphaBlendOperation};
  }
  p->depth_format=d.depthAttachmentPixelFormat;p->stencil_format=d.stencilAttachmentPixelFormat;p->samples=d.rasterSampleCount;

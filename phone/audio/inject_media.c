@@ -482,6 +482,41 @@ thumbnail_render(id self, SEL selector, void *sample_buffer, id input)
 	(void)self, (void)selector, (void)sample_buffer, (void)input;
 }
 
+/*
+ * The preview in BGRA. The preview's sink (BWImageQueueSinkNode, Camera.app's CAImageQueue) takes 420f/420v,
+ * which backboardd's Core Animation samples as one MTLPixelFormatYCBCR8_420_2P texture: a format Turnip (and
+ * SweetMetal2) does not have, so every preview frame failed ("Failed to allocate MTLTexture from IOSurface") and
+ * the preview stayed black. Its input is asked for BGRA instead; VideoToolbox's software transfer (vt_test) makes it
+ * where the graph rotates the picture anyway. /private/var/local/camera-preview-yuv (any content) turns this off.
+ */
+static IMP original_set_format_requirements;
+
+static void
+set_format_requirements(id self, SEL selector, id requirements)
+{
+	static int wanted = -1;
+	id node = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("node"));
+
+	if (wanted < 0) {
+		wanted = access("/private/var/local/camera-preview-yuv", F_OK) != 0;
+	}
+	if (wanted && requirements != nil && is_node(node, "BWImageQueueSinkNode") &&
+	    strcmp(object_getClassName(requirements), "BWVideoFormatRequirements") == 0) {
+		id formats = ((id (*)(id, SEL))objc_msgSend)(requirements, sel_registerName("supportedPixelFormats"));
+		id description = formats != nil ? ((id (*)(id, SEL))objc_msgSend)(formats, sel_registerName("description")) : nil;
+		const char *text = description != nil ? ((const char *(*)(id, SEL))objc_msgSend)(description, sel_registerName("UTF8String")) : "(none)";
+		CFNumberRef bgra = CFNumberCreate(NULL, kCFNumberSInt32Type, &(int32_t){ 0x42475241 /* BGRA */ });
+		CFArrayRef only = CFArrayCreate(NULL, (const void **)&bgra, 1, &kCFTypeArrayCallBacks);
+
+		say("redwood: mediaserverd: the preview's sink asked for %s: given BGRA\n", text);
+		((void (*)(id, SEL, id))objc_msgSend)(requirements, sel_registerName("setSupportedPixelFormats:"), (id)only);
+		((void (*)(id, SEL, id))objc_msgSend)(requirements, sel_registerName("setPreferredPixelFormats:"), (id)only);
+		CFRelease(only);
+		CFRelease(bgra);
+	}
+	((void (*)(id, SEL, id))original_set_format_requirements)(self, selector, requirements);
+}
+
 struct method_spec {
 	const char *selector, *types;
 	IMP imp;
@@ -548,6 +583,7 @@ static struct replacement {
 	/* (redfin, 16.7.x: not in HackiOS's list) */
 	{ "BWMultiFilterThumbnailNode", "prepareForCurrentConfigurationToBecomeLive", 0, (IMP)thumbnail_prepare, NULL, true, false },
 	{ "BWMultiFilterThumbnailNode", "renderSampleBuffer:forInput:", 0, (IMP)thumbnail_render, NULL, true, false },
+	{ "BWNodeInput", "setFormatRequirements:", 0, (IMP)set_format_requirements, &original_set_format_requirements, true, false },
 };
 
 /* ---- the Metal device leaves this process before the capture stack asks for it -------------------- */
