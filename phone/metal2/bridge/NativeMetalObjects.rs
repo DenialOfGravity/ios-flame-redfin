@@ -769,6 +769,13 @@ pub extern "C" fn nmb_texture_new_on_surface(buffer: *mut NmbBuffer, descriptor:
     })
 }
 
+/// SweetMetal2: the generation of a two-plane YCbCr texture's planes (its surface's seed + 1; 0 = unknown): the runtime converts them
+/// again only when it changes (bridge patch 0103). False for any other texture.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_set_converted_generation(texture: *const NmbTexture, generation: u64) -> bool {
+    guard(false, || Ok(get(texture)?.0.set_converted_generation(generation)))
+}
+
 /// `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:` (Apple SPI).
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_texture_new_linear(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64, bytes_per_row: u64,

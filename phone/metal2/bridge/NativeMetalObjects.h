@@ -91,6 +91,8 @@ NmbTexture *nmb_texture_new_on_buffer(NmbBuffer *, const struct NmbTextureDescri
 struct NmbSurfaceFacts {uint32_t pixel_format, matrix; uint64_t plane, width, height, chroma_offset, chroma_bytes_per_row;};
 NmbTexture *nmb_texture_new_on_surface(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, bool planar,
                                        const struct NmbSurfaceFacts *facts);
+/* The surface seed + 1 a two-plane YCbCr texture's planes hold now: converted again only when it changes. False for other textures. */
+bool nmb_texture_set_converted_generation(const NmbTexture *, uint64_t generation);
 NmbTexture *nmb_texture_new_linear(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, uint64_t bytes_per_image);
 /* whole: a view of every level and slice as format; else levels and slices are {start, count} and kind the view's texture type. */
 NmbTexture *nmb_texture_new_view(NmbTexture *, uint64_t format, uint64_t kind, const uint64_t levels[2], const uint64_t slices[2], bool whole);
