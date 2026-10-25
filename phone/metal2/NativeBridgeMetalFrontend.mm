@@ -100,6 +100,34 @@ static void journal(const std::string &line) {
  noteProblem([NSString stringWithFormat:@"missing %s %s",class_getName(object_getClass(self)),sel_getName(selector)]);
  [super doesNotRecognizeSelector:selector];
 }
+// SweetMetal2 (C1): an object that conforms to one of Metal's protocols (MTLFunction, MTLSamplerState, ... added at device open) may be
+// sent any selector the protocol, or Metal's private twin of it (NAME + "SPI"), declares. One this file does not implement is answered
+// 0/nil with the protocol's type encoding, logged once (MISSING line), instead of raising in the render server; any other selector still
+// reaches doesNotRecognizeSelector: as before.
+static const char *declaredTypes(Class cls,SEL selector) {
+ for(Class c=cls;c;c=class_getSuperclass(c)) {
+  unsigned count=0;Protocol *__unsafe_unretained *list=class_copyProtocolList(c,&count);
+  for(unsigned i=0;i<count;i++) {
+   Protocol *candidates[2]={list[i],objc_getProtocol([NSString stringWithFormat:@"%s%s",protocol_getName(list[i]),"SPI"].UTF8String)};
+   for(Protocol *p:candidates)for(int required=1;p && required>=0;required--) {
+    struct objc_method_description d=protocol_getMethodDescription(p,selector,required,YES);
+    if(d.types){free(list);return d.types;}
+   }
+  }
+  free(list);
+ }
+ return nullptr;
+}
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {
+ if(NSMethodSignature *own=[super methodSignatureForSelector:selector])return own;
+ const char *types=declaredTypes(object_getClass(self),selector);
+ return types?[NSMethodSignature signatureWithObjCTypes:types]:nil;
+}
+- (void)forwardInvocation:(NSInvocation *)invocation {
+ if(gMissing)gMissing(class_getName(object_getClass(self)),[NSString stringWithFormat:@"%s (answered 0: declared by a Metal protocol)",sel_getName(invocation.selector)].UTF8String);
+ const NSUInteger length=invocation.methodSignature.methodReturnLength;
+ if(length){std::vector<uint8_t> zero(length,0);[invocation setReturnValue:zero.data()];}
+}
 @end
 
 // ---- resources ----
@@ -310,9 +338,29 @@ static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUIn
 @property(nonatomic) MTLFunctionType functionType;
 @property(nonatomic) std::string constantsText;   // name:type:hex of each constant value it was specialized with (the journal's)
 @end
+// SweetMetal2 (C1): iOS 16.7 Metal checks a pipeline descriptor's functions against the MTLFunction protocol and NSLogs
+// "vertexFunction is not a MTLFunction." / "fragmentFunction is not a MTLFunction." on a miss (r18g: 450 lines from backboardd,
+// one per function of each pipeline Core Animation made). NBFunction now conforms (native_bridge_metal_open adds the protocol, as
+// for MTLTextureImplementation) and answers the whole public protocol: no reflection is offered (no vertex/stage-input attributes,
+// no function constants named), which is what a Metal function built without reflection answers. Any other selector Metal's own
+// function protocols declare is answered 0/nil (logged once each) rather than raising, so a validation path that the conformance
+// newly opens cannot take backboardd down.
 @implementation NBFunction
 - (void)dealloc {nmb_function_release(_handle);}
 - (MTLFunctionOptions)options {return MTLFunctionOptionNone;}
+- (MTLPatchType)patchType {return MTLPatchTypeNone;}
+- (NSInteger)patchControlPointCount {return 0;}
+- (NSArray *)vertexAttributes {return @[];}
+- (NSArray *)stageInputAttributes {return @[];}
+- (NSDictionary *)functionConstantsDictionary {return @{};}
+- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)index {
+ if(gMissing)gMissing("NBFunction","newArgumentEncoderWithBufferIndex: (argument buffers)");
+ (void)index;return nil;
+}
+- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)index reflection:(MTLAutoreleasedArgument *)reflection {
+ if(reflection)*reflection=nil;
+ return [self newArgumentEncoderWithBufferIndex:index];
+}
 @end
 // The target's own accessors of MTLFunctionConstantValues (as the offline frontend reads them); their ABI is checked before any call.
 @interface MTLFunctionConstantValues (NBOriginalConstantAccess)
@@ -1082,6 +1130,25 @@ static void journalRenderPipeline(MTLRenderPipelineDescriptor *d,uint64_t began,
  for(char &c:line)if(c=='\n')c=' ';
  journal(line);
 }
+// SweetMetal2 (C1): render pipeline outcomes in the log (the journal is a file on the phone): every refused key (vertex | fragment |
+// first colour format) once with the reason, and a count line at the 1st, 10th, 50th, 100th, 200th, ... pipeline made.
+static void notePipeline(MTLRenderPipelineDescriptor *d,const char *refused) {
+ static std::mutex lock;static std::vector<std::string> seen;static uint64_t made,failed;
+ NBFunction *vf=[(id)d.vertexFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.vertexFunction:nil;
+ NBFunction *ff=[(id)d.fragmentFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.fragmentFunction:nil;
+ std::string key=std::string(vf?vf.name.UTF8String?:"?":"-")+" | "+(ff?ff.name.UTF8String?:"?":"-")+" | c0 "+
+     std::to_string((unsigned long)d.colorAttachments[0].pixelFormat);
+ bool log=false;uint64_t m,f;
+ {
+  std::lock_guard<std::mutex> l(lock);
+  if(refused){failed++;if(seen.size()<64 && std::find(seen.begin(),seen.end(),key)==seen.end()){seen.push_back(key);log=true;}}
+  else made++;
+  m=made;f=failed;
+ }
+ if(log)NBLOG(@"native-metal: render pipeline refused (%s): %s",key.c_str(),refused);
+ if(!refused && (m==1 || m==10 || m==50 || m%100==0))sm2_logs([NSString stringWithFormat:@"native-metal: render pipelines made %llu, refused %llu",
+     (unsigned long long)m,(unsigned long long)f].UTF8String);
+}
 // A render pipeline descriptor in the bridge's form; false, with the error, for a function of another device.
 static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDescriptor *p,NSError **error) {
  if(![(id)d.vertexFunction isKindOfClass:[NBFunction class]] || (d.fragmentFunction && ![(id)d.fragmentFunction isKindOfClass:[NBFunction class]])) {
@@ -1570,13 +1637,14 @@ static void ycbcrRefresh(NBTexture *texture) {
                                                         reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection error:(NSError **)error {
  if(reflection)*reflection=nil;
  auto *p=new NmbRenderPipelineDescriptor();
- if(!renderDescriptor(d,p,error)){delete p;return nil;}
+ if(!renderDescriptor(d,p,error)){delete p;notePipeline(d,"a function of another device");return nil;}
  std::vector<NmbBinaryArchive *> archives;
  if(!pipelineArchives(d.binaryArchives,archives,error)){delete p;return nil;}
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
+ notePipeline(d,handle?nullptr:nmb_last_error());
  if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
 }
@@ -1675,6 +1743,25 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  // MTLTextureImplementation." on every miss (~600 lines/s from backboardd while scrolling).
  {Protocol *tp=objc_getProtocol("MTLTextureImplementation");if(tp)class_addProtocol([NBTexture class],tp);
   NBLOG(@"native-metal: MTLTextureImplementation %s",tp?([NBTexture conformsToProtocol:tp]?"adopted":"not adopted"):"missing");}
+ // SweetMetal2 (C1): the same for functions ("vertexFunction is not a MTLFunction." / "fragmentFunction is not a MTLFunction.", 450
+ // NSLog lines a session from backboardd on r18g, one per function of each pipeline Core Animation made) and for the other objects
+ // a descriptor or an encoder hands back to Metal's validation: their public protocols. One line says what was adopted, and whether
+ // Metal has the private classes a subclassing fix would need (phase 2: if the messages persist, the check is a class test).
+ {
+  struct {Class cls;const char *protocol;} adopt[]={{[NBFunction class],"MTLFunction"},{[NBLibrary class],"MTLLibrary"},
+   {[NBRenderPipeline class],"MTLRenderPipelineState"},{[NBComputePipeline class],"MTLComputePipelineState"},
+   {[NBSampler class],"MTLSamplerState"},{[NBDepthStencil class],"MTLDepthStencilState"}};
+  std::string done;
+  for(auto &a:adopt) {
+   Protocol *p=objc_getProtocol(a.protocol);
+   const bool was=p && [a.cls conformsToProtocol:p];
+   if(p && !was)class_addProtocol(a.cls,p);
+   done+=std::string(" ")+class_getName(a.cls)+(p?([a.cls conformsToProtocol:p]?(was?"=":"+"):"!"):"?")+a.protocol;
+  }
+  Class mf=objc_getClass("_MTLFunction");
+  NBLOG(@"native-metal: protocols (+ adopted, = already, ? no such protocol):%s; Metal's _MTLFunction %s (%zu bytes)",done.c_str(),
+        mf?"present":"absent",mf?class_getInstanceSize(mf):(size_t)0);
+ }
  objc_registerClassPair(cls);
  gDeviceObject=[cls new];
  return gDeviceObject;
