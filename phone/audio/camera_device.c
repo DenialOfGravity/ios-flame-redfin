@@ -384,7 +384,9 @@ format(int sensor_width, int sensor_height, int max_fps, bool binned, double fov
 	put(f, "VideoBinningFactorHorizontal", number_i(binned ? 2 : 1));
 	put(f, "VideoBinningFactorVertical", number_i(binned ? 2 : 1));
 	put(f, "VideoFieldOfView", number_f(fov));
-	put(f, "PixelSize", number_f(pixel_size));      /* (redfin: the Pixel 5's sensor's pitch, um) */
+	if (access("/private/var/local/camera-plain-props", F_OK) != 0) {
+		put(f, "PixelSize", number_f(pixel_size));      /* (redfin: the Pixel 5's sensor's pitch, um) */
+	}
 	put(f, "VideoMinIntegrationTime", number_i(100));
 	put(f, "VideoMaxIntegrationTime", number_i(1000000 / 15));
 	put(f, "VideoRawBitDepth", number_i(10));
@@ -2654,7 +2656,22 @@ stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef
 		camera->pixel_size) };
 
 	s->formats = CFArrayCreate(NULL, (const void **)f, 2, &kCFTypeArrayCallBacks);
-	s->supported = supported(stream_props, sizeof(stream_props) / sizeof(stream_props[0]));
+	/*
+	 * (redfin: /private/var/local/camera-plain-props: the properties r18f listed and no more -- the guessed names of
+	 * custom exposure and white balance left out, for telling whether they change what the capture stack does)
+	 */
+	size_t listed = sizeof(stream_props) / sizeof(stream_props[0]);
+
+	if (access("/private/var/local/camera-plain-props", F_OK) == 0) {
+		for (size_t i = 0; i < listed; i++) {
+			if (strcmp(stream_props[i].name, "AEWindowParams") == 0) {
+				listed = i;
+				say("stream: the properties r18f listed only (camera-plain-props)");
+				break;
+			}
+		}
+	}
+	s->supported = supported(stream_props, listed);
 	CFRelease(f[0]);
 	CFRelease(f[1]);
 	return o;
