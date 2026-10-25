@@ -41,7 +41,7 @@ struct redwood_camera_frame {
 	uint32_t        sensor;         /* which: 0 the macro, 1 the wide, 2 the front, 3 the ultra-wide camera */
 	uint32_t        focus;          /* the lens's position as last set, 0 (the furthest) to 1023: REDWOOD_CAMERA_NO_FOCUS where it
 	                                 * has no motor (or it does not answer) */
-	uint32_t        reserved[5];
+	uint32_t        reserved[5];    /* redfin: see REDWOOD_CAMERA_R_* below */
 };
 
 #define REDWOOD_CAMERA_NO_FOCUS 0xffffffffu
@@ -60,5 +60,38 @@ struct redwood_camera_command {
 	uint32_t        bytes;          /* of what follows this structure */
 	uint32_t        a, b, c, d;
 };
+
+/*
+ * redfin: the camera ABI contract of the 2026-10-25 camera/GPU plan (kernel bsd/dev/sweet_cam.c <-> this plug-in),
+ * additions only: the frame's size is unchanged, reserved[5] is given meanings, and the commands take more.
+ *
+ *   EXPOSURE 1: a lines, b analog gain (256 = 1x), c frame lines (0: the shortest), d digital gain (256 = 1x,
+ *               0: unchanged). The kernel clamps what it cannot do and reports what it set (the frames' header).
+ *   SENSOR   3: a camera (1 back IMX363, 2 front IMX355, 3 ultra-wide IMX481), b mode index or ~0, c (with b ~0) the
+ *               kind of mode the kernel picks: REDWOOD_CAMERA_MODE_*.
+ *   FOCUS    4: a position 0 (infinity) to 1023 (macro), b 0 move now / 1 park. No actuator: focus stays NO_FOCUS.
+ *   FLASH    5: a current in mA (the kernel caps it), b frames to light (1: the next full frame), c 1: a pre-flash at
+ *               torch level first (for metering). The lit frame carries REDWOOD_CAMERA_FLASH_LIT.
+ */
+enum {
+	REDWOOD_CAMERA_FLASH = 5,
+};
+
+/* SENSOR's c, with b = ~0 */
+#define REDWOOD_CAMERA_MODE_AUTO        0u
+#define REDWOOD_CAMERA_MODE_PHOTO       1u      /* the most pixels at 4:3 */
+#define REDWOOD_CAMERA_MODE_VIDEO       2u      /* 16:9, >= 30 fps, <= 4K */
+#define REDWOOD_CAMERA_MODE_VIDEO60     3u      /* >= 60 fps */
+
+/* reserved[]'s meanings */
+#define REDWOOD_CAMERA_R_FLAGS          0       /* REDWOOD_CAMERA_FLASH_LIT | LENS_MOVING | MODE_CHANGED */
+#define REDWOOD_CAMERA_R_SOF_LO         1       /* start of frame, mach_absolute_time(), low 32 bits ... */
+#define REDWOOD_CAMERA_R_SOF_HI         2       /* ... high 32 bits (0 and 0: not given) */
+#define REDWOOD_CAMERA_R_DGAIN          3       /* the sensor's digital gain: lo16 unity, hi16 max (0: it has none) */
+#define REDWOOD_CAMERA_R_FPS_MILLI      4       /* the current mode's frames a second, in thousandths (0: not given) */
+
+#define REDWOOD_CAMERA_FLASH_LIT        (1u << 0)       /* this frame was exposed with the flash on */
+#define REDWOOD_CAMERA_LENS_MOVING      (1u << 1)       /* the lens moved while this frame was exposed */
+#define REDWOOD_CAMERA_MODE_CHANGED     (1u << 2)       /* the first frame after a SENSOR/mode change */
 
 #endif /* _SYS_REDWOOD_CAMERA_H_ */
