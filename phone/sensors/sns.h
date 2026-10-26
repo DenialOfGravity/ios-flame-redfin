@@ -33,7 +33,7 @@
  *   768 sns_std_sensor_physical_config_event (ignored)
  *   1025 sns_std_sensor_event { 1 repeated float data; 2 enum status (0 unreliable .. 3 high) }
  *   proximity: sns_proximity_event { 1 enum proximity_event_type (0 far, 1 near); 2 uint32 raw_adc; 3 status }
- *              (msg id >= 1024; told apart from 1025 by the wire type of field 1, not by its number)
+ *              (msg id 769 on redfin's TCS3701; also accepted >= 1024, told apart from 1025 by wire type)
  *   10  disable (empty request)
  */
 #ifndef SNS_H
@@ -58,6 +58,7 @@
 #define SNS_MSG_SUID_EVENT	768
 #define SNS_MSG_PHYS_CONFIG_EVENT 768	/* same number, from a sensor's own SUID */
 #define SNS_MSG_SENSOR_EVENT	1025
+#define SNS_MSG_PROX_EVENT	769	/* SNS_PROXIMITY_MSGID_SNS_PROXIMITY_EVENT (seen on the phone) */
 
 #define SNS_PROC_APSS		1
 #define SNS_DELIVERY_WAKEUP	0

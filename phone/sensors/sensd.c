@@ -13,7 +13,15 @@
  *                                off with /var/local/sensd.off
  * Options: --dump (every QMI message in hex), --secs N (stop after N s), --no-motion (print only),
  *          --no-orient (no type-10 orientation samples from accel), --no-follow (daemon: stream everything),
- *          --node N --port P (skip the service lookup), --qrtr-fd FD (an inherited fd instead of the device).
+ *          --node N --port P (skip the service lookup), --qrtr-fd FD (an inherited fd instead of the device),
+ *          --orient-inject [TYPE] (hand each orientation sensd derives to backboardd, below).
+ *   sensd --orient-set N [TYPE]  set the device orientation once and hold it for --secs (default 30) s
+ *
+ * Orientation injection: on iPhones backboardd's BKOrientationManager takes the device orientation from CoreMotion
+ * (locationd), which has no motion input here. BackBoardServices' BKSHIDServicesLockOrientation(orientation,
+ * TYPE) locks backboardd's effective device orientation instead (BKSHIDServicesUnlockOrientation first: a second
+ * lock is ignored while one is held). TYPE is the lock type (unknown enum, default 0); TYPE -1 uses
+ * BKSHIDServicesSetDeviceInterfaceOrientation(orientation) instead. Needs sensd-ents.plist's entitlements.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -24,6 +32,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <dlfcn.h>
 #include "rqrtr.h"
 #include "sensor.h"
 
@@ -34,6 +43,7 @@ static struct {
 	uint32_t node, port;
 	int qrtr_fd;
 	uint64_t written, write_errors;
+	int inject, inject_type;
 } opt = { .motion_fd = -1, .orient = 1, .follow = 1, .qrtr_fd = -1 };
 
 static volatile sig_atomic_t stop_flag;
@@ -47,8 +57,45 @@ static void stamp(void)
 	printf("%02d:%02d:%02d ", tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
+/* BackBoardServices, looked up at run time (no SDK stubs for it). */
+static void (*bks_lock)(long orientation, long type);
+static void (*bks_unlock)(void);
+static void (*bks_set_interface)(long orientation);
+
+static int bks_load(void)
+{
+	void *h = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
+	if (!h) {
+		printf("sensd: BackBoardServices: %s\n", dlerror());
+		return -1;
+	}
+	bks_lock = (void (*)(long, long))dlsym(h, "BKSHIDServicesLockOrientation");
+	bks_unlock = (void (*)(void))dlsym(h, "BKSHIDServicesUnlockOrientation");
+	bks_set_interface = (void (*)(long))dlsym(h, "BKSHIDServicesSetDeviceInterfaceOrientation");
+	printf("sensd: BKSHIDServicesLockOrientation %p, Unlock %p, SetDeviceInterfaceOrientation %p\n",
+	    (void *)bks_lock, (void *)bks_unlock, (void *)bks_set_interface);
+	return bks_lock && bks_unlock ? 0 : -1;
+}
+
+static void bks_orient(int o, int type)
+{
+	if (type < 0) {
+		if (bks_set_interface)
+			bks_set_interface(o);
+	} else if (bks_lock && bks_unlock) {
+		bks_unlock();
+		bks_lock(o, type);
+	}
+	stamp();
+	printf("sensd: orientation %d -> backboardd (%s %d)\n", o, type < 0 ? "SetDeviceInterfaceOrientation" :
+	    "LockOrientation type", type);
+	fflush(stdout);
+}
+
 static void out(void *ctx, struct sensor *s, const struct motion_sample *m)
 {
+	if (opt.inject && m->type == MOTION_TYPE_ORIENTATION)
+		bks_orient((int)m->v[0], opt.inject_type);
 	(void)ctx;
 	if (opt.motion_fd >= 0) {
 		if (write(opt.motion_fd, m, sizeof(*m)) == (ssize_t)sizeof(*m))
@@ -361,7 +408,8 @@ static int cmd_daemon(void)
 static void usage(void)
 {
 	printf("usage: sensd --list | --stream NAME [HZ] | --all | --daemon  [--dump] [--secs N] [--no-motion]\n"
-	    "       [--no-orient] [--no-follow] [--node N --port P] [--qrtr-fd FD]\n"
+	    "       [--no-orient] [--no-follow] [--orient-inject [TYPE]] [--node N --port P] [--qrtr-fd FD]\n"
+	    "       sensd --orient-set N [TYPE] [--secs S]\n"
 	    "NAME: accel gyro als prox compass pressure (or ambient_light proximity mag)\n");
 }
 
@@ -389,7 +437,16 @@ int main(int argc, char **argv)
 			motion = 0;
 		else if (!strcmp(a, "--no-orient"))
 			opt.orient = 0;
-		else if (!strcmp(a, "--no-follow"))
+		else if (!strcmp(a, "--orient-inject")) {
+			opt.inject = 1;
+			if (i + 1 < argc && (argv[i + 1][0] != '-' || (argv[i + 1][1] >= '0' && argv[i + 1][1] <= '9')))
+				opt.inject_type = atoi(argv[++i]);
+		} else if (!strcmp(a, "--orient-set") && i + 1 < argc) {
+			mode = "orient-set";
+			hz = (float)atoi(argv[++i]);
+			if (i + 1 < argc && (argv[i + 1][0] != '-' || (argv[i + 1][1] >= '0' && argv[i + 1][1] <= '9')))
+				opt.inject_type = atoi(argv[++i]);
+		} else if (!strcmp(a, "--no-follow"))
 			opt.follow = 0;
 		else if (!strcmp(a, "--node") && i + 1 < argc)
 			opt.node = (uint32_t)strtoul(argv[++i], NULL, 0);
@@ -409,6 +466,19 @@ int main(int argc, char **argv)
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
 	signal(SIGPIPE, SIG_IGN);
+	if (!strcmp(mode, "orient-set")) {
+		if (bks_load())
+			return 1;
+		bks_orient((int)hz, opt.inject_type);
+		for (int t = 0; t < (opt.secs ? opt.secs : 30) && !stop_flag; t++)
+			sleep(1);
+		if (opt.inject_type >= 0 && bks_unlock)
+			bks_unlock();
+		printf("sensd: orientation released\n");
+		return 0;
+	}
+	if (opt.inject && bks_load())
+		opt.inject = 0;
 	env.verbose = opt.verbose;
 	env.orient = opt.orient;
 	if (motion && strcmp(mode, "list"))
