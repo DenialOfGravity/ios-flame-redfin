@@ -23,7 +23,7 @@
 
 #include <libhexagonrpc/error.h>
 #include <libhexagonrpc/hexagonrpc.h>
-#include <libhexagonrpc/session.h>
+/* fastrpcd: <libhexagonrpc/session.h> (unused here) is not part of this copy */
 #include <libhexagonrpc/interface/remotectl.h>
 
 int hexagonrpc_open(int fd, const char *name, uint32_t *hdl, size_t n_err, char *err)

@@ -1,7 +1,7 @@
-From c45c3aa9ea11aa7e55176a349ec818a7b49b8987 Mon Sep 17 00:00:00 2001
+From 18b105612a46fb7c71d6e1a338873794d2e67a49 Mon Sep 17 00:00:00 2001
 From: WS-D <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 00:37:43 +0100
-Subject: [PATCH] 0951 redfin: pd-mapper in the ADSP's kernel QRTR
+Subject: [PATCH 2/3] 0951 redfin: pd-mapper in the ADSP's kernel QRTR
 
 The service registry locator (QMI service 0x40, port 0x4001) is served from
 sweet_adsp.c: announced to the DSP after its QRTR HELLO and given to its
@@ -15,10 +15,10 @@ adsp_pdm=0: not served. Poke f 4: announce again.
  1 file changed, 166 insertions(+), 2 deletions(-)
 
 diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
-index fee7a46..dc3e013 100644
+index eff1192..f27b855 100644
 --- a/bsd/dev/sweet_adsp.c
 +++ b/bsd/dev/sweet_adsp.c
-@@ -2405,6 +2405,148 @@ qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to
+@@ -2408,6 +2408,148 @@ qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to
  	return error;
  }
  
@@ -167,7 +167,7 @@ index fee7a46..dc3e013 100644
  static void
  qrtr_control(const struct qrtr_header *header, const struct qrtr_control *control)
  {
-@@ -2418,6 +2560,7 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
+@@ -2421,6 +2563,7 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
  		}
  		error = qrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, header->from_node, QRTR_CONTROL, &hello, sizeof(hello));
  		printf("adsp: qrtr: HELLO FROM NODE %u; ours to it: %s\n", header->from_node, error == 0 ? "SENT" : "NOT SENT");
@@ -175,7 +175,7 @@ index fee7a46..dc3e013 100644
  		break;
  	case QRTR_NEW_SERVER:
  		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
-@@ -2450,8 +2593,18 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
+@@ -2453,8 +2596,18 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
  	case QRTR_NEW_LOOKUP:
  		/* the DSP looks for a service of ours (a protection domain's locator, say): there are none yet */
  		if (qrtr_lookups++ < 16) {
@@ -196,7 +196,7 @@ index fee7a46..dc3e013 100644
  		}
  		break;
  	case QRTR_BYE:
-@@ -2512,6 +2665,10 @@ qrtr_input(const uint8_t *data, uint32_t length)
+@@ -2515,6 +2668,10 @@ qrtr_input(const uint8_t *data, uint32_t length)
  		qrtr_control(&header, &control);
  		return;
  	}
@@ -207,7 +207,7 @@ index fee7a46..dc3e013 100644
  	printf("adsp: qrtr: a datagram of %u bytes from node %u port %u to our port %u: nobody here listens there\n", header.size,
  	    header.from_node, header.from_port, header.to_port);
  }
-@@ -3476,6 +3633,12 @@ sweet_adsp_poke(unsigned what, __unused uint64_t a, __unused uint64_t b)
+@@ -3543,6 +3700,12 @@ sweet_adsp_poke(unsigned what, __unused uint64_t a, __unused uint64_t b)
  		return 0;
  	case 3:
  		return fastrpc_smmu_identity((uint32_t)a);
@@ -220,7 +220,7 @@ index fee7a46..dc3e013 100644
  	case 5:
  		fastrpc_smmu_faults();
  		return 0;
-@@ -3860,6 +4023,7 @@ redwood_adsp_init(void)
+@@ -3927,6 +4090,7 @@ redwood_adsp_init(void)
  		return;
  	}
  	fastrpc_init();                         /* 0950: /dev/redwood-fastrpc (adsp_fastrpc=0: not) */

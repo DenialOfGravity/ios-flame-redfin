@@ -120,6 +120,38 @@ adsprpc-mem may need a hyp-assign (TZ SMC) — if the DSP refuses our buffers, r
 may not cure `sar.cc chre_utils fatal` (then: dump what it asked for and whether `/mnt/vendor/persist/sensors/registry`
 was writable).
 
+#### D4/D5 as built: `phone/fastrpc/fastrpcd` (WS-D2)
+- Program: `fastrpcd [-v] [-r ROOT] [--mmap-method 2|4] [-d DEVICE]`, GPL-3.0+ (hexagonrpcd's listener/localctl/
+  apps_mem/marshalling + new `transport.c`, `apps_std.c`, `fastrpcd.c`). Built by `phone/fastrpc/build.sh` in
+  userland.yml (artefacts `fastrpcd`, `org.iosonpixel.fastrpcd.plist`, `fastrpcd-test.log`); host tests
+  `sh phone/fastrpc/test.sh` (layout bytes for a 2-in/1-out call, a fake DSP: attach, remotectl, INIT_MMAP fallback,
+  the listener with a >4 KiB request via get_in_bufs2, DSP loss; apps_std over a temp tree).
+- Transport: one buffer per call from `FASTRPC_ALLOC` (size classes 64 KiB/1/4/16 MiB, reused, never freed), written
+  and read through `/dev/pmem`; Android adsprpc layout (`40n + 388` metadata, buffers at 128 B, `pv` = PA, page
+  `addr` = page PA | 3 << 32); message `addr` = PA | 3 << 32, `size` = used rounded to 4 KiB; `ctx = idx << 4 | pd`
+  (idx 1-63), client 0 for handle 1 (INIT_ATTACH_SNS, INIT_MMAP), the pid otherwise; answer thread matches ctx bits
+  4-9, honours rspv2 flags (early/complete). INIT_MMAP: method 4 (Linux, num 16) first, method 2 (Android 64-bit,
+  num 1) if the DSP refuses, then that one for good.
+- Files: DSP path -> ROOT + path after `/system/vendor` -> `/vendor`, `/mnt/vendor/persist` -> `/persist`; `..` and
+  links cannot leave ROOT; writes only under `/persist` (registry). `fopen_with_env`: absolute names as they are,
+  relative ones in `<dir>/adsp/<name>` then `<dir>/<name>` for `$ADSP_LIBRARY_PATH` = /usr/lib/qcom/adsp,
+  /vendor/lib/rfsa/adsp, /vendor/dsp and `$ADSP_AVS_CFG_PATH` = /vendor/etc/acdbdata. apps_std methods 0-5, 8-12,
+  15, 16, 19, 22-24, 26-33; anything else (and any undecodable request) gets an error answer, the loop goes on.
+- r23a fixes (0950 regenerated, 0951/0956 rebased on it): FASTRPC_ALLOC now comes from the GPU pool below 4 GiB
+  (`sweet_gpu_pool_alloc`, as 0923's camera frames; XNU's RAM starts at 4 GiB, so `kmem_alloc_contig` never could),
+  zeroed by the kernel through a device mapping; fastrpcd's /dev/pmem accesses are 32-bit aligned (bounce for the
+  edges). Boot-arg `adsp=2`: the DSP is started by the first open of /dev/redwood-fastrpc (fastrpcd exists before
+  the sensors PD asks for files); the "given up" flag is cleared then, so write() says ENOTCONN and read() waits
+  until the channel opens; fastrpcd polls every 250 ms for the first minute while it sees ENOTCONN.
+- Exit codes: 0 `/var/local/fastrpcd.off`, 1 error, 2 no tree (after 30 s), 3 DSP gone (ECONNRESET), 4 refused.
+  Waits (1-30 s back-off) for `/dev/pmem`, `/dev/redwood-fastrpc` (ENOENT/EBUSY) and the channel (ENOTCONN).
+- Install: `bash tools/redfin-install-hexagon-wsl.sh USERLAND.zip [recon/fw-adsp] [recon/fw-qol/persist.tar | recon/persist/sensors]` (root
+  image + launchd job; `--live` pushes to the running phone with flame-files.py; `--stage-only` to inspect).
+  Understands recon/fw-adsp/hexagon laid out like the phone or like hexagonrpcd's -R dir; soc0.txt split per attribute.
+- Log lines to look for in `/var/local/fastrpcd.log`: `/dev/redwood-fastrpc open; SMMU stream 0x1403 is session 3`,
+  `INIT_ATTACH_SNS (pd 2, tgid N) -> 0`, `adsp_default_listener (handle 0x..) register -> 0`, `adsp_listener: init2
+  ok`, then one line per `fopen_with_env(...)`/`fopen`/`stat`/`opendir`/`readdir`/`fwrite` with its result.
+
 ### WS-A — Speaker + microphone (branch `ws-a-audio`, Opus; phone test after WS-D)
 A1 **(M)** 0952 `sweet_sound.c` from HackiOS `hakios.sound.c` (APR AFE/ADM/ASM; message layouts carry over):
    `AFE_CMD_REMOTE_LPASS_CORE_HW_VOTE_REQUEST` 0x100f4 blocks 3/4 first (this is what lets APPS touch LPASS/LPI

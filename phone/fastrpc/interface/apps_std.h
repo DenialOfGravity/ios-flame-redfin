@@ -17,6 +17,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Modified for fastrpcd (ios-flame, 2026): the methods of interface/apps_std.c.
  */
 
 #ifndef INTERFACE_APPS_STD_H
@@ -24,16 +26,30 @@
 
 #include <libhexagonrpc/hexagonrpc.h>
 
+extern const struct hrpc_method_def_interp4 apps_std_fopen_def;
 extern const struct hrpc_method_def_interp4 apps_std_freopen_def;
 extern const struct hrpc_method_def_interp4 apps_std_fflush_def;
 extern const struct hrpc_method_def_interp4 apps_std_fclose_def;
 extern const struct hrpc_method_def_interp4 apps_std_fread_def;
+extern const struct hrpc_method_def_interp4 apps_std_fwrite_def;
+extern const struct hrpc_method_def_interp4 apps_std_ftell_def;
 extern const struct hrpc_method_def_interp4 apps_std_fseek_def;
+extern const struct hrpc_method_def_interp4 apps_std_flen_def;
+extern const struct hrpc_method_def_interp4 apps_std_rewind_def;
+extern const struct hrpc_method_def_interp4 apps_std_feof_def;
+extern const struct hrpc_method_def_interp4 apps_std_print_string_def;
+extern const struct hrpc_method_def_interp4 apps_std_getenv_def;
 extern const struct hrpc_method_def_interp4 apps_std_fopen_with_env_def;
+extern const struct hrpc_method_def_interp4 apps_std_fileExists_def;
+extern const struct hrpc_method_def_interp4 apps_std_fsync_def;
+extern const struct hrpc_method_def_interp4 apps_std_fremove_def;
 extern const struct hrpc_method_def_interp4 apps_std_opendir_def;
 extern const struct hrpc_method_def_interp4 apps_std_closedir_def;
 extern const struct hrpc_method_def_interp4 apps_std_readdir_def;
 extern const struct hrpc_method_def_interp4 apps_std_mkdir_def;
+extern const struct hrpc_method_def_interp4 apps_std_rmdir_def;
 extern const struct hrpc_method_def_interp4 apps_std_stat_def;
+extern const struct hrpc_method_def_interp4 apps_std_ftrunc_def;
+extern const struct hrpc_method_def_interp4 apps_std_frename_def;
 
 #endif /* INTERFACE_APPS_STD_H */
