@@ -139,7 +139,7 @@ was writable).
   15, 16, 19, 22-24, 26-33; anything else (and any undecodable request) gets an error answer, the loop goes on.
 - Exit codes: 0 `/var/local/fastrpcd.off`, 1 error, 2 no tree (after 30 s), 3 DSP gone (ECONNRESET), 4 refused.
   Waits (1-30 s back-off) for `/dev/pmem`, `/dev/redwood-fastrpc` (ENOENT/EBUSY) and the channel (ENOTCONN).
-- Install: `bash tools/redfin-install-hexagon-wsl.sh USERLAND.zip [recon/fw-adsp] [recon/persist/sensors]` (root
+- Install: `bash tools/redfin-install-hexagon-wsl.sh USERLAND.zip [recon/fw-adsp] [recon/fw-qol/persist.tar | recon/persist/sensors]` (root
   image + launchd job; `--live` pushes to the running phone with flame-files.py; `--stage-only` to inspect).
   Understands recon/fw-adsp/hexagon laid out like the phone or like hexagonrpcd's -R dir; soc0.txt split per attribute.
 - Log lines to look for in `/var/local/fastrpcd.log`: `/dev/redwood-fastrpc open; SMMU stream 0x1403 is session 3`,

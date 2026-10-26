@@ -7,23 +7,26 @@
 #     vendor/etc/sensors/sns_reg_config        recon/fw-adsp/hexagon
 #     vendor/etc/acdbdata/                     recon/fw-adsp/hexagon (if captured)
 #     usr/lib/qcom/adsp/                       recon/fw-adsp/hexagon (the phone's /vendor/dsp/adsp, if captured)
-#     persist/sensors/                         recon/persist/sensors (registry: the only part the DSP writes)
+#     persist/sensors/                         sensors/ of recon/fw-qol/persist.tar, else recon/persist/sensors
+#                                              (registry: the only part the DSP writes)
 #     sys/devices/soc0/<attribute>             recon/fw-adsp/soc0.txt, one file per attribute
 #   launchd job org.iosonpixel.fastrpcd        fastrpcd at boot, restarted when the DSP comes back (log
 #                                              /var/local/fastrpcd.log; off: /var/local/fastrpcd.off)
 # Vendor files never go into git: they come from YOUR phone's dumps on the PC.
 #
-#   bash tools/redfin-install-hexagon-wsl.sh USERLAND.zip [ADSP_DIR] [PERSIST_DIR]
+#   bash tools/redfin-install-hexagon-wsl.sh USERLAND.zip [ADSP_DIR] [PERSIST]
 #       edits ~/redfin-work/iosroot.img (then: bash tools/redfin-install-root-wsl.sh delta, phone in TWRP)
-#   bash tools/redfin-install-hexagon-wsl.sh --live USERLAND.zip [ADSP_DIR] [PERSIST_DIR]
+#   bash tools/redfin-install-hexagon-wsl.sh --live USERLAND.zip [ADSP_DIR] [PERSIST]
 #       pushes the binary and the tree to the RUNNING phone with tools/flame-files.py (PHONE_FILES_HOST);
 #       the launchd job needs the image mode once (or start it by hand: /var/local/bin/fastrpcd -v)
-#   bash tools/redfin-install-hexagon-wsl.sh --stage-only [ADSP_DIR] [PERSIST_DIR]
+#   bash tools/redfin-install-hexagon-wsl.sh --stage-only [ADSP_DIR] [PERSIST]
 #       only builds the tree in ~/redfin-work/hexagon (to look at it)
 #
 #     USERLAND.zip  the ios-userland artifact (e.g. /mnt/c/ClaudeProjects/iOS_Pixel5/ios-userland.zip)
 #     ADSP_DIR      default /mnt/c/ClaudeProjects/iOS_Pixel5/ios-redfin-tree/ios-redfin/recon/fw-adsp
-#     PERSIST_DIR   default /mnt/c/ClaudeProjects/iOS_Pixel5/ios-redfin-tree/ios-redfin/recon/persist/sensors
+#     PERSIST       default: sensors/ out of .../ios-redfin/recon/fw-qol/persist.tar (the whole persist partition:
+#                   registry, *.csv calibration) if it exists, else .../ios-redfin/recon/persist/sensors. A .tar
+#                   (its sensors/ is used) or a directory (the phone's /mnt/vendor/persist/sensors) may be given.
 #
 # recon/fw-adsp/hexagon may be laid out like the phone (vendor/etc/sensors/..., vendor/dsp/adsp, ...) or like
 # hexagonrpcd's -R directory (sensors/config, sensors/sns_reg.conf, acdb/, dsp/, socinfo/); both are understood.
@@ -35,9 +38,12 @@ WIN=/mnt/c/ClaudeProjects/iOS_Pixel5/ios-redfin-tree/ios-redfin
 MODE=image
 case ${1:-} in --live) MODE=live; shift;; --stage-only) MODE=stage; shift;; esac
 if [[ $MODE != stage ]]; then
-	ZIP=${1:?usage: $0 [--live|--stage-only] USERLAND.zip [ADSP_DIR] [PERSIST_DIR]}; shift
+	ZIP=${1:?usage: $0 [--live|--stage-only] USERLAND.zip [ADSP_DIR] [PERSIST]}; shift
 fi
-ADSP=${1:-$WIN/recon/fw-adsp} PERSIST=${2:-$WIN/recon/persist/sensors}
+ADSP=${1:-$WIN/recon/fw-adsp} PERSIST=${2:-}
+if [[ -z $PERSIST ]]; then
+	if [[ -f $WIN/recon/fw-qol/persist.tar ]]; then PERSIST=$WIN/recon/fw-qol/persist.tar; else PERSIST=$WIN/recon/persist/sensors; fi
+fi
 HEX=$ADSP/hexagon
 
 echo "== stage the served tree in $W/hexagon"
@@ -72,7 +78,36 @@ else
 	echo "$HEX: neither vendor/ nor sensors/ inside; found:"; ls -la "$HEX"; exit 1
 fi
 # the writable registry: the phone's /mnt/vendor/persist/sensors
-if [[ -d $PERSIST ]]; then
+if [[ -f $PERSIST ]]; then
+	# sensors/ of the persist partition's tar (members "sensors/...", "./sensors/..." or "persist/sensors/...");
+	# only plain files and directories, nothing absolute or with ".."
+	mkdir -p "$S/persist/sensors"
+	python3 -I - "$PERSIST" "$S/persist/sensors" <<'PY'
+import os, sys, tarfile
+src, dst = sys.argv[1], sys.argv[2]
+n = 0
+with tarfile.open(src) as t:
+    for m in t:
+        parts = [p for p in m.name.split('/') if p not in ('', '.')]
+        if '..' in parts or m.name.startswith('/'):
+            continue
+        if parts and parts[0] == 'persist':
+            parts = parts[1:]
+        if len(parts) < 2 or parts[0] != 'sensors':
+            continue
+        out = os.path.join(dst, *parts[1:])
+        if m.isdir():
+            os.makedirs(out, exist_ok=True)
+        elif m.isreg():
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            with t.extractfile(m) as f, open(out, 'wb') as o:
+                o.write(f.read())
+            n += 1
+print(f'  persist: {n} files from sensors/ in {src}')
+if n == 0:
+    sys.exit('no sensors/ in ' + src)
+PY
+elif [[ -d $PERSIST ]]; then
 	copydir "$PERSIST" "$S/persist/sensors"
 else
 	echo "  WARNING: no $PERSIST: the DSP starts with an empty registry (it writes a new one)"
