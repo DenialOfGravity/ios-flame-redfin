@@ -359,4 +359,27 @@ User actions needed (physical): get the phone from Android into fastboot when ph
 Type-C 1.5 A+) for r21d; taps/rotations for sensor and audio tests; running `tools-claude/bt-spike.sh` in WSL.
 
 ## 6. Results log
-(filled in as workstreams report)
+
+### 2026-10-26 01:20 — Phase 1 done, Phase 2a on the phone (power)
+
+Phase 1: all five branches green in CI. ws-p-power @ 7f6f188 (0960-0969, klog PA 0x101d1a8d8); ws-a-audio @ 9cf0607
+(0952-0955); ws-s-sensors @ 87c444e (0971-0972 + phone/sensors/sensd); ws-b-bluetooth @ 6ceb76d (0980-0981 +
+phone/bt/btd); ws-d-fastrpc @ 79979fd (0950, 0951, 0956 kernel done; **phone/fastrpc/fastrpcd not written**: the
+worker was stopped twice by the safety classifier while writing the userland daemon; design and the exact remaining
+work are in the project doc "fastrpcd Technical Brief"). All merged into `redfin-qol` @ 121bbfb; 0960/0961/0972/0981
+were regenerated against the merged tree (their bsd/conf/files and sweet_poke.c context had moved; CI would have
+silently skipped them). Merged kernel + userland CI runs 40248921561 / 40248923960.
+
+Phone (images r21a-e = ws-p-power kernel + r19a ADT; r21a = r19a's command line, r21b+ = flamereboot=0):
+- **r21a** (no new args): TSENS works (tsens0/1 trdy ok): 40 C at boot, 63-74 C during the boot storm with all 8
+  cores at max clock and ~97 % busy. Battery: SDAM valid, SOC seeded 52 %, counted SOC; boot regs FCC 2000 mA,
+  FV 4450 mV, ICL cfg 1500 mA, JEITA_EN 0xd0, WD_CFG 0 (no watchdog), SBB 0x0c; 1366=02 (USB51 mode) so the
+  effective ICL on the PC port was 500 mA (1107=0a) although cfg said 1500. LMh raw 0 (not limiting).
+- **r21b** (flamecpufreq=2): governor works: at idle gold 652 / prime 806 MHz, silver 1363-1804; temperatures
+  fall to ~54 C within a minute of the boot storm ending (were ~70 C pinned). "gov on a/b/c changes" counts rise.
+- **r21d** (+ sweetbig=2 sweettcap=3 sweetchg=1): SPMI writes work: `write 2:1366 = 03 (was 02) -> reads 03 ok`,
+  `1365 = b5 (was a5)`, no owner/mismatch errors. First APSD said CDP -> HC mode 1500 mA, but AICL then
+  collapsed to 50 mA (soft-ilimit: the PC port cannot source it); `poke w chg apsd` re-ran APSD -> SDP -> hardware
+  500 mA, battery -67 mA at idle (was -221 on r21b, -640 with the camera on r18). On a power bank the user's meter
+  showed **9.5 W** drawn (= the 2 A tier) — klog to be read when the phone is back on the PC.
+- r21c and r21e (PSCI idle) not booted yet; r21c's args are inside r21d.
