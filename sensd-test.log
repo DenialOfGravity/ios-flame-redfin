@@ -1,0 +1,4 @@
+accel     accel          suid 99aabbccddeeff001122334455667788 (1)  name "lsm6dsr" vendor "STMicro" type "accel" available 1 physical 1 hw_id 0 stream streaming rates 26 52 104 range -78.4532..78.4532 (9 attributes)
+sensd: accel: error event 4
+sensd: pressure: the DSP has no "pressure" sensor
+all sensd host tests passed (0 failures)

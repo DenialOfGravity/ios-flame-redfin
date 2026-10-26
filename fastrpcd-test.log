@@ -1,0 +1,25 @@
+14:02:16.651 fastrpcd: INIT_ATTACH_SNS (pd 2, tgid 4242) -> 0
+14:02:16.653 fastrpcd: INIT_MMAP (method 4) flags 0x1000 8192 bytes at 0x80010000 -> 78, DSP address 0
+14:02:16.653 fastrpcd: INIT_MMAP (method 2) retry -> 0, DSP address 0xe0001000: using this method from now on
+14:02:16.653 fastrpcd: INIT_MMAP (method 2) flags 0x1000 8192 bytes at 0x80012000 -> 0, DSP address 0xe0001000
+14:02:16.653 fastrpcd: answers: read: Connection reset by peer -- the DSP has gone
+14:02:16.785 fastrpcd: INIT_ATTACH_SNS (pd 2, tgid 4242) -> -1: Connection reset by peer
+14:02:16.788 fastrpcd: bad file handle 0x100
+14:02:16.788 fastrpcd: fopen_with_env($ADSP_LIBRARY_PATH) /vendor/etc/sensors/config/nope.json (r) -> /private/var/folders/s6/5hzmn6lx4dz5nxs7k_0slzph0000gn/T/fastrpcd-test-8058/vendor/etc/sensors/config/nope.json: No such file or directory
+14:02:16.788 fastrpcd: fopen_with_env($ADSP_LIBRARY_PATH) /vendor/etc/sensors/sns_reg_config (w): REFUSED (outside the served tree or not writable)
+14:02:16.789 fastrpcd: fwrite 0x101 (/mnt/vendor/persist/sensors/registry/registry/lsm6dsr_0) 400 bytes
+14:02:16.789 fastrpcd: stat /sys/devices/soc0/nope -> /private/var/folders/s6/5hzmn6lx4dz5nxs7k_0slzph0000gn/T/fastrpcd-test-8058/sys/devices/soc0/nope: No such file or directory
+14:02:16.789 fastrpcd: opendir /vendor/etc/sensors/config -> handle 0x100, 1 entries, sensors first
+14:02:16.789 fastrpcd: readdir /vendor/etc/sensors/config -> (end, 1 entries)
+14:02:16.789 fastrpcd: opendir /../..: REFUSED (outside the served tree)
+14:02:16.790 fastrpcd: opendir /persist/sensors/registry/registry -> handle 0x100, 7 entries, sensors first
+14:02:16.790 fastrpcd: readdir /persist/sensors/registry/registry -> (end, 7 entries)
+14:02:16.790 fastrpcd: mkdir /persist/sensors/registry/new (mode 755)
+14:02:16.790 fastrpcd: mkdir /vendor/new: REFUSED
+14:02:16.798 fastrpcd: adsp_listener: init2 ok, serving the DSP's calls
+14:02:16.799 fastrpcd: fwrite 0x100 (/persist/sensors/registry/registry/big) 6000 bytes
+Unsupported method: 7 (07010000)
+14:02:16.799 fastrpcd: request handle 1 sc 0x7010000: not served, answered 20
+14:02:16.799 fastrpcd: answers: read: Connection reset by peer -- the DSP has gone
+14:02:16.799 fastrpcd: adsp_listener next2: Connection reset by peer
+fastrpcd host tests: all passed
