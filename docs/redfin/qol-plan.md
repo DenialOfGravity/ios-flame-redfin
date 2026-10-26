@@ -280,6 +280,14 @@ that look like capabilities (mkadt.py copies /product whole today, so anything t
 D22AP tree has a sensor node and backboardd/locationd log about a missing "accel"/"aop" service, the next step is
 to name our services after those nodes (`IOName`), not to add DT nodes.
 
+**Rotation.** backboardd's BKOrientationManager takes the device orientation from CoreMotion, i.e. locationd's
+CLOrientationNotifier. On this (AOP) hardware class locationd does not compute it from accel: it matches an HID
+service with usage pair {0x20, 0x8a} (logged "Adding match entry for usage pair {32, 138}", then "IoHidDevice is not
+ready!" while none existed) and takes kIOHIDEventTypeOrientation events whose DeviceOrientationUsage field
+(0xa0004) is 0x64-0x6a (disassembly of CLOrientationNotifier::onIohidEvent): ambiguous, portrait, upside down,
+landscape left, landscape right, face up, face down. 0971's orientation service now has that pair and posts
+0x64 + UIDeviceOrientation (knob orientbase 100); sensd derives the orientation from accel and writes type 10.
+
 **Auto-brightness (0973).** CoreBrightness accepted our ALS (`Esensor=66`, kAABStateAutoBrightness) but
 computed `L_newtarget=1.000000` = `_L_minimum` and `systemShallUpdateBacklight=false`: it had no panel luminance.
 0973 publishes nit keys on AppleARMBacklight (`sweetnits=0` off); `mkadt.py --backlight` adds D22AP's /backlight
