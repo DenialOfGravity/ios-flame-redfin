@@ -1,4 +1,4 @@
-From 8ca2c720a4816a41bfe723afc1e3f1994edc9bbe Mon Sep 17 00:00:00 2001
+From 34c948219917ec8ab6026e635c0c2d8c69f72629 Mon Sep 17 00:00:00 2001
 From: WS-A <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 00:39:19 +0100
 Subject: [PATCH] redfin: speakers' path through the ADSP (sound=1/2: LPASS
@@ -42,7 +42,7 @@ index 2b423c2..7721f2f 100644
  	bool hc = poke_num(&s, end, &c), hd = poke_num(&s, end, &d);
 diff --git a/bsd/dev/sweet_sound.c b/bsd/dev/sweet_sound.c
 new file mode 100644
-index 0000000..8fe05b2
+index 0000000..dabc617
 --- /dev/null
 +++ b/bsd/dev/sweet_sound.c
 @@ -0,0 +1,1081 @@
@@ -290,7 +290,7 @@ index 0000000..8fe05b2
 +		wr(lpi + LPI_VAL(n), (lpi_found_val[i] & ~0x3ffu) | LPI_ACTIVE);
 +		wr(lpi + LPI_DIR(n), 1u << 1);
 +	}
-+	SAY("LPI gpio6-9 now: val %#x %#x %#x %#x dir %#x %#x %#x %#x (want val %#x dir 0x2)\n", rd(lpi + LPI_VAL(6)),
++	SAY("LPI gpio6-9 now: val %#x %#x %#x %#x dir %#x %#x %#x %#x (want val[9:0] %#x dir 0x2; bits above 9 are kept as found)\n", rd(lpi + LPI_VAL(6)),
 +	    rd(lpi + LPI_VAL(7)), rd(lpi + LPI_VAL(8)), rd(lpi + LPI_VAL(9)), rd(lpi + LPI_DIR(6)), rd(lpi + LPI_DIR(7)),
 +	    rd(lpi + LPI_DIR(8)), rd(lpi + LPI_DIR(9)), LPI_ACTIVE);
 +	return true;

@@ -1,4 +1,4 @@
-From 2f7f9a2958fe282ecd17fc4f4b60f1599075bf85 Mon Sep 17 00:00:00 2001
+From 1b44904b84880ccc8b530b5de0b1c2018289025b Mon Sep 17 00:00:00 2001
 From: WS-A <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 00:43:03 +0100
 Subject: [PATCH] redfin: CS35L41 amplifiers in ASP bypass + HackiOS speaker
@@ -6,10 +6,10 @@ Subject: [PATCH] redfin: CS35L41 amplifiers in ASP bypass + HackiOS speaker
 
 ---
  bsd/conf/files          |   2 +
- bsd/dev/sweet_cs35l41.c | 665 ++++++++++++++++++++++++++++++++++++++++
- bsd/dev/sweet_guard.c   | 324 ++++++++++++++++++++
+ bsd/dev/sweet_cs35l41.c | 669 ++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_guard.c   | 324 +++++++++++++++++++
  bsd/dev/sweet_sound.c   | 223 +++++++++++++-
- 4 files changed, 1200 insertions(+), 14 deletions(-)
+ 4 files changed, 1204 insertions(+), 14 deletions(-)
  create mode 100644 bsd/dev/sweet_cs35l41.c
  create mode 100644 bsd/dev/sweet_guard.c
 
@@ -28,10 +28,10 @@ index 9d43a9b..9779f28 100644
  bsd/dev/sweet_poke.c			standard
 diff --git a/bsd/dev/sweet_cs35l41.c b/bsd/dev/sweet_cs35l41.c
 new file mode 100644
-index 0000000..8179d25
+index 0000000..980766c
 --- /dev/null
 +++ b/bsd/dev/sweet_cs35l41.c
-@@ -0,0 +1,665 @@
+@@ -0,0 +1,669 @@
 +/*
 + * redfin (Pixel 5): the two Cirrus Logic CS35L41 speaker amplifiers. Patch 0953 (WS-A).
 + *
@@ -39,8 +39,10 @@ index 0000000..8179d25
 + * "cirrus,left-channel-amp", ASP RX slot 0) and 0x41 (cs35l41_r, earpiece-top, prefix "R", slot 1) on
 + * QUPv3 SE9, the DRV2624's bus: every transfer goes through bsd/dev/sweet_haptic.c's
 + * sweet_se9_xfer(), under its lock (so sweethaptic=1 must have brought the bus up). Reset lines:
-+ * PM8150L GPIO11 (0x40) and GPIO10 (0x41) (SPMI SID 4, peripherals 0xca/0xc9), "output-high" in
-+ * Android's default pinctrl; boost 1.0 uH / 15 uF / 3700 mA peak, ASP SDOUT hi-Z 3, HW noise gate 0x3f.
++ * PM8150L GPIO11 (0x40, SID 4 peripheral 0xca) and PM7250B GPIO11 (0x41, SID 2 peripheral 0xca): the 0x41
++ * node's reset-gpios still names PM8150L GPIO10, but on production redfin (lito-redfin-proto1_1-audio.dtsi,
++ * lito-v2-redfin-evt-audio.dtsi, the live DT) that pin's pinctrl is disabled and its pinctrl-0 drives
++ * reset_pin_bottom_default1_1 = PM7250B GPIO11 output-high instead -- that is the real reset line; boost 1.0 uH / 15 uF / 3700 mA peak, ASP SDOUT hi-Z 3, HW noise gate 0x3f.
 + *
 + * How they are set up: the redbull kernel's sound/soc/codecs/cs35l41.c without its DSP: probe (OTP boot
 + * done, DEVID 0x35a40, REVID, the per-revision errata patch, the OTP trim unpack with
@@ -54,7 +56,7 @@ index 0000000..8179d25
 + * the pdn patch). Errors (amp short, boost short/OVP/UVP, over-temperature) power both down at once.
 + *
 + * The reset lines are PMIC GPIOs: a write to them is an SPMI write, so it happens only with boot-arg
-+ * sndgpio=1 (allow-list: PM8150L GPIO10/11 and PM7250B GPIO6, the microphones' LDO, nothing else, and
++ * sndgpio=1 (allow-list: PM8150L GPIO11, PM7250B GPIO11 and PM7250B GPIO6, the microphones' LDO, nothing else, and
 + * only on channels this EE owns, as sweet_haptic.c does for PM7250B GPIO1). Without it the amplifiers
 + * are probed as the boot chain left them, and if they do not answer the line states are only read.
 + *
@@ -107,7 +109,7 @@ index 0000000..8179d25
 +	const char *name;
 +} allowed[3] = {
 +	{ 4, 0xca, "PM8150L GPIO11 (CS35L41 0x40 reset)" },
-+	{ 4, 0xc9, "PM8150L GPIO10 (CS35L41 0x41 reset)" },
++	{ 2, 0xca, "PM7250B GPIO11 (CS35L41 0x41 reset)" },
 +	{ 2, 0xc5, "PM7250B GPIO6 (audio LDO, mic 1)" },
 +};
 +
@@ -235,8 +237,10 @@ index 0000000..8179d25
 +		SAY("%s: type %#x, not a GPIO: not written\n", allowed[which].name, type);
 +		err = ENXIO;
 +	} else {
-+		v = 0x01;
-+		err |= spmi(which, 0x41, true, &v);
++		if (!(allowed[which].sid == 2 && allowed[which].peripheral == 0xca)) {
++			v = 0x01;       /* power-source 1 (the DT gives none for PM7250B GPIO11: its VIN is left as found) */
++			err |= spmi(which, 0x41, true, &v);
++		}
 +		v = high ? 0x80 : 0x00;
 +		err |= spmi(which, 0x44, true, &v);
 +		v = 0x01;
@@ -1028,7 +1032,7 @@ index 0000000..1c296cb
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_sound.c b/bsd/dev/sweet_sound.c
-index 8fe05b2..9329460 100644
+index dabc617..f4dfecf 100644
 --- a/bsd/dev/sweet_sound.c
 +++ b/bsd/dev/sweet_sound.c
 @@ -40,8 +40,16 @@

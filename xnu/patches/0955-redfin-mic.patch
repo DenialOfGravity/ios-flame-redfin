@@ -1,4 +1,4 @@
-From 2a0f1bb35640e99ee50bee9dc1208312639d2257 Mon Sep 17 00:00:00 2001
+From 2608a72a60c9fa2aafff0ea765225a27bb464d8c Mon Sep 17 00:00:00 2001
 From: WS-A <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 00:48:41 +0100
 Subject: [PATCH] redfin: microphones (mic=1): ALC5513 on SE7, PRI_TDM_TX
@@ -1285,7 +1285,7 @@ index 0000000..b8ef1e3
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_sound.c b/bsd/dev/sweet_sound.c
-index 73c8fdc..69b1d00 100644
+index b9f6598..5116bf7 100644
 --- a/bsd/dev/sweet_sound.c
 +++ b/bsd/dev/sweet_sound.c
 @@ -54,7 +54,8 @@
