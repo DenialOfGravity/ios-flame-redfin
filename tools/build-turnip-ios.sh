@@ -5,6 +5,8 @@
 # reference-repos/UniXNU/scripts/data/adreno-compiler-inputs.json). The backend (tu_knl_darwin.cc) talks to
 # the kernel's SweetAccelerator v2 user client through phone/turnip/NativeAdrenoABI.h.
 # Output: work/turnip/build-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib
+# r34: Mesa's shader disk cache is built in (SweetMetal2 points MESA_SHADER_CACHE_DIR at the m2v cache directory: compiled
+# ir3 shaders found across processes even where the runtime's per-making VkPipelineCache records are not; SWEET_MESA_CACHE=0 off).
 set -e
 cd "$(dirname "$0")/.."
 ROOT=$PWD
@@ -13,7 +15,7 @@ target=${1:-ios}
 export PATH=$T/venv/bin:/opt/homebrew/opt/bison/bin:/opt/homebrew/opt/flex/bin:$PATH
 opts="-Dgallium-drivers= -Dvulkan-drivers=freedreno -Dfreedreno-kmds=darwin -Dtu-darwin-abi-dir=$ROOT/phone/turnip
  -Dplatforms=macos -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled
- -Dllvm=disabled -Dshared-glapi=disabled -Dxmlconfig=disabled -Dshader-cache=disabled -Dtools= -Dbuild-tests=false
+ -Dllvm=disabled -Dshared-glapi=disabled -Dxmlconfig=disabled -Dshader-cache=enabled -Dtools= -Dbuild-tests=false
  -Dvideo-codecs= -Dvulkan-layers= -Dlibunwind=disabled -Dlmsensors=disabled -Dvalgrind=disabled -Dexpat=disabled
  -Dzstd=disabled -Dbuildtype=release -Db_ndebug=true"
 if [ "$target" = ios ]; then

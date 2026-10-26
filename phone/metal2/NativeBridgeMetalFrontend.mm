@@ -218,6 +218,170 @@ static void encThreadNote() {
   kr==KERN_SUCCESS?info.pth_maxpriority:-1,kr==KERN_SUCCESS?info.pth_policy:-1,(unsigned)qos,relative,encCPU(),encMHz(),done);
  sm2_logs(line);
 }
+// u-e (r34): render pipeline prewarm. Every render pipeline state CA makes (backboardd, SpringBoard) is recorded once in
+// <cache>/prewarm.v1: both functions by their library's digest (SHA-256 of its bytes, the library kept as prewarm-lib-DIGEST.bin
+// beside it), name and constant values, and the bridge descriptor's bytes. At the next device creation a utility-QoS thread makes them
+// again, in the order CA first asked, before CA asks: the runtime keeps what a making produced by content (translations, libraries of
+// pipeline parts, variants' pipelines), so CA's own creation of the same state finds it made. The prewarmed states are kept for the
+// process's life. Bounded by SWEET_PREWARM_MAX (300 states) and SWEET_PREWARM_MS (30000 ms); "native-metal: prewarm: N pipelines in
+// M ms" when done. /var/local/mtl2-env SWEET_PREWARM=0: no recording, no prewarm.
+static std::string gPrewarmDir;
+static std::mutex gPrewarmLock;
+static std::unordered_map<std::string,bool> gPrewarmSeen;   // recorded lines (the file's and this process's)
+static std::atomic<bool> gPrewarmRunning{false};
+static bool prewarmOn() {
+ static int on=-1;
+ if(on<0){const char *e=getenv("SWEET_PREWARM"),*p=getprogname();
+  on=!(e && !strcmp(e,"0")) && (!strcmp(p,"backboardd") || !strcmp(p,"SpringBoard"))?1:0;}
+ return on==1 && !gPrewarmDir.empty();
+}
+static unsigned prewarmKnob(const char *name,unsigned fallback) {const char *e=getenv(name);return e && atoi(e)>0?(unsigned)atoi(e):fallback;}
+static std::string hexOf(const void *bytes,size_t size) {
+ static const char digits[]="0123456789abcdef";std::string out;out.resize(size*2);
+ for(size_t i=0;i<size;i++){const uint8_t b=((const uint8_t *)bytes)[i];out[2*i]=digits[b>>4];out[2*i+1]=digits[b&15];}
+ return out;
+}
+static bool unhex(const std::string &text,std::vector<uint8_t> &out) {
+ if(text.size()%2)return false;
+ out.resize(text.size()/2);
+ auto v=[](char c)->int{return c>='0' && c<='9'?c-'0':c>='a' && c<='f'?c-'a'+10:-1;};
+ for(size_t i=0;i<out.size();i++){const int h=v(text[2*i]),l=v(text[2*i+1]);if(h<0 || l<0)return false;out[i]=(uint8_t)(h<<4|l);}
+ return true;
+}
+static std::vector<std::string> splitOn(const std::string &s,char by) {
+ std::vector<std::string> out;size_t at=0;
+ for(;;){const size_t next=s.find(by,at);out.push_back(s.substr(at,next==std::string::npos?std::string::npos:next-at));if(next==std::string::npos)break;at=next+1;}
+ return out;
+}
+// A library's digest (prewarm records name it), its bytes kept once in the cache directory; "" where prewarm is off.
+static std::string prewarmLibrary(const void *bytes,size_t size) {
+ if(!prewarmOn() || !bytes || !size)return "";
+ unsigned char digest[CC_SHA256_DIGEST_LENGTH];CC_SHA256(bytes,(CC_LONG)size,digest);
+ const std::string name=hexOf(digest,16);
+ const std::string path=gPrewarmDir+"/prewarm-lib-"+name+".bin";
+ if(access(path.c_str(),R_OK)!=0) {
+  const std::string temp=path+".tmp"+std::to_string(getpid());
+  if(FILE *f=fopen(temp.c_str(),"wb")) {
+   const bool ok=fwrite(bytes,1,size,f)==size;
+   if(fclose(f)==0 && ok)rename(temp.c_str(),path.c_str());else unlink(temp.c_str());
+  }
+ }
+ return name;
+}
+// A function's part of a record: LIB:S|P:NAMEHEX:CONSTANTS (TYPE.INDEX.NAMEHEX.BYTESHEX joined by ',', or -).
+static std::string prewarmFunctionKey(const std::string &library,NSString *name,const NmbConstant *constants,size_t count,bool specialized) {
+ if(library.empty() || !name.UTF8String)return "";
+ std::string key=library+(specialized?":S:":":P:")+hexOf(name.UTF8String,strlen(name.UTF8String))+":";
+ if(!count)key+="-";
+ for(size_t i=0;i<count;i++) {
+  const NmbConstant &c=constants[i];
+  char head[48];snprintf(head,sizeof head,"%s%llu.%llu.",i?",":"",(unsigned long long)c.type,(unsigned long long)c.index);
+  key+=head;key+=c.name?hexOf(c.name,strlen(c.name)):"";key+=".";key+=hexOf(c.bytes,(size_t)c.length);
+ }
+ return key;
+}
+// Record a state CA made: "P1 VERTEX FRAGMENT|- OPTIONS DESCRIPTOR" (the descriptor's bytes, functions zeroed, trailing zeros dropped).
+static void prewarmRecord(const std::string &vertex,const std::string &fragment,const NmbRenderPipelineDescriptor &d,uint64_t options) {
+ if(!prewarmOn() || vertex.empty() || fragment=="")return;
+ NmbRenderPipelineDescriptor copy=d;copy.vertex=nullptr;copy.fragment=nullptr;
+ size_t size=sizeof copy;const uint8_t *bytes=(const uint8_t *)&copy;
+ while(size && !bytes[size-1])size--;
+ char opts[24];snprintf(opts,sizeof opts,"%llx",(unsigned long long)options);
+ const std::string line="P1 "+vertex+" "+fragment+" "+opts+" "+hexOf(bytes,size);
+ std::lock_guard<std::mutex> lock(gPrewarmLock);
+ if(gPrewarmSeen.size()>=1000 || !gPrewarmSeen.emplace(line,true).second)return;
+ if(FILE *f=fopen((gPrewarmDir+"/prewarm.v1").c_str(),"a")){fputs(line.c_str(),f);fputc('\n',f);fclose(f);}
+}
+// The prewarm itself (a utility-QoS GCD thread, from device creation).
+static void prewarmRun(std::vector<std::string> lines) {
+ gPrewarmRunning=true;
+ const uint64_t began=nowUs();
+ const unsigned most=prewarmKnob("SWEET_PREWARM_MAX",300),budgetMs=prewarmKnob("SWEET_PREWARM_MS",30000);
+ static std::vector<NmbRenderPipeline *> kept;   // the prewarmed states, for the process's life
+ std::unordered_map<std::string,NmbLibrary *> libraries;
+ unsigned made=0,failed=0,noLibrary=0,bad=0,tried=0;
+ NmbShaderCacheStats c0={},c1={};const bool haveC0=nmb_device_shader_cache_stats(gDevice,&c0);
+ auto function=[&](const std::string &key,bool &missing)->NmbFunction * {
+  const std::vector<std::string> p=splitOn(key,':');
+  if(p.size()!=4){bad++;return nullptr;}
+  NmbLibrary *library=nullptr;
+  auto at=libraries.find(p[0]);
+  if(at!=libraries.end())library=at->second;
+  else {
+   NSData *data=[NSData dataWithContentsOfFile:[NSString stringWithUTF8String:(gPrewarmDir+"/prewarm-lib-"+p[0]+".bin").c_str()]
+                                       options:NSDataReadingMappedIfSafe error:nil];
+   library=data?nmb_library_new(gDevice,data.bytes,data.length,false):nullptr;
+   libraries[p[0]]=library;
+  }
+  if(!library){missing=true;return nullptr;}
+  std::vector<uint8_t> nameBytes;if(!unhex(p[2],nameBytes)){bad++;return nullptr;}
+  const std::string name(nameBytes.begin(),nameBytes.end());
+  if(p[1]=="P")return nmb_function_new(library,name.c_str());
+  std::vector<NmbConstant> constants;std::vector<std::string> names;std::vector<std::vector<uint8_t>> values;
+  if(p[3]!="-") {
+   const std::vector<std::string> items=splitOn(p[3],',');
+   names.reserve(items.size());values.reserve(items.size());
+   for(const std::string &item:items) {
+    const std::vector<std::string> f=splitOn(item,'.');
+    if(f.size()!=4){bad++;return nullptr;}
+    std::vector<uint8_t> n,v;if(!unhex(f[2],n) || !unhex(f[3],v)){bad++;return nullptr;}
+    names.emplace_back(n.begin(),n.end());values.push_back(v);
+    constants.push_back({strtoull(f[0].c_str(),nullptr,10),strtoull(f[1].c_str(),nullptr,10),nullptr,nullptr,(uint64_t)v.size()});
+   }
+   for(size_t i=0;i<constants.size();i++){constants[i].name=names[i].empty()?nullptr:names[i].c_str();constants[i].bytes=values[i].data();}
+  }
+  return nmb_function_new_specialized(library,name.c_str(),constants.data(),(uint32_t)constants.size());
+ };
+ for(const std::string &line:lines) {
+  if(tried>=most || (nowUs()-began)/1000>=budgetMs)break;
+  const std::vector<std::string> t=splitOn(line,' ');
+  if(t.size()!=5 || t[0]!="P1"){bad++;continue;}
+  tried++;
+  bool missing=false;
+  NmbFunction *vertex=function(t[1],missing);
+  NmbFunction *fragment=t[2]=="-"?nullptr:function(t[2],missing);
+  std::vector<uint8_t> bytes;
+  NmbRenderPipelineDescriptor d={};
+  if(!vertex || (t[2]!="-" && !fragment) || !unhex(t[4],bytes) || bytes.size()>sizeof d) {
+   if(missing)noLibrary++;else failed++;
+  } else {
+   memcpy(&d,bytes.data(),bytes.size());d.vertex=vertex;d.fragment=fragment;
+   const NmbPipelineOptions options={strtoull(t[3].c_str(),nullptr,16),nullptr,0};
+   NmbRenderPipeline *state=nmb_render_pipeline_new_with_options(gDevice,&d,&options);
+   if(state){kept.push_back(state);made++;}else failed++;
+  }
+  if(vertex)nmb_function_release(vertex);
+  if(fragment)nmb_function_release(fragment);
+ }
+ const bool haveC1=haveC0 && nmb_device_shader_cache_stats(gDevice,&c1);
+ char line[400];
+ snprintf(line,sizeof line,"native-metal: prewarm: %u pipelines in %llu ms (%u records, %u tried, %u failed, %u without their library, %u unreadable)"
+  " | cache: spirv hit %llu miss %llu, drv loads %llu saves %llu same %llu",made,(unsigned long long)((nowUs()-began)/1000),(unsigned)lines.size(),
+  tried,failed,noLibrary,bad,haveC1?(unsigned long long)(c1.hits-c0.hits):0ull,haveC1?(unsigned long long)(c1.misses-c0.misses):0ull,
+  haveC1?(unsigned long long)(c1.driver_loads-c0.driver_loads):0ull,haveC1?(unsigned long long)(c1.driver_saves-c0.driver_saves):0ull,
+  haveC1?(unsigned long long)(c1.driver_unchanged-c0.driver_unchanged):0ull);
+ sm2_logs(line);
+ gPrewarmRunning=false;
+}
+// At device creation: read the records (they also seed the "seen" set) and start the prewarm.
+static void prewarmStart(const char *cache) {
+ if(!cache)return;
+ gPrewarmDir=cache;
+ if(!prewarmOn())return;
+ std::vector<std::string> lines;
+ if(FILE *f=fopen((gPrewarmDir+"/prewarm.v1").c_str(),"r")) {
+  std::string line;int c;
+  while((c=fgetc(f))!=EOF) {
+   if(c!='\n'){line+=(char)c;continue;}
+   if(!line.empty()){std::lock_guard<std::mutex> lock(gPrewarmLock);if(gPrewarmSeen.emplace(line,true).second)lines.push_back(line);}
+   line.clear();
+  }
+  fclose(f);
+ }
+ if(lines.empty()){sm2_logs("native-metal: prewarm: no records yet");return;}
+ sm2_logs([NSString stringWithFormat:@"native-metal: prewarm: %zu records, starting",lines.size()].UTF8String);
+ dispatch_after(dispatch_time(DISPATCH_TIME_NOW,200*NSEC_PER_MSEC),dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{@autoreleasepool{prewarmRun(lines);}});
+}
 // The pixel formats textures were asked for (first eight distinct), with how many were refused: native_bridge_metal_formats.
 static uint32_t gFormats[8];static unsigned gFormatCount;static std::atomic<uint64_t> gTextureRefusals;
 static void noteFormat(uint32_t format,bool made) {
@@ -577,12 +741,14 @@ static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUIn
 // ---- libraries, functions, states ----
 @interface NBLibrary : NBObject
 @property(nonatomic) NmbLibrary *handle;
+@property(nonatomic) std::string prewarmDigest;   // u-e: its bytes' digest (prewarm records), "" where prewarm is off
 @end
 @interface NBFunction : NBObject
 @property(nonatomic) NmbFunction *handle;
 @property(nonatomic,copy) NSString *name;
 @property(nonatomic) MTLFunctionType functionType;
 @property(nonatomic) std::string constantsText;   // name:type:hex of each constant value it was specialized with (the journal's)
+@property(nonatomic) std::string prewarmKey;      // u-e: library digest, name and constants (prewarm records), "" where prewarm is off
 @end
 // SweetMetal2 (C1): iOS 16.7 Metal checks a pipeline descriptor's functions against the MTLFunction protocol and NSLogs
 // "vertexFunction is not a MTLFunction." / "fragmentFunction is not a MTLFunction." on a miss (r18g: 450 lines from backboardd,
@@ -689,7 +855,8 @@ static std::string quartzCoreCallers();
   if(error)*error=nbError([NSString stringWithFormat:@"specialized function: %@",lastError()]);return nil;
  }
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
- function.constantsText=text;if(error)*error=nil;return (id<MTLFunction>)function;
+ function.constantsText=text;function.prewarmKey=prewarmFunctionKey(self.prewarmDigest,name,constants.data(),constants.size(),true);
+ if(error)*error=nil;return (id<MTLFunction>)function;
 }
 - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
@@ -717,6 +884,7 @@ static std::string quartzCoreCallers();
  NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);
  if(!handle)return nil;
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+ function.prewarmKey=prewarmFunctionKey(self.prewarmDigest,name,nullptr,0,false);
  return (id<MTLFunction>)function;
 }
 @end
@@ -2176,16 +2344,18 @@ static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {ENC_SCOPE(EC_PIPE,"newLibrary(data)");
  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
  const uint64_t libraryBegan=nowUs();
- NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);(void)mapped;gTimeLibrary.add(libraryBegan);
+ NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
- NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
+ NBLibrary *library=[NBLibrary new];library.handle=handle;library.prewarmDigest=prewarmLibrary(bytes,size);(void)mapped;
+ if(error)*error=nil;return (id<MTLLibrary>)library;
 }
 - (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {ENC_SCOPE(EC_PIPE,"newLibrary(file)");
  NSData *bytes=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error]:nil;if(!bytes)return nil;
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
- NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
+ NBLibrary *library=[NBLibrary new];library.handle=handle;library.prewarmDigest=prewarmLibrary(bytes.bytes,bytes.length);
+ if(error)*error=nil;return (id<MTLLibrary>)library;
 }
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error {
  if(!url.isFileURL){if(error)*error=nbError(@"a file URL is required");return nil;}
@@ -2235,7 +2405,25 @@ static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
  if(!pipelineArchives(d.binaryArchives,archives,error)){delete p;return nil;}
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
- NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
+ // u-e (r34): what the caches did for this creation, for its "E slow" line
+ NmbShaderCacheStats cacheBefore={};uint64_t workBefore[10]={};
+ const bool counted=encStatOn() && nmb_device_shader_cache_stats(gDevice,&cacheBefore) && nmb_device_work_stats(gDevice,workBefore);
+ NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);gTimePipeline.add(pipelineBegan);
+ if(handle) {
+  NBFunction *vf=[(id)d.vertexFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.vertexFunction:nil;
+  NBFunction *ff=[(id)d.fragmentFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.fragmentFunction:nil;
+  if(vf)prewarmRecord(vf.prewarmKey,d.fragmentFunction?(ff?ff.prewarmKey:std::string()):std::string("-"),*p,(uint64_t)options);
+ }
+ delete p;
+ NmbShaderCacheStats cacheAfter={};uint64_t workAfter[10]={};
+ if(counted && encScope_.slow() && nmb_device_shader_cache_stats(gDevice,&cacheAfter) && nmb_device_work_stats(gDevice,workAfter)) {
+  const size_t at=strlen(tEncDetail);
+  snprintf(tEncDetail+at,sizeof tEncDetail-at," | spirv hit %llu miss %llu, drv loads %llu saves %llu same %llu rejected %llu, VkPipelines %llu %.1f ms%s",
+   (unsigned long long)(cacheAfter.hits-cacheBefore.hits),(unsigned long long)(cacheAfter.misses-cacheBefore.misses),
+   (unsigned long long)(cacheAfter.driver_loads-cacheBefore.driver_loads),(unsigned long long)(cacheAfter.driver_saves-cacheBefore.driver_saves),
+   (unsigned long long)(cacheAfter.driver_unchanged-cacheBefore.driver_unchanged),(unsigned long long)(cacheAfter.rejected-cacheBefore.rejected),
+   (unsigned long long)(workAfter[0]-workBefore[0]),(workAfter[1]-workBefore[1])/1e3,gPrewarmRunning?" (prewarm running)":"");
+ }
  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
  notePipeline(d,handle?nullptr:nmb_last_error());
  if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
@@ -2339,6 +2527,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  gDevice=nmb_device_open(loader,cache);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
+ prewarmStart(cache);
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
  {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
@@ -2645,10 +2834,15 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
    NmbShaderCacheStats cs={};
    static NmbShaderCacheStats lastCs;static bool haveCs;
    if(at<sizeof line && gDevice && nmb_device_shader_cache_stats(gDevice,&cs)) {
-    if(haveCs)at+=(size_t)snprintf(line+at,sizeof line-at," | cache 5s: spirv hit %llu miss %llu wr %llu (fail %llu) drv hit %llu miss %llu save %llu",
+    if(haveCs)at+=(size_t)snprintf(line+at,sizeof line-at," | cache 5s: spirv hit %llu miss %llu wr %llu (fail %llu) drv hit %llu miss %llu save %llu"
+     " load %llu same %llu rej %llu mism %llu trunc %llu rdfail %llu evict %llu",
      (unsigned long long)(cs.hits-lastCs.hits),(unsigned long long)(cs.misses-lastCs.misses),(unsigned long long)(cs.writes-lastCs.writes),
      (unsigned long long)(cs.write_failures-lastCs.write_failures),(unsigned long long)(cs.driver_hits-lastCs.driver_hits),
-     (unsigned long long)(cs.driver_misses-lastCs.driver_misses),(unsigned long long)(cs.driver_saves-lastCs.driver_saves));
+     (unsigned long long)(cs.driver_misses-lastCs.driver_misses),(unsigned long long)(cs.driver_saves-lastCs.driver_saves),
+     (unsigned long long)(cs.driver_loads-lastCs.driver_loads),(unsigned long long)(cs.driver_unchanged-lastCs.driver_unchanged),
+     (unsigned long long)(cs.rejected-lastCs.rejected),(unsigned long long)(cs.driver_mismatched-lastCs.driver_mismatched),
+     (unsigned long long)(cs.driver_truncated-lastCs.driver_truncated),(unsigned long long)(cs.read_failures-lastCs.read_failures),
+     (unsigned long long)(cs.evictions-lastCs.evictions));
     lastCs=cs;haveCs=true;
    }
    sm2_logs(line);

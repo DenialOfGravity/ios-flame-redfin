@@ -196,6 +196,23 @@ static bool listed(void)
 			}
 			fclose(ef);
 		}
+		/* r34: Mesa's shader disk cache (Turnip is built with it) in this process's m2v cache directory: compiled ir3 shaders are
+		 * found across restarts even where the runtime's per-making VkPipelineCache records miss. SWEET_MESA_CACHE=0 turns it off. */
+		{
+			const char *knob = getenv("SWEET_MESA_CACHE");
+			if (knob && !strcmp(knob, "0")) {
+				setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
+				sm2_log("Mesa shader cache off (SWEET_MESA_CACHE=0)");
+			} else {
+				char mesa[300];
+				snprintf(mesa, sizeof(mesa), "%s/mesa", cache);
+				mkdir(mesa, 0777);
+				setenv("MESA_SHADER_CACHE_DIR", mesa, 0);
+				setenv("MESA_SHADER_CACHE_MAX_SIZE", "256M", 0);
+				setenv("MESA_SHADER_CACHE_DISABLE", "false", 0);
+				sm2_log("Mesa shader cache %s (%s)", getenv("MESA_SHADER_CACHE_DIR"), access(mesa, W_OK) == 0 ? "writable" : "NOT writable");
+			}
+		}
 		/* debugging: Turnip options for this process from /var/local/mtl2-tu-debug (TU_DEBUG), its log to /var/local/turnip-<proc>.log */
 		{
 			char opts[128] = { 0 };
