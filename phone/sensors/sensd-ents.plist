@@ -1,6 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- sensd --orient-inject / --orient-set: backboardd checks its clients' entitlements (names from its strings). -->
 <plist version="1.0">
 <dict>
 	<key>com.apple.backboard.client</key>
