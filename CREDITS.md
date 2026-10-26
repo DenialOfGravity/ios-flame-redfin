@@ -43,6 +43,14 @@ what you need to fetch yourself.
   SMP2P, GLINK, QRTR and remoteproc drivers (GPL-2.0). It also follows Bjorn Andersson's rmtfs, pd-mapper and
   tqftpserv for those protocols. The FTS touch driver (patch 0085) was written from Google's `fts_touch`
   module (GPL-2.0) and the phone's device tree.
+- **HexagonRPC** (the Sensor Shell / HexagonRPC contributors, <https://github.com/linux-msm/hexagonrpc>,
+  GPL-3.0-or-later; libhexagonrpc parts LGPL-3.0-or-later): `phone/fastrpc/` (`fastrpcd`, the ADSP sensors PD's
+  file service) is built from hexagonrpcd's listener, localctl, apps_mem, iobuffer and libhexagonrpc marshalling
+  code and interface definitions (each file keeps its header and says what fastrpcd changed). `fastrpcd` is a
+  separate program under the **GPL-3.0-or-later** (`phone/fastrpc/LICENSE.hexagonrpc`); the files written for it
+  (`transport.c`, `apps_std.c`, `fastrpcd.c`, `log.c`, the tests) are under the same licence. Argument layouts and
+  method numbers were checked against Qualcomm's fastrpc (`apps_std_skel.c`, BSD-3-Clause) and Android's
+  `adsprpc.c` (GPL-2.0) -- read, not copied.
 - **blacktop/darwin-xnu-build** (<https://github.com/blacktop/darwin-xnu-build>, MIT): the XNU build.
 - Fetched and built by the user, not in git:
   - Google's factory image, AOSP `mkbootimg` and `avbtool` (Apache 2.0)

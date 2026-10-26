@@ -17,6 +17,9 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Modified for fastrpcd (ios-flame, 2026): input buffers of any size (get_in_bufs2), unsupported
+ * requests answered with an error instead of ending the loop, log lines through flog().
  */
 
 #include <inttypes.h>
@@ -26,7 +29,12 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include "interface/adsp_listener.h"
+#include "log.h"
 #include "iobuffer.h"
 #include "listener.h"
 
@@ -416,22 +424,38 @@ err:
 	return NULL;
 }
 
+/*
+ * fastrpcd: the input buffers of a request are fetched into a buffer that grows as needed (Android's
+ * listener_android.c): next2 says how many bytes the request has, and get_in_bufs2 fetches what did not
+ * fit (registry writes are larger than hexagonrpcd's fixed 256 bytes).
+ */
+static char *inbufs_mem;
+static uint32_t inbufs_cap;
+
 static int return_for_next_invoke(int fd,
 				  uint32_t result,
 				  uint32_t *rctx,
 				  uint32_t *handle,
 				  uint32_t *sc,
+				  uint32_t n_returned,
 				  const struct fastrpc_io_buffer *returned,
 				  struct fastrpc_io_buffer **decoded)
 {
 	struct fastrpc_decoder_context *ctx;
-	char inbufs[256];
 	char *outbufs = NULL;
 	uint32_t inbufs_len;
-	uint32_t outbufs_len;
+	uint32_t outbufs_len = 0;
 	int ret;
 
-	outbufs_len = outbufs_calculate_size(REMOTE_SCALARS_OUTBUFS(*sc), returned);
+	if (inbufs_mem == NULL) {
+		inbufs_cap = 4096;
+		inbufs_mem = malloc(inbufs_cap);
+		if (inbufs_mem == NULL)
+			return -1;
+	}
+
+	if (result == 0 && returned != NULL)
+		outbufs_len = outbufs_calculate_size(n_returned, returned);
 
 	if (outbufs_len) {
 		outbufs = malloc(outbufs_len);
@@ -440,45 +464,67 @@ static int return_for_next_invoke(int fd,
 			return -1;
 		}
 
-		outbufs_encode(REMOTE_SCALARS_OUTBUFS(*sc), returned, outbufs);
+		outbufs_encode(n_returned, returned, outbufs);
 	}
 
 	ret = adsp_listener_next2(fd,
 				  *rctx, result,
 				  outbufs_len, outbufs,
 				  rctx, handle, sc,
-				  &inbufs_len, 256, inbufs);
+				  &inbufs_len, inbufs_cap, inbufs_mem);
 	if (ret) {
 		if (ret == -1)
-			perror("Could not fetch next FastRPC message");
+			flog("adsp_listener next2: %s", strerror(errno));
 		else
-			fprintf(stderr, "Could not fetch next FastRPC message: %d\n", ret);
+			flog("adsp_listener next2: DSP error %d (%#x)", ret, (unsigned)ret);
 
 		goto err_free_outbufs;
 	}
 
-	if (inbufs_len > 256) {
-		fprintf(stderr, "Large (>256B) input buffers aren't implemented\n");
-		ret = -1;
-		goto err_free_outbufs;
+	/* from here on a failure is the request's (answered with an error, ret 1), not the loop's */
+	if (inbufs_len > inbufs_cap) {
+		uint32_t have = inbufs_cap, req = 0;
+		uint32_t cap = (inbufs_len + 4095) & ~4095u;
+		char *bigger;
+
+		if (inbufs_len > (16u << 20)) {
+			flog("request ctx %#x: %u bytes of input: too large", *rctx, inbufs_len);
+			ret = 1;
+			goto err_free_outbufs;
+		}
+		bigger = realloc(inbufs_mem, cap);
+		if (bigger == NULL) {
+			ret = 1;
+			goto err_free_outbufs;
+		}
+		inbufs_mem = bigger;
+		inbufs_cap = cap;
+		ret = adsp_listener_get_in_bufs2(fd, *rctx, have, inbufs_cap - have, inbufs_mem + have, &req);
+		vlog("get_in_bufs2 ctx %#x offset %u -> %d (%u bytes)", *rctx, have, ret, req);
+		if (ret) {
+			flog("adsp_listener get_in_bufs2 (%u of %u bytes): %d", have, inbufs_len, ret);
+			ret = 1;
+			goto err_free_outbufs;
+		}
 	}
 
 	ctx = inbuf_decode_start(*sc);
 	if (!ctx) {
 		perror("Could not start decoding");
-		ret = -1;
+		ret = 1;
 		goto err_free_outbufs;
 	}
 
-	ret = inbuf_decode(ctx, inbufs_len, inbufs);
+	ret = inbuf_decode(ctx, inbufs_len, inbufs_mem);
 	if (ret) {
 		perror("Could not decode");
+		ret = 1;
 		goto err_free_outbufs;
 	}
 
 	if (!inbuf_decode_is_complete(ctx)) {
-		fprintf(stderr, "Expected more input buffers\n");
-		ret = -1;
+		flog("request handle %u sc %#x: fewer input bytes (%u) than buffers", *handle, *sc, inbufs_len);
+		ret = 1;
 		goto err_free_outbufs;
 	}
 
@@ -560,6 +606,10 @@ static int invoke_requested_procedure(size_t n_ifaces,
 	return 0;
 }
 
+/*
+ * fastrpcd: a request we cannot serve gets an error answer and the loop goes on (upstream exited); a
+ * failed next2 (the DSP has gone, or refused the listener) ends the loop with its error.
+ */
 int run_fastrpc_listener(int fd,
 			 size_t n_ifaces,
 			 struct fastrpc_interface **ifaces)
@@ -575,30 +625,47 @@ int run_fastrpc_listener(int fd,
 
 	ret = adsp_listener_init2(fd);
 	if (ret) {
-		fprintf(stderr, "Could not initialize the listener: %u\n", ret);
+		flog("adsp_listener init2: %d%s%s", ret, ret == -1 ? ": " : "", ret == -1 ? strerror(errno) : "");
 		return ret;
 	}
+	flog("adsp_listener: init2 ok, serving the DSP's calls");
 
-	while (!ret) {
+	for (;;) {
+		decoded = NULL;
 		ret = return_for_next_invoke(fd,
 					     result, &rctx, &handle, &sc,
-					     returned, &decoded);
-		if (ret)
-			break;
-
+					     n_outbufs, returned, &decoded);
 		if (returned != NULL)
 			iobuf_free(n_outbufs, returned);
-
-		ret = invoke_requested_procedure(n_ifaces, ifaces,
-						 handle, sc, &result,
-						 decoded, &returned);
+		returned = NULL;
+		n_outbufs = 0;
+		if (ret == 1) {		/* a request we could not even read: answer it with an error */
+			result = AEE_EBADPARM;
+			continue;
+		}
 		if (ret)
 			break;
+
+		vlog("request ctx %#x handle %u sc %#x (m%u %u/%u)", rctx, handle, sc, REMOTE_SCALARS_METHOD(sc),
+		     REMOTE_SCALARS_INBUFS(sc), REMOTE_SCALARS_OUTBUFS(sc));
+		if (invoke_requested_procedure(n_ifaces, ifaces,
+					       handle, sc, &result,
+					       decoded, &returned)) {
+			flog("request handle %u sc %#x: not served, answered %u", handle, sc, result);
+			returned = NULL;
+		} else if (result != 0) {
+			vlog("request handle %u sc %#x -> %u", handle, sc, result);
+		}
+		if (result == 0 && returned != NULL)
+			n_outbufs = REMOTE_SCALARS_OUTBUFS(sc);
+		else if (returned != NULL) {
+			iobuf_free(REMOTE_SCALARS_OUTBUFS(sc), returned);
+			returned = NULL;
+		}
 
 		if (decoded != NULL)
 			iobuf_free(REMOTE_SCALARS_INBUFS(sc), decoded);
-
-		n_outbufs = REMOTE_SCALARS_OUTBUFS(sc);
+		decoded = NULL;
 	}
 
 	return ret;

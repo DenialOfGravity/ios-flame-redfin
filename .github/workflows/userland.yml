@@ -2,7 +2,7 @@ name: userland
 
 # iOS 16 arm64 userland for SSH into the phone: dropbear (root-only, pubkey
 # only) and dash. Built with the runner's Xcode iOS SDK, ad hoc signed.
-# Also wland (phone/wifi, sunfish constants) and phone/tools. Install with
+# Also wland (phone/wifi, sunfish constants), fastrpcd (phone/fastrpc, GPL-3.0+) and phone/tools. Install with
 # tools/sunfish-install-ssh.sh over the kernel file server.
 
 on:
@@ -91,6 +91,9 @@ jobs:
           cd repo
           sh phone/wifi/build.sh
           cp phone/wifi/out/wland ../out/
+          sh phone/fastrpc/test.sh > ../out/fastrpcd-test.log 2>&1 || { echo "::warning::fastrpcd host tests failed"; tail -20 ../out/fastrpcd-test.log; }
+          sh phone/fastrpc/build.sh
+          cp phone/fastrpc/out/fastrpcd phone/fastrpc/org.iosonpixel.fastrpcd.plist ../out/
           bash phone/tools/build.sh || echo "::warning::some phone tools failed"
           sh phone/haptics/build.sh && cp phone/haptics/out/SweetHaptics.dylib ../out/ || echo "::warning::SweetHaptics.dylib failed"
           # (the build's output goes out with the files: the run's own logs cannot be fetched from Claude's container)

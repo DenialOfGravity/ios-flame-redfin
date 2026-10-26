@@ -1,31 +1,25 @@
 /*
- * FastRPC operating system interface - context initialization
- *
- * Copyright (C) 2023 The Sensor Shell Contributors
- *
- * This file is part of sensh.
- *
- * Sensh is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ * fastrpcd: the DSP's apps_std file service over a directory tree (replaces hexagonrpcd's hexagonfs).
+ * Copyright (C) 2026 the ios-flame contributors. GPL-3.0-or-later (part of fastrpcd).
  */
-
 #ifndef APPS_STD_H
 #define APPS_STD_H
 
-#include "hexagonfs.h"
+#include <stddef.h>
 #include "listener.h"
 
-struct fastrpc_interface *fastrpc_apps_std_init(struct hexagonfs_dirent *root);
+/*
+ * The DSP's paths are served from ROOT + the path, after these aliases:
+ *   /system/vendor/...      -> /vendor/...
+ *   /mnt/vendor/persist/... -> /persist/...
+ * so the tree under ROOT is vendor/etc/sensors/{config,sns_reg_config}, vendor/etc/acdbdata,
+ * persist/sensors/registry (the only writable part), sys/devices/soc0 (one file per attribute) and
+ * usr/lib/qcom/adsp. ".." never leaves ROOT; neither does a symbolic link.
+ */
+struct fastrpc_interface *fastrpc_apps_std_init(const char *root);
 void fastrpc_apps_std_deinit(struct fastrpc_interface *iface);
+
+/* DSP path -> host path (exposed for the unit test). 0, or -1 if refused. */
+int apps_std_map(const char *root, const char *dsp_path, int for_write, char *out, size_t n_out);
 
 #endif

@@ -17,6 +17,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Modified for fastrpcd (ios-flame, 2026): the mmap goes through fastrpc_ioctl() (transport.c).
  */
 
 #include <inttypes.h>
@@ -25,7 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <misc/fastrpc.h>
-#include <sys/ioctl.h>
+#include "log.h"
 
 #include "apps_mem.h"
 #include "interface/apps_mem.h"
@@ -61,7 +63,8 @@ static uint32_t apps_mem_request_map64(void *data,
 	int ret;
 
 	if (!(first_in->rflags & ADSP_MMAP_ADD_PAGES)) {
-		fprintf(stderr, "Unsupported mmap operation: DMA buffer request\n");
+		flog("apps_mem request_map64 heap %u lflags %#x rflags %#x len %llu: not ADD_PAGES, unsupported",
+		     first_in->heap_id, first_in->lflags, first_in->rflags, (unsigned long long)first_in->len);
 		return AEE_EUNSUPPORTED;
 	}
 
@@ -70,10 +73,10 @@ static uint32_t apps_mem_request_map64(void *data,
 	mmap.vaddrin = 0;
 	mmap.size = first_in->len;
 
-	ret = ioctl(ctx->fd, FASTRPC_IOCTL_MMAP, &mmap);
+	ret = fastrpc_ioctl(ctx->fd, FASTRPC_IOCTL_MMAP, &mmap);
 	if (ret) {
-		fprintf(stderr, "Memory map failed: %s\n",
-			hexagonrpc_strerror(ret));
+		flog("apps_mem request_map64 (%llu bytes): %s (%d)", (unsigned long long)first_in->len,
+		     hexagonrpc_strerror(ret), ret);
 		return ret;
 	}
 
