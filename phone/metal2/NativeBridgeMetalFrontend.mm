@@ -68,12 +68,12 @@ static bool timelineOn() {
  return on==1;
 }
 static uint64_t tlNow() {return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);}
-struct TLRecord {uint64_t created,commit,kStart,kEnd,gStart,gEnd,notice,handler;EncodedWork work;bool frame,waitedCompleted,waitedScheduled;};
+struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;};
+struct TLRecord {uint64_t created,commit,kStart,kEnd,gStart,gEnd,notice,handler;EncodedWork work;uint32_t surface;bool frame,waitedCompleted,waitedScheduled;};
 static std::mutex gTLLock;
 static std::vector<TLRecord> gTL;   // completed since the last report (at most 4096 kept)
 static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs);
 static std::atomic<uint64_t> gSurfaceFlushBytes,gSurfaceFlushDuplicates;
-struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;};
 struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0;int64_t scheduledUs=-1;uint32_t index=0;EncodedWork work={};};
 static CommitRecord gCommitRing[32];
 static std::mutex gCommitLock;
@@ -675,6 +675,7 @@ static void notified(void *context,uint64_t value) {
  uint64_t createdUs;
  // u-t frame timeline (SWEET_TIMELINE, backboardd): CLOCK_MONOTONIC_RAW ns, the runtime's host clock (its GPU and kernel times)
  uint64_t tlCreated,tlFirstEncoder,tlCommit,tlNotice;
+ uint32_t tlSurface;   // the frame's framebuffer IOSurface ID (CA's swap chain: how many it cycles through)
  bool tlFrame,tlWaitedCompleted,tlWaitedScheduled;
 }
 @property(nonatomic) NmbCommandBuffer *handle;
@@ -1049,7 +1050,7 @@ static void noteDeviceLost(const char *why) {
    gPasses++;gPassPixels+=pixels;encodedWork.passes++;encodedWork.pixels+=pixels;
    uint64_t seen=gBiggestPass.load();while(pixels>seen && !gBiggestPass.compare_exchange_weak(seen,pixels)){}
    if(pixels>=2000000)gFullScreenPasses++;
-   if(pixels>=1500000 && [(id)first isKindOfClass:[NBTexture class]] && ((NBTexture *)first).surface)tlFrame=true;
+   if(pixels>=1500000 && [(id)first isKindOfClass:[NBTexture class]] && ((NBTexture *)first).surface){tlFrame=true;tlSurface=IOSurfaceGetID(((NBTexture *)first).surface);}
   }
  }
  auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
@@ -1179,7 +1180,7 @@ static void noteDeviceLost(const char *why) {
  auto ns=[](double seconds)->uint64_t{return seconds>0?(uint64_t)(seconds*1e9):0;};
  r.kStart=ns(nmb_command_buffer_kernel_time(_handle,false));r.kEnd=ns(nmb_command_buffer_kernel_time(_handle,true));
  r.gStart=ns(nmb_command_buffer_gpu_time(_handle,false));r.gEnd=ns(nmb_command_buffer_gpu_time(_handle,true));
- r.work=encodedWork;r.frame=tlFrame;r.waitedCompleted=tlWaitedCompleted;r.waitedScheduled=tlWaitedScheduled;
+ r.work=encodedWork;r.surface=tlSurface;r.frame=tlFrame;r.waitedCompleted=tlWaitedCompleted;r.waitedScheduled=tlWaitedScheduled;
  std::lock_guard<std::mutex> lock(gTLLock);
  if(gTL.size()<4096)gTL.push_back(r);
 }
@@ -2348,6 +2349,13 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
   coveredTo=std::max(coveredTo,r->gEnd);lastEnd=std::max(lastEnd,r->gEnd);
  }
  const TLRecord *previous=nullptr;
+ // hitches: the worst 3 frame intervals (commit to commit), split along the earlier frame's life and the gap after it:
+ //   prev frame: sub (commit->kernel end: the submission, Turnip's CPU waits included) | q (->GPU start: queued behind earlier
+ //   GPU work) | gpu | ntc (GPU end->completion callback) ; gap (its notice->this frame's first encoder: outside Metal: CA
+ //   waiting for vsync/swap/its own throttle) ; enc (this frame's first encoder->commit)
+ struct Hitch {int64_t every,sub,q,gpu,ntc,gap,enc;};
+ std::vector<Hitch> hitches;
+ std::vector<uint32_t> surfaces;
  for(const TLRecord &r:records) {
   if(!r.frame) {
    aux++;
@@ -2356,7 +2364,12 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
    continue;
   }
   frames++;
+  if(r.surface && std::find(surfaces.begin(),surfaces.end(),r.surface)==surfaces.end())surfaces.push_back(r.surface);
   if(previous) {
+   const TLRecord &p=*previous;
+   auto d=[](uint64_t a,uint64_t b)->int64_t{return a && b?(int64_t)b-(int64_t)a:-1;};
+   hitches.push_back({(int64_t)(r.commit-p.commit),d(p.commit,p.kEnd),d(p.kEnd,p.gStart),d(p.gStart,p.gEnd),d(p.gEnd,p.notice),
+    d(p.notice,r.created),d(r.created,r.commit)});
    every.push_back((int64_t)(r.commit-previous->commit));
    if(previous->notice)next.push_back((int64_t)r.created-(int64_t)previous->notice);
   }
@@ -2386,6 +2399,17 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
   (unsigned long long)(waits[2]-lastWaits[2]),(unsigned long long)((waits[3]-lastWaits[3])/1000),passes);
  memcpy(lastWaits,waits,sizeof lastWaits);
  sm2_logs(line);
+ std::sort(hitches.begin(),hitches.end(),[](const Hitch &a,const Hitch &b){return a.every>b.every;});
+ {
+  size_t at=(size_t)snprintf(line,sizeof line,"native-metal: T worst 5s: fb surfaces %zu |",surfaces.size());
+  auto ms=[](int64_t ns){return ns<0?-1.0:ns/1e6;};
+  for(size_t i=0;i<3 && i<hitches.size() && at<sizeof line;i++) {
+   const Hitch &h=hitches[i];
+   at+=(size_t)snprintf(line+at,sizeof line-at," %.1fms = prev[sub %.1f q %.1f gpu %.1f ntc %.1f] gap %.1f enc %.1f;",
+    ms(h.every),ms(h.sub),ms(h.q),ms(h.gpu),ms(h.ntc),ms(h.gap),ms(h.enc));
+  }
+  if(!hitches.empty())sm2_logs(line);
+ }
  // T2: the runtime's submissions (deltas of its WorkCounts)
  static uint64_t lastSched[9];static bool haveSched;
  uint64_t sched[9]={};
