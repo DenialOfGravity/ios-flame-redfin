@@ -258,7 +258,7 @@ index 60ad3a8..5c0888f 100644
  
  static void tu_reset_render_pass(struct tu_cmd_buffer *cmd_buffer)
 diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
-index b03c6ee..7cb0ebc 100644
+index b03c6ee..83c82a5 100644
 --- a/src/freedreno/vulkan/tu_knl_darwin.cc
 +++ b/src/freedreno/vulkan/tu_knl_darwin.cc
 @@ -851,6 +851,58 @@ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *e
@@ -357,7 +357,7 @@ index b03c6ee..7cb0ebc 100644
 +      /* The GPU idles before this submission's work: its first buffer is the wait. */
 +      NativeAdrenoAbiSubmitBuffer wfi = {};
 +      darwin_wfi(dev, &wfi);
-+      *util_dynarray_grow(&submit->commands, NativeAdrenoAbiSubmitBuffer, 1) = wfi;
++      *(NativeAdrenoAbiSubmitBuffer *) util_dynarray_grow(&submit->commands, NativeAdrenoAbiSubmitBuffer, 1) = wfi;
 +      NativeAdrenoAbiSubmitBuffer *all = util_dynarray_element(&submit->commands, NativeAdrenoAbiSubmitBuffer, 0);
 +      memmove(all + 1, all, total * sizeof(*all));
 +      all[0] = wfi;
