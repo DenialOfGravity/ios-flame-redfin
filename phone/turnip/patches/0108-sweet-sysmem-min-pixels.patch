@@ -1,0 +1,24 @@
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index ef66976..befb0ab 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -1456,6 +1456,19 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
+       return true;
+    }
+ 
++   /* sweet 0108: SWEET_TU_SYSMEM_MIN_PIXELS=N: passes whose render area has N pixels or more draw in sysmem, ahead of
++    * the autotuner (which keeps fetching passes in GMEM). On redfin (A620, 22 bins of 576x224 for CA's 1125x2436
++    * BGRA frame) a full-screen CA pass took 4.8 ms in sysmem against 5.6 ms in GMEM (r33a, TU_DEBUG=sysmem). 0 = off. */
++   {
++      static const unsigned sweet_sysmem_min_pixels = debug_get_num_option("SWEET_TU_SYSMEM_MIN_PIXELS", 0);
++      const VkExtent2D sweet_area = cmd->state.render_areas[0].extent;
++      if (sweet_sysmem_min_pixels && !cmd->state.per_layer_render_area &&
++          (uint64_t) sweet_area.width * sweet_area.height >= sweet_sysmem_min_pixels) {
++         cmd->state.rp.gmem_disable_reason = "SWEET_TU_SYSMEM_MIN_PIXELS";
++         return true;
++      }
++   }
++
+    tu_autotune::render_mode optimal_mode =
+       cmd->device->autotune->get_optimal_mode(cmd, rp_ctx, rp_key);
+    bool use_sysmem = optimal_mode == tu_autotune::render_mode::SYSMEM;
