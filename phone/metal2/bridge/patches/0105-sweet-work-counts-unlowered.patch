@@ -1,0 +1,38 @@
+diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
+index f61522e..10c9cd6 100644
+--- a/crates/metal2vulkan-runtime/src/work_counts.rs
++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
+@@ -4504,14 +4504,32 @@ pub struct WorkCounts {
+     pub tile_dispatches_recorded: u64,
+ }
+ 
++thread_local! {
++    /// SweetMetal2 (u-t): set while [`Device::work_counts_unlowered`] reads the counts.
++    static SWEET_UNLOWERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
+ impl Device {
++    /// SweetMetal2 (u-t): [`work_counts`](Self::work_counts) without lowering the render encoders' logged calls first, so a
++    /// thread other than the encoders' (backboardd's frame timeline, every 5 s) reads the scheduler's counts without taking
++    /// their lowering: the counts of calls not lowered yet are low by those.
++    #[doc(hidden)]
++    pub fn work_counts_unlowered(&self) -> WorkCounts {
++        SWEET_UNLOWERED.with(|skip| skip.set(true));
++        let counts = self.work_counts();
++        SWEET_UNLOWERED.with(|skip| skip.set(false));
++        counts
++    }
++
+     /// What its commit path did so far (`work_counts.rs`): counts the lanes hold to bounds. No
+     /// Metal counterpart; not part of the API.
+     #[doc(hidden)]
+     pub fn work_counts(&self) -> WorkCounts {
+         // What the calls of the device's render encoders logged and not yet lowered will count
+         // (`render/deferral.rs`).
+-        self.shared().deferred.lower_all();
++        if !SWEET_UNLOWERED.with(|skip| skip.get()) {
++            self.shared().deferred.lower_all();
++        }
+         let counters = &self.shared().counts;
+         // The driver's time in its pipeline makings (`device/compiles.rs`, by `VkDevice`), and
+         // what the shader cache's directory cost (`shader_cache/store.rs`): neither is in

@@ -39,6 +39,7 @@ size_t nmb_device_name(const NmbDevice *, char *out, size_t size);
 uint64_t nmb_device_max_buffer_length(const NmbDevice *);
 // Pipeline makings (count, total us, longest us, waited us, failed), sink messages (info, warning+), shader cache hits/misses/writes.
 bool nmb_device_work_stats(const NmbDevice *, uint64_t out[10]);
+bool nmb_device_sched_counts(const NmbDevice *, uint64_t out[14]);   /* u-t: scheduler WorkCounts (NativeMetalObjects.rs) */
 /* Artifact lookups and driver pipeline records are separate cache layers. */
 struct NmbShaderCacheStats {
     uint64_t hits, misses, rejected, read_failures, writes, write_failures, evictions;
@@ -193,6 +194,7 @@ int nmb_command_buffer_wait(NmbCommandBuffer *, uint64_t timeout_ms);
 uint64_t nmb_command_buffer_status(const NmbCommandBuffer *);
 size_t nmb_command_buffer_error(const NmbCommandBuffer *, char *out, size_t size);
 double nmb_command_buffer_gpu_time(const NmbCommandBuffer *, bool end);
+double nmb_command_buffer_kernel_time(const NmbCommandBuffer *, bool end);   /* u-t: scheduler submit begin/end, host clock s */
 
 /* Events: an MTLEvent (shared false) or an MTLSharedEvent within this process. */
 NmbEvent *nmb_event_new(NmbDevice *, bool shared);

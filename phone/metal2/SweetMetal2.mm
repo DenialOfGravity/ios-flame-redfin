@@ -22,7 +22,7 @@
 
 extern "C" void sm2_logs(const char *s)
 {
-	char buf[700];
+	char buf[1500];	/* u-t: the T 5s line runs to ~800 */
 	int n = snprintf(buf, sizeof(buf), "MTL2[%d %s]: %s\n", getpid(), getprogname(), s);
 	if (n > (int)sizeof(buf) - 1)
 		n = (int)sizeof(buf) - 1;
@@ -175,6 +175,13 @@ static bool listed(void)
 		CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
 		/* the runtime's VkPipeline makings count into the telemetry (V row) */
 		setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
+		/* u-t (r31): backboardd's frame timeline ("native-metal: T 5s" lines, Turnip's pass times) on unless
+		 * /var/local/mtl2-env says SWEET_TIMELINE=0; the shadow-copy repack (bridge 0104) off unless it says
+		 * SWEET_SHADOW_REPACK=1 (it changed nothing measurable); SWEET_TU_GPU_WAIT=1 lets Turnip leave its
+		 * waits on submitted fences to the GPU (phone/turnip/patches/0105) */
+		if (!strcmp(getprogname(), "backboardd"))
+			setenv("SWEET_TIMELINE", "1", 0);
+		setenv("SWEET_SHADOW_REPACK", "0", 0);
 		/* debugging: KEY=VALUE lines of /var/local/mtl2-env into this process's environment */
 		if (FILE *ef = fopen("/var/local/mtl2-env", "r")) {
 			char line[256];
@@ -232,6 +239,12 @@ static bool listed(void)
 		if (vk)
 			dladdr(vk, &tu);
 		sm2_log("images: SweetMetal2 %p, libvulkan_freedreno %p", self.dli_fbase, tu.dli_fbase);
+		/* u-t: Turnip's pass timeline report (phone/turnip/patches/0105) for the frontend's T line */
+		if (th) {
+			native_bridge_metal_pass_report = (size_t (*)(char *, size_t, unsigned))dlsym(th, "sweet_tu_pass_report");
+			if (!native_bridge_metal_pass_report && !strcmp(getprogname(), "backboardd"))
+				sm2_log("timeline: sweet_tu_pass_report not exported by Turnip: no pass times");
+		}
 		/* backboardd: the frontend's counters every 10 s, into /var/local/mtl2.log only (with /var/local/mtl2-telemetry) */
 		if (device && !strcmp(getprogname(), "backboardd"))
 			dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{

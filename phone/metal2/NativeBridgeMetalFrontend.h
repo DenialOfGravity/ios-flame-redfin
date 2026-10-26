@@ -16,6 +16,9 @@ size_t native_bridge_metal_status(char *out, size_t size);
 // The pixel formats of the textures asked for (first eight distinct) and how many texture requests the runtime refused.
 size_t native_bridge_metal_formats(char *out, size_t size);
 size_t native_bridge_metal_telemetry(char *out, size_t size);
+// u-t: Turnip's pass timeline report (sweet_tu_pass_report, phone/turnip/patches/0105), set by the plugin once Turnip is loaded; null
+// where Turnip does not export it. Used by backboardd's "T 5s" frame timeline line (SWEET_TIMELINE).
+extern size_t (*native_bridge_metal_pass_report)(char *out, size_t size, unsigned top);
 // Structured cumulative artifact/driver-cache counters for offline qualification.
 struct NmbShaderCacheStats;
 bool native_bridge_metal_shader_cache_stats(struct NmbShaderCacheStats *out);

@@ -55,6 +55,23 @@ static Timed gTimeWaitScheduled,gTimeWaitCompleted;
 static Timed gTimeResourceWait;
 static std::atomic<uint64_t> gResourceChecks,gResourceSkipped;
 static Timed gTimeSurfaceFlush;
+// u-t (r31): backboardd's frame timeline. Every command buffer's life on one clock (CLOCK_MONOTONIC_RAW, the runtime's host clock,
+// on which it places the GPU's timestamps through VK_KHR_calibrated_timestamps): created, first encoder, commit, the scheduler's
+// submission (kernel start/end), GPU start/end, the completion callback (notice) and its completed handlers' start. A command
+// buffer with a render pass into an IOSurface of 1.5 Mpx or more is a frame (CA's framebuffer). Every 5 s, from a commit, one line
+// "native-metal: T 5s: ..." (and a "T2" line of the runtime's scheduler counts) goes to the console and /var/local/mtl2.log.
+// /var/local/mtl2-env SWEET_TIMELINE=0 turns it off (the plugin sets 1 for backboardd).
+size_t (*native_bridge_metal_pass_report)(char *,size_t,unsigned);
+static bool timelineOn() {
+ static int on=-1;
+ if(on<0){const char *e=getenv("SWEET_TIMELINE");on=!strcmp(getprogname(),"backboardd") && e && *e && strcmp(e,"0")?1:0;}
+ return on==1;
+}
+static uint64_t tlNow() {return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);}
+struct TLRecord {uint64_t created,commit,kStart,kEnd,gStart,gEnd,notice,handler;EncodedWork work;bool frame,waitedCompleted,waitedScheduled;};
+static std::mutex gTLLock;
+static std::vector<TLRecord> gTL;   // completed since the last report (at most 4096 kept)
+static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs);
 static std::atomic<uint64_t> gSurfaceFlushBytes,gSurfaceFlushDuplicates;
 struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;};
 struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0;int64_t scheduledUs=-1;uint32_t index=0;EncodedWork work={};};
@@ -656,6 +673,9 @@ static void notified(void *context,uint64_t value) {
 @public
  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
  uint64_t createdUs;
+ // u-t frame timeline (SWEET_TIMELINE, backboardd): CLOCK_MONOTONIC_RAW ns, the runtime's host clock (its GPU and kernel times)
+ uint64_t tlCreated,tlFirstEncoder,tlCommit,tlNotice;
+ bool tlFrame,tlWaitedCompleted,tlWaitedScheduled;
 }
 @property(nonatomic) NmbCommandBuffer *handle;
 @property(nonatomic,strong) NBQueue *queue;
@@ -969,7 +989,7 @@ static void noteDeviceLost(const char *why) {
 @implementation NBCommandBuffer
 - (instancetype)init {
  if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_writtenSurfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
- if(self)createdUs=nowUs();
+ if(self){createdUs=nowUs();if(timelineOn())tlCreated=tlNow();}
  return self;
 }
 - (void)dealloc {nmb_command_buffer_release(_handle);}
@@ -1000,10 +1020,11 @@ static void noteDeviceLost(const char *why) {
 // The kernel driver's own submission times are not recorded: 0 is Metal's answer where they are unavailable.
 - (CFTimeInterval)kernelStartTime {return 0;}
 - (CFTimeInterval)kernelEndTime {return 0;}
-- (BOOL)commitAndWaitUntilSubmitted {[(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];return !self.failedLocally;}
+- (BOOL)commitAndWaitUntilSubmitted {tlWaitedScheduled=true;[(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];return !self.failedLocally;}
 - (CFTimeInterval)GPUStartTime {return nmb_command_buffer_gpu_time(_handle,false);}
 - (CFTimeInterval)GPUEndTime {return nmb_command_buffer_gpu_time(_handle,true);}
 - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)what {
+ if(!tlFirstEncoder && tlCreated)tlFirstEncoder=tlNow();
  if(self.committed){[self refuse:[what stringByAppendingString:@" after commit"]];return nil;}
  if(!handle){[self refuse:[NSString stringWithFormat:@"%@: %@",what,lastError()]];return nil;}
  encoder.handle=handle;encoder.commandBuffer=self;return encoder;
@@ -1028,6 +1049,7 @@ static void noteDeviceLost(const char *why) {
    gPasses++;gPassPixels+=pixels;encodedWork.passes++;encodedWork.pixels+=pixels;
    uint64_t seen=gBiggestPass.load();while(pixels>seen && !gBiggestPass.compare_exchange_weak(seen,pixels)){}
    if(pixels>=2000000)gFullScreenPasses++;
+   if(pixels>=1500000 && [(id)first isKindOfClass:[NBTexture class]] && ((NBTexture *)first).surface)tlFrame=true;
   }
  }
  auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
@@ -1103,6 +1125,7 @@ static void noteDeviceLost(const char *why) {
   completedHandlers=[_completedHandlers copy];[_completedHandlers removeAllObjects];
  }
  void (^run)(void)=^{
+  if(self->tlNotice && !self.failedLocally)[self timelineRecord];
   for(MTLCommandBufferHandler block in completedHandlers)block((id<MTLCommandBuffer>)self);
   dispatch_group_leave(self->_handlers);
  };
@@ -1113,6 +1136,18 @@ static void noteDeviceLost(const char *why) {
  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
  self.committed=YES;
  self.committedUs=nowUs();
+ if(tlCreated) {
+  tlCommit=tlNow();
+  static std::atomic<uint64_t> nextReport{0};
+  uint64_t due=nextReport.load();
+  if(tlCommit>=due && nextReport.compare_exchange_strong(due,tlCommit+5000000000ull) && due) {
+   std::vector<TLRecord> records;
+   {std::lock_guard<std::mutex> lock(gTLLock);records.swap(gTL);}
+   static dispatch_queue_t reporter=dispatch_queue_create("sweet.timeline",DISPATCH_QUEUE_SERIAL);
+   const uint64_t span=tlCommit-(due-5000000000ull);
+   dispatch_async(reporter,^{timelineReport(records,span);});
+  }
+ }
  noteShadowCopies();
  {
   std::lock_guard<std::mutex> lock(gCommitLock);
@@ -1137,8 +1172,20 @@ static void noteDeviceLost(const char *why) {
  self.failedLocally=YES;gCommitFailures++;
  dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{[self finish];});
 }
+// u-t: this command buffer's timeline record, as its completed handlers start.
+- (void)timelineRecord {
+ TLRecord r={};
+ r.created=tlFirstEncoder?tlFirstEncoder:tlCreated;r.commit=tlCommit;r.notice=tlNotice;r.handler=tlNow();
+ auto ns=[](double seconds)->uint64_t{return seconds>0?(uint64_t)(seconds*1e9):0;};
+ r.kStart=ns(nmb_command_buffer_kernel_time(_handle,false));r.kEnd=ns(nmb_command_buffer_kernel_time(_handle,true));
+ r.gStart=ns(nmb_command_buffer_gpu_time(_handle,false));r.gEnd=ns(nmb_command_buffer_gpu_time(_handle,true));
+ r.work=encodedWork;r.frame=tlFrame;r.waitedCompleted=tlWaitedCompleted;r.waitedScheduled=tlWaitedScheduled;
+ std::lock_guard<std::mutex> lock(gTLLock);
+ if(gTL.size()<4096)gTL.push_back(r);
+}
 - (void)waitUntilCompleted {
  if(!self.committed)return;
+ tlWaitedCompleted=true;
  const uint64_t began=nowUs();
  if(!self.failedLocally)nmb_command_buffer_wait(_handle,0);
  dispatch_group_wait(_handlers,DISPATCH_TIME_FOREVER);
@@ -1146,6 +1193,7 @@ static void noteDeviceLost(const char *why) {
 }
 - (void)waitUntilScheduled {
  if(!self.committed)return;
+ tlWaitedScheduled=true;
  const uint64_t began=nowUs();
  if(!self.failedLocally && !nmb_command_buffer_wait_scheduled(_handle)){
   NBLOG(@"native-metal: waitUntilScheduled refused: %@",lastError());return;
@@ -1159,6 +1207,7 @@ static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSc
 static void completed(void *context) {
  gCompleted++;
  NBCommandBuffer *commandBuffer=(__bridge_transfer NBCommandBuffer *)context;
+ if(commandBuffer->tlCreated)commandBuffer->tlNotice=tlNow();
  {
   const uint64_t took=nowUs()-commandBuffer.committedUs;
   gTimeEncodeToCommit.count++;gTimeEncodeToCommit.total+=took;
@@ -2271,6 +2320,87 @@ static void noteShadowCopies() {
      (unsigned long long)(c[0]-last[0]),(unsigned long long)(c[1]-last[1]),(unsigned long long)(c[3]-last[3]),(unsigned long long)(c[4]-last[4]),
      (unsigned long long)(c[2]-last[2])].UTF8String);
  memcpy(last,c,sizeof last);
+}
+// u-t: the frame timeline's 5 s line (see TLRecord). Medians and 95th percentiles in ms over the frames (CA's framebuffer command
+// buffers) completed in the window:
+//   frames N (every p50/p95: commit to commit) | encode (first encoder to commit) | commit->submit (to the scheduler's first
+//   vkQueueSubmit) | submit->gpu-start | gpu (the frame command buffer's GPU start to end) | gpu-done->cpu-notice (GPU end to the
+//   runtime's completion callback; +h: on to its completed handlers) | gpu idle before a frame (since the GPU last ended any work)
+//   and GPU busy % of the window | notice->next (a frame's notice to the next frame's first encoder: about 0 where CA waits for
+//   completion) | cb per frame (aux: other command buffers by content, their GPU p50) | CA's waits (waitUntilCompleted and
+//   waitUntilScheduled: count, ms) | top passes (Turnip: WxH format load/store gmem|sysmem avg ms x count) and Turnip's submit waits.
+// T2: the runtime scheduler's counts in the window (vkQueueSubmit calls and ms in them, batches submitted with 0/1/2-3/4+ of their
+// VkQueue pending, heads held for host steps / at their gate / for earlier commits, GPU waits, groups kept, sleep slices).
+static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
+ auto pct=[](std::vector<int64_t> v,double q)->double{
+  if(v.empty())return -1;std::sort(v.begin(),v.end());size_t i=(size_t)(q*(v.size()-1)+0.5);return v[std::min(i,v.size()-1)]/1e6;};
+ std::sort(records.begin(),records.end(),[](const TLRecord &a,const TLRecord &b){return a.commit<b.commit;});
+ std::vector<int64_t> every,encode,c2s,s2g,gpu,notice,handler,idle,next,auxGpu;
+ unsigned frames=0,aux=0,auxPasses=0,auxBlits=0,auxCompute=0,auxEmpty=0,timed=0;
+ // the GPU's busy time and the idle before each frame: work in GPU start order
+ std::vector<const TLRecord *> byStart;
+ for(const TLRecord &r:records)if(r.gStart && r.gEnd>=r.gStart){byStart.push_back(&r);timed++;}
+ std::sort(byStart.begin(),byStart.end(),[](const TLRecord *a,const TLRecord *b){return a->gStart<b->gStart;});
+ uint64_t busy=0,coveredTo=0,lastEnd=0;
+ for(const TLRecord *r:byStart) {
+  if(r->frame && lastEnd)idle.push_back(r->gStart>lastEnd?(int64_t)(r->gStart-lastEnd):0);
+  const uint64_t from=std::max(r->gStart,coveredTo);if(r->gEnd>from)busy+=r->gEnd-from;
+  coveredTo=std::max(coveredTo,r->gEnd);lastEnd=std::max(lastEnd,r->gEnd);
+ }
+ const TLRecord *previous=nullptr;
+ for(const TLRecord &r:records) {
+  if(!r.frame) {
+   aux++;
+   if(r.work.passes)auxPasses++;else if(r.work.blits)auxBlits++;else if(r.work.dispatches)auxCompute++;else auxEmpty++;
+   if(r.gStart && r.gEnd>=r.gStart)auxGpu.push_back((int64_t)(r.gEnd-r.gStart));
+   continue;
+  }
+  frames++;
+  if(previous) {
+   every.push_back((int64_t)(r.commit-previous->commit));
+   if(previous->notice)next.push_back((int64_t)r.created-(int64_t)previous->notice);
+  }
+  previous=&r;
+  encode.push_back((int64_t)r.commit-(int64_t)r.created);
+  if(r.kStart)c2s.push_back((int64_t)r.kStart-(int64_t)r.commit);
+  if(r.gStart && r.gEnd>=r.gStart) {
+   if(r.kStart)s2g.push_back((int64_t)r.gStart-(int64_t)r.kStart);
+   gpu.push_back((int64_t)(r.gEnd-r.gStart));
+   notice.push_back((int64_t)r.notice-(int64_t)r.gEnd);
+  }
+  handler.push_back((int64_t)r.handler-(int64_t)r.notice);
+ }
+ // CA's own waits in the window (the J rows' totals, as deltas)
+ static uint64_t lastWaits[4];
+ const uint64_t waits[4]={gTimeWaitCompleted.count.load(),gTimeWaitCompleted.total.load(),gTimeWaitScheduled.count.load(),gTimeWaitScheduled.total.load()};
+ char passes[420]="n/a (Turnip has no sweet_tu_pass_report)";
+ if(native_bridge_metal_pass_report)native_bridge_metal_pass_report(passes,sizeof passes,3);
+ char line[1400];
+ snprintf(line,sizeof line,"native-metal: T 5s: frames %u (every %.1f/%.1f) | encode %.1f/%.1f ms | commit->submit %.2f | submit->gpu-start %.2f"
+  " | gpu %.1f/%.1f ms | gpu-done->cpu-notice %.2f/%.2f ms (+h %.2f) | gpu idle %.1f, busy %.0f%% | notice->next %.1f"
+  " | cb per frame %.2f (aux %u: rp %u bl %u cs %u e %u, gpu %.1f) | waits cpl %llu/%llums sch %llu/%llums | %s",
+  frames,pct(every,.5),pct(every,.95),pct(encode,.5),pct(encode,.95),pct(c2s,.5),pct(s2g,.5),pct(gpu,.5),pct(gpu,.95),
+  pct(notice,.5),pct(notice,.95),pct(handler,.5),pct(idle,.5),spanNs?100.0*busy/spanNs:0,pct(next,.5),
+  frames?(double)records.size()/frames:0,aux,auxPasses,auxBlits,auxCompute,auxEmpty,pct(auxGpu,.5),
+  (unsigned long long)(waits[0]-lastWaits[0]),(unsigned long long)((waits[1]-lastWaits[1])/1000),
+  (unsigned long long)(waits[2]-lastWaits[2]),(unsigned long long)((waits[3]-lastWaits[3])/1000),passes);
+ memcpy(lastWaits,waits,sizeof lastWaits);
+ sm2_logs(line);
+ // T2: the scheduler (deltas of the runtime's WorkCounts)
+ static uint64_t lastSched[14];static bool haveSched;
+ uint64_t sched[14]={};
+ if(gDevice && nmb_device_sched_counts(gDevice,sched)) {
+  uint64_t d[14];for(int i=0;i<14;i++)d[i]=sched[i]-lastSched[i];
+  if(haveSched) {
+   snprintf(line,sizeof line,"native-metal: T2 5s: cbs %zu (timed %u) | vkQueueSubmit %llu (%.1fms) | batches pending 0:%llu 1:%llu 2-3:%llu 4+:%llu"
+    " | held host-step %llu gate %llu earlier %llu | gpu-waits %llu groups-kept %llu slices %llu gate-slept %llu arms-after-wake %llu",
+    records.size(),timed,(unsigned long long)d[0],d[1]/1e6,(unsigned long long)d[2],(unsigned long long)d[3],(unsigned long long)d[4],
+    (unsigned long long)d[5],(unsigned long long)d[6],(unsigned long long)d[7],(unsigned long long)d[8],(unsigned long long)d[9],
+    (unsigned long long)d[10],(unsigned long long)d[11],(unsigned long long)d[12],(unsigned long long)d[13]);
+   sm2_logs(line);
+  }
+  memcpy(lastSched,sched,sizeof lastSched);haveSched=true;
+ }
 }
 // The telemetry table the plugin streams to the kernel's log: newline-separated rows of at most 90 characters.
 extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
