@@ -382,4 +382,27 @@ Phone (images r21a-e = ws-p-power kernel + r19a ADT; r21a = r19a's command line,
   collapsed to 50 mA (soft-ilimit: the PC port cannot source it); `poke w chg apsd` re-ran APSD -> SDP -> hardware
   500 mA, battery -67 mA at idle (was -221 on r21b, -640 with the camera on r18). On a power bank the user's meter
   showed **9.5 W** drawn (= the 2 A tier) — klog to be read when the phone is back on the PC.
-- r21c and r21e (PSCI idle) not booted yet; r21c's args are inside r21d.
+- r21c's args are inside r21d.
+
+### 2026-10-26 02:10 — r21e, r22b-g (merged kernel), bisect of the sensor crash
+
+- **r21e (sweetidle=1, PSCI power collapse):** works first time. `PSCI_FEATURES(CPU_SUSPEND) = 3`, memory-mapped
+  broadcast timer frame 0 (CNTACR0 -> 3f) on CPU0, CPUs 1-7 in state 0x40000003: ~160k pc/resume in 2 min, err 0,
+  no panic. Idle battery -73 mA on the PC port (same as without; the gain is under load/heat, not at idle).
+- **Merged kernel** (redfin-qol 121bbfb, then e03ca00 with 0971 "Sweet" transport): klog PA **0x101d428d8**.
+- **r22b (adsp=1 sweetbtlog=1):** WS-D kernel half proven: `fastrpcglink-apps-dsp` opens both ways, pd-mapper answers
+  the DSP's lookups (avs/audio 1 domain, tms/servreg 3 domains); the sensors PD still dies at 73 s with 0 FastRPC
+  messages (no daemon yet). **Bluetooth:** bluetoothd registers IOKit notifications `IONameMatch "marconi-bt"` and
+  `IONameMatch "bluetooth"` (-> none); no kctl/dev-node attempts in 3 min. WS-B's 0982 (`sweetbtnub=1/2/3`) publishes
+  stand-in nubs with full property-read logging for the next probe boot (ws-b-bluetooth @ ed160ed, PA 0x101d16710).
+- **Sensors:** backboardd matches and opens all seven HID stand-ins and configures them (DeviceOpenedByEventSystem,
+  MotionEventRestricted=false, LogLevel, PreserveTimestamp, ReportInterval 0 / BatchInterval; the ALS gets
+  `ALSLPannelValues`). **But backboardd crash-loops** (every ~10 s) with `*** Terminating app due to uncaught exception
+  'NSInvalidArgumentException', reason: '-[NSNull applyUIMode:]'` after `AppleSPUKext/liblog_aop.cpp:135` asserts.
+  Bisect: sweetmotion=0x03 (accel+gyro) stable (r22d); 0x7f crash (r22b/e, Transport SPU and Sweet alike); 0x7b (no
+  ALS) crash (r22f); 0x6b (no ALS, no compass) crash (r22g) => the trigger is prox (0x08), pressure (0x20) or
+  orientation (0x40). `poke m rot 3` on r22d (fake accel -1 g x) did **not** rotate Safari: backboardd had set the accel
+  ReportInterval to 0 (not consuming raw accel); rotation presumably needs the orientation service (type 10), which is
+  in the suspect group. **Phone left on r22d** (merged kernel, power on, accel+gyro only).
+- Charging: the 9.5 W seen on the power bank was with the phone reset (the ring ended at 287 s): the PMIC's own
+  defaults with a real charger, not our policy. Policy test with a wall charger still open.
