@@ -46,7 +46,8 @@ int tlv_parse(const uint8_t *buf, size_t n, struct tlv_info *ti, const char **er
 		ti->patch_version = le16(buf + 20);
 		ti->entry = le32(buf + 24);
 		return 0;
-	case TLV_TYPE_NVM: {
+	case TLV_TYPE_NVM:
+	case 4: {	/* redfin's crnv32.bin says 4; Linux btqca.c only logs the file's type byte and goes by the caller's */
 		ti->type = TLV_TYPE_NVM;
 		const uint8_t *d = buf + 4;
 		uint32_t idx = 0;
