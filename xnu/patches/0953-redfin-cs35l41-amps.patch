@@ -1,4 +1,4 @@
-From 1b44904b84880ccc8b530b5de0b1c2018289025b Mon Sep 17 00:00:00 2001
+From b9d5aceb8993923cb368717640e5603c801c1667 Mon Sep 17 00:00:00 2001
 From: WS-A <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 00:43:03 +0100
 Subject: [PATCH] redfin: CS35L41 amplifiers in ASP bypass + HackiOS speaker
@@ -6,10 +6,10 @@ Subject: [PATCH] redfin: CS35L41 amplifiers in ASP bypass + HackiOS speaker
 
 ---
  bsd/conf/files          |   2 +
- bsd/dev/sweet_cs35l41.c | 669 ++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_cs35l41.c | 687 ++++++++++++++++++++++++++++++++++++++++
  bsd/dev/sweet_guard.c   | 324 +++++++++++++++++++
- bsd/dev/sweet_sound.c   | 223 +++++++++++++-
- 4 files changed, 1204 insertions(+), 14 deletions(-)
+ bsd/dev/sweet_sound.c   | 223 ++++++++++++-
+ 4 files changed, 1222 insertions(+), 14 deletions(-)
  create mode 100644 bsd/dev/sweet_cs35l41.c
  create mode 100644 bsd/dev/sweet_guard.c
 
@@ -28,10 +28,10 @@ index 9d43a9b..9779f28 100644
  bsd/dev/sweet_poke.c			standard
 diff --git a/bsd/dev/sweet_cs35l41.c b/bsd/dev/sweet_cs35l41.c
 new file mode 100644
-index 0000000..980766c
+index 0000000..2372597
 --- /dev/null
 +++ b/bsd/dev/sweet_cs35l41.c
-@@ -0,0 +1,669 @@
+@@ -0,0 +1,687 @@
 +/*
 + * redfin (Pixel 5): the two Cirrus Logic CS35L41 speaker amplifiers. Patch 0953 (WS-A).
 + *
@@ -554,6 +554,24 @@ index 0000000..980766c
 +			(void)sweet_audio_pmic_gpio(allowed[amps[i].reset_gpio].sid, allowed[amps[i].reset_gpio].peripheral, 1);
 +		}
 +		sleep_ms(3);
++	}
++	/*
++	 * The SE9 bus is sweet_haptic.c's, brought up by its own thread (8 s after start, then the DRV2624):
++	 * the DSP may be up before it (r26a: amps probed at 67.47 s, SE9 up at 67.67 s), and sweet_se9_xfer()
++	 * says ENXIO both for "bus not up" and for a NACK. So wait, up to 15 s, until either amplifier answers.
++	 */
++	{
++		uint32_t id = 0;
++		unsigned waited;
++
++		for (waited = 0; waited < 15000; waited += 100) {
++			if (cs_read(&amps[0], CS_DEVID, &id) == 0 || cs_read(&amps[1], CS_DEVID, &id) == 0) {
++				break;
++			}
++			sleep_ms(100);
++		}
++		SAY("SE9: %s after %u ms\n", waited < 15000 ? "an amplifier answers" : "NO AMPLIFIER ANSWERS (or the bus never came up)",
++		    waited);
 +	}
 +	for (unsigned i = 0; i < 2; i++) {
 +		struct amp *a = &amps[i];

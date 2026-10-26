@@ -1,15 +1,15 @@
-From efa1ca78ec3ed90e37f790b49fc9a6acb9b6a815 Mon Sep 17 00:00:00 2001
+From 387708afa781cba4fee6236ab2f637a00b78732a Mon Sep 17 00:00:00 2001
 From: WS-A <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 11:49:03 +0100
 Subject: [PATCH] redfin: poke a gain N takes N or -N dB under Android's level;
  hard cap 6 dB under (ASP bypass, no protection firmware)
 
 ---
- bsd/dev/sweet_sound.c | 37 ++++++++++++++++++++++++++-----------
- 1 file changed, 26 insertions(+), 11 deletions(-)
+ bsd/dev/sweet_sound.c | 40 +++++++++++++++++++++++++++++-----------
+ 1 file changed, 29 insertions(+), 11 deletions(-)
 
 diff --git a/bsd/dev/sweet_sound.c b/bsd/dev/sweet_sound.c
-index 5116bf7..485e537 100644
+index 5116bf7..a88ae70 100644
 --- a/bsd/dev/sweet_sound.c
 +++ b/bsd/dev/sweet_sound.c
 @@ -42,8 +42,8 @@
@@ -50,7 +50,7 @@ index 5116bf7..485e537 100644
  	PE_parse_boot_argn("sndgain", &guard_gain, sizeof(guard_gain));
  	guard_gain = guard_gain > REDWOOD_GUARD_MAX_GAIN ? REDWOOD_GUARD_MAX_GAIN : guard_gain;
  	PE_parse_boot_argn("sndsecs", &hold_secs, sizeof(hold_secs));
-@@ -1349,15 +1349,30 @@ sweet_sound_cmd(const char *s, const char *end)
+@@ -1349,15 +1349,33 @@ sweet_sound_cmd(const char *s, const char *end)
  		return 0;
  	}
  	if (is(w, len, "gain")) {
@@ -71,19 +71,22 @@ index 5116bf7..485e537 100644
 +		dbs = number(&s, end, ~0u);
 +		if (dbs == ~0u) {
 +			SAY("gain: `a gain N' (N dB under Android's level, 0..102) wants a number\n");
-+			return -1;
-+		}
-+		if (level < 3 || !path_up) {
-+			SAY("gain: the amplifiers are not in use (sound=%u, path %s)\n", level, path_up ? "up" : "down");
  			return -1;
  		}
 -		below_wanted = dbs * 8 < below_min ? below_min : dbs * 8 > 816 ? 816 : dbs * 8;
 -		SAY("gain: the amplifiers %s dB under Android's level from now on\n", db(t, below_wanted));
++		if (level < 3 || !path_up) {
++			SAY("gain: the amplifiers are not in use (sound=%u, path %s)\n", level, path_up ? "up" : "down");
++			return -1;
++		}
 +		dbs = dbs > 102 ? 102 : dbs;
 +		below_wanted = dbs * 8 < below_min ? below_min : dbs * 8;
-+		SAY("gain: the amplifiers %s dB under Android's level from now on%s%s dB)\n", db(t, below_wanted),
-+		    dbs * 8 < below_min ? " (CAPPED: ASP bypass without protection firmware, no louder than " : "",
-+		    dbs * 8 < below_min ? db(t2, below_min) : "");
++		if (dbs * 8 < below_min) {
++			SAY("gain: the amplifiers %s dB under Android's level from now on (CAPPED: ASP bypass without protection "
++			    "firmware, no louder than %s dB under)\n", db(t, below_wanted), db(t2, below_min));
++		} else {
++			SAY("gain: the amplifiers %s dB under Android's level from now on\n", db(t, below_wanted));
++		}
  		return 0;
  	}
  	if (is(w, len, "off")) {
