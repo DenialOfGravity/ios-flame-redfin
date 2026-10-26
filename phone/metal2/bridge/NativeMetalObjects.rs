@@ -1534,35 +1534,29 @@ pub extern "C" fn nmb_command_buffer_kernel_time(command_buffer: *const NmbComma
     })
 }
 
-/// SweetMetal2 (u-t): the runtime's scheduler counts the frame timeline reports (`WorkCounts`, totals since the device was made),
-/// in this order: vkQueueSubmit calls, nanoseconds spent in them, batches submitted with none / one / two-three / four-plus
-/// earlier batches of their VkQueue pending, heads held for host steps, heads waiting at their gate (the GPU drains first),
-/// heads held for earlier commits, scheduler GPU waits, groups kept pending, scheduler sleep slices, gate waits slept,
-/// completion arms after a wake: fourteen words.
+/// SweetMetal2 (u-t): the runtime's submission counts the frame timeline reports (`WorkCounts`, totals since the device was made), in
+/// this order: vkQueueSubmit calls, VkCommandBuffers submitted, commits handed to another thread's pass, internal submissions,
+/// staging submissions, queue drains (a full wait for the device's queues), timeline waits, encoders re-encoded, shadow copies:
+/// nine words.
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_device_sched_counts(device: *const NmbDevice, out: *mut u64) -> bool {
     guard(false, || {
         if out.is_null() {
             return Err("null counts".into());
         }
-        let c = get(device)?.0.work_counts_unlowered();
+        let c = get(device)?.0.work_counts();
         let words = [
             c.queue_submissions,
-            c.batch_submit_nanos,
-            c.batches_with_none_pending,
-            c.batches_with_one_pending,
-            c.batches_with_two_or_three_pending,
-            c.batches_with_four_or_more_pending,
-            c.heads_held_for_host_steps,
-            c.heads_waiting_at_their_gate,
-            c.heads_held_for_earlier_commits,
-            c.scheduler_gpu_waits,
-            c.groups_kept_pending,
-            c.scheduler_sleep_slices,
-            c.gate_waits_slept,
-            c.completion_arms_after_a_wake,
+            c.command_buffers_submitted,
+            c.commits_handed_off,
+            c.internal_submissions,
+            c.staging_submissions,
+            c.queue_drains,
+            c.timeline_waits,
+            c.encoders_reencoded,
+            c.shadow_copies,
         ];
-        // SAFETY: the header's fourteen words.
+        // SAFETY: the header's nine words.
         unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out, words.len()) };
         Ok(true)
     })

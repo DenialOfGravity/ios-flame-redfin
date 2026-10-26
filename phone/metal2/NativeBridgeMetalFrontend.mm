@@ -2329,8 +2329,8 @@ static void noteShadowCopies() {
 //   and GPU busy % of the window | notice->next (a frame's notice to the next frame's first encoder: about 0 where CA waits for
 //   completion) | cb per frame (aux: other command buffers by content, their GPU p50) | CA's waits (waitUntilCompleted and
 //   waitUntilScheduled: count, ms) | top passes (Turnip: WxH format load/store gmem|sysmem avg ms x count) and Turnip's submit waits.
-// T2: the runtime scheduler's counts in the window (vkQueueSubmit calls and ms in them, batches submitted with 0/1/2-3/4+ of their
-// VkQueue pending, heads held for host steps / at their gate / for earlier commits, GPU waits, groups kept, sleep slices).
+// T2: the runtime's submissions in the window (vkQueueSubmit calls, VkCommandBuffers, commits handed off to another thread's pass,
+// internal and staging submissions, queue drains, timeline waits, re-encodes, shadow copies).
 static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
  auto pct=[](std::vector<int64_t> v,double q)->double{
   if(v.empty())return -1;std::sort(v.begin(),v.end());size_t i=(size_t)(q*(v.size()-1)+0.5);return v[std::min(i,v.size()-1)]/1e6;};
@@ -2386,17 +2386,16 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
   (unsigned long long)(waits[2]-lastWaits[2]),(unsigned long long)((waits[3]-lastWaits[3])/1000),passes);
  memcpy(lastWaits,waits,sizeof lastWaits);
  sm2_logs(line);
- // T2: the scheduler (deltas of the runtime's WorkCounts)
- static uint64_t lastSched[14];static bool haveSched;
- uint64_t sched[14]={};
+ // T2: the runtime's submissions (deltas of its WorkCounts)
+ static uint64_t lastSched[9];static bool haveSched;
+ uint64_t sched[9]={};
  if(gDevice && nmb_device_sched_counts(gDevice,sched)) {
-  uint64_t d[14];for(int i=0;i<14;i++)d[i]=sched[i]-lastSched[i];
+  uint64_t d[9];for(int i=0;i<9;i++)d[i]=sched[i]-lastSched[i];
   if(haveSched) {
-   snprintf(line,sizeof line,"native-metal: T2 5s: cbs %zu (timed %u) | vkQueueSubmit %llu (%.1fms) | batches pending 0:%llu 1:%llu 2-3:%llu 4+:%llu"
-    " | held host-step %llu gate %llu earlier %llu | gpu-waits %llu groups-kept %llu slices %llu gate-slept %llu arms-after-wake %llu",
-    records.size(),timed,(unsigned long long)d[0],d[1]/1e6,(unsigned long long)d[2],(unsigned long long)d[3],(unsigned long long)d[4],
-    (unsigned long long)d[5],(unsigned long long)d[6],(unsigned long long)d[7],(unsigned long long)d[8],(unsigned long long)d[9],
-    (unsigned long long)d[10],(unsigned long long)d[11],(unsigned long long)d[12],(unsigned long long)d[13]);
+   snprintf(line,sizeof line,"native-metal: T2 5s: cbs %zu (gpu-timed %u) | vkQueueSubmit %llu (VkCommandBuffers %llu) handed-off %llu internal %llu"
+    " staging %llu queue-drains %llu timeline-waits %llu reencoded %llu shadow-copies %llu",
+    records.size(),timed,(unsigned long long)d[0],(unsigned long long)d[1],(unsigned long long)d[2],(unsigned long long)d[3],
+    (unsigned long long)d[4],(unsigned long long)d[5],(unsigned long long)d[6],(unsigned long long)d[7],(unsigned long long)d[8]);
    sm2_logs(line);
   }
   memcpy(lastSched,sched,sizeof lastSched);haveSched=true;
