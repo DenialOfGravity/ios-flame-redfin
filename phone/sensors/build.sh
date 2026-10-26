@@ -5,5 +5,5 @@ cd "$(dirname "$0")"
 mkdir -p out
 ../../work/userland/bin/ios-cc -O2 -Wall -Wextra -Wno-unused-parameter -o out/sensd \
 	sensd.c sensor.c sns.c pb.c rqrtr.c ../wifi/qmi.c
-codesign -f -s - out/sensd 2>/dev/null
+codesign -f -s - --entitlements sensd-ents.plist out/sensd 2>/dev/null || codesign -f -s - out/sensd
 ls -la out/sensd
