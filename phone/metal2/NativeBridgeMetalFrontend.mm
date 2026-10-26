@@ -2685,6 +2685,32 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
    sm2_logs(line);
   }
  }
+ // u-c (r34): T5, the runtime's render encoder steps (bridge patch 0106; /var/local/mtl2-env SWEET_DRAWSTAT=1, off by default):
+ // per step of a draw (DRAW = whole draws), of a render endEncoding (END) and renderCommandEncoder (OPEN) in the window: ms total,
+ // count, us mean; then counts (#rp render passes made, #fb framebuffers, #set sets allocated, #set-reused sets 0 reused, #held state
+ // copies kept for re-recording, #writes descriptor writes).
+ if(nmb_sweet_drawstat_on()) {
+  enum {kSteps=64};
+  static uint64_t lastStep[2*kSteps];static bool haveSteps;
+  uint64_t step[2*kSteps]={};
+  const size_t steps=nmb_sweet_drawstat(step,kSteps);
+  if(haveSteps && steps) {
+   char out[1400];size_t at=0;int part=0;
+   auto flush=[&]{if(at)sm2_logs(out);at=0;};
+   for(size_t i=0;i<steps;i++) {
+    const char *name=nmb_sweet_drawstat_name(i);if(!name)break;
+    const uint64_t ns=step[2*i]-lastStep[2*i],n=step[2*i+1]-lastStep[2*i+1];
+    const int want=name[0]=='#'?2:!strncmp(name,"e.",2) || !strcmp(name,"END") || !strcmp(name,"OPEN")?1:0;
+    if(want!=part){flush();part=want;}
+    if(!at)at=(size_t)snprintf(out,sizeof out,"native-metal: T5 %s 5s:",part==0?"draw steps (ms, n, us)":part==1?"end/open steps (ms, n, us)":"counts");
+    if(!n || at>=sizeof out-64)continue;
+    if(part==2)at+=(size_t)snprintf(out+at,sizeof out-at," %s %llu;",name,(unsigned long long)n);
+    else at+=(size_t)snprintf(out+at,sizeof out-at," %s %.1f %llu %.1f;",name,ns/1e6,(unsigned long long)n,ns/1e3/n);
+   }
+   flush();
+  }
+  memcpy(lastStep,step,sizeof lastStep);haveSteps=true;
+ }
  // T2: the runtime's submissions (deltas of its WorkCounts)
  static uint64_t lastSched[9];static bool haveSched;
  uint64_t sched[9]={};

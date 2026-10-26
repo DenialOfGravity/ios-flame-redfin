@@ -1,0 +1,619 @@
+diff --git a/crates/metal2vulkan-runtime/src/binding.rs b/crates/metal2vulkan-runtime/src/binding.rs
+index 000794d..4963ee3 100644
+--- a/crates/metal2vulkan-runtime/src/binding.rs
++++ b/crates/metal2vulkan-runtime/src/binding.rs
+@@ -767,6 +767,33 @@ const WRITES_AT_ONCE: usize = 16;
+ ///
+ /// No pending or recording command uses `sets`, and every buffer, view and sampler written stays
+ /// live while a command that binds the sets can run.
++/// ios-on-pixel: what a set 0 written with `writes` through `layout` holds, flattened, for
++/// `DescriptorArena::sweet_memo`: two sets of one layout written with equal keys hold the same
++/// descriptors. `None` where a write keeps something alive (`Write::held`), never reused.
++pub(super) fn sweet_set_key(layout: vk::PipelineLayout, writes: &[Write]) -> Option<Vec<u64>> {
++    use ash::vk::Handle;
++    let mut key = Vec::with_capacity(1 + writes.len() * 7);
++    key.push(layout.as_raw());
++    for write in writes {
++        if write.held.is_some() {
++            return None;
++        }
++        key.push(u64::from(write.set) | (u64::from(write.binding) << 32));
++        key.push(u64::from(write.element) | ((write.ty.as_raw() as u32 as u64) << 32));
++        match write.info {
++            Info::Buffer(info) => key.extend([1, info.buffer.as_raw(), info.offset, info.range]),
++            Info::Image(info) => key.extend([
++                2,
++                info.sampler.as_raw(),
++                info.image_view.as_raw(),
++                info.image_layout.as_raw() as u32 as u64,
++            ]),
++            Info::Texel(view) => key.extend([3, view.as_raw(), 0, 0]),
++        }
++    }
++    Some(key)
++}
++
+ pub(super) unsafe fn write_sets(
+     device: &Device,
+     sets: &[vk::DescriptorSet],
+@@ -775,6 +802,7 @@ pub(super) unsafe fn write_sets(
+     if writes.iter().any(|write| write.set as usize >= sets.len()) {
+         return Err(internal("a descriptor write to a set the layout lacks"));
+     }
++    crate::sweet_drawstat::count_n(crate::sweet_drawstat::C_DESCRIPTOR_WRITES, writes.len() as u64);
+     for writes in writes.chunks(WRITES_AT_ONCE) {
+         let mut buffer_infos = [[vk::DescriptorBufferInfo::default()]; WRITES_AT_ONCE];
+         let mut image_infos = [[vk::DescriptorImageInfo::default()]; WRITES_AT_ONCE];
+diff --git a/crates/metal2vulkan-runtime/src/descriptor_arena.rs b/crates/metal2vulkan-runtime/src/descriptor_arena.rs
+index f54f31d..0f6db1d 100644
+--- a/crates/metal2vulkan-runtime/src/descriptor_arena.rs
++++ b/crates/metal2vulkan-runtime/src/descriptor_arena.rs
+@@ -162,6 +162,10 @@ pub(crate) struct DescriptorArena {
+     book: Book,
+     pools: Vec<DescriptorPool>,
+     device: Option<Device>,
++    /// ios-on-pixel: sets 0 this command buffer's draws wrote, with what they were written with
++    /// (`sweet_drawstat::desc_reuse`): the pipeline layout and each write, flattened; the newest
++    /// last, at most `sweet_drawstat::MEMO_SETS`. Emptied with the pools.
++    pub(crate) sweet_memo: Vec<(Vec<u64>, vk::DescriptorSet)>,
+ }
+ 
+ impl DescriptorArena {
+@@ -213,6 +217,7 @@ impl DescriptorArena {
+             .result()
+             .map_err(vulkan)?;
+         self.book.take(at, needs);
++        crate::sweet_drawstat::count(crate::sweet_drawstat::C_SETS_ALLOCATED);
+         Ok(set)
+     }
+ 
+@@ -220,6 +225,7 @@ impl DescriptorArena {
+     /// their sets any more.
+     pub(crate) fn give_back(&mut self) {
+         self.book.rooms.clear();
++        self.sweet_memo.clear();
+         let Some(device) = &self.device else {
+             return;
+         };
+@@ -233,6 +239,7 @@ impl DescriptorArena {
+     /// was never submitted).
+     pub(crate) fn release(&mut self) {
+         self.book.rooms.clear();
++        self.sweet_memo.clear();
+         let Some(device) = &self.device else {
+             return;
+         };
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index 93c5ee9..753a750 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -171,6 +171,7 @@ mod shader_cache;
+ mod shadow;
+ /// ios-on-pixel: shadow copy counts for the SweetMetal2 bridge's telemetry.
+ pub mod sweet_counts;
++pub mod sweet_drawstat;
+ mod shadow_merge;
+ mod shadow_stencil;
+ mod sharing;
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 119119d..0699036 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -1257,6 +1257,7 @@ impl CommandBuffer {
+         again: Option<Residency>,
+     ) -> Result<RenderCommandEncoder, Error> {
+         const CALL: &str = "render_command_encoder";
++        let _sweet_span = crate::sweet_drawstat::Span::new(crate::sweet_drawstat::O_TOTAL);
+         let device = self.device();
+         let log = match again {
+             None => device
+@@ -2975,12 +2976,15 @@ impl RenderCommandEncoder {
+     /// is left untouched, as plain Metal leaves it. The encoder is consumed either way, so a
+     /// refusal leaves its command buffer abandoned, as Metal stops there.
+     pub fn end_encoding(self) -> Result<(), Error> {
++        let _sweet_span = crate::sweet_drawstat::Span::new(crate::sweet_drawstat::E_TOTAL);
+         let (core, residency, log) = self.end_pass()?;
+-        core.end_with_replay(
++        let ended = core.end_with_replay(
+             EncoderKind::Render,
+             Some(residency),
+             log.map(|log| Replay::Render(Box::new(log))),
+-        )
++        );
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::E_CORE);
++        ended
+     }
+ 
+     /// An encoder made by `CommandBuffer::open_render` to encode an ended one again
+@@ -3006,6 +3010,7 @@ impl RenderCommandEncoder {
+     /// its end captured its draws' tile reach, whose tally lies in the command buffer).
+     fn end_pass(mut self) -> Result<(EncoderCore, Residency, Option<RenderLog>), Error> {
+         const CALL: &str = "end_encoding";
++        crate::sweet_drawstat::start();
+         if self.dispatched {
+             self.instance_after_dispatch()?;
+         }
+@@ -3131,6 +3136,7 @@ impl RenderCommandEncoder {
+         // another format, a fetched texture's scratch), the attachments the device renders only
+         // so render through images their textures keep, but one a draw took a view of
+         // (`linear_attachment.rs`).
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::E_PRE);
+         let others: Vec<Vec<usize>> = instances
+             .iter()
+             .map(|instance| {
+@@ -3322,6 +3328,7 @@ impl RenderCommandEncoder {
+         // pass's layers does not render: a layered pass that resolves then ends with an instance of
+         // no draws over every layer. Every instance resolves as the pass ends: into the targets set
+         // last (`render/late_resolve.rs`).
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::E_SETTLE);
+         let resolving = PassShape::of(&layout)?;
+         late_resolve::settle(
+             instances.iter_mut().map(|instance| &mut instance.shape),
+@@ -3632,6 +3639,7 @@ impl RenderCommandEncoder {
+                 depth_stencil: None,
+                 ..layout.clone()
+             });
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::E_PLAN);
+         let mut objects = Vec::with_capacity(count);
+         for (index, instance) in instances.iter().enumerate() {
+             let at = Position {
+@@ -3647,6 +3655,7 @@ impl RenderCommandEncoder {
+         }
+         // The layout of the instances that resolve: the scratch image as the depth/stencil
+         // attachment where its copy stands for it.
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::E_OBJECTS);
+         let resolving_layout = resolve_source
+             .as_ref()
+             .map(|source| source.resolving(&layout));
+@@ -3897,6 +3906,7 @@ impl RenderCommandEncoder {
+         // alike whether the pass records now or later with its executions
+         // (`render/pass_steps.rs`).
+         let dispatch_count = dispatches.len();
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::E_PLAN2);
+         let mut drawn = Vec::with_capacity(count);
+         let mut instance_steps = Vec::with_capacity(count);
+         let fills_and_copies = shadow_fills.into_iter().zip(reformat_copies);
+@@ -4062,6 +4072,7 @@ impl RenderCommandEncoder {
+             deferred = Some(Arc::clone(&pass));
+             core.defer(Deferred::RenderPass(pass))?;
+         }
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::E_STEPS);
+         if let Some(resolves) = exact_resolves {
+             resolves.record(&mut core);
+         }
+@@ -4193,6 +4204,7 @@ impl RenderCommandEncoder {
+         ));
+         // What it made resident joins its command buffer's (`residency.rs`), and is its own
+         // (`CommandBuffer::ended_encoders`).
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::E_TAIL);
+         let log = log.filter(|_| captured.is_none());
+         Ok((core, residency, log))
+     }
+@@ -5647,6 +5659,8 @@ impl RenderCommandEncoder {
+         buffers: DrawBuffers<'_>,
+         empty: bool,
+     ) -> Result<(), Error> {
++        let _sweet_span = crate::sweet_drawstat::Span::new(crate::sweet_drawstat::D_TOTAL);
++        crate::sweet_drawstat::start();
+         self.sync_heaps();
+         // And whether it rasterizes, without which its primitives reach no tile (EV RRS3-reach4c,
+         // `no_raster_t11`). And whether it chooses its viewport.
+@@ -5671,6 +5685,7 @@ impl RenderCommandEncoder {
+         self.command_encoded(reads);
+         self.called = true;
+         self.drew |= !empty && rasterizes;
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_POST);
+         // The pixels it may write: its viewports' within its scissors, every viewport where it
+         // chooses one or an amplification offsets it, and anywhere through a rate map.
+         if !empty && rasterizes {
+@@ -5725,6 +5740,7 @@ impl RenderCommandEncoder {
+         buffers: DrawBuffers<'_>,
+         empty: bool,
+     ) -> Result<(), Error> {
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_PRE);
+         let pipeline = match self.pipeline.as_ref().map(RenderPipelineState::kind) {
+             None => return Err(invalid(call, Problem::NoPipelineState)),
+             Some(RenderStateKind::Tile(_)) => {
+@@ -5805,6 +5821,7 @@ impl RenderCommandEncoder {
+         // A draw that blends into or reads an extended-range color an earlier draw of the pass
+         // wrote, or whose clear its codes cannot hold, starts the color's `half` shadow where it
+         // can (`render/extended_shadow.rs`).
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_CHECKS);
+         self.start_extended_shadows(&pipeline)?;
+         // A draw that reads and writes colors in the interlocked storage form that the current
+         // instance's subpass has records that instance's draws again first, into one that leaves
+@@ -5847,6 +5864,7 @@ impl RenderCommandEncoder {
+         // into the recording that replays them, before the pass (`render/executions.rs`).
+         // A capture draw (`render/capture.rs`) runs before the pass: it reads the bytes as they
+         // were then, in place, and announces nothing its first recording did not.
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_SETTINGS);
+         let capture = self.capture_addresses();
+         let pass_start = match capture {
+             Some(_) => PassStartTables::default(),
+@@ -5868,6 +5886,7 @@ impl RenderCommandEncoder {
+         }
+         // The encoder's kept bind state, brought to the draw's (`live_bind.rs`), held for the
+         // draw: no draw of the encoder runs inside another past here.
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_PASS_START);
+         let live = Arc::clone(&self.live);
+         let mut live = lock(&live);
+         let settled = self.settle_draw(
+@@ -5878,6 +5897,7 @@ impl RenderCommandEncoder {
+             &function_tables,
+         )?;
+         let (variant, plan) = (Arc::clone(&settled.variant), Arc::clone(&settled.plan));
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_SETTLE);
+         self.give_up_extended_shadows(&pipeline, &live.state);
+         // A capture draw runs its variant's capture form, where its objects are made: else it
+         // records nothing, and the capture neither.
+@@ -5956,6 +5976,7 @@ impl RenderCommandEncoder {
+                 return Err(Error::NotImplemented(RuntimeGap::ImageblockMasters));
+             }
+         }
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_CHECKS2);
+         let commands = plan
+             .instantiate_draw(&live.state, &draw)
+             .map_err(Error::Bind)?;
+@@ -6007,6 +6028,7 @@ impl RenderCommandEncoder {
+             self.skipped_draw();
+             return Ok(());
+         }
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_INSTANTIATE);
+         let rewrite = match (restarted, &buffers.index) {
+             (None, _) => None,
+             (Some(_), None) => return Err(internal("a restarted strip without indices")),
+@@ -6225,6 +6247,7 @@ impl RenderCommandEncoder {
+             Next::New { .. } | Next::Current => None,
+         };
+         let layout = stood.as_ref().unwrap_or(&self.layout);
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_PASSES);
+         let render_area = layout.extent;
+         let inputs = input_attachments(layout, graphics)?;
+         let storage_uses = storage_uses(layout, &storage)?;
+@@ -6380,6 +6403,7 @@ impl RenderCommandEncoder {
+                 blobs.push((stage, blob));
+             }
+         }
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_TABLES);
+         let command = binding::Command {
+             descriptor_bytes: &commands.descriptor_bytes,
+             descriptor_ranges: &commands.descriptor_ranges,
+@@ -6476,6 +6500,7 @@ impl RenderCommandEncoder {
+         }
+         let profile = device.compile_device().profile();
+         let selects = graphics.writes_viewport_index;
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_USES);
+         let mut fixed = self.draw_fixed(
+             graphics,
+             failing.as_ref(),
+@@ -6602,6 +6627,7 @@ impl RenderCommandEncoder {
+             sample_positions: &self.layout.sample_positions,
+         };
+         // The formats the draw binds, which a specialized notice names.
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_STATE);
+         let formats = |slot| tables.bound_format(slot);
+         device.degrade_half_texel_writes(&variant.pipeline().dependencies, Some(&formats));
+         device.degrade_bound_formats(&variant.pipeline().stages, Some(&formats));
+@@ -6634,6 +6660,7 @@ impl RenderCommandEncoder {
+         // replay, whose host step records now, nor for a draw that records nothing, nor in a pass
+         // of custom sample positions, whose instance binds its first draw's pipeline as it
+         // begins (`positioned`).
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_DEGRADE);
+         let compatible = Arc::clone(&instance.compatible);
+         // Nor while the encoder records an instance's draws again, whose instance a failed
+         // reroute drops (`render/reroute.rs`).
+@@ -6663,6 +6690,7 @@ impl RenderCommandEncoder {
+         if let DrawPipeline::Made(made) = &draw_pipeline {
+             variant.first_use(made, specialization, &formats);
+         }
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_PIPELINE);
+         let bound = {
+             let mut state = self.core.command_buffer().state();
+             let memo = Some(&mut self.bind_memo);
+@@ -6685,17 +6713,54 @@ impl RenderCommandEncoder {
+             true => std::slice::from_ref(&push),
+             false => &amplified[..],
+         };
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_BIND);
+         let objects = Arc::clone(variant.objects());
+         // Set 0 per draw; set 1 the device's (written below, once nothing refuses).
+         let mut writes = bound.writes;
+         let heap_writes: Vec<_> = writes.extract_if(.., |write| write.set > 0).collect();
+-        let set = objects.set_zero(&mut self.core.command_buffer().state().descriptors)?;
+-        // SAFETY: the set was just allocated and no command uses it yet; every buffer, view
+-        // and sampler written is live (the command buffer retains them below, and a refusal
+-        // leaves the set unused in its pool).
+-        unsafe { binding::write_sets(&device, set.as_slice(), &writes) }?;
++        // ios-on-pixel: a set 0 written as an earlier draw of the command buffer wrote one through
++        // the same layout is that draw's set (`sweet_drawstat::desc_reuse`): no set allocated
++        // or written, and none bound again where the last draw bound it. What it names stays
++        // live: the earlier draw's command buffer, this one, retains it until it completes.
++        let reuse = match crate::sweet_drawstat::desc_reuse() {
++            true => binding::sweet_set_key(objects.layout(), &writes),
++            false => None,
++        };
++        let set = match reuse {
++            None => {
++                let set = objects.set_zero(&mut self.core.command_buffer().state().descriptors)?;
++                // SAFETY: the set was just allocated and no command uses it yet; every buffer,
++                // view and sampler written is live (the command buffer retains them below, and a
++                // refusal leaves the set unused in its pool).
++                unsafe { binding::write_sets(&device, set.as_slice(), &writes) }?;
++                set
++            }
++            Some(key) => {
++                let mut state = self.core.command_buffer().state();
++                let arena = &mut state.descriptors;
++                match arena.sweet_memo.iter().rposition(|(kept, _)| *kept == key) {
++                    Some(at) => {
++                        crate::sweet_drawstat::count(crate::sweet_drawstat::C_SETS_REUSED);
++                        Some(arena.sweet_memo[at].1)
++                    }
++                    None => {
++                        let set = objects.set_zero(arena)?;
++                        // SAFETY: as above.
++                        unsafe { binding::write_sets(&device, set.as_slice(), &writes) }?;
++                        if let Some(made) = set {
++                            if arena.sweet_memo.len() >= crate::sweet_drawstat::MEMO_SETS {
++                                arena.sweet_memo.remove(0);
++                            }
++                            arena.sweet_memo.push((key, made));
++                        }
++                        set
++                    }
++                }
++            }
++        };
+         // The Vulkan draws: the binder's, the index bounds pass's two, or the index rewrite
+         // pass's one.
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_SETS);
+         let sized = device.shared().sized_index_bind;
+         let one = |draw| ([draw; 2], 1);
+         let (vk_draws, count) = match (&rewrite, &bounds, index, &mesh_work, commands.draw) {
+@@ -6848,6 +6913,7 @@ impl RenderCommandEncoder {
+         }
+         // The query that resumes the active one after a draw whose fragments Vulkan would count
+         // and Metal does not.
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_TRACK);
+         let counts_none = matches!(failing, Some(FailingDraw::Runs(_)));
+         let resumed = match counts_none && !empty && !culled {
+             true => self.visibility.continuation(&device)?,
+@@ -7023,6 +7089,7 @@ impl RenderCommandEncoder {
+         self.barrier_splits += usize::from(run_barrier_split);
+         self.run_barrier = false;
+         self.current.shadows.add(&draw_shadows, &uses);
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_PREP);
+         if !empty && !culled {
+             for source in index.into_iter().chain(indirect) {
+                 match (source.copy_steps(&mut self.core), before_instance) {
+@@ -7155,6 +7222,7 @@ impl RenderCommandEncoder {
+                 }
+             }
+             device.shared().counts.draw_states_recorded(states_recorded);
++            crate::sweet_drawstat::lap(crate::sweet_drawstat::D_RECORD);
+             if let Some((making, state, draws, query)) = split {
+                 // The record's times: the pipeline's, then those of the other `VkPipeline`s the
+                 // draw records, made at the draw, set once the making made it. Every copy of the
+@@ -7219,6 +7287,7 @@ impl RenderCommandEncoder {
+                 });
+             }
+         }
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_KEEP);
+         let padding = index.and_then(DrawSource::padding);
+         if let (Some(source), Some(positions)) = (index, padding) {
+             let (buffer, offset) = source.metal();
+@@ -7304,6 +7373,7 @@ impl RenderCommandEncoder {
+         if capture.is_some() {
+             self.capture_uses(uses);
+         }
++        crate::sweet_drawstat::lap(crate::sweet_drawstat::D_RETAIN);
+         Ok(())
+     }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/render/reroute.rs b/crates/metal2vulkan-runtime/src/render/reroute.rs
+index 7ea6871..2d9c3b2 100644
+--- a/crates/metal2vulkan-runtime/src/render/reroute.rs
++++ b/crates/metal2vulkan-runtime/src/render/reroute.rs
+@@ -285,6 +285,7 @@ impl RenderCommandEncoder {
+ 
+     /// The encoder's state a draw reads, as it stands.
+     fn held(&self) -> Held {
++        crate::sweet_drawstat::count(crate::sweet_drawstat::C_HELD_CLONES);
+         Held {
+             pipeline: self.pipeline.clone(),
+             state: self.state.clone(),
+diff --git a/crates/metal2vulkan-runtime/src/render_target.rs b/crates/metal2vulkan-runtime/src/render_target.rs
+index 0310edd..27f8c19 100644
+--- a/crates/metal2vulkan-runtime/src/render_target.rs
++++ b/crates/metal2vulkan-runtime/src/render_target.rs
+@@ -1240,6 +1240,7 @@ fn create(
+     // SAFETY: `info` and every array and structure it points at are live for the call; the
+     // device is Vulkan 1.2 or later (the compile layer's floor).
+     let raw = unsafe { crate::creation::render_pass2(device.shared().vk(), &info) }?;
++    crate::sweet_drawstat::count(crate::sweet_drawstat::C_RENDER_PASSES);
+     Ok(RenderPassObject {
+         device: device.clone(),
+         raw,
+@@ -1439,6 +1440,7 @@ fn made_framebuffer(
+     // layers the instance renders, inside the pass's (checked by the callers), at least `extent`
+     // large; a multiview pass's framebuffer has one layer, and each view holds every view.
+     let raw = unsafe { crate::creation::framebuffer(device.shared().vk(), &info) }?;
++    crate::sweet_drawstat::count(crate::sweet_drawstat::C_FRAMEBUFFERS);
+     Ok(FramebufferObject {
+         device: device.clone(),
+         raw,
+diff --git a/crates/metal2vulkan-runtime/src/sweet_drawstat.rs b/crates/metal2vulkan-runtime/src/sweet_drawstat.rs
+new file mode 100644
+index 0000000..4536b7d
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/sweet_drawstat.rs
+@@ -0,0 +1,169 @@
++//! ios-on-pixel: where a render encoder's CPU time goes, per step of its draws and of its end
++//! (env `SWEET_DRAWSTAT=1`, off by default), and the draw-overhead knobs (`SWEET_DESC_REUSE`).
++//!
++//! The steps are laps: [`start`] marks the thread's clock, each [`lap`] adds the time since the
++//! last mark to its step and marks again, so the steps of one draw add up to the draw less what
++//! lies between laps. [`Span`] times a whole call. The counts ([`count`]) are events with no time.
++//! The SweetMetal2 bridge reads [`snapshot`] for its telemetry (`T5` lines in the kernel's log).
++
++use std::cell::Cell;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::OnceLock;
++use std::time::Instant;
++
++// Laps of `RenderCommandEncoder::draw` and `draw_resident`, in order.
++pub const D_PRE: usize = 0;
++pub const D_CHECKS: usize = 1;
++pub const D_SETTINGS: usize = 2;
++pub const D_PASS_START: usize = 3;
++pub const D_SETTLE: usize = 4;
++pub const D_CHECKS2: usize = 5;
++pub const D_INSTANTIATE: usize = 6;
++pub const D_PASSES: usize = 7;
++pub const D_TABLES: usize = 8;
++pub const D_USES: usize = 9;
++pub const D_STATE: usize = 10;
++pub const D_DEGRADE: usize = 11;
++pub const D_PIPELINE: usize = 12;
++pub const D_BIND: usize = 13;
++pub const D_SETS: usize = 14;
++pub const D_TRACK: usize = 15;
++pub const D_PREP: usize = 16;
++pub const D_RECORD: usize = 17;
++pub const D_KEEP: usize = 18;
++pub const D_RETAIN: usize = 19;
++pub const D_POST: usize = 20;
++/// Whole `draw` calls (a span).
++pub const D_TOTAL: usize = 21;
++// Laps of a render encoder's end (`end_pass`, `end_encoding`).
++pub const E_PRE: usize = 22;
++pub const E_SETTLE: usize = 23;
++pub const E_PLAN: usize = 24;
++pub const E_OBJECTS: usize = 25;
++pub const E_PLAN2: usize = 26;
++pub const E_STEPS: usize = 27;
++pub const E_TAIL: usize = 28;
++pub const E_CORE: usize = 29;
++/// Whole render `end_encoding` calls (a span).
++pub const E_TOTAL: usize = 30;
++/// Whole `render_command_encoder` opens (a span).
++pub const O_TOTAL: usize = 31;
++// Counts.
++pub const C_RENDER_PASSES: usize = 32;
++pub const C_FRAMEBUFFERS: usize = 33;
++pub const C_SETS_ALLOCATED: usize = 34;
++pub const C_SETS_REUSED: usize = 35;
++pub const C_HELD_CLONES: usize = 36;
++pub const C_DESCRIPTOR_WRITES: usize = 37;
++pub const STEPS: usize = 38;
++
++/// Each step's short name, in the order of the constants above.
++pub const NAMES: [&str; STEPS] = [
++    "pre", "checks", "settings", "passstart", "settle", "checks2", "instantiate", "passes",
++    "tables", "uses", "state", "degrade", "pipeline", "bind", "sets", "track", "prep", "record",
++    "keep", "retain", "post", "DRAW", "e.pre", "e.settle", "e.plan", "e.objects", "e.plan2",
++    "e.steps", "e.tail", "e.core", "END", "OPEN", "#rp", "#fb", "#set", "#set-reused",
++    "#held", "#writes",
++];
++
++static NS: [AtomicU64; STEPS] = [const { AtomicU64::new(0) }; STEPS];
++static N: [AtomicU64; STEPS] = [const { AtomicU64::new(0) }; STEPS];
++
++thread_local! {
++    static MARK: Cell<Option<Instant>> = const { Cell::new(None) };
++}
++
++fn flag(name: &str, default: bool) -> bool {
++    std::env::var(name).map_or(default, |v| {
++        let v = v.trim();
++        match default {
++            true => v != "0",
++            false => !v.is_empty() && v != "0",
++        }
++    })
++}
++
++/// Whether the steps are timed (env `SWEET_DRAWSTAT`, off unless set and not `0`).
++#[inline]
++pub fn on() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| flag("SWEET_DRAWSTAT", false))
++}
++
++/// Whether a draw takes the set 0 of an earlier draw of its command buffer that wrote the same
++/// descriptors through the same pipeline layout, in place of a new set written again (env
++/// `SWEET_DESC_REUSE`, on unless `0`).
++#[inline]
++pub fn desc_reuse() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| flag("SWEET_DESC_REUSE", true))
++}
++
++/// Mark the thread's clock: the next [`lap`] times from here.
++#[inline]
++pub fn start() {
++    if on() {
++        MARK.with(|m| m.set(Some(Instant::now())));
++    }
++}
++
++/// Add the time since the thread's last mark to `step`, and mark again.
++#[inline]
++pub fn lap(step: usize) {
++    if !on() {
++        return;
++    }
++    let now = Instant::now();
++    if let Some(then) = MARK.with(|m| m.replace(Some(now))) {
++        NS[step].fetch_add(now.duration_since(then).as_nanos() as u64, Ordering::Relaxed);
++        N[step].fetch_add(1, Ordering::Relaxed);
++    }
++}
++
++/// One event of `step`.
++#[inline]
++pub fn count(step: usize) {
++    count_n(step, 1);
++}
++
++/// `n` events of `step`.
++#[inline]
++pub fn count_n(step: usize, n: u64) {
++    if on() {
++        N[step].fetch_add(n, Ordering::Relaxed);
++    }
++}
++
++/// A whole call's time, into `step` when it drops.
++pub struct Span(usize, Option<Instant>);
++
++impl Span {
++    #[inline]
++    pub fn new(step: usize) -> Span {
++        Span(step, on().then(Instant::now))
++    }
++}
++
++impl Drop for Span {
++    #[inline]
++    fn drop(&mut self) {
++        if let Some(then) = self.1 {
++            NS[self.0].fetch_add(then.elapsed().as_nanos() as u64, Ordering::Relaxed);
++            N[self.0].fetch_add(1, Ordering::Relaxed);
++        }
++    }
++}
++
++/// Each step's nanoseconds and count since the process started, as pairs, into `out` (at most
++/// `out.len() / 2` steps): the number of steps written.
++pub fn snapshot(out: &mut [u64]) -> usize {
++    let steps = (out.len() / 2).min(STEPS);
++    for i in 0..steps {
++        out[2 * i] = NS[i].load(Ordering::Relaxed);
++        out[2 * i + 1] = N[i].load(Ordering::Relaxed);
++    }
++    steps
++}
++
++/// The most sets a command buffer's arena remembers for reuse (`DescriptorArena::sweet_memo`).
++pub(crate) const MEMO_SETS: usize = 16;
