@@ -201,7 +201,7 @@ static void ev_cb(void *ctx, const struct sns_suid *suid, uint32_t msg_id, uint6
 			hexdump("sensd: physical config", p, n);
 		return;
 	}
-	if (msg_id >= 1024)
+	if (msg_id >= 1024 || (msg_id == SNS_MSG_PROX_EVENT && s->k->motion_type == MOTION_TYPE_PROX))
 		sample(c->e, s, msg_id, ts, p, n);
 	else
 		printf("sensd: %s: unhandled event %u (%zu bytes)\n", s->k->alias, msg_id, n);
