@@ -5,7 +5,7 @@ Only what the early boot path actually reads (see ios-sweet's NOTES.md); every
 MMIO address comes from the flame (Pixel 4, SM8150) live FDT. The kernel's
 built-in drivers still match the Redmi names (xiaomi,sweet, qcom,kryo470,
 sweet,display), so those stay next to the flame ones.
-Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--camera] [--flash] [--backlight]
+Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--camera] [--flash] [--backlight] [--gamut]
 """
 import hashlib, os, struct, sys
 
@@ -131,10 +131,11 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, camera=False, flash=False, backlight=False):
+def build(seed=None, qemu=False, highmem=False, camera=False, flash=False, backlight=False, gamut=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
     camera=True: /arm-io/isp (Camera.app on the home screen); flash=True: /product/camera flash
-    (the flashlight in Control Center). See CAMERA below."""
+    (the flashlight in Control Center). See CAMERA below.
+    gamut=True (--gamut, opt-in): /product artwork-display-gamut P3 -> sRGB (see below)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
@@ -303,6 +304,13 @@ def build(seed=None, qemu=False, highmem=False, camera=False, flash=False, backl
     ])
 
     product_props = d22ap_product()
+    # --gamut (from ios-topaz 3eacb48 / HackiOS 40e4ddc): the iPhone X says 'P3', so MobileGestalt answers
+    # HasExtendedColorDisplay and WebKit draws page tiles into 10-bit surfaces ('w30r', 'b3a8'); HackiOS's
+    # kernel lacked them (blank Safari). Opt-in here because kernel 0124 already provides them to WebContent
+    # (Safari works with Metal v2) and sRGB changes what every app is told about the display: try it only
+    # if Safari/Photos pages are blank again, or to drop the 0124 10-bit special case.
+    if gamut and product_props:
+        product_props = [(k, cstr('sRGB') if k == 'artwork-display-gamut' else v) for k, v in product_props]
     haptics = d22ap_product_child('haptics')
     product_children = [node('haptics', [ph()] + haptics)] if haptics else []
     if flash or camera:
@@ -329,7 +337,8 @@ def build(seed=None, qemu=False, highmem=False, camera=False, flash=False, backl
 
 if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 camera='--camera' in sys.argv, flash='--flash' in sys.argv, backlight='--backlight' in sys.argv)
+                 camera='--camera' in sys.argv, flash='--flash' in sys.argv, backlight='--backlight' in sys.argv,
+                 gamut='--gamut' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
