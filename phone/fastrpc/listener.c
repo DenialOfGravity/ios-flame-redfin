@@ -620,7 +620,7 @@ int run_fastrpc_listener(int fd,
 	uint32_t handle;
 	uint32_t rctx = 0;
 	uint32_t sc = REMOTE_SCALARS_MAKE(0, 0, 0);
-	uint32_t n_outbufs = 0;
+	uint32_t n_outbufs = 0, n_calls = 0, n_errors = 0;
 	int ret;
 
 	ret = adsp_listener_init2(fd);
@@ -641,6 +641,7 @@ int run_fastrpc_listener(int fd,
 		n_outbufs = 0;
 		if (ret == 1) {		/* a request we could not even read: answer it with an error */
 			result = AEE_EBADPARM;
+			n_errors++;
 			continue;
 		}
 		if (ret)
@@ -648,14 +649,20 @@ int run_fastrpc_listener(int fd,
 
 		vlog("request ctx %#x handle %u sc %#x (m%u %u/%u)", rctx, handle, sc, REMOTE_SCALARS_METHOD(sc),
 		     REMOTE_SCALARS_INBUFS(sc), REMOTE_SCALARS_OUTBUFS(sc));
+		if (++n_calls % 100 == 0)
+			flog("served %u calls (%u answered with an error); the last: handle %u method %u", n_calls, n_errors,
+			     handle, REMOTE_SCALARS_METHOD(sc));
 		if (invoke_requested_procedure(n_ifaces, ifaces,
 					       handle, sc, &result,
 					       decoded, &returned)) {
 			flog("request handle %u sc %#x: not served, answered %u", handle, sc, result);
 			returned = NULL;
 		} else if (result != 0) {
-			vlog("request handle %u sc %#x -> %u", handle, sc, result);
+			if (n_errors < 20 || flog_verbose)
+				flog("request handle %u sc %#x (m%u) -> error %u", handle, sc, REMOTE_SCALARS_METHOD(sc), result);
 		}
+		if (result != 0)
+			n_errors++;
 		if (result == 0 && returned != NULL)
 			n_outbufs = REMOTE_SCALARS_OUTBUFS(sc);
 		else if (returned != NULL) {

@@ -89,7 +89,7 @@ int main(int argc, char **argv)
 	struct frpc_mem mem;
 	struct stat st;
 	unsigned wait = 1;
-	int i, fd, ret, tries;
+	int i, fd, ret, tries, e;
 
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "-v"))
@@ -106,6 +106,7 @@ int main(int argc, char **argv)
 			usage();
 	}
 	signal(SIGPIPE, SIG_IGN);
+	frpc_boost_thread();	/* every call of the DSP's waits for us: run before SpringBoard's start-up storm */
 	flog("starting (pid %d): tree %s, device %s, INIT_MMAP method %d", (int)getpid(), root, device, frpc_mmap_method);
 	if (off()) {
 		flog("%s exists: not starting", OFF_FILE);
@@ -139,7 +140,8 @@ int main(int argc, char **argv)
 			break;
 		if (frpc_dead())
 			return EXIT_DSP_GONE;
-		if (ret == -1 && errno != ENOTCONN && errno != EAGAIN)
+		e = errno;	/* (off() below calls stat(), which sets errno: r24a lost 2.3 s in the slow back-off) */
+		if (ret == -1 && e != ENOTCONN && e != EAGAIN)
 			return EXIT_ERROR;
 		if (ret > 0 && tries >= 5) {
 			flog("the DSP refused INIT_ATTACH_SNS %d times (last %d, %s): giving up", tries + 1, ret,
@@ -148,7 +150,7 @@ int main(int argc, char **argv)
 		}
 		if (off())
 			return EXIT_OFF;
-		if (ret == -1 && errno == ENOTCONN && tries < 240) {
+		if (ret == -1 && e == ENOTCONN && tries < 240) {
 			/* the DSP is starting (adsp=2 starts it on our open): its sensors PD asks for files a few
 			 * seconds after the channel opens, so look every 250 ms for the first minute */
 			if (tries == 0)

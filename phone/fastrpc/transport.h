@@ -65,7 +65,8 @@ struct frpc_dev {
 int frpc_start(const struct frpc_dev *dev, const struct frpc_mem *mem);	/* starts the answer reader */
 void frpc_stop(void);
 int frpc_session_new(int32_t client);	/* a pseudo fd for fastrpc_ioctl(); its PD is set by INIT_ATTACH(_SNS) */
-int frpc_dead(void);			/* the DSP has gone (ECONNRESET) */
+int frpc_dead(void);
+void frpc_boost_thread(void);		/* this thread: USER_INTERACTIVE QoS (Darwin), the process at nice -20 */			/* the DSP has gone (ECONNRESET) */
 extern int frpc_mmap_method;		/* INIT_MMAP: 4 (Linux, default) or 2 (Android 64-bit) */
 
 /* The real device and memory: /dev/redwood-fastrpc (+ FASTRPC_ALLOC) and /dev/pmem. */
