@@ -96,6 +96,11 @@ NmbTexture *nmb_texture_new_on_surface(NmbBuffer *, const struct NmbTextureDescr
 bool nmb_texture_set_converted_generation(const NmbTexture *, uint64_t generation);
 /* SweetMetal2: shadow copy counts since start (patch 0104): copies, texel bytes, repacked, YCbCr copies skipped, layouts refused. */
 bool nmb_sweet_shadow_counts(uint64_t out[5]);
+/* SweetMetal2: render encoder step times (patch 0106, env SWEET_DRAWSTAT=1): (ns, count) pairs since start into out[2*capacity];
+   returns the steps written. nmb_sweet_drawstat_name: step index's name (static), or NULL. */
+bool nmb_sweet_drawstat_on(void);
+size_t nmb_sweet_drawstat(uint64_t *out, size_t capacity);
+const char *nmb_sweet_drawstat_name(size_t index);
 NmbTexture *nmb_texture_new_linear(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, uint64_t bytes_per_image);
 /* whole: a view of every level and slice as format; else levels and slices are {start, count} and kind the view's texture type. */
 NmbTexture *nmb_texture_new_view(NmbTexture *, uint64_t format, uint64_t kind, const uint64_t levels[2], const uint64_t slices[2], bool whole);

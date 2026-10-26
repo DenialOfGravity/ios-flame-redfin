@@ -789,6 +789,34 @@ pub extern "C" fn nmb_sweet_shadow_counts(out: *mut u64) -> bool {
     true
 }
 
+/// SweetMetal2: whether the runtime times its render encoders' steps (bridge patch 0106, env `SWEET_DRAWSTAT=1`).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_sweet_drawstat_on() -> bool {
+    metal2vulkan_runtime::sweet_drawstat::on()
+}
+
+/// SweetMetal2: the runtime's render encoder step times and counts since the process started (bridge patch 0106), as
+/// (nanoseconds, count) pairs into the caller's `2 * capacity` words: the number of steps written.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_sweet_drawstat(out: *mut u64, capacity: usize) -> usize {
+    if out.is_null() || capacity == 0 {
+        return 0;
+    }
+    // SAFETY: the caller passes `2 * capacity` writable words.
+    let out = unsafe { std::slice::from_raw_parts_mut(out, 2 * capacity) };
+    metal2vulkan_runtime::sweet_drawstat::snapshot(out)
+}
+
+/// SweetMetal2: the name of render encoder step `index` (a static NUL-terminated string), or null past the last.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_sweet_drawstat_name(index: usize) -> *const c_char {
+    static NAMES: std::sync::OnceLock<Vec<std::ffi::CString>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        metal2vulkan_runtime::sweet_drawstat::NAMES.iter().map(|n| std::ffi::CString::new(*n).unwrap_or_default()).collect()
+    });
+    names.get(index).map_or(std::ptr::null(), |n| n.as_ptr())
+}
+
 /// `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:` (Apple SPI).
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_texture_new_linear(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64, bytes_per_row: u64,
