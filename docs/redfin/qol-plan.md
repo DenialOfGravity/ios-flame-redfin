@@ -152,7 +152,7 @@ PRI_TDM_TX_0 (mics) runs 8 x 32 at 12.288 MHz, mic 1 at slot offset 0 (2nd/3rd: 
 only for >1 port or PRI_TDM_TX, so the speaker sends no group message.
 
 Boot-args (all default off/old behaviour; all need `adsp=1`): `sound=1..4`, `sndsecs=S`, `sndlpi=0`, `sndbelow=E`
-(1/8 dB under Android's level, default 160; sound=3 never louder), `sndgain=E` (sound=4 guard gain, default 96),
+(1/8 dB under Android's level, default 160; hard cap 48 = 6 dB under, 0957), `sndgain=E` (sound=4 guard gain, default 96),
 `sndgpio=1` (allow the PMIC GPIO writes: PM8150L GPIO11 + PM7250B GPIO11 amp resets, PM7250B GPIO6 mic LDO), `mic=1`, `micgain=N`.
 Poke (`a`): `a status`, `a tone [MS]`, `a gain DB`, `a off`, `a on`, `a mic SECS`.
 

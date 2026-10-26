@@ -1,0 +1,92 @@
+From efa1ca78ec3ed90e37f790b49fc9a6acb9b6a815 Mon Sep 17 00:00:00 2001
+From: WS-A <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 11:49:03 +0100
+Subject: [PATCH] redfin: poke a gain N takes N or -N dB under Android's level;
+ hard cap 6 dB under (ASP bypass, no protection firmware)
+
+---
+ bsd/dev/sweet_sound.c | 37 ++++++++++++++++++++++++++-----------
+ 1 file changed, 26 insertions(+), 11 deletions(-)
+
+diff --git a/bsd/dev/sweet_sound.c b/bsd/dev/sweet_sound.c
+index 5116bf7..485e537 100644
+--- a/bsd/dev/sweet_sound.c
++++ b/bsd/dev/sweet_sound.c
+@@ -42,8 +42,8 @@
+  *            OFF; the path then stays up feeding silence (poke `a tone MS` plays the tone again)
+  *   sound=3  ... and the amplifiers (0953, bsd/dev/sweet_cs35l41.c): probed and configured, powered
+  *            down; HackiOS's speaker guard (bsd/dev/sweet_guard.c) armed at their level first; the tone
+- *            AUDIBLE for a second at sndbelow (default and loudest for sound=3: 20 dB under Android's
+- *            level); the amplifiers run only while something plays and stop after 2 s of silence
++ *            AUDIBLE for a second at sndbelow (default 20 dB under Android's level; never louder than 6 dB
++ *            under); the amplifiers run only while something plays and stop after 2 s of silence
+  *   sound=4  what iOS plays (0954): /dev/redwood-audio (bsd/dev/sweet_audio.c) into a ring, the ring into
+  *            the periods (silence when iOS writes nothing; the stream never stops), through the guard
+  *            (with sndgain eighths of a dB of gain first, default and most 96: iOS keeps its peaks that
+@@ -53,7 +53,7 @@
+  * sndbelow=E (eighths of a dB under Android's level, sound>=3; default 160), sndgain=E (sound=4),
+  * sndgpio=1 (sweet_cs35l41.c: let the kernel drive the amplifiers' PMIC reset lines).
+  * poke (bsd/dev/sweet_poke.c, letter a): `a status`, `a tone [MS]` (default 1000, at most 5000),
+- * `a gain DB` (the amplifiers DB dB under Android's level; sound=3 no louder than 20, sound=4 than 0), `a off` (the
++ * `a gain N` (the amplifiers N dB under Android's level, `-N` accepted too; hard cap 6 dB under), `a off` (the
+  * amplifiers off and kept off), `a on` (allowed again), `a mic SECS` (0955, bsd/dev/sweet_mic.c: record SECS
+  * seconds from the microphone, mic=1, and print the `files read /dev/pmem PA LEN` that fetches it).
+  *
+@@ -90,7 +90,7 @@ static LCK_MTX_DECLARE(sound_lock, &sound_lock_group);  /* the path being set up
+ 
+ static uint32_t level, hold_secs = 3, use_lpi = 1;
+ static uint32_t below = 160;            /* the amplifiers' level, eighths of a dB under Android's (sndbelow) */
+-static uint32_t below_min = 160;        /* the loudest allowed: sound=3 20 dB under, sound=4 Android's own */
++static uint32_t below_min = 48;         /* the loudest ever allowed: 6 dB under Android's level (hard cap) */
+ static uint32_t guard_gain = REDWOOD_GUARD_MAX_GAIN;    /* sndgain, sound=4 */
+ 
+ /* bsd/dev/sweet_cs35l41.c */
+@@ -1243,7 +1243,7 @@ redwood_sound_dsp_up(void)
+ 	if (level > 4) {
+ 		level = 4;
+ 	}
+-	below_min = level >= 4 ? 0 : 160;
++	below_min = 48;         /* hard cap: 6 dB under Android's level (ASP bypass, no Halo protection firmware) */
+ 	PE_parse_boot_argn("sndgain", &guard_gain, sizeof(guard_gain));
+ 	guard_gain = guard_gain > REDWOOD_GUARD_MAX_GAIN ? REDWOOD_GUARD_MAX_GAIN : guard_gain;
+ 	PE_parse_boot_argn("sndsecs", &hold_secs, sizeof(hold_secs));
+@@ -1349,15 +1349,30 @@ sweet_sound_cmd(const char *s, const char *end)
+ 		return 0;
+ 	}
+ 	if (is(w, len, "gain")) {
+-		uint32_t dbs = number(&s, end, ~0u);
+-		char t[16];
++		uint32_t dbs;
++		char t[16], t2[16];
+ 
+-		if (dbs == ~0u || level < 3) {
+-			SAY("gain: `a gain DB' (DB dB under Android's level) needs sound>=3\n");
++		/* `a gain 10' and `a gain -10' both mean 10 dB under Android's level (0 = Android's own) */
++		while (s < end && (*s == ' ' || *s == '\t')) {
++			s++;
++		}
++		if (s < end && *s == '-') {
++			s++;
++		}
++		dbs = number(&s, end, ~0u);
++		if (dbs == ~0u) {
++			SAY("gain: `a gain N' (N dB under Android's level, 0..102) wants a number\n");
++			return -1;
++		}
++		if (level < 3 || !path_up) {
++			SAY("gain: the amplifiers are not in use (sound=%u, path %s)\n", level, path_up ? "up" : "down");
+ 			return -1;
+ 		}
+-		below_wanted = dbs * 8 < below_min ? below_min : dbs * 8 > 816 ? 816 : dbs * 8;
+-		SAY("gain: the amplifiers %s dB under Android's level from now on\n", db(t, below_wanted));
++		dbs = dbs > 102 ? 102 : dbs;
++		below_wanted = dbs * 8 < below_min ? below_min : dbs * 8;
++		SAY("gain: the amplifiers %s dB under Android's level from now on%s%s dB)\n", db(t, below_wanted),
++		    dbs * 8 < below_min ? " (CAPPED: ASP bypass without protection firmware, no louder than " : "",
++		    dbs * 8 < below_min ? db(t2, below_min) : "");
+ 		return 0;
+ 	}
+ 	if (is(w, len, "off")) {
+-- 
+2.43.0
+
