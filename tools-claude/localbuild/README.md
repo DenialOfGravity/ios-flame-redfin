@@ -64,10 +64,30 @@ to the repo afterwards.
   Mesa is a blobless checkout reset and re-patched each run; the meson build dir is kept (rebuilt from scratch when
   `bin/*` changes).
 
+## The r29a boot failure (2026-10-26) and its fix
+
+r29a (local kernel ws-q-bt 9f1431a) reset before USB networking; the CI kernel of the same commit (r29b) booted.
+Cause: `libfirehose_kernel.a`, which xnu.sh compiles itself (not through xnu's makefiles), was built with no `-mcpu`.
+For an `arm64-apple-macos` triple upstream clang then picks target-cpu **apple-m1**, and the backend used an M1-only
+instruction in `firehose_buffer_stream_chunk_install`: `stlur` (FEAT_LRCPC2, Armv8.4). SM7250's Cortex-A76/A55
+cores don't have it -> undefined instruction on the first kernel os_log. The kernel's own objects were fine: xnu's
+makefiles pass SWEET's `-mcpu=cortex-a55+crypto` (patch 0095), so they are A55 code (`ldapr`, `udot`: both legal
+on A76/A55; `xpaclri` is a hint = NOP).
+
+Fix (xnu.sh): `-mcpu=generic` in the clang shim's flags (xnu's own `-mcpu` comes later and wins); a full rebuild
+whenever the compiler or these flags change (`COMPILER.txt` in the output records them); and an **ISA check** after
+the link that fails the build on any Armv8.4+ instruction (stlur/ldapur, FlagM, SHA3/SM, BF16, I8MM, SB, LS64...).
+Output folders from before the fix carry `DO-NOT-BOOT.txt` instead of `COMPILER.txt`.
+
+Checked equal to the CI kernel of 8d69d7e: kalloc_type views (all 1564 signatures, flags, sizes), the startup entry
+table (4160 entries, same order), `__mod_init_func`/`__mod_term_func` lists, section set (minus `__ctf`). Remaining
+differences: compiler codegen (no hot/cold splitting, more NEON, no `___chkstk_darwin`), alignment padding in
+`.s` files is zero bytes instead of NOPs (only after unconditional branches/ret, never executed), symbol addresses.
+
 ## Known differences from CI output (checked on redfin-qol a2c5c3b)
 
 - Kernel: same segment layout and entry; ~3.5% less code (upstream clang: no hot/cold splitting, no
   `___chkstk_darwin` stack probes, different inlining). **Symbol addresses differ from the CI kernel of the same
-  commit**, so use the build's `KLOG_PA.txt`. Not yet boot-tested as of 2026-10-26.
+  commit**, so use the build's `KLOG_PA.txt`. First boot (r29a) failed: see above; fixed builds not boot-tested yet.
 - Userland: LC_BUILD_VERSION sdk 27.0 (CI 17.5), minos 16.0 as CI; ~15% smaller; upstream clang's ObjC ARC calls
   (no `objc_release_x19` helpers); code signature identifier = file name for plain binaries (CI: `name-<hash>`).

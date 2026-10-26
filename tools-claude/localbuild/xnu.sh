@@ -24,7 +24,11 @@ mkdir -p "$X" "$FR"
 export LB_MODE=xnu LB_TC=$TC UNIXNU_SDKROOT=$FR UNIXNU_SDK_VERSION=14.0 PLATFORM=MacOSX
 export CROSS_CLANG=$XNU_CLANG DARWIN_TRIPLE=arm64-apple-macos14.0
 # + diagnostics that clang 21+ makes errors by default and Xcode 15's clang (CI) only warns about
-export CROSS_EXTRA_FLAGS="-mllvm -disable-atexit-based-global-dtor-lowering -Wno-error=incompatible-pointer-types"
+# -mcpu=generic: for an arm64-apple-macos triple upstream clang picks target-cpu apple-m1 whatever -march says, and the
+# backend then uses M1-only instructions (RCPC2 stlur in firehose_buffer_stream_chunk_install, ldapr, udot, xpaclri):
+# SM7250's Cortex-A76/A55 have no LRCPC2 -> undefined instruction early in boot (r29a, 2026-10-26). Apple clang (CI)
+# gives the plain armv8.2-a+crypto of SWEET's MACHINE_FLAGS; generic + -march is the same feature set.
+export CROSS_EXTRA_FLAGS="-mcpu=generic -mllvm -disable-atexit-based-global-dtor-lowering -Wno-error=incompatible-pointer-types"
 export PATH="$TC/xnu-bin:$CLT/bin:$XCT/bin:$PATH"
 ln -sf "$(command -v python3)" "$TC/xnu-bin/python"	# tools/lldbmacros scripts run `env python`
 
@@ -126,6 +130,15 @@ rsync -rlc --no-times --delete --exclude .git --itemize-changes "$PREP/xnu/" "$X
 if [ "${XNU_CLEAN:-0}" = 1 ]; then rm -rf "$X/build"; fi
 rm -rf "$X"/build/xnu.obj/kernel.* "$FR"/System/Library/Kernels/kernel.*
 
+# Compiler or flags changed since the last build -> make does not notice: rebuild every object and the two libraries
+FLAGS_ID="$(sha1sum < "$XNU_CLANG" | cut -c1-12) $DARWIN_TRIPLE $CROSS_EXTRA_FLAGS $(sha1sum < "$CLT/bin/clang" | cut -c1-12)"
+if [ "$(cat "$X/build/.lb-flags" 2>/dev/null)" != "$FLAGS_ID" ]; then
+	say "compiler/flags changed: full rebuild ($FLAGS_ID)"
+	rm -rf "$X/build/xnu.obj" "$X/build/xnu.sym" "$X/build/firehose" "$SRC/linux-cc_kext/obj" \
+		"$FR/usr/local/lib/kernel/libfirehose_kernel.a" "$FR/usr/local/lib/kernel/libcc_kext.a"
+	mkdir -p "$X/build"; echo "$FLAGS_ID" > "$X/build/.lb-flags"
+fi
+
 # ---- 2. fakeroot (once) ----
 MEM=$(( $(getconf _PHYS_PAGES) * $(getconf PAGE_SIZE) ))
 LINUX_ARGS=(XCRUN="$TC/xnu-bin/xcrun" PLUTIL="$TC/xnu-bin/plutil" HOST_CODESIGN="$TC/xnu-bin/codesign"
@@ -210,6 +223,12 @@ if [ $rc = 0 ] && [ -f "$K" ]; then
 	gzip -9 -c "$K" > "$OUT/kernel.development.sweet.gz"
 	(cd "$(dirname "$K")" && sha256sum kernel.development.sweet) > "$OUT/SHA256SUMS"
 	rm -f "$OUT/errors.txt" "$OUT/errors-context.txt"
+	echo "$FLAGS_ID" > "$OUT/COMPILER.txt"
+	# ISA check: SM7250 is Cortex-A76/A55 (armv8.2 + RCpc + DotProd). Instructions of later architectures = no boot.
+	bad=$(llvm-objdump -d --no-show-raw-insn --no-leading-addr "$K" | awk -F'\t' '/^ +\t/{split($2,m,".");print m[1]}' |
+		grep -c -x -E 'stlur[bh]?|ldapur(s?[bhw])?|cfinv|setf8|setf16|rmif|axflag|xaflag|frint(32|64)[xz]|sb|bcax|eor3|rax1|xar|sha512(h|h2|su0|su1)|sm3.*|sm4.*|bfcvtn?2?|bfdot|bfmmla|bfmlal[bt]|[su]s?mmla|usdot|sudot|ld64b|st64bv?0?')
+	if [ "$bad" != 0 ]; then say "ISA CHECK FAILED: $bad instructions newer than armv8.2+RCpc+DotProd (see COMPILER.txt)"; exit 1; fi
+	say "ISA check ok (no armv8.4+ instructions)"
 	# the agent's `klog PA` for this kernel: PA = VA(_sweet_log_total) - 0xfffffe0006000000 + 0x100000000
 	va=$(llvm-nm "$K" | awk '$3=="_sweet_log_total"{print $1}')
 	[ -n "$va" ] && python3 -c "import sys;print('klog PA 0x%x  (_sweet_log_total 0x%s)'%(int(sys.argv[1],16)-0xfffffe0006000000+0x100000000,sys.argv[1]))" "$va" | tee "$OUT/KLOG_PA.txt"
