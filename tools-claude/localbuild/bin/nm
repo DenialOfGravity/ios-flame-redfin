@@ -1,0 +1,3 @@
+#!/bin/sh
+# Apple nm for Mach-O on Linux: LLVM's
+exec llvm-nm "$@"

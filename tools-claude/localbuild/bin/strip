@@ -1,0 +1,3 @@
+#!/bin/sh
+# Apple strip for Mach-O on Linux: LLVM's
+exec llvm-strip "$@"

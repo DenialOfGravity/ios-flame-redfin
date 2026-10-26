@@ -1,0 +1,3 @@
+#!/bin/sh
+# Apple otool for Mach-O on Linux: LLVM's
+exec llvm-otool "$@"

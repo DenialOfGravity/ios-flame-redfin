@@ -1,0 +1,7 @@
+#!/bin/bash
+# The distribution's clang++ for Darwin targets, linking with xtool's ld64.lld (LLD 21 patched: it reads the iOS 27 SDK's
+# arm64e.x1 .tbd stubs and links arm64 against them; Ubuntu's ld64.lld cannot). The caller gives -target/-isysroot.
+# Linker flags only when linking: meson's checks use -Werror=unused-command-line-argument.
+LDDIR=${XTOOL_LD_DIR:-$HOME/.swiftpm/swift-sdks/darwin.artifactbundle/toolset/bin/orig}
+for a in "$@"; do case $a in -c|-E|-S|-M|-MM|-fsyntax-only|-emit-llvm|--version|-print-*|-v) exec clang++ "$@";; esac; done
+exec clang++ -fuse-ld=lld -B"$LDDIR/" "$@"

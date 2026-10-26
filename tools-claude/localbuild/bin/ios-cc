@@ -1,0 +1,5 @@
+#!/bin/sh
+# What CI's ios-cc is (clang -arch arm64 -isysroot <iPhoneOS SDK> -miphoneos-version-min=16.0), for Linux.
+LB=${LB_TC:-$HOME/redfin-build/toolchain}/lb-bin
+SDK=${IOS_SDK:-$("$LB/xcrun" --sdk iphoneos --show-sdk-path)}
+exec "$LB/ios-clang" -target arm64-apple-ios16.0 -isysroot "$SDK" "$@"

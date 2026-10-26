@@ -36,6 +36,15 @@
 #   reload                     start this script again (after Claude updated it)
 #   ssh-key                    make the key for the phone (~/.ssh/redfin-claude) and put its public half in agent/stage
 #   phone CMD                  run CMD on the phone over SSH (dropbear on 192.168.7.2): the phone only, never this PC
+#
+# Local builds (tools-claude/localbuild, in WSL as this user, never root; output and logs in builds/):
+#   build-env                  what the build host has (cores, memory, disk, toolchain, SDKs)
+#   build-apt                  sudo apt-get install the fixed package list below (the only step that uses sudo)
+#   build-setup STEP           background: lb.sh setup STEP  (toolchain into ~/redfin-build/toolchain)
+#   build TARGET [REF]         background: lb.sh build TARGET REF  (TARGET shim|userland|metal2|xnu, REF a branch
+#                              or commit of DenialOfGravity/ios-flame-redfin, default redfin-qol)
+#   build-jobs                 running local builds;   build-kill  stops them all
+#   build-diag                 run localbuild/diag.sh (a throwaway inspection script Claude writes; foreground)
 set -uo pipefail
 P=/mnt/c/ClaudeProjects/iOS_Pixel5
 REPO=${REPO:-$HOME/ios-redfin}
@@ -125,6 +134,18 @@ net() {
 # fastboot.exe / adb.exe (Windows) take Windows paths
 winpath() { case $1 in *.exe) wslpath -w "$2";; *) echo "$2";; esac; }
 
+LB=$P/tools-claude/localbuild/lb.sh
+BUILD_APT="build-essential pkg-config ninja-build python3 python3-dev python3-venv python3-pip xz-utils libssl-dev
+ zlib1g-dev libbsd-dev uuid-dev llvm llvm-dev libclang-dev clang lld device-tree-compiler git patch flex bison bzip2
+ cpio rsync curl wget ca-certificates tcsh unifdef cmake mtools lz4 m4 jq file libxml2-dev glslang-tools meson
+ libplist-dev libplist-2.0-dev ldid rustup ruby"
+lb_bg() {	# KIND ARGS...: start lb.sh detached, log in builds/logs
+	mkdir -p "$P/builds/logs"
+	local log=$P/builds/logs/$1-$(echo "${*:2}" | tr ' /' '__')-$(date +%Y%m%d-%H%M%S).log
+	setsid nohup bash "$LB" "$@" </dev/null >"$log" 2>&1 &
+	echo "started pid $! -> ${log#$P/}"
+}
+
 ok_name() { [[ $1 =~ ^r[0-9a-z]+(-[0-9a-z]+)*$ ]]; }
 
 run() {	# one request line
@@ -209,6 +230,26 @@ run() {	# one request line
 	phone)
 		timeout 300 ssh -i ~/.ssh/redfin-claude -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
 			-o ConnectTimeout=10 -o LogLevel=ERROR root@192.168.7.2 "$rest";;
+	build-env) timeout 120 bash "$LB" env;;
+	build-diag) timeout 170 bash "$LB" diag;;	# runs localbuild/diag.sh: one-off checks while porting a build
+	build-apt)
+		sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update -q 2>&1 | tail -2
+		local have=() p; for p in $BUILD_APT; do
+			if apt-cache show "$p" >/dev/null 2>&1; then have+=("$p"); else echo "(no package $p here)"; fi
+		done
+		timeout 1500 sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "${have[@]}" 2>&1 | tail -8;;
+	build-setup)
+		[[ $rest =~ ^[a-z0-9-]+$ ]] || { echo "bad step"; return 1; }
+		lb_bg setup "$rest";;
+	build)
+		read -r tgt ref <<<"$rest"
+		[[ $tgt =~ ^(shim|userland|metal2|xnu)$ ]] || { echo "TARGET: shim userland metal2 xnu"; return 1; }
+		[[ ${ref:-x} =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad ref"; return 1; }
+		lb_bg build "$tgt" ${ref:-redfin-qol};;
+	build-jobs) pgrep -af "localbuild/lb.sh" || echo "no local builds running";;
+	build-kill)	# lb.sh runs under setsid: its pid is the process group of the whole build
+		local k=0; for pid in $(pgrep -f "localbuild/lb.sh"); do kill -TERM -- "-$pid" 2>/dev/null && k=1; done
+		[ $k = 1 ] && echo killed || echo "nothing running";;
 	*) echo "unknown action: $act"; return 1;;
 	esac
 }

@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""codesign(1) for Linux: ad hoc signatures with ldid (-Cadhoc, like `codesign -s -`). Handles what the build scripts use:
+   codesign -f -s - [--entitlements FILE] PATH...
+PATH a Mach-O file, a bundle directory, or the main executable of a bundle (Info.plist beside it): bundles are signed
+as bundles, as Apple's codesign does (identifier = CFBundleIdentifier, _CodeSignature/CodeResources).
+Anything else (-d, --verify, -v) succeeds without doing anything."""
+import os, plistlib, shutil, subprocess, sys
+
+args, ents, paths, sign = sys.argv[1:], None, [], False
+i = 0
+while i < len(args):
+    a = args[i]
+    if a in ('-s', '--sign'):
+        sign = True; i += 2; continue
+    if a in ('--entitlements', '-i', '--identifier', '--prefix', '-r', '--requirements', '-o', '--options'):
+        if a == '--entitlements': ents = args[i + 1]
+        i += 2; continue
+    if a.startswith('--entitlements='):
+        ents = a.split('=', 1)[1]
+    elif not a.startswith('-'):
+        paths.append(a)
+    i += 1
+if not sign:
+    sys.exit(0)
+ldid = shutil.which('ldid') or os.path.expanduser('~/redfin-build/toolchain/bin/ldid')
+S = '-S' + (ents or '')
+
+def bundle_of(p):
+    """(bundle dir, Info.plist dict) when p is a bundle or a bundle's main executable"""
+    d = p if os.path.isdir(p) else os.path.dirname(os.path.abspath(p))
+    for info in (os.path.join(d, 'Info.plist'), os.path.join(d, 'Contents', 'Info.plist')):
+        if os.path.exists(info):
+            pl = plistlib.load(open(info, 'rb'))
+            if os.path.isdir(p) or pl.get('CFBundleExecutable') == os.path.basename(p):
+                return d, pl
+    return None, None
+
+rc = 0
+for p in paths:
+    b, pl = bundle_of(p)
+    if b:
+        ident = pl.get('CFBundleIdentifier', os.path.basename(b))
+        r = subprocess.run([ldid, '-Cadhoc', S, '-I' + ident, b])
+        if r.returncode != 0:
+            exe = os.path.join(b, pl.get('CFBundleExecutable', ''))
+            print(f'codesign(ldid): bundle signing failed, signing {exe} only', file=sys.stderr)
+            r = subprocess.run([ldid, '-Cadhoc', S, '-I' + ident, exe])
+    else:
+        r = subprocess.run([ldid, '-Cadhoc', S, '-I' + os.path.basename(p), p])
+    rc |= r.returncode
+sys.exit(rc)
