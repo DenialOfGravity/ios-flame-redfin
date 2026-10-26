@@ -14,7 +14,8 @@
  * Options: --dump (every QMI message in hex), --secs N (stop after N s), --no-motion (print only),
  *          --no-orient (no type-10 orientation samples from accel), --no-follow (daemon: stream everything),
  *          --node N --port P (skip the service lookup), --qrtr-fd FD (an inherited fd instead of the device),
- *          --orient-inject [TYPE] (hand each orientation sensd derives to backboardd, below).
+ *          --orient-inject [TYPE] (hand each orientation sensd derives to backboardd, below; froze the phone
+ *          once: test --orient-set first).
  *   sensd --orient-set N [TYPE]  set the device orientation once and hold it for --secs (default 30) s
  *
  * Orientation injection: on iPhones backboardd's BKOrientationManager takes the device orientation from CoreMotion
@@ -33,6 +34,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
+#include <pthread.h>
 #include "rqrtr.h"
 #include "sensor.h"
 
@@ -92,10 +94,50 @@ static void bks_orient(int o, int type)
 	fflush(stdout);
 }
 
+/*
+ * --orient-inject froze the phone once (r26, cause unknown: a lock/unlock storm making SpringBoard rotate over and
+ * over is the suspect). So the BKS calls run on their own thread, never from the sample path, and only for a
+ * changed orientation that has been stable for 1 s, at least 3 s after the previous one, at most 10 per run.
+ */
+static pthread_mutex_t inject_mu = PTHREAD_MUTEX_INITIALIZER;
+static int inject_want, inject_done;
+static long inject_want_ms;
+
+static void *inject_thread(void *arg)
+{
+	(void)arg;
+	long last = -100000;
+	int count = 0;
+	for (;;) {
+		struct timespec ts = { 0, 200000000 };
+		nanosleep(&ts, NULL);
+		pthread_mutex_lock(&inject_mu);
+		int want = inject_want;
+		long since = inject_want_ms;
+		pthread_mutex_unlock(&inject_mu);
+		long now = sensor_now_ms();
+		if (!want || want == inject_done || now - since < 1000 || now - last < 3000)
+			continue;
+		if (count++ >= 10) {
+			printf("sensd: --orient-inject: 10 orientation changes reached, stopping injection\n");
+			return NULL;
+		}
+		bks_orient(want, opt.inject_type);
+		inject_done = want;
+		last = now;
+	}
+}
+
 static void out(void *ctx, struct sensor *s, const struct motion_sample *m)
 {
-	if (opt.inject && m->type == MOTION_TYPE_ORIENTATION)
-		bks_orient((int)m->v[0], opt.inject_type);
+	if (opt.inject && m->type == MOTION_TYPE_ORIENTATION) {
+		pthread_mutex_lock(&inject_mu);
+		if ((int)m->v[0] != inject_want) {
+			inject_want = (int)m->v[0];
+			inject_want_ms = sensor_now_ms();
+		}
+		pthread_mutex_unlock(&inject_mu);
+	}
 	(void)ctx;
 	if (opt.motion_fd >= 0) {
 		if (write(opt.motion_fd, m, sizeof(*m)) == (ssize_t)sizeof(*m))
@@ -479,6 +521,13 @@ int main(int argc, char **argv)
 	}
 	if (opt.inject && bks_load())
 		opt.inject = 0;
+	if (opt.inject) {
+		pthread_t t;
+		if (pthread_create(&t, NULL, inject_thread, NULL) == 0)
+			pthread_detach(t);
+		else
+			opt.inject = 0;
+	}
 	env.verbose = opt.verbose;
 	env.orient = opt.orient;
 	if (motion && strcmp(mode, "list"))

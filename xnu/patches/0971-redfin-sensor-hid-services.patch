@@ -8,7 +8,9 @@ IOHIDEventService stand-ins next to SweetHIDButtons/SweetHIDTouch, one per
 sensor, with the usage pairs of an iPhone's SPU sensor services (Apple vendor
 page 0xff00: accel 3, ALS 4, prox 8, gyro 9, compass 0xa, verified against
 IOHIDFamily-1035.70.7's AppleHIDUsageTables.h, now filled in here; pressure on
-the HID sensor page, orientation on AppleVendorMotion 0xff0c/6). Every open,
+the HID sensor page, orientation on the HID sensor page's device orientation
+0x20/0x8a with DeviceOrientationUsage 0x64 + UIDeviceOrientation: what
+locationd's CLOrientationNotifier matches and accepts). Every open,
 user client (pid, name), copyEvent type and setProperties key/value is logged
 ("SWEET MOTION:"); ReportInterval is kept and published. copyEvent returns the
 last sample. Samples arrive through sweet_hid_sensor() (SweetMotion.h) and are
@@ -17,15 +19,15 @@ sweetmotion=MASK (default 0x77 = all but prox, 0x7f = all, 0 = none): with
 the prox service registered backboardd crash-looped (-[NSNull applyUIMode:]);
 prox now publishes DisplayIntegrated/ProtectedAccess/SensorPropertySupported
 and answers copyEvent with "far". Every user-space property read of a sensor service
-is logged (key, present/ABSENT, pid). The ALS (and with bit 0x200 every
-service) answers copyEvent with a neutral sample until a real one exists; the
+is logged (key, present/ABSENT, pid). The ALS, prox and orientation (and with bit
+0x200 every service) answer copyEvent with a neutral sample until a real one exists; the
 ALS posts 100 lux 500 ms after an open. Transport is "Sweet" (0x100: "SPU").
 ---
  iokit/Kernel/arm/hid/AppleHIDUsageTables.h |  91 +++
- iokit/Kernel/arm/hid/SweetHID.cpp          | 767 ++++++++++++++++++++-
+ iokit/Kernel/arm/hid/SweetHID.cpp          | 770 ++++++++++++++++++++-
  iokit/Kernel/arm/hid/SweetMotion.h         |  54 ++
  iokit/KernelConfigTables.cpp               |  35 +
- 4 files changed, 946 insertions(+), 1 deletion(-)
+ 4 files changed, 949 insertions(+), 1 deletion(-)
  create mode 100644 iokit/Kernel/arm/hid/SweetMotion.h
 
 diff --git a/iokit/Kernel/arm/hid/AppleHIDUsageTables.h b/iokit/Kernel/arm/hid/AppleHIDUsageTables.h
@@ -128,7 +130,7 @@ index c00cbd4..8b0b292 100644
 +
 +#endif /* _APPLEHIDUSAGETABLES_H */
 diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
-index 6d98131..5b50a92 100644
+index 6d98131..57fb51a 100644
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp
 @@ -13,7 +13,9 @@
@@ -142,7 +144,7 @@ index 6d98131..5b50a92 100644
   * every N seconds, to test the event path without input hardware.
   */
  #include <IOKit/IOLib.h>
-@@ -601,3 +603,766 @@ sweet_hid_touch(int finger, int down, int x, int y)
+@@ -601,3 +603,769 @@ sweet_hid_touch(int finger, int down, int x, int y)
  		gSweetTouch->touch(finger, down != 0, x, y);
  	}
  }
@@ -151,7 +153,7 @@ index 6d98131..5b50a92 100644
 + * redfin 0971: motion and environment sensors. One IOHIDEventService per sensor with the usage pair an
 + * iPhone's SPU sensor service publishes (Apple vendor page 0xff00: accel 3, ALS 4, prox 8, gyro 9, compass
 + * 0xa, from IOHIDFamily-1035.70.7's AppleHIDUsageTables.h; pressure: HID sensor page atmospheric pressure;
-+ * orientation: AppleVendorMotion 0xff0c usage 6). Samples come from /dev/redwood-motion (sensd, 0972) or
++ * orientation: HID sensor page device orientation 0x20/0x8a, what locationd matches). Samples come from /dev/redwood-motion (sensd, 0972) or
 + * `poke m fake` through sweet_hid_sensor() (SweetMotion.h). Every open, user client, copyEvent type and
 + * setProperties key/value is logged ("SWEET MOTION:"): that is how we learn what backboardd, locationd and
 + * CoreBrightness ask for; user-space property reads of the services are logged too. Boot-arg sweetmotion=MASK
@@ -188,7 +190,8 @@ index 6d98131..5b50a92 100644
 +	{ "prox",        kHIDPage_AppleVendor,       kHIDUsage_AppleVendor_ProximitySensor,    14, 0x13, 100000, kIOHIDEventTypeProximity },
 +	{ "compass",     kHIDPage_AppleVendor,       kHIDUsage_AppleVendor_Compass,            21, 0x14, 20000,  kIOHIDEventTypeCompass },
 +	{ "pressure",    kHIDPage_Sensor,            kHIDUsage_Snsr_Environmental_AtmosphericPressure, 31, 0x15, 200000, kIOHIDEventTypeAtmosphericPressure },
-+	{ "orientation", kHIDPage_AppleVendorMotion, kHIDUsage_AppleVendorMotion_Orientation,  10, 0x16, 0,      kIOHIDEventTypeOrientation },
++	/* locationd's CLOrientationNotifier (the AOP path) matches {0x20, 0x8a} and takes DeviceOrientationUsage 0x64-0x6a */
++	{ "orientation", kHIDPage_Sensor,            kHIDUsage_Snsr_Orientation_DeviceOrientation, 10, 0x16, 0,  kIOHIDEventTypeOrientation },
 +};
 +
 +/* Runtime knobs (`poke m knob NAME VALUE`); the defaults are guesses the phone has to confirm. */
@@ -196,11 +199,12 @@ index 6d98131..5b50a92 100644
 +	int accsign;            /* -1: iOS g = -(Android m/s²) / 9.80665 (CoreMotion: face up reads z = -1 g) */
 +	int gyrodeg;            /* 1: gyro events in deg/s (HID sensor page units) instead of rad/s */
 +	uint32_t proxmask;      /* detection mask of a "near" proximity event */
-+	int orientbase;         /* orientation event usage = orientbase + UIDeviceOrientation */
++	int orientbase;         /* orientation event usage = orientbase + UIDeviceOrientation: 100, i.e. 0x65 portrait ..
++	                         * 0x6a face down (0x64 ambiguous), the range locationd's CLOrientationNotifier accepts */
 +	int orientauto;         /* derive orientation events from accel samples in the kernel */
 +	uint32_t logmax;        /* setProperties/copyEvent log lines per service */
 +	uint32_t every;         /* log every Nth posted sample (the first 3 always) */
-+} gSweetKnobs = { -1, 0, kIOHIDProximityDetectionLargeBodyContact | kIOHIDProximityDetectionReceiver, 0, 0, 64, 1000 };
++} gSweetKnobs = { -1, 0, kIOHIDProximityDetectionLargeBodyContact | kIOHIDProximityDetectionReceiver, 100, 0, 64, 1000 };
 +
 +/*
 + * Default: everything but prox (0x77). On the phone (2026-10-26) backboardd crash-loops with
@@ -557,6 +561,7 @@ index 6d98131..5b50a92 100644
 +	}
 +	IOLockUnlock(fLock);
 +	if (!event && (sensorIndex() == SWEET_SENSOR_ALS || sensorIndex() == SWEET_SENSOR_PROX ||
++	    sensorIndex() == SWEET_SENSOR_ORIENT ||
 +	    (sweet_motion_mask() & SWEET_MOTION_INITIAL_EVENTS)) &&
 +	    (type == gSweetSensorInfo[sensorIndex()].eventType || type == kIOHIDEventTypeNULL)) {
 +		event = initialEvent();         /* a nil copyEvent may be the NSNull */
