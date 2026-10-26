@@ -1,0 +1,31 @@
+5725-/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_btbridge.c:107:7: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+5726-                int e = uiomove((caddr_t)(r->buf + off), (int)run, uio);
+5727-                    ^
+5728:/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_btbridge.c:177:16: error: use of undeclared identifier 'IO_NDELAY'
+5729-                if (ioflag & IO_NDELAY) {
+5730-                             ^
+5731-/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_btbridge.c:181:7: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+5732-                int e = msleep(r, &br_lock, PZERO | PCATCH, "btbrrd", NULL);
+5733-                    ^
+5734-/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_btbridge.c:174:15: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+5735-        struct ring *r = m == MINOR_HOST ? &br.b2h : &br.h2b;
+5736-                     ^
+5737-/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_btbridge.c:213:6: warning: declaration shadows a variable in the global scope [-Wshadow]
+5738-        int total = 0;
+5739-            ^
+5740-/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/sys/vmmeter.h:139:25: note: previous declaration is here
+5741-extern struct   vmtotal total;
+5742-                        ^
+5743:/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_btbridge.c:216:17: error: use of undeclared identifier 'IO_NDELAY'
+5744-                        if (ioflag & IO_NDELAY) {
+5745-                                     ^
+5746-/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_btbridge.c:220:8: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+5747-                        int e = msleep(r, &br_lock, PZERO | PCATCH, "btbrwr", NULL);
+5748-                            ^
+5749-/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_btbridge.c:226:7: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+5750-                int n = uio_to_ring(r, uio);
+5751-                    ^
+5752-/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_btbridge.c:211:15: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]
+5753-        struct ring *r = m == MINOR_HOST ? &br.h2b : &br.b2h;
+5754-                     ^
+5755-/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_btbridge.c:251:15: warning: mixing declarations and code is incompatible with standards before C99 [-Wdeclaration-after-statement]

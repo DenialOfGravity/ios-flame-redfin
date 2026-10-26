@@ -1,0 +1,11 @@
+5728:/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_btbridge.c:177:16: error: use of undeclared identifier 'IO_NDELAY'
+5743:/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/bsd/dev/sweet_btbridge.c:216:17: error: use of undeclared identifier 'IO_NDELAY'
+5761:12 warnings and 2 errors generated.
+5762:make[7]: *** [sweet_btbridge.o] Error 1
+43171:make[6]: *** [build_all] Error 2
+43172:make[5]: *** [do_all] Error 2
+43174:make[4]: *** [build_all] Error 2
+43175:make[3]: *** [build_all_recurse_into_conf] Error 2
+43177:make[2]: *** [build_all_recurse_into_bsd] Error 2
+43179:make[1]: *** [build_all_bootstrap_DEVELOPMENT^ARM64^SWEET] Error 2
+43181:make: *** [install] Error 2
