@@ -776,6 +776,19 @@ pub extern "C" fn nmb_texture_set_converted_generation(texture: *const NmbTextur
     guard(false, || Ok(get(texture)?.0.set_converted_generation(generation)))
 }
 
+/// SweetMetal2: the runtime's shadow copy counts since the process started (bridge patch 0104), into the caller's five words:
+/// copies recorded, their texel bytes, of them repacked through the kernel, YCbCr copies in skipped, linear layouts refused.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_sweet_shadow_counts(out: *mut u64) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let counts = metal2vulkan_runtime::sweet_counts::snapshot();
+    // SAFETY: the caller passes five writable words.
+    unsafe { std::ptr::copy_nonoverlapping(counts.as_ptr(), out, counts.len()) };
+    true
+}
+
 /// `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:` (Apple SPI).
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_texture_new_linear(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64, bytes_per_row: u64,

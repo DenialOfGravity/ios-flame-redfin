@@ -47,6 +47,7 @@ static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBigg
 // Where the time goes on the CPU side of the bridge: pipeline, library and function creation (count, total and slowest, in microseconds), and the
 // last commits with what each held and how long the GPU took (commit to completion).
 static uint64_t nowUs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;}
+static void noteShadowCopies();   // WS-U: backboardd's 5 s "J copies" line (defined by the telemetry table)
 struct Timed {std::atomic<uint64_t> count{0},total{0},slowest{0};
  void add(uint64_t began){const uint64_t took=nowUs()-began;count++;total+=took;uint64_t seen=slowest.load();while(took>seen && !slowest.compare_exchange_weak(seen,took)){}}};
 static Timed gTimePipeline,gTimeLibrary,gTimeFunction,gTimeEncodeToCommit;
@@ -1112,6 +1113,7 @@ static void noteDeviceLost(const char *why) {
  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
  self.committed=YES;
  self.committedUs=nowUs();
+ noteShadowCopies();
  {
   std::lock_guard<std::mutex> lock(gCommitLock);
   // Assign once under the same lock as publication. A concurrent commit cannot reuse this index.
@@ -2252,6 +2254,24 @@ extern "C" size_t native_bridge_metal_benchmark(id device,const char *metallib,u
  }
  return at;
 }
+// WS-U (bridge patch 0104): the runtime's shadow copies (a texture whose rows Turnip refused as a linear layout is an image of its
+// own the encoders copy into and back; rows not 64-byte multiples now go through the rotation kernel, one blit instead of one per
+// row on the A6xx; SWEET_SHADOW_REPACK=0 restores the old copies). Every 5 s, from a commit, backboardd logs the 5 s deltas:
+// "J copies: N done (B bytes) N skipped, refusals N, repacked N".
+static void noteShadowCopies() {
+ static const bool on=!strcmp(getprogname(),"backboardd");
+ if(!on)return;
+ static std::atomic<uint64_t> nextUs{0};
+ const uint64_t t=nowUs();uint64_t due=nextUs.load();
+ if(t<due || !nextUs.compare_exchange_strong(due,t+5000000))return;
+ uint64_t c[5]={};
+ if(!nmb_sweet_shadow_counts(c))return;
+ static uint64_t last[5]={};
+ if(due)sm2_logs([NSString stringWithFormat:@"native-metal: J copies: %llu done (%llu bytes) %llu skipped, refusals %llu, repacked %llu",
+     (unsigned long long)(c[0]-last[0]),(unsigned long long)(c[1]-last[1]),(unsigned long long)(c[3]-last[3]),(unsigned long long)(c[4]-last[4]),
+     (unsigned long long)(c[2]-last[2])].UTF8String);
+ memcpy(last,c,sizeof last);
+}
 // The telemetry table the plugin streams to the kernel's log: newline-separated rows of at most 90 characters.
 extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  size_t at=0;out[0]=0;
@@ -2280,6 +2300,8 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("J surface cleans skipped (seed)=%llu invalidates=%llu%s",(unsigned long long)gSurfaceCleanSkips.load(),
   (unsigned long long)gSurfaceInvalidates.load(),flushAll()?" (SWEET_FLUSH=all)":"");
  row("J ycbcr %s fills=%llu skips=%llu",ycbcrOnGPU()?"gpu":"cpu",(unsigned long long)gYCbCrFills.load(),(unsigned long long)gYCbCrSkips.load());
+ {uint64_t c[5]={};if(nmb_sweet_shadow_counts(c))row("J copies: %llu done (%llu bytes) %llu skipped, refusals %llu, repacked %llu",(unsigned long long)c[0],
+   (unsigned long long)c[1],(unsigned long long)c[3],(unsigned long long)c[4],(unsigned long long)c[2]);}
  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
  // its shader cache: where the driver's compile time goes.
  uint64_t work[10]={};
