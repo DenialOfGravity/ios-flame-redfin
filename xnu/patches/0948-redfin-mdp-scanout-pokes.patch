@@ -1,0 +1,663 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Tue, 27 Oct 2026 12:00:00 +0100
+Subject: [PATCH] 0948 redfin: display-engine dump and scanout test pokes (p mdp
+ dump|smmu|test|scale|restore)
+
+Steps (a)-(c) of docs/redfin/scanout-plan.md, inert unless poked:
+p mdp dump logs the MDP blocks ABL set up (top, CTL0-3, VIG0/1 with their
+QSEED3LITE scalers, DMA0-2, LM0/1, PP0/1, DSC0/1, INTF1); p mdp smmu [walk]
+reads the apps SMMU match registers and context bank for the MDP streams
+(0xb40/0x402); p mdp test points VIG0/VIG1 at a test pattern at 0xa1400000
+in the splash region; p mdp scale shows a 1125x2436 pattern (4608-byte rows)
+through both scalers (bilinear, overlapping 563-column crops, right pipe at
+phase 0.5). Both save every pipe register first, stop presents and 0905's
+flips, and put everything back after SECS (default 10) or at p mdp restore.
+
+---
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index e89bda0..acbcd9c 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -549,6 +549,7 @@ static uint32_t back_fence;             /* latest present queued into the back b
+ static uint64_t flip_abs;               /* when the last flip was flushed */
+ static uint64_t stat_flips;
+ static uint32_t stat_flip_late;         /* flips taken as latched by time, not by CTL0's flush bits */
++static int mdp_owned;                   /* 0948: the poke p mdp test/scale owns VIG0/VIG1 (sweet_gpu_mdp_own) */
+ 
+ static bool
+ fb_flip_on(void)
+@@ -583,6 +584,9 @@ flip_latched_locked(void)
+ static void
+ flip_to_locked(uint32_t buf)
+ {
++	if (mdp_owned) {
++		return;         /* 0948: the pipes show a test pattern; p mdp restore puts this buffer back */
++	}
+ 	uint64_t from = A6_FB_PA + scan_buf * A6_FB_BUF_OFF, to = A6_FB_PA + buf * A6_FB_BUF_OFF;
+ 	for (uint32_t p = 0; p < 2; p++) {
+ 		uint32_t a = a6_rd(SSPP_VIG(p) + SSPP_SRC0_ADDR);
+@@ -699,6 +703,19 @@ sweet_mdp_wr(uint32_t off, uint32_t v)
+ 	}
+ }
+ 
++/*
++ * 0948: the poke p mdp test/scale (SweetFramebuffer.cpp) takes VIG0/VIG1 over: no flip touches them until it gives
++ * them back. Under sweet_gpu_lock, so a flip in progress finishes first.
++ */
++void sweet_gpu_mdp_own(int on);
++void
++sweet_gpu_mdp_own(int on)
++{
++	lck_mtx_lock(&sweet_gpu_lock);
++	mdp_owned = on;
++	lck_mtx_unlock(&sweet_gpu_lock);
++}
++
+ /* ---- surfaces ---- */
+ 
+ static int present_wait_locked(uint32_t k, const char *why);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a90fefb..379559c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -54,6 +54,7 @@ bool sweet_gpu_present_poll(void);      /* 0943: a present's blit still out (pol
+ void sweet_gpu_present_landed(uint64_t *sum_abs, uint64_t *n);
+ uint32_t sweet_mdp_rd(uint32_t off);    /* 0943: MDP registers, offset from 0x0ae00000 */
+ void sweet_mdp_wr(uint32_t off, uint32_t v);
++void sweet_gpu_mdp_own(int on);         /* 0948: p mdp test/scale owns the pipes */
+ int sweet_gpu_cpu_target(uint64_t *pa);         /* 0946 (sweetfbx & 8) */
+ void sweet_gpu_cpu_flip(void);
+ void sweet_gpu_present_tag(uint64_t swap_abs);
+@@ -202,6 +203,7 @@ public:
+ 	void          statShown(uint64_t swapAbs);
+ 	void          statLine(uint64_t now);
+ 	void          fbCmd(const char *s, const char *end);
++	void          mdpCmd(const char *s, const char *end);    /* 0948: p mdp ... */
+ 	/* 0946 */
+ 	uint64_t      fPresentingAbs;         /* SwapEnd of the frame being presented */
+ 	uint64_t      fStVisAbs, fStCpuAbs;   /* SwapEnd -> panel-visible, CPU copy time (fLock) */
+@@ -1159,11 +1161,557 @@ AppleCLCD::setHz(uint32_t hz, bool tc)
+ 	return true;
+ }
+ 
++/*
++ * ---- 0948: direct-scanout experiments, steps (a)-(c) of docs/redfin/scanout-plan.md; inert unless poked ----
++ *
++ *   p mdp dump          log the display engine as ABL left it (and as we changed it): MDSS/MDP top, CTL0-3, VIG0/1
++ *                       with their QSEED3LITE scalers, DMA0-2, LM0/1, PP0/1, DSC0/1, INTF1 (non-zero words only)
++ *   p mdp smmu [walk]   the apps SMMU's match registers that take the MDP streams (lito DT smmu_sde_unsec
++ *                       <&apps_smmu 0xb40 0x402>, sec 0xb41), their S2CR, CBAR and context bank; walk: also the bank's
++ *                       stage-1 tables for IOVA 0xa0000000 (reads table pages: only once SCTLR.M = 1 was seen)
++ *   p mdp test [SECS]   VIG0/VIG1 on a test pattern at 0xa1400000 (splash memory above 0905's two panel buffers),
++ *                       the current geometry, no scaler; put back after SECS (default 10, 0 = at p mdp restore)
++ *   p mdp scale [SECS]  a 1125x2436 pattern (4608-byte rows, like CA's surfaces) through both scalers to 2 x 540x2340:
++ *                       overlapping source crops (0 and 562, 563 wide), the right pipe's initial phase 0.5
++ *   p mdp restore       every pipe register written goes back, one CTL0 flush, presents resume
++ *
++ * Registers only inside the MDP's 2 MB window (sweet_mdp_rd/wr); the SMMU through its own 4 KB pages. While a test
++ * owns the pipes, presents are skipped (present()) and 0905's flips leave the pipes alone (sweet_gpu_mdp_own).
++ */
++#define MDP_CTL(n)              (0x2000u + 0x200u * (n))
++#define MDP_VIG(n)              (0x5000u + 0x2000u * (n))
++#define MDP_DMA(n)              (0x25000u + 0x2000u * (n))
++#define MDP_LM(n)               (0x45000u + 0x1000u * (n))
++#define MDP_PP(n)               (0x71000u + 0x800u * (n))
++#define MDP_DSC(n)              (0x81000u + 0x400u * (n))
++#define MDP_CTL_FLUSH           0x018u
++#define MDP_FLUSH_VIG01         0x3u
++#define SSPP_SRC_SIZE           0x000u
++#define SSPP_SRC_IMG            0x004u
++#define SSPP_SRC_XY             0x008u
++#define SSPP_OUT_SIZE           0x00cu
++#define SSPP_OUT_XY             0x010u
++#define SSPP_SRC0               0x014u
++#define SSPP_YSTRIDE0           0x024u
++#define SSPP_FORMAT             0x030u  /* bit 8: alpha (SRCC3_EN) */
++#define SSPP_PE(c, r)           (0x100u + 0x10u * (c) + 4u * (r))       /* pixel extension C0/C1C2/C3: LR, TB, REQ */
++#define QSEED                   0xa00u  /* lito DT qcom,sde-vig-qseed-off, "qseedv3lite" */
++#define QS_VERSION              (QSEED + 0x00)
++#define QS_OP_MODE              (QSEED + 0x04)
++#define QS_STEP_Y_H             (QSEED + 0x10)
++#define QS_STEP_Y_V             (QSEED + 0x14)
++#define QS_STEP_UV_H            (QSEED + 0x18)
++#define QS_STEP_UV_V            (QSEED + 0x1c)
++#define QS_PRELOAD              (QSEED + 0x20)
++#define QS_SRC_SIZE             (QSEED + 0x40)
++#define QS_SRC_SIZE_UV          (QSEED + 0x44)
++#define QS_DST_SIZE             (QSEED + 0x48)
++#define QS_INIT_Y_H             (QSEED + 0x90)
++#define QS_INIT_Y_V             (QSEED + 0x94)
++#define QS_INIT_UV_H            (QSEED + 0x98)
++#define QS_INIT_UV_V            (QSEED + 0x9c)
++#define SWEET_SPLASH_PA         0xa0000000ULL   /* redfin cont_splash_region */
++#define SWEET_SPLASH_LEN        0x2300000ULL
++#define SWEET_MDP_TEST_PA       0xa1400000ULL   /* above A6_FB_SIZE (0905's buffers), below the backlight packet */
++#define SWEET_MDP_TEST_LEN      0xab8000ULL     /* 4608 x 2436 in 16 KB pages: ends 0xa1eb8000 < 0xa2200000 */
++#define SWEET_MDP_SURF_STRIDE   4608u
++#define SWEET_SMMU_PA           0x15000000ULL
++#define SWEET_MDP_SID           0xb40u
++#define SWEET_MDP_SID_MASK      0x402u
++
++static const uint16_t sweet_mdp_regs[] = {
++	SSPP_SRC_SIZE, SSPP_SRC_IMG, SSPP_SRC_XY, SSPP_OUT_SIZE, SSPP_OUT_XY, SSPP_SRC0, SSPP_YSTRIDE0,
++	SSPP_PE(0, 0), SSPP_PE(0, 1), SSPP_PE(0, 2), SSPP_PE(1, 0), SSPP_PE(1, 1), SSPP_PE(1, 2),
++	SSPP_PE(2, 0), SSPP_PE(2, 1), SSPP_PE(2, 2),
++	QS_OP_MODE, QS_STEP_Y_H, QS_STEP_Y_V, QS_STEP_UV_H, QS_STEP_UV_V, QS_PRELOAD, QS_SRC_SIZE, QS_SRC_SIZE_UV,
++	QS_DST_SIZE, QS_INIT_Y_H, QS_INIT_Y_V, QS_INIT_UV_H, QS_INIT_UV_V,
++};
++#define SWEET_MDP_NREGS         (sizeof(sweet_mdp_regs) / sizeof(sweet_mdp_regs[0]))
++enum { MR_SRC_SIZE, MR_SRC_IMG, MR_SRC_XY, MR_OUT_SIZE, MR_OUT_XY, MR_SRC0, MR_YSTRIDE0 };
++
++static struct {
++	IOLock             *lock;
++	IOTimerEventSource *timer;
++	bool                active;         /* the pipes are ours; old[] holds what goes back */
++	uint32_t            old[2][SWEET_MDP_NREGS];
++	vm_offset_t         smmu_va[6];
++	uint64_t            smmu_pa[6];
++} sweet_mdp;
++static volatile bool sweet_mdp_busy;    /* present() skips frames */
++
++/* Non-zero words of one block, eight to a line. */
++static void
++sweet_mdp_block(const char *name, uint32_t base, uint32_t len)
++{
++	char line[200];
++	int n = snprintf(line, sizeof(line), "SWEET MDP: %s +%05x:", name, base), k = 0, lines = 0;
++	for (uint32_t o = 0; o < len; o += 4) {
++		uint32_t v = sweet_mdp_rd(base + o);
++		if (v == 0) {
++			continue;
++		}
++		n += snprintf(line + n, sizeof(line) - (size_t)n, " %x=%x", o, v);
++		if (++k == 8) {
++			IOLog("%s\n", line);
++			lines++;
++			n = snprintf(line, sizeof(line), "SWEET MDP: %s  ", name);
++			k = 0;
++		}
++	}
++	if (k != 0 || lines == 0) {
++		IOLog("%s%s\n", line, k == 0 ? " (all zero)" : "");
++	}
++}
++
++static void
++sweet_mdp_dump(void)
++{
++	IOLog("SWEET MDP: dump: mdss %08x intf1 frames %u ctl0 flush %x\n", sweet_mdp_rd(0),
++	    sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT), sweet_mdp_rd(MDP_CTL(0) + MDP_CTL_FLUSH));
++	sweet_mdp_block("mdss", 0, 0x60);
++	sweet_mdp_block("top", 0x1000, 0x494);
++	for (uint32_t c = 0; c < 4; c++) {
++		uint32_t b = MDP_CTL(c);
++		IOLog("SWEET MDP: ctl%u: layer %x %x %x %x top %x flush %x dsc %x intf %x\n", c, sweet_mdp_rd(b),
++		    sweet_mdp_rd(b + 4), sweet_mdp_rd(b + 8), sweet_mdp_rd(b + 0xc), sweet_mdp_rd(b + 0x14),
++		    sweet_mdp_rd(b + MDP_CTL_FLUSH), sweet_mdp_rd(b + 0xe8), sweet_mdp_rd(b + 0xf4));
++	}
++	sweet_mdp_block("ctl0", MDP_CTL(0), 0x1e4);
++	sweet_mdp_block("vig0", MDP_VIG(0), 0x1f8);
++	sweet_mdp_block("vig0.qseed", MDP_VIG(0) + QSEED, 0xa0);
++	sweet_mdp_block("vig1", MDP_VIG(1), 0x1f8);
++	sweet_mdp_block("vig1.qseed", MDP_VIG(1) + QSEED, 0xa0);
++	for (uint32_t d = 0; d < 3; d++) {
++		uint32_t b = MDP_DMA(d);
++		IOLog("SWEET MDP: dma%u: size %x xy %x out %x addr %x stride %x fmt %x\n", d, sweet_mdp_rd(b + SSPP_SRC_SIZE),
++		    sweet_mdp_rd(b + SSPP_SRC_XY), sweet_mdp_rd(b + SSPP_OUT_SIZE), sweet_mdp_rd(b + SSPP_SRC0),
++		    sweet_mdp_rd(b + SSPP_YSTRIDE0), sweet_mdp_rd(b + SSPP_FORMAT));
++	}
++	sweet_mdp_block("lm0", MDP_LM(0), 0x320);
++	sweet_mdp_block("lm1", MDP_LM(1), 0x320);
++	sweet_mdp_block("pp0", MDP_PP(0), 0xd4);
++	sweet_mdp_block("pp1", MDP_PP(1), 0xd4);
++	sweet_mdp_block("dsc0", MDP_DSC(0), 0x140);
++	sweet_mdp_block("dsc1", MDP_DSC(1), 0x140);
++	sweet_mdp_block("intf1", SWEET_INTF1, 0x2b8);
++}
++
++/* ---- the apps SMMU (read only), one 4 KB device page per register page used ---- */
++
++static volatile uint32_t *
++sweet_smmu_reg(uint64_t pa)
++{
++	uint64_t page = pa & ~0xfffULL;
++	for (uint32_t i = 0; i < 6; i++) {
++		if (sweet_mdp.smmu_va[i] == 0) {
++			sweet_mdp.smmu_va[i] = ml_io_map((vm_offset_t)page, 0x1000);
++			sweet_mdp.smmu_pa[i] = page;
++		}
++		if (sweet_mdp.smmu_va[i] != 0 && sweet_mdp.smmu_pa[i] == page) {
++			return (volatile uint32_t *)(sweet_mdp.smmu_va[i] + (pa & 0xfff));
++		}
++	}
++	return NULL;
++}
++
++static uint32_t
++sweet_smmu_rd(uint64_t pa)
++{
++	volatile uint32_t *r = sweet_smmu_reg(pa);
++	uint32_t v = r != NULL ? *r : 0xdeadbeefu;
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++/* One 64-bit descriptor of a table page (mapped uncached for the read, then dropped). */
++static bool
++sweet_smmu_desc(uint64_t pa, uint64_t *out)
++{
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa & ~0xfffULL, 0x1000, kIODirectionIn);
++	IOMemoryMap *map = md != NULL ? md->map(kIOMapInhibitCache) : NULL;
++	OSSafeReleaseNULL(md);
++	if (map == NULL) {
++		return false;
++	}
++	*out = *(volatile uint64_t *)(map->getVirtualAddress() + (pa & 0xff8));
++	map->release();
++	return true;
++}
++
++static void
++sweet_smmu_walk(uint64_t cb, uint64_t iova)
++{
++	uint32_t tcr = sweet_smmu_rd(cb + 0x30), t0sz = tcr & 0x3f;
++	uint64_t table = ((uint64_t)sweet_smmu_rd(cb + 0x24) << 32 | sweet_smmu_rd(cb + 0x20)) & 0x0000fffffffff000ULL;
++	if (((tcr >> 14) & 3) != 0 || t0sz < 16 || t0sz > 39) {
++		IOLog("SWEET MDP: smmu walk: TCR %#x not a 4 KB-granule stage 1 handled here\n", tcr);
++		return;
++	}
++	for (uint32_t level = t0sz >= 34 ? 2 : t0sz >= 25 ? 1 : 0; level <= 3; level++) {
++		uint32_t shift = 39 - 9 * level;
++		uint64_t d = 0, at = table + 8 * ((iova >> shift) & 0x1ff);
++		if (!sweet_smmu_desc(at, &d)) {
++			IOLog("SWEET MDP: smmu walk: table page %#llx not mappable\n", at);
++			return;
++		}
++		IOLog("SWEET MDP: smmu walk %#llx L%u [%#llx] = %#llx\n", iova, level, at, d);
++		if (!(d & 1) || level == 3 || !(d & 2)) {
++			return;         /* invalid, page or block */
++		}
++		table = d & 0x0000fffffffff000ULL;
++	}
++}
++
++static void
++sweet_mdp_smmu(bool walk)
++{
++	uint64_t g0 = SWEET_SMMU_PA;
++	uint32_t id0 = sweet_smmu_rd(g0 + 0x20), id1 = sweet_smmu_rd(g0 + 0x24);
++	uint32_t nsmr = id0 & 0xff, ncb = id1 & 0xff, psize = (id1 >> 31) ? 0x10000 : 0x1000;
++	uint32_t npage = 1u << (((id1 >> 28) & 7) + 1), valid = 0, hits = 0;
++	IOLog("SWEET MDP: smmu: cr0 %x idr0 %x idr1 %x: %u SMRs, %u banks, page %#x, banks at +%#x\n",
++	    sweet_smmu_rd(g0), id0, id1, nsmr, ncb, psize, npage * psize);
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		uint32_t smr = sweet_smmu_rd(g0 + 0x800 + 4 * i);
++		if (!(smr >> 31)) {
++			continue;
++		}
++		valid++;
++		uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
++		if (((id ^ SWEET_MDP_SID) & ~(mask | SWEET_MDP_SID_MASK) & 0x7ffe) != 0) {
++			continue;       /* takes none of 0xb40/0xb41/0xb42/0xf40.. */
++		}
++		hits++;
++		uint32_t s2cr = sweet_smmu_rd(g0 + 0xc00 + 4 * i), type = (s2cr >> 16) & 3, cb = s2cr & 0xff;
++		IOLog("SWEET MDP: smmu: SMR%u %#x (id %#x mask %#x) S2CR %#x (%s, bank %u)\n", i, smr, id, mask, s2cr,
++		    type == 0 ? "translate" : type == 1 ? "bypass" : "fault", cb);
++		if (type != 0 || cb >= ncb) {
++			continue;
++		}
++		uint64_t b = g0 + (uint64_t)(npage + cb) * psize;
++		uint32_t sctlr = sweet_smmu_rd(b);
++		IOLog("SWEET MDP: smmu: bank %u CBAR %#x CBA2R %#x SCTLR %#x (M %u) TCR %#x TCR2 %#x TTBR0 %08x%08x MAIR0 %#x "
++		    "FSR %#x FAR %08x%08x\n", cb, sweet_smmu_rd(g0 + psize + 4 * cb), sweet_smmu_rd(g0 + psize + 0x800 + 4 * cb),
++		    sctlr, sctlr & 1, sweet_smmu_rd(b + 0x30), sweet_smmu_rd(b + 0x10), sweet_smmu_rd(b + 0x24),
++		    sweet_smmu_rd(b + 0x20), sweet_smmu_rd(b + 0x38), sweet_smmu_rd(b + 0x58), sweet_smmu_rd(b + 0x64),
++		    sweet_smmu_rd(b + 0x60));
++		if (walk && (sctlr & 1)) {
++			sweet_smmu_walk(b, SWEET_SPLASH_PA);
++		}
++	}
++	IOLog("SWEET MDP: smmu: %u valid SMRs, %u take MDP streams\n", valid, hits);
++}
++
++/* ---- steps (b) and (c): the pipes on a test pattern, everything written put back ---- */
++
++/* A w x h pattern at SWEET_MDP_TEST_PA: white border, red block top left, colour bars above, a 64 px grid below,
++ * a red 2 px line left and right of column seam (where the two pipes meet). Through a write-combined mapping. */
++static bool
++sweet_mdp_pattern(uint32_t w, uint32_t h, uint32_t stride, uint32_t seam)
++{
++	static const uint32_t bars[8] = {
++		0xffffffff, 0xffffff00, 0xff00ffff, 0xff00ff00, 0xffff00ff, 0xffff0000, 0xff0000ff, 0xff000000,
++	};
++	uint64_t len = round_page((uint64_t)stride * h);
++	if (w == 0 || h == 0 || stride < w * 4 || len > SWEET_MDP_TEST_LEN) {
++		return false;
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(SWEET_MDP_TEST_PA, len, kIODirectionInOut);
++	IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++	OSSafeReleaseNULL(md);
++	if (map == NULL) {
++		return false;
++	}
++	uint8_t *base = (uint8_t *)map->getVirtualAddress();
++	for (uint32_t y = 0; y < h; y++) {
++		uint32_t *row = (uint32_t *)(base + (uint64_t)y * stride);
++		for (uint32_t x = 0; x < w; x++) {
++			uint32_t c;
++			if (x < 4 || x + 4 >= w || y < 4 || y + 4 >= h) {
++				c = 0xffffffff;
++			} else if (x >= 40 && x < 240 && y >= 40 && y < 240) {
++				c = 0xffff0000;
++			} else if (x + 1 == seam || x == seam) {
++				c = 0xffff0000;
++			} else if (y < h / 2) {
++				c = bars[x * 8 / w];
++			} else {
++				c = (x % 64 == 0 || y % 64 == 0) ? 0xffffffff : 0xff303030;
++			}
++			row[x] = c;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	map->release();
++	return true;
++}
++
++static void
++sweet_mdp_pipes(const char *what)
++{
++	for (uint32_t p = 0; p < 2; p++) {
++		uint32_t b = MDP_VIG(p);
++		IOLog("SWEET MDP: %s: vig%u size %x img %x xy %x out %x/%x addr %x stride %x fmt %x pe %x | qseed v%x op %x "
++		    "step %x/%x init %x/%x src %x dst %x\n", what, p, sweet_mdp_rd(b + SSPP_SRC_SIZE),
++		    sweet_mdp_rd(b + SSPP_SRC_IMG), sweet_mdp_rd(b + SSPP_SRC_XY), sweet_mdp_rd(b + SSPP_OUT_SIZE),
++		    sweet_mdp_rd(b + SSPP_OUT_XY), sweet_mdp_rd(b + SSPP_SRC0), sweet_mdp_rd(b + SSPP_YSTRIDE0),
++		    sweet_mdp_rd(b + SSPP_FORMAT), sweet_mdp_rd(b + SSPP_PE(0, 2)), sweet_mdp_rd(b + QS_VERSION),
++		    sweet_mdp_rd(b + QS_OP_MODE), sweet_mdp_rd(b + QS_STEP_Y_H), sweet_mdp_rd(b + QS_STEP_Y_V),
++		    sweet_mdp_rd(b + QS_INIT_Y_H), sweet_mdp_rd(b + QS_INIT_Y_V), sweet_mdp_rd(b + QS_SRC_SIZE),
++		    sweet_mdp_rd(b + QS_DST_SIZE));
++	}
++}
++
++/* CTL0 flush of both pipes; autorefresh latches them at the next frame start (the flush bits read back clear). */
++static void
++sweet_mdp_flush(const char *what)
++{
++	uint32_t f0 = sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT), i;
++	uint64_t t0 = mach_absolute_time(), ns;
++	sweet_mdp_wr(MDP_CTL(0) + MDP_CTL_FLUSH, MDP_FLUSH_VIG01);
++	for (i = 0; i < 100 && (sweet_mdp_rd(MDP_CTL(0) + MDP_CTL_FLUSH) & MDP_FLUSH_VIG01); i++) {
++		IOSleep(1);
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	IOLog("SWEET MDP: %s: flush %s after %llu us, intf1 frames +%u, ctl0 flush %x\n", what,
++	    i < 100 ? "latched" : "NOT latched", ns / 1000, sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT) - f0,
++	    sweet_mdp_rd(MDP_CTL(0) + MDP_CTL_FLUSH));
++}
++
++/* With sweet_mdp.lock: stop the presents, wait out a flip in flight, save the pipes. */
++static bool
++sweet_mdp_take(AppleCLCD *fb, const char *what)
++{
++	if (sweet_mdp.active) {
++		IOLog("SWEET MDP: %s: a test still owns the pipes (p mdp restore)\n", what);
++		return false;
++	}
++	if (fb->fPhys != SWEET_SPLASH_PA) {
++		IOLog("SWEET MDP: %s: panel memory %#llx is not redfin's splash region\n", what, fb->fPhys);
++		return false;
++	}
++	for (uint32_t p = 0; p < 2; p++) {
++		uint32_t a = sweet_mdp_rd(MDP_VIG(p) + SSPP_SRC0), out = sweet_mdp_rd(MDP_VIG(p) + SSPP_OUT_SIZE);
++		if (a < SWEET_SPLASH_PA || a >= SWEET_SPLASH_PA + SWEET_SPLASH_LEN || (out & 0xffff) == 0 || (out >> 16) == 0 ||
++		    sweet_mdp_rd(MDP_VIG(p) + SSPP_SRC_SIZE) == 0) {
++			IOLog("SWEET MDP: %s: vig%u (addr %x out %x) is not ABL's set-up: left alone\n", what, p, a, out);
++			return false;
++		}
++	}
++	sweet_gpu_mdp_own(1);
++	sweet_mdp_busy = true;
++	for (uint32_t i = 0; i < 50 && (sweet_mdp_rd(MDP_CTL(0) + MDP_CTL_FLUSH) & MDP_FLUSH_VIG01); i++) {
++		IOSleep(1);     /* a flip flushed just before: let it latch */
++	}
++	for (uint32_t p = 0; p < 2; p++) {
++		for (uint32_t i = 0; i < SWEET_MDP_NREGS; i++) {
++			sweet_mdp.old[p][i] = sweet_mdp_rd(MDP_VIG(p) + sweet_mdp_regs[i]);
++		}
++	}
++	sweet_mdp.active = true;
++	sweet_mdp_pipes("saved");
++	return true;
++}
++
++/* With sweet_mdp.lock. */
++static void
++sweet_mdp_restore_locked(AppleCLCD *fb, const char *why)
++{
++	if (!sweet_mdp.active) {
++		IOLog("SWEET MDP: restore (%s): nothing to put back\n", why);
++		return;
++	}
++	if (sweet_mdp.timer != NULL) {
++		sweet_mdp.timer->cancelTimeout();
++	}
++	for (uint32_t p = 0; p < 2; p++) {
++		for (uint32_t i = 0; i < SWEET_MDP_NREGS; i++) {
++			sweet_mdp_wr(MDP_VIG(p) + sweet_mdp_regs[i], sweet_mdp.old[p][i]);
++		}
++	}
++	sweet_mdp_flush("restore");
++	sweet_mdp_pipes("restored");
++	sweet_mdp.active = false;
++	sweet_mdp_busy = false;
++	sweet_gpu_mdp_own(0);
++	IOLockLock(fb->fLock);
++	fb->fDirty = true;      /* the latest frame again at the next tick */
++	IOLockUnlock(fb->fLock);
++	IOLog("SWEET MDP: restored (%s), presents resume\n", why);
++}
++
++static void
++sweet_mdp_timer_fired(OSObject *owner, IOTimerEventSource *sender __unused)
++{
++	AppleCLCD *fb = OSDynamicCast(AppleCLCD, owner);
++	if (fb == NULL || sweet_mdp.lock == NULL) {
++		return;
++	}
++	IOLockLock(sweet_mdp.lock);
++	if (sweet_mdp.active) {
++		sweet_mdp_restore_locked(fb, "timer");
++	}
++	IOLockUnlock(sweet_mdp.lock);
++}
++
++/* Step (b): the pattern in the current geometry (no scaler), both pipes moved by the same offset. */
++static bool
++sweet_mdp_test(void)
++{
++	uint32_t w = (sweet_mdp.old[0][MR_OUT_SIZE] & 0xffff) + (sweet_mdp.old[1][MR_OUT_SIZE] & 0xffff);
++	uint32_t h = sweet_mdp.old[0][MR_OUT_SIZE] >> 16, stride = sweet_mdp.old[0][MR_YSTRIDE0] & 0xffff;
++	if (!sweet_mdp_pattern(w, h, stride, w / 2)) {
++		IOLog("SWEET MDP: test: no pattern (%ux%u, stride %u)\n", w, h, stride);
++		return false;
++	}
++	uint32_t base = sweet_mdp.old[0][MR_SRC0];
++	for (uint32_t p = 0; p < 2; p++) {
++		sweet_mdp_wr(MDP_VIG(p) + SSPP_SRC0, (uint32_t)SWEET_MDP_TEST_PA + (sweet_mdp.old[p][MR_SRC0] - base));
++	}
++	sweet_mdp_flush("test");
++	sweet_mdp_pipes("test");
++	return true;
++}
++
++/*
++ * Step (c): 1125x2436 -> the two 540-wide halves (OUT_SIZE as ABL set it). One phase step for the whole width
++ * (2^21 x 1125 / 1080), so the halves meet: panel column X samples source X x step; the right pipe starts at source
++ * column 562 with phase 0.5 and both fetch 563 columns (bilinear needs the next column). QSEED3LITE in bilinear
++ * mode needs no coefficient tables (as upstream DPU: _dpu_plane_setup_scaler3, dpu_hw_setup_scaler3).
++ */
++static bool
++sweet_mdp_scale(void)
++{
++	const uint32_t sw = SWEET_FB_LOGICAL_W, sh = SWEET_FB_LOGICAL_H;
++	uint32_t ver = sweet_mdp_rd(MDP_VIG(0) + QS_VERSION), ver1 = sweet_mdp_rd(MDP_VIG(1) + QS_VERSION);
++	uint32_t dw0 = sweet_mdp.old[0][MR_OUT_SIZE] & 0xffff, dw1 = sweet_mdp.old[1][MR_OUT_SIZE] & 0xffff;
++	uint32_t dh = sweet_mdp.old[0][MR_OUT_SIZE] >> 16, W = dw0 + dw1;
++	if (ver < 0x2000 || ver != ver1 || dh == 0 || W == 0 || dh != sweet_mdp.old[1][MR_OUT_SIZE] >> 16) {
++		IOLog("SWEET MDP: scale: scaler version %x/%x or outputs %x/%x not handled\n", ver, ver1,
++		    sweet_mdp.old[0][MR_OUT_SIZE], sweet_mdp.old[1][MR_OUT_SIZE]);
++		return false;
++	}
++	if (!sweet_mdp_pattern(sw, sh, SWEET_MDP_SURF_STRIDE, sw / 2 + 1)) {
++		IOLog("SWEET MDP: scale: no pattern\n");
++		return false;
++	}
++	uint64_t step_x = ((1ULL << 21) * sw + W / 2) / W, step_y = ((1ULL << 21) * sh + dh / 2) / dh;
++	for (uint32_t p = 0; p < 2; p++) {
++		uint32_t b = MDP_VIG(p), dw = p ? dw1 : dw0;
++		uint64_t pos = (uint64_t)(p ? dw0 : 0) * step_x;
++		uint32_t sx = (uint32_t)(pos >> 21), phase = (uint32_t)(pos & 0x1fffff);
++		uint32_t cw = (uint32_t)((pos + (uint64_t)(dw - 1) * step_x) >> 21) - sx + 2;
++		if (sx + cw > sw) {
++			cw = sw - sx;
++		}
++		uint32_t src = sh << 16 | cw;
++		uint32_t op = 1u | 3u << 16 | 1u << 14 | 1u << 31;      /* on, Y/RGB bilinear, 8-bit format, blend cfg */
++		if (sweet_mdp_rd(b + SSPP_FORMAT) & (1u << 8)) {
++			op |= 1u << 10 | 1u << 29;                      /* alpha through the scaler, bilinear */
++		}
++		sweet_mdp_wr(b + SSPP_SRC0, (uint32_t)SWEET_MDP_TEST_PA);
++		sweet_mdp_wr(b + SSPP_YSTRIDE0, (sweet_mdp.old[p][MR_YSTRIDE0] & 0xffff0000u) | SWEET_MDP_SURF_STRIDE);
++		sweet_mdp_wr(b + SSPP_SRC_IMG, sh << 16 | sw);
++		sweet_mdp_wr(b + SSPP_SRC_XY, sx);
++		sweet_mdp_wr(b + SSPP_SRC_SIZE, src);
++		for (uint32_t c = 0; c < 3; c++) {
++			sweet_mdp_wr(b + SSPP_PE(c, 0), 0);
++			sweet_mdp_wr(b + SSPP_PE(c, 1), 0);
++			sweet_mdp_wr(b + SSPP_PE(c, 2), src);   /* requested pixels = the crop */
++		}
++		sweet_mdp_wr(b + QS_STEP_Y_H, (uint32_t)step_x & 0xffffff);
++		sweet_mdp_wr(b + QS_STEP_UV_H, (uint32_t)step_x & 0xffffff);
++		sweet_mdp_wr(b + QS_STEP_Y_V, (uint32_t)step_y & 0xffffff);
++		sweet_mdp_wr(b + QS_STEP_UV_V, (uint32_t)step_y & 0xffffff);
++		sweet_mdp_wr(b + QS_INIT_Y_H, phase);
++		sweet_mdp_wr(b + QS_INIT_UV_H, phase);
++		sweet_mdp_wr(b + QS_INIT_Y_V, 0);
++		sweet_mdp_wr(b + QS_INIT_UV_V, 0);
++		sweet_mdp_wr(b + QS_PRELOAD, 0x03040304u);       /* DPU_QSEED3_DEFAULT_PRELOAD_H 4, _V 3 */
++		sweet_mdp_wr(b + QS_SRC_SIZE, src);
++		sweet_mdp_wr(b + QS_SRC_SIZE_UV, src);
++		sweet_mdp_wr(b + QS_DST_SIZE, dh << 16 | dw);
++		sweet_mdp_wr(b + QS_OP_MODE, op);
++		IOLog("SWEET MDP: scale: vig%u source x %u w %u phase %#x -> %ux%u, step %#llx/%#llx op %#x\n", p, sx, cw,
++		    phase, dw, dh, step_x, step_y, op);
++	}
++	sweet_mdp_flush("scale");
++	sweet_mdp_pipes("scale");
++	return true;
++}
++
++void
++AppleCLCD::mdpCmd(const char *s, const char *end)
++{
++	const char *q = s;
++	while (q < end && *q == ' ') {
++		q++;
++	}
++	const char *w = q;
++	while (q < end && *q >= 'a' && *q <= 'z') {
++		q++;
++	}
++	size_t wl = (size_t)(q - w);
++	while (q < end && *q == ' ') {
++		q++;
++	}
++	uint32_t secs = 10;
++	if (q < end && *q >= '0' && *q <= '9') {
++		secs = 0;
++		while (q < end && *q >= '0' && *q <= '9') {
++			secs = secs * 10 + (uint32_t)(*q++ - '0');
++		}
++		if (secs > 600) {
++			secs = 600;
++		}
++	}
++	if (sweet_mdp.lock == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (l != NULL && !OSCompareAndSwapPtr(NULL, l, (void * volatile *)&sweet_mdp.lock)) {
++			IOLockFree(l);
++		}
++		if (sweet_mdp.lock == NULL) {
++			return;
++		}
++	}
++	IOLockLock(sweet_mdp.lock);
++	if (wl == 4 && !strncmp(w, "dump", 4)) {
++		sweet_mdp_dump();
++	} else if (wl == 4 && !strncmp(w, "smmu", 4)) {
++		sweet_mdp_smmu(end - q >= 4 && !strncmp(q, "walk", 4));
++	} else if ((wl == 4 && !strncmp(w, "test", 4)) || (wl == 5 && !strncmp(w, "scale", 5))) {
++		bool scale = wl == 5;
++		if (sweet_mdp.timer == NULL) {
++			sweet_mdp.timer = IOTimerEventSource::timerEventSource(this, sweet_mdp_timer_fired);
++			if (sweet_mdp.timer != NULL && fWorkLoop->addEventSource(sweet_mdp.timer) != kIOReturnSuccess) {
++				OSSafeReleaseNULL(sweet_mdp.timer);
++			}
++		}
++		if (sweet_mdp_take(this, scale ? "scale" : "test")) {
++			if (!(scale ? sweet_mdp_scale() : sweet_mdp_test())) {
++				sweet_mdp_restore_locked(this, "failed");
++			} else if (secs != 0 && sweet_mdp.timer != NULL) {
++				sweet_mdp.timer->setTimeoutMS(secs * 1000);
++				IOLog("SWEET MDP: %s on screen for %u s (p mdp restore puts it back sooner)\n",
++				    scale ? "scale" : "test", secs);
++			} else {
++				IOLog("SWEET MDP: %s on screen until p mdp restore\n", scale ? "scale" : "test");
++			}
++		}
++	} else if (wl == 7 && !strncmp(w, "restore", 7)) {
++		sweet_mdp_restore_locked(this, "poke");
++	} else {
++		IOLog("SWEET MDP: p mdp dump | smmu [walk] | test [SECS] | scale [SECS] | restore\n");
++	}
++	IOLockUnlock(sweet_mdp.lock);
++}
++
+ /*
+  * Poke commands (bsd/dev/sweet_poke.c "p WORD"):
+  *   p fc            INTF1's TE frame counter (and INTF frame counter) twice, 1 s apart: the panel's real rate,
+  *                   with the tear-check configuration
+  *   p hz 60|90 [tc] the panel's rate now (DCS 0x53), ticks and SyncRate with it; tc: tear-check line clock too
++ *   p mdp ...       0948: display-engine dump and scanout tests (above)
+  */
+ void
+ AppleCLCD::fbCmd(const char *s, const char *end)
+@@ -1244,7 +1792,11 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+ 		IOLog("SWEET FB: fbx now %#x (swap queue %s)\n", sweet_fbx, q4 ? "on" : "off");
+ 		return;
+ 	}
+-	IOLog("SWEET FB: poke p: fc | hz 60|90 [tc] | fbx HEX\n");
++	if (end - s >= 3 && s[0] == 'm' && s[1] == 'd' && s[2] == 'p') {
++		mdpCmd(s + 3, end);     /* 0948 */
++		return;
++	}
++	IOLog("SWEET FB: poke p: fc | hz 60|90 [tc] | fbx HEX | mdp dump|smmu|test|scale|restore\n");
+ }
+ 
+ extern "C" void sweet_fb_cmd(const char *s, const char *end);
+@@ -1706,6 +2258,9 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
++	if (sweet_mdp_busy) {
++		return;         /* 0948: a p mdp test owns the pipes; the latest frame goes out after p mdp restore */
++	}
+ 	uint32_t mask = get32(rec, 0x104);
+ 
+ 
+-- 
+2.43.0
+
