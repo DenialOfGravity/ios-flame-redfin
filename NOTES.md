@@ -296,6 +296,7 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   `org.iosonpixel.fastrpcd`, log `/var/local/fastrpcd.log`, exit 3 when the DSP goes; `-v`, `--mmap-method 2|4`.
 - 0957 poke `a gain N` (or `-N`): N dB under Android's level; hard cap 6 dB under (ASP bypass, no protection firmware)
   for sound=3 and 4, also for `sndbelow`.
+- 0958 CS35L41 lazy re-probe: an amp that missed the boot probe (r29b 0x40 NO ANSWER) is reset+probed+configured again at the next ON (watcher thread, >= 10 s apart, <= 20/boot); `poke a probe` forces it; boot failure logs the SE9 state; log labels 0x40 = top, 0x41 = bottom (routing unchanged)
 - 0982 stand-in Bluetooth nubs + AppleOLYHAL (`sweetbtnub` bitmask: 1 "bluetooth", 2 "marconi-bt", 4 AppleOLYHAL;
   off by default): SweetBTNub services for bluetoothd's IONameMatch notifications carrying the D22 bluetooth-node
   properties (transport-encoding 3, 3 Mbaud, vendor/product/profiles/coex, compatible "bluetooth,n88"); AppleOLYHAL
