@@ -296,9 +296,14 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   `org.iosonpixel.fastrpcd`, log `/var/local/fastrpcd.log`, exit 3 when the DSP goes; `-v`, `--mmap-method 2|4`.
 - 0957 poke `a gain N` (or `-N`): N dB under Android's level; hard cap 6 dB under (ASP bypass, no protection firmware)
   for sound=3 and 4, also for `sndbelow`.
-- 0982 stand-in Bluetooth nubs (`sweetbtnub=1` "bluetooth", `=2` "marconi-bt", `=3` both; off by default): SweetBTNub
-  services under the platform expert for bluetoothd's IONameMatch notifications; every property read from them logged
-  with found/MISSING, user-client requests refused + logged, setProperties keys logged (`SWEET BTNUB:`).
+- 0982 stand-in Bluetooth nubs + AppleOLYHAL (`sweetbtnub` bitmask: 1 "bluetooth", 2 "marconi-bt", 4 AppleOLYHAL;
+  off by default): SweetBTNub services for bluetoothd's IONameMatch notifications carrying the D22 bluetooth-node
+  properties (transport-encoding 3, 3 Mbaud, vendor/product/profiles/coex, compatible "bluetooth,n88"); AppleOLYHAL
+  is an empty IOService for BlueTool's IOProviderClass match. Property reads logged found/MISSING, user-client
+  requests refused + logged, setProperties keys logged (`SWEET BTNUB:`).
+- 0983 Bluetooth bridge (`btbridge=1`, no nodes by default): /dev/cu.bluetooth + /dev/uart.bluetooth (one H4 pipe
+  bluetoothd opens) <-> /dev/btbridge (btd --bridge) + dummy /dev/btwake. Two 16 KiB rings, blocking/O_NONBLOCK/
+  select; btd forwards standard HCI to the WCN3998 and fakes/logs vendor 0xFC__ commands (`SWEET BTBR:`, btd `BTD BRIDGE:`).
 - 0973 AppleARMBacklight publishes the panel's nits for CoreBrightness (MinNits/MaxNits/MaxNitsPanel,
   HardwareAccessibleMin/MaxNits, user-accessible-max-nits, digital-dimming-min-nits, brightness-nits(-cap),
   DisplayPanel/ProductLuminanceMin/Mid/Max: 2..500, integer nits; 500 nits <-> level 1023): `sweetnits=0` off.
