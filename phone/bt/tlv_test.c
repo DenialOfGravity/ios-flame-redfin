@@ -134,6 +134,21 @@ static void test_nvm(void)
 	for (size_t i = 0; i < n; i++)
 		diff += b[i] != copy[i];
 	CHECK(diff == 7, "%zu bytes differ from the original, want 7 (baud + address)", diff);
+	/* redfin's crnv32.bin: type 4 wrapping a type-2 header, the tags, then 0xff padding */
+	{
+		uint8_t *w = malloc(n + 4 + 64);
+		memset(w, 0xff, n + 4 + 64);
+		memcpy(w + 4, b, n);			/* nested type-2 header + tags */
+		put32(w, (uint32_t)((n + 64) << 8 | 4));
+		struct tlv_info wi;
+		CHECK(tlv_parse(w, n + 4 + 64, &wi, &err) == 0 && wi.type == TLV_TYPE_NVM && wi.ntags == ti.ntags &&
+		      wi.hci_tag_len == 8, "type-4 wrapper: %s, %d tags", err ? err : "ok", wi.ntags);
+		char hx[64];
+		CHECK(tlv_nvm_tag_hex(w, n + 4 + 64, 17, hx, sizeof(hx)) == 8, "tag 17 hex in the wrapper");
+		CHECK(tlv_nvm_edit(w, n + 4 + 64, 17, 1, 0, NULL) == 1 && w[8 + 52 + 18 + 12 + 1] == 17,
+		      "edit inside the wrapper (baud at [1])");
+		free(w);
+	}
 	put16(b + 4 + 52 + 2, 60000);	/* break the tag list */
 	CHECK(tlv_nvm_edit(b, n, 14, 2, 0, NULL) == -1, "malformed tag list must fail");
 	free(b);
@@ -359,6 +374,8 @@ static void write_file(const char *path, const uint8_t *b, size_t n)
 	fclose(f);
 }
 
+static int noaddr;
+
 static void test_flow(int mode, const char *baud)
 {
 	memset(&chip, 0, sizeof(chip));
@@ -378,13 +395,17 @@ static void test_flow(int mode, const char *baud)
 	chip.nvm_diff_want = strcmp(baud, "115200") != 0;
 	char *argv[] = { "btd", "--scan", "1", getenv("BTD_TEST_LOG") ? "-v" : "-q", "--baud", (char *)baud, "--fw", "/tmp/btd-test-fw.tlv",
 		"--nvm", "/tmp/btd-test-nvm.bin", "--bdaddr", "02:50:49:58:45:4d", NULL };
-	int rc = btd_main(12, argv);
+	int rc = btd_main(noaddr ? 10 : 12, argv);
 	CHECK(rc == 0, "mode %d baud %s: btd --scan returned %d", mode, baud, rc);
 	CHECK(chip.files == 2, "mode %d: %d files downloaded", mode, chip.files);
 	CHECK(chip.segs == 489 + (nn + 242) / 243, "mode %d: %u segments", mode, chip.segs);
 	CHECK(chip.reset == 1, "HCI reset count %d", chip.reset);
 	CHECK(chip.adv_sent, "no scan");
-	CHECK(chip.addr[0] == 0x4d && chip.addr[5] == 0x02, "BD address little endian: %02x..%02x", chip.addr[0], chip.addr[5]);
+	if (noaddr)
+		CHECK(chip.addr[0] == 0 && chip.addr[5] == 0, "BD address written without --bdaddr/--setaddr");
+	else
+		CHECK(chip.addr[0] == 0x4d && chip.addr[5] == 0x02, "BD address little endian: %02x..%02x", chip.addr[0],
+		      chip.addr[5]);
 	if (strcmp(baud, "115200"))
 		CHECK(chip.baud == 3000000 && chip.nvm_baud == 14, "chip speed %u, NVM baud index %d", chip.baud, chip.nvm_baud);
 	CHECK(chip.cmds_before_power == 0, "%d commands before the power pulse", chip.cmds_before_power);
@@ -401,6 +422,8 @@ int main(void)
 	for (int mode = 0; mode < 4; mode++)
 		test_flow(mode, "3000000");
 	test_flow(3, "115200");
+	noaddr = 1;
+	test_flow(0, "3000000");
 	printf("%s (%d failures)\n", fails ? "FAILED" : "all passed", fails);
 	return fails != 0;
 }

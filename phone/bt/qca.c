@@ -177,7 +177,8 @@ static int seg_ack(struct hci *h, const struct qca_ver *v, unsigned ms)
 	return -1;
 }
 
-int qca_download(struct hci *h, const char *path, const struct qca_ver *v, int baud_idx, int ibs, unsigned *segs)
+int qca_download(struct hci *h, const char *path, const struct qca_ver *v, int baud_idx, const struct nvm_opts *no,
+	unsigned *segs)
 {
 	size_t n;
 	struct tlv_info ti;
@@ -204,9 +205,17 @@ int qca_download(struct hci *h, const char *path, const struct qca_ver *v, int b
 			hci_log(h, "BTD: warning: patch rom build 0x%04x but the controller says rom 0x%04x\n",
 				ti.rom_build, v->rom_ver);
 	} else {
-		int c = tlv_nvm_edit(buf, n, baud_idx, v->cc_style ? 1 : 2, ibs, NULL);
-		hci_log(h, "BTD: %s: NVM %zu bytes, %d tags, HCI tag %s, baud index %d, in-band sleep %s: %d bytes edited\n",
-			path, n, ti.ntags, ti.hci_tag_len >= 0 ? "present" : "absent", baud_idx, ibs ? "on" : "off", c);
+		char t17[128], t27[64];
+		int pos = no->baud_pos >= 0 ? no->baud_pos : v->cc_style ? 1 : 2;
+		tlv_nvm_tag_hex(buf, n, TLV_TAG_HCI, t17, sizeof(t17));
+		tlv_nvm_tag_hex(buf, n, TLV_TAG_DEEP_SLEEP, t27, sizeof(t27));
+		hci_log(h, "BTD: %s: NVM as in the file: tag 17 (HCI) [%s], tag 27 (deep sleep) [%s]\n", path, t17, t27);
+		int c = no->keep ? 0 : tlv_nvm_edit(buf, n, baud_idx, pos, no->ibs, NULL);
+		tlv_nvm_tag_hex(buf, n, TLV_TAG_HCI, t17, sizeof(t17));
+		tlv_nvm_tag_hex(buf, n, TLV_TAG_DEEP_SLEEP, t27, sizeof(t27));
+		hci_log(h, "BTD: %s: NVM %zu bytes, %d tags, %s: baud index %d at tag 17 [%d], in-band sleep %s: %d bytes "
+			"edited -> tag 17 [%s], tag 27 [%s]\n", path, n, ti.ntags, no->keep ? "--nvm-keep (unchanged)" : "edited",
+			baud_idx, pos, no->ibs ? "on" : "off", c, t17, t27);
 	}
 	struct tlv_seg *sg = malloc(sizeof(*sg) * (n / TLV_SEG_MAX + 2));
 	size_t ns = tlv_segments(n, mode, sg, n / TLV_SEG_MAX + 2);
@@ -267,7 +276,7 @@ int qca_local_version(struct hci *h)
 	return (int)manu;
 }
 
-static int read_bdaddr(struct hci *h, uint8_t out[6])
+int qca_read_bdaddr(struct hci *h, uint8_t out[6])
 {
 	uint8_t r[16];
 	size_t n = sizeof(r);
@@ -280,30 +289,68 @@ static int read_bdaddr(struct hci *h, uint8_t out[6])
 	return 0;
 }
 
-int qca_set_bdaddr(struct hci *h, const uint8_t addr[6])
+static int bdaddr_fc0b(struct hci *h, const uint8_t le[6])
 {
-	uint8_t le[6], got[6], cmd[9];
-	for (int i = 0; i < 6; i++)
-		le[i] = addr[5 - i];
-	read_bdaddr(h, got);
-	if (!memcmp(got, addr, 6))
-		return 0;
 	/* qca_set_bdaddr_rome (the redbull kernel's choice): NVM access, set tag 2 */
-	cmd[0] = 0x01;
-	cmd[1] = 0x02;
-	cmd[2] = 6;
-	memcpy(cmd + 3, le, 6);
-	uint8_t rsp[32];
+	uint8_t cmd[9] = { 0x01, 0x02, 6 }, rsp[32];
 	size_t rl = sizeof(rsp);
+	memcpy(cmd + 3, le, 6);
 	int r = hci_cmd_ev(h, 0xFC0B, cmd, sizeof(cmd), EV_VENDOR, NULL, 0, rsp, &rl, 1000);
 	hci_log(h, "BTD: 0xFC0B NVM tag 2 -> %d\n", r);
-	if (!read_bdaddr(h, got) && !memcmp(got, addr, 6))
-		return 0;
+	return r;
+}
+
+static int bdaddr_fc14(struct hci *h, const uint8_t le[6])
+{
 	/* mainline's choice for WCN399x: EDL_WRITE_BD_ADDR */
-	rl = sizeof(rsp);
-	r = hci_cmd_ev(h, 0xFC14, le, 6, EV_VENDOR, NULL, 0, rsp, &rl, 1000);
+	uint8_t rsp[32];
+	size_t rl = sizeof(rsp);
+	int r = hci_cmd_ev(h, 0xFC14, le, 6, EV_VENDOR, NULL, 0, rsp, &rl, 1000);
 	hci_log(h, "BTD: 0xFC14 write BD_ADDR -> %d\n", r);
-	if (!read_bdaddr(h, got) && !memcmp(got, addr, 6))
+	return r;
+}
+
+int qca_set_bdaddr(struct hci *h, const uint8_t addr[6], int cc_style)
+{
+	uint8_t le[6], got[6];
+	for (int i = 0; i < 6; i++)
+		le[i] = addr[5 - i];
+	if (!qca_read_bdaddr(h, got) && !memcmp(got, addr, 6))
 		return 0;
+	for (int k = 0; k < 2; k++) {
+		int fc14 = cc_style ? k == 0 : k == 1;
+		(fc14 ? bdaddr_fc14 : bdaddr_fc0b)(h, le);
+		if (!qca_read_bdaddr(h, got) && !memcmp(got, addr, 6))
+			return 0;
+	}
 	return -1;
+}
+
+void qca_baud_probe(struct hci *h)
+{
+	static const unsigned try[] = { 0, 115200, 3200000, 3000000, 2000000, 921600, 230400 };
+	struct uart *u = h->u;
+	unsigned was = u->baud;
+	for (unsigned i = 0; i < sizeof(try) / sizeof(try[0]); i++) {
+		unsigned b = try[i] ? try[i] : was;
+		if (i && b == was)
+			continue;
+		u->set_baud(u, b);
+		u->set_flow(u, 1);
+		u->flush_rx(u);
+		h->rpos = h->rlen = 0;
+		uint8_t w = IBS_WAKE_IND, r[16];
+		u->write(u, &w, 1);
+		size_t n = sizeof(r);
+		unsigned long ibs0 = h->n_ibs, junk0 = h->n_junk;
+		int s = hci_cmd(h, 0x1001, NULL, 0, r, &n, 300);
+		hci_log(h, "BTD PROBE-BAUD: %u Bd: Read_Local_Version %s, %lu IBS bytes, %lu junk bytes\n", b,
+			s == 0 ? "ANSWERED" : "no answer", h->n_ibs - ibs0, h->n_junk - junk0);
+		if (s == 0) {
+			hci_log(h, "BTD PROBE-BAUD: the controller talks at %u Bd\n", b);
+			return;
+		}
+	}
+	u->set_baud(u, was);
+	hci_log(h, "BTD PROBE-BAUD: no speed answered (back at %u Bd)\n", was);
 }

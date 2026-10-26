@@ -51,6 +51,9 @@ struct hci {
 	struct h4 rx;
 	uint64_t t0;
 	unsigned long n_tx, n_rx, n_junk, n_ibs, n_hwerr;
+	uint8_t ibs_last;		/* the last IBS byte and how many came in a row (with no packet between) */
+	unsigned long ibs_run;
+	uint64_t ibs_first;
 	/* every received packet not consumed by the command being waited for (advertising reports...) */
 	void (*on_async)(struct hci *h, const struct hci_pkt *p);
 	/* raw bridge: every received packet and IBS byte, before any interpretation */

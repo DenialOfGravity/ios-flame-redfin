@@ -295,3 +295,6 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   `org.iosonpixel.fastrpcd`, log `/var/local/fastrpcd.log`, exit 3 when the DSP goes; `-v`, `--mmap-method 2|4`.
 - 0957 poke `a gain N` (or `-N`): N dB under Android's level; hard cap 6 dB under (ASP bypass, no protection firmware)
   for sound=3 and 4, also for `sndbelow`.
+- 0982 stand-in Bluetooth nubs (`sweetbtnub=1` "bluetooth", `=2` "marconi-bt", `=3` both; off by default): SweetBTNub
+  services under the platform expert for bluetoothd's IONameMatch notifications; every property read from them logged
+  with found/MISSING, user-client requests refused + logged, setProperties keys logged (`SWEET BTNUB:`).

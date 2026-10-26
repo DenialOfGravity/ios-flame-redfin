@@ -39,6 +39,7 @@ struct tlv_info {
 	/* NVM */
 	int ntags;
 	int hci_tag_len;		/* -1: no tag 17 */
+	uint32_t nvm_off, nvm_len;	/* NVM: where the 12-byte tags start in the file and how many bytes they span */
 };
 
 struct tlv_seg {
@@ -66,6 +67,9 @@ int tlv_nvm_edit(uint8_t *buf, size_t n, int baud_idx, int baud_pos, int ibs, co
  * Returns the number of segments (also when larger than max: only max are written).
  */
 size_t tlv_segments(size_t n, int dnld_mode, struct tlv_seg *out, size_t max);
+
+/* the bytes of NVM tag id as hex into out ("absent" if none); returns the tag length or -1 */
+int tlv_nvm_tag_hex(const uint8_t *buf, size_t n, uint16_t id, char *out, size_t cap);
 
 /* btqca.c firmware naming: rom_ver = ((soc_ver & 0xf00) >> 4) | (soc_ver & 0xf), soc_ver = soc_id << 16 | rom */
 unsigned qca_rom_ver(uint32_t soc_id, uint16_t rom_ver);

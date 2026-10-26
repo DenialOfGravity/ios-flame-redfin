@@ -29,9 +29,22 @@ int qca_set_speed(struct hci *h, unsigned baud);
  * Download one TLV file (rampatch or NVM; type from its header). NVM gets tlv_nvm_edit(baud_idx, ibs).
  * Returns 0 or -1; *segs = segments sent.
  */
-int qca_download(struct hci *h, const char *path, const struct qca_ver *v, int baud_idx, int ibs, unsigned *segs);
-/* addr in the usual written order (addr[0] is the most significant byte); 0 if Read_BD_ADDR agrees */
-int qca_set_bdaddr(struct hci *h, const uint8_t addr[6]);
+struct nvm_opts {
+	int ibs;		/* keep in-band sleep / deep sleep on (Linux) */
+	int keep;		/* download the NVM exactly as the file has it */
+	int baud_pos;		/* tag 17 byte for the baud index; -1: 1 for Command-Complete-style controllers
+				   (Linux: WCN3991 and later), else 2 */
+};
+int qca_download(struct hci *h, const char *path, const struct qca_ver *v, int baud_idx, const struct nvm_opts *no,
+	unsigned *segs);
+/*
+ * addr in the usual written order (addr[0] is the most significant byte); 0 if Read_BD_ADDR agrees.
+ * 0xFC14 first for Command-Complete-style controllers (mainline, WCN399x), else 0xFC0B first.
+ */
+int qca_set_bdaddr(struct hci *h, const uint8_t addr[6], int cc_style);
+int qca_read_bdaddr(struct hci *h, uint8_t out[6]);
+/* after a lost controller: IBS wake + Read_Local_Version at the current speed, then 115200, 3.2 M, 3 M, ... */
+void qca_baud_probe(struct hci *h);
 /* Read_Local_Version; returns the manufacturer (29 = Qualcomm) or -1 */
 int qca_local_version(struct hci *h);
 #endif
