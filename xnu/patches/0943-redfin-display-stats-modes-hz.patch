@@ -1,0 +1,787 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Mon, 26 Oct 2026 23:00:00 +0100
+Subject: [PATCH] 0943 redfin: display frame statistics, IOMFB modes, 90 Hz
+
+A frame statistics line every 5 s while frames come ("SWEET FB: 5s: swaps N
+shown N dropped N | le11 .. gt35 | p50 p95 ms | blitq us fence us | hz H"),
+replacing the old 5 s line. Boot-arg sweetfbx=MASK (default 0 = as before):
+0x1 TimingElements/ColorElements with SyncRate, GetBlock(0x40) and sel 77 =
+mach_absolute_time; 0x2 no cache clean of a frame's surface unless the CPU
+locked it for writing since its last present (IOSurface seed). sweetfb_hz=90
+runs the S6E3HC2 at 90 Hz (DCS short write 0x53 0x38) with 11.1 ms ticks.
+Poke "p fc" measures INTF1's TE frame rate over 1 s, "p hz 60|90 [tc]"
+switches live. IOMFB selectors are each logged once.
+---
+  bsd/dev/sweet_gpu.c                   |  77 ++++++
+  bsd/dev/sweet_poke.c                  |  13 +
+  iokit/Kernel/arm/SweetFramebuffer.cpp | 446 ++++++++++++++++++++++++++++++++--
+  3 files changed, 511 insertions(+), 25 deletions(-)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 8abc525..c439593 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -638,6 +638,31 @@ sweet_gpu_scanout_front(void)
+ 	lck_mtx_unlock(&sweet_gpu_lock);
+ }
+ 
++/*
++ * 0943: display engine registers for the framebuffer (SweetFramebuffer.cpp: p fc, p hz, the tear-check
++ * phase). Only inside the MDP's 2 MB device window, which the panel code above already maps (gpu_io);
++ * nothing past it is ever read. INTF1 and its tear check run since ABL (autorefresh), so they are clocked.
++ */
++#define MDP_WINDOW      0x200000u
++uint32_t sweet_mdp_rd(uint32_t off);
++void sweet_mdp_wr(uint32_t off, uint32_t v);
++uint32_t
++sweet_mdp_rd(uint32_t off)
++{
++	if (off >= MDP_WINDOW || (off & 3)) {
++		return 0;
++	}
++	return a6_rd(MDP + off);
++}
++
++void
++sweet_mdp_wr(uint32_t off, uint32_t v)
++{
++	if (off < MDP_WINDOW && !(off & 3)) {
++		a6_wr(MDP + off, v);
++	}
++}
++
+ /* ---- surfaces ---- */
+ 
+ static int present_wait_locked(uint32_t k, const char *why);
+@@ -720,6 +745,56 @@ present_wait_locked(uint32_t k, const char *why)
+ 	}
+ 	return 0;
+ }
++
++/*
++ * 0943: when each present's blit landed, for the framebuffer's 5 s line (fence us = queued -> fence seen
++ * signalled, as finely as it is polled: every present, every vsync tick and every 1 ms of the present thread
++ * while a blit is out).
++ */
++static uint64_t present_queued_abs[2];  /* 0 = landed (or never queued) */
++static uint64_t present_land_abs, present_land_n;
++
++static void
++present_landed_locked(uint64_t now)
++{
++	for (uint32_t k = 0; k < 2; k++) {
++		if (present_queued_abs[k] && (!present_fence[k] || a6_fence_done(&gpu, present_fence[k]))) {
++			present_land_abs += now - present_queued_abs[k];
++			present_land_n++;
++			present_queued_abs[k] = 0;
++		}
++	}
++}
++
++/* True while a present's blit is still out. Never blocks. */
++bool sweet_gpu_present_poll(void);
++bool
++sweet_gpu_present_poll(void)
++{
++	if (!gpu_ready || !(present_queued_abs[0] | present_queued_abs[1])) {
++		return false;
++	}
++	if (lck_mtx_try_lock(&sweet_gpu_lock)) {
++		present_landed_locked(mach_absolute_time());
++		lck_mtx_unlock(&sweet_gpu_lock);
++	}
++	return (present_queued_abs[0] | present_queued_abs[1]) != 0;
++}
++
++/* Sum (absolute time) and count of blit->fence latencies since the last call (0 when the GPU lock is busy). */
++void sweet_gpu_present_landed(uint64_t *sum_abs, uint64_t *n);
++void
++sweet_gpu_present_landed(uint64_t *sum_abs, uint64_t *n)
++{
++	*sum_abs = *n = 0;
++	if (!gpu_ready || !lck_mtx_try_lock(&sweet_gpu_lock)) {
++		return;
++	}
++	*sum_abs = present_land_abs;
++	*n = present_land_n;
++	present_land_abs = present_land_n = 0;
++	lck_mtx_unlock(&sweet_gpu_lock);
++}
+ #define PANEL_W         1080
+ #define PANEL_H         2340
+ #define DISPLAY_MASK_OFF        0x500000ULL     /* 2x2 corner mattes, one per corner */
+@@ -799,6 +874,7 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 	}
+ 	static uint32_t ib[10 * A6_BLIT_MAX_DW];
+ 	lck_mtx_lock(&sweet_gpu_lock);
++	present_landed_locked(mach_absolute_time());	/* 0943 */
+ 	uint64_t fb_gva = A6_GVA_FB;
+ 	if (fb_flip_on()) {
+ 		/* 0905: draw into the buffer that is not on screen, once the last flip has latched */
+@@ -893,6 +969,7 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 		gpu_note_submit_locked();
+ 		present_fence[k] = a6_submit_ib_async(&gpu, a6_pool_va(PRESENT_IB(k)), n, 100);
+ 		gpu_owner_locked(present_fence[k], 0);
++		present_queued_abs[k] = present_fence[k] ? mach_absolute_time() : 0;	/* 0943 */
+ 		rc = present_fence[k] ? 0 : -1;
+ 		present_next++;
+ 		if (fb_flip > 0 && present_fence[k]) {
+diff --git a/bsd/dev/sweet_poke.c b/bsd/dev/sweet_poke.c
+index 2b423c2..13e613a 100644
+--- a/bsd/dev/sweet_poke.c
++++ b/bsd/dev/sweet_poke.c
+@@ -8,6 +8,7 @@
+  *   w ADDR VAL             write
+  *   m ADDR MASK VAL        read-modify-write: (old & ~MASK) | (VAL & MASK)
+  *   p ADDR MASK VAL MS     poll until (read & MASK) == VAL, at most MS ms
++ *   p fc | p hz 60|90 [tc] the panel's frame rate (0943, SweetFramebuffer.cpp)
+  *   s MS                   sleep
+  *   # ...                  comment
+  *
+@@ -127,6 +128,18 @@ poke_line(const char *s, const char *end, unsigned lineno)
+ 	while (s < end && (*s == ' ' || *s == '\t')) {
+ 		s++;
+ 	}
++	if (end - s > 2 && s[0] == 'p' && (s[1] == ' ' || s[1] == '\t')) {
++		/* redfin (0943): "p WORD ..." = display commands (SweetFramebuffer.cpp: p fc, p hz 60|90 [tc]); "p ADDR ..." stays a poll */
++		const char *q = s + 1;
++		while (q < end && (*q == ' ' || *q == '\t')) {
++			q++;
++		}
++		if (q < end && *q >= 'a' && *q <= 'z') {
++			extern void sweet_fb_cmd(const char *s, const char *end);
++			sweet_fb_cmd(q, end);
++			return;
++		}
++	}
+ 	if (s >= end || *s == '#' || *s == '\n') {
+ 		return;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1859d39..8a28d2f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -50,6 +50,10 @@ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint
+ void sweet_gpu_panel_stride(uint32_t stride);
+ void sweet_gpu_flip_poll(void);         /* 0905: sweetfbflip=1 */
+ void sweet_gpu_scanout_front(void);
++bool sweet_gpu_present_poll(void);      /* 0943: a present's blit still out (polls its fence) */
++void sweet_gpu_present_landed(uint64_t *sum_abs, uint64_t *n);
++uint32_t sweet_mdp_rd(uint32_t off);    /* 0943: MDP registers, offset from 0x0ae00000 */
++void sweet_mdp_wr(uint32_t off, uint32_t v);
+ extern int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
+ }
+ #define SWEET_FB_GPU_ROWBYTES           4352    /* the 2D engine writes 64-byte multiples */
+@@ -78,8 +82,35 @@ enum {
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
+ 	kSweetFBNotifications           = 72,
++	kSweetFBGetCurrentAbsoluteTime  = 77,   /* 0943 (sweetfbx & 1) */
++	kSweetFBGetBlock                = 79,   /* 0943 (sweetfbx & 1): block 0x40 = the current mode */
+ };
+ 
++/*
++ * 0943: boot-arg sweetfbx=MASK, display experiments (default 0 = as before 0943, but for the stats line):
++ *   0x1  publish TimingElements/ColorElements (SyncRate = the panel Hz), GetBlock(0x40), sel 77 = mach time
++ *   0x2  no cache clean of a frame's surface unless the CPU locked it for writing since its last present
++ *   0x4  (0944) present at SwapEnd (2 frames queued, SwapEnd held when full), vsync ticks phased to the TE
++ * sweetfb_hz=90: the panel at 90 Hz (DCS 0x53 0x38) and 11.1 ms ticks; anything else is 60 Hz.
++ */
++#define SWEET_FBX_MODES         0x1
++#define SWEET_FBX_NOCLEAN       0x2
++#define SWEET_FBX_SWAPQ         0x4
++static uint32_t sweet_fbx;
++
++/* INTF1 (DSI0) and its tear check, offsets from the MDP (as shim/sde.c): the TE frame counter is INT_COUNT >> 16 */
++#define SWEET_INTF1             0x6b800u
++#define INTF_FRAME_COUNT        0x0ac
++#define INTF_TEAR_EN            0x284
++#define INTF_TEAR_SYNC_VSYNC    0x288   /* bits 18:0 vsync_count (19.2 MHz clocks a line), 19 counter on, 20 TE in */
++#define INTF_TEAR_SYNC_HEIGHT   0x28c
++#define INTF_TEAR_INIT_VAL      0x294
++#define INTF_TEAR_INT_COUNT     0x298   /* 31:16 frames (read pointer), 15:0 line */
++#define INTF_TEAR_LINE_COUNT    0x2b0
++#define INTF_TEAR_AUTOREFRESH   0x2b4
++#define SWEET_FB_HIST_FINE      500     /* shown-frame intervals: 0.1 ms bins to 50 ms ... */
++#define SWEET_FB_HIST           950     /* ... then 1 ms bins to 500 ms; longer = a pause, not counted */
++
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_NOTIFY_TYPES           8
+@@ -115,6 +146,11 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	uint64_t            fNextVsync;     /* absolute deadline of the next tick */
+ 	uint64_t            fVsyncAbs;      /* tick period in absolute time units */
+ 	uint64_t            fStatSwaps, fStatPresents, fStatPresentAbs;
++	/* 0943: the 5 s frame statistics (fLock) */
++	uint64_t            fStWin, fStLastSwap, fStLastShown, fStBlitqAbs;
++	uint32_t            fStSwaps, fStShown, fStDropped, fStBlitqN, fStHistN;
++	uint32_t            fStBucket[5];
++	uint16_t            fStHist[SWEET_FB_HIST];
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 
+@@ -142,6 +178,19 @@ public:
+ 	bool          fPresentReq;    /* 0149: vsync asked the present thread for the latest frame */
+ 	bool          fPresentThread; /* 0149: the present thread runs (else: present on the vsync tick) */
+ 	uint8_t      *fPresentRec;    /* 0149: the present thread's copy of the swap record */
++	uint64_t      fPendingAbs;    /* 0943: when fPending was swapped */
++	uint64_t      fPresentRecAbs; /* 0943: ... and fPresentRec */
++	uint32_t      fHz;            /* 0943: panel refresh, 60 or 90 */
++	IOLock       *fDsiLock;       /* 0943: one DSI command at a time (brightness, refresh rate) */
++	struct { const void *s; uint32_t id, seed; } fSeen[8];  /* 0943: surfaces' seeds at their last present */
++	uint32_t      fSeenNext;
++	void          publishModes(void);
++	bool          setHz(uint32_t hz, bool tc);
++	bool          dsiSend(const uint8_t *pkt, uint32_t size);
++	bool          cpuWrote(SweetSurface *s);
++	void          statShown(uint64_t swapAbs);
++	void          statLine(uint64_t now);
++	void          fbCmd(const char *s, const char *end);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -169,6 +218,8 @@ public:
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++static AppleCLCD *sweet_fb_instance;    /* 0943: for the poke commands (p fc, p hz) */
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -252,7 +303,22 @@ AppleCLCD::dsiDcs(const uint8_t *payload, uint32_t len)
+ 	pkt[2] = 0x39;
+ 	pkt[3] = 0xc0;
+ 	memcpy(pkt + 4, payload, len);
+-	uint32_t size = (4 + len + 3) & ~3u;
++	return dsiSend(pkt, (4 + len + 3) & ~3u);
++}
++
++/*
++ * 0943: one packet (4-byte header [+ payload], a multiple of 4 bytes) through the command DMA, between two
++ * autorefresh frames. One at a time: brightness (blLoop) and the refresh rate (setHz) share it.
++ */
++bool
++AppleCLCD::dsiSend(const uint8_t *pkt, uint32_t size)
++{
++	if (fDsi == NULL || fBlPkt == NULL || size < 4 || size > 32 || (size & 3)) {
++		return false;
++	}
++	if (fDsiLock != NULL) {
++		IOLockLock(fDsiLock);
++	}
+ 	for (uint32_t i = 0; i < size / 4; i++) {
+ 		uint32_t w;
+ 		memcpy(&w, pkt + 4 * i, 4);
+@@ -285,6 +351,9 @@ AppleCLCD::dsiDcs(const uint8_t *payload, uint32_t len)
+ 	if ((trig & 7) != 4) {
+ 		dsi_wr(fDsi, DSI_TRIG_CTRL, trig);
+ 	}
++	if (fDsiLock != NULL) {
++		IOLockUnlock(fDsiLock);
++	}
+ 	return done;
+ }
+ 
+@@ -493,7 +562,11 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	/* 0943: sweetfb_hz=90 also runs the panel and the ticks at 90 Hz (the DCS command goes out below) */
++	PE_parse_boot_argn("sweetfbx", &sweet_fbx, sizeof(sweet_fbx));
++	fHz = hz == 90 ? 90 : 60;
++	fDsiLock = IOLockAlloc();
++	fVsync->setTimeoutUS(fHz == 90 ? 11111 : SWEET_FB_VSYNC_US);
+ 	/*
+ 	 * 0149: panel copies on their own thread. On the vsync tick a GPU present waited ~30 ms behind the render
+ 	 * server's GPU jobs, delaying the next vsync notification and capping the panel at ~18 updates/s.
+@@ -533,6 +606,16 @@ AppleCLCD::start(IOService *provider)
+ 		}
+ 		OSSafeReleaseNULL(bl);
+ 	}
++	if (fHz == 90 && !setHz(90, false)) {
++		IOLog("SWEET FB: sweetfb_hz=90: the panel did not take DCS 0x53 0x38: 60 Hz\n");
++		fHz = 60;
++		fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	}
++	if (sweet_fbx & SWEET_FBX_MODES) {
++		publishModes();
++	}
++	sweet_fb_instance = this;
++	IOLog("SWEET FB: sweetfbx %#x, panel %u Hz\n", sweet_fbx, fHz);
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+@@ -553,7 +636,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	 * ~40 Hz with jitter, and backboardd paces its frames on it.
+ 	 */
+ 	if (fb->fVsyncAbs == 0) {
+-		nanoseconds_to_absolutetime(SWEET_FB_VSYNC_US * 1000ULL, &fb->fVsyncAbs);
++		nanoseconds_to_absolutetime(fb->fHz == 90 ? 11111111ULL : SWEET_FB_VSYNC_US * 1000ULL, &fb->fVsyncAbs);
+ 		fb->fNextVsync = now;
+ 	}
+ 	fb->fNextVsync += fb->fVsyncAbs;
+@@ -562,19 +645,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	sender->wakeAtTime(fb->fNextVsync);
+ 	sweet_gpu_flip_poll();	/* 0905: a finished frame in the back buffer goes on screen at this vsync */
+-	if ((count % 300) == 0) {
+-		/* Every 5 s: frames backboardd swapped, frames copied to the panel. */
+-		uint64_t swaps = sweet_fb_swap_count - fb->fStatSwaps, ns = 0;
+-		absolutetime_to_nanoseconds(fb->fStatPresentAbs, &ns);
+-		if (swaps || fb->fStatPresents) {
+-			IOLog("SWEET FB: 5s: %llu swaps (%llu.%llu fps), %llu panel copies, avg copy %llu us\n",
+-			    swaps, swaps / 5, (swaps * 2) % 10, fb->fStatPresents,
+-			    fb->fStatPresents ? ns / 1000 / fb->fStatPresents : 0);
+-		}
+-		fb->fStatSwaps = sweet_fb_swap_count;
+-		fb->fStatPresents = 0;
+-		fb->fStatPresentAbs = 0;
+-	}
++	sweet_gpu_present_poll();	/* 0943: blit->fence latency */
++	fb->statLine(now);		/* 0943: every 5 s, the frame statistics */
+ 	/*
+ 	 * CA::WindowServer::IOMFBServer::vsync_callback(fb, a1, a2, a3, refcon): a1 only goes to kdebug, a2 is
+ 	 * the vsync's host time and a2 + a3 the next one (a3 = the refresh period, also CA's CVTimeStamp
+@@ -624,6 +696,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->fDirty = false;
+ 		}
+ 	}
++	uint64_t recAbs = fb->fPendingAbs;
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+ 		uint64_t t0 = mach_absolute_time();
+@@ -633,9 +706,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		if (fb->fPresentBusy) {
+ 			IOLockLock(fb->fLock);
+ 			fb->fDirty = true;	/* not shown: again on the next tick (fPending, maybe newer by then) */
++			fb->fStDropped += fb->fPendingAbs != recAbs;	/* 0943: a newer one came meanwhile */
+ 			IOLockUnlock(fb->fLock);
+ 		} else {
+ 			fb->fStatPresents++;
++			fb->statShown(recAbs);
+ 		}
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+@@ -648,12 +723,20 @@ AppleCLCD::presentLoop(void *arg)
+ 	for (;;) {
+ 		IOLockLock(fb->fLock);
+ 		while (!fb->fPresentReq) {
+-			IOLockSleep(fb->fLock, &fb->fPresentReq, THREAD_UNINT);
++			if (sweet_gpu_present_poll()) {
++				/* 0943: a blit is out: look at its fence every 1 ms (the stats' blit->fence latency) */
++				uint64_t dl;
++				clock_interval_to_deadline(1, kMillisecondScale, &dl);
++				IOLockSleepDeadline(fb->fLock, &fb->fPresentReq, dl, THREAD_UNINT);
++			} else {
++				IOLockSleep(fb->fLock, &fb->fPresentReq, THREAD_UNINT);
++			}
+ 		}
+ 		fb->fPresentReq = false;
+ 		bool go = fb->fDirty && !fb->fPowerOff;
+ 		if (go) {
+ 			memcpy(fb->fPresentRec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++			fb->fPresentRecAbs = fb->fPendingAbs;
+ 			fb->fDirty = false;
+ 		}
+ 		IOLockUnlock(fb->fLock);
+@@ -665,9 +748,11 @@ AppleCLCD::presentLoop(void *arg)
+ 			if (fb->fPresentBusy) {
+ 				IOLockLock(fb->fLock);
+ 				fb->fDirty = true;
++				fb->fStDropped += fb->fPendingAbs != fb->fPresentRecAbs;	/* 0943 */
+ 				IOLockUnlock(fb->fLock);
+ 			} else {
+ 				fb->fStatPresents++;
++				fb->statShown(fb->fPresentRecAbs);
+ 			}
+ 		}
+ 	}
+@@ -712,8 +797,22 @@ static uint32_t sweet_fb_swaps_logged;
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	uint64_t now = mach_absolute_time();
+ 	IOLockLock(fLock);
++	/* 0943: swap->swap interval (ms buckets, pauses over 500 ms not counted), and frames never shown */
++	if (fStLastSwap != 0) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(now - fStLastSwap, &ns);
++		uint64_t t = ns / 100000;       /* 0.1 ms */
++		if (t <= 5000) {
++			fStBucket[t <= 111 ? 0 : t <= 180 ? 1 : t <= 260 ? 2 : t <= 350 ? 3 : 4]++;
++		}
++	}
++	fStLastSwap = now;
++	fStSwaps++;
++	fStDropped += fDirty;
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++	fPendingAbs = now;
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+@@ -721,6 +820,282 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
++/*
++ * ---- 0943: frame statistics, display modes, refresh rate ----
++ *
++ * One line every 5 s while frames come (tools parse it; keep the format):
++ *   SWEET FB: 5s: swaps N shown N dropped N | le11 a le18 b le26 c le35 d gt35 e | p50 X.X p95 Y.Y ms |
++ *   blitq Q us fence F us | hz H
++ * swaps = SwapEnds, shown = frames that went to the panel (blit queued or CPU copy done), dropped = frames
++ * replaced before they were shown; le11..gt35 = swap->swap intervals (<= 11.1, 18, 26, 35 ms, longer; pauses
++ * over 500 ms not counted); p50/p95 = intervals between shown frames; blitq = mean SwapEnd -> blit queued,
++ * fence = mean blit queued -> its fence seen signalled (polled every 1 ms); hz = the panel's rate.
++ */
++void
++AppleCLCD::statShown(uint64_t swapAbs)
++{
++	uint64_t now = mach_absolute_time();
++	IOLockLock(fLock);
++	fStShown++;
++	if (swapAbs != 0 && now > swapAbs) {
++		fStBlitqAbs += now - swapAbs;
++		fStBlitqN++;
++	}
++	if (fStLastShown != 0) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(now - fStLastShown, &ns);
++		uint64_t t = ns / 100000;       /* 0.1 ms */
++		if (t < 5000) {
++			fStHist[t < SWEET_FB_HIST_FINE ? t : SWEET_FB_HIST_FINE + (t - SWEET_FB_HIST_FINE) / 10]++;
++			fStHistN++;
++		}
++	}
++	fStLastShown = now;
++	IOLockUnlock(fLock);
++}
++
++/* The interval (0.1 ms) under which pct % of the shown frames' intervals are. With fLock. */
++static uint32_t
++sweet_fb_pct(const uint16_t *hist, uint32_t n, uint32_t pct)
++{
++	uint32_t want = (n * pct + 99) / 100, acc = 0;
++	for (uint32_t i = 0; n != 0 && i < SWEET_FB_HIST; i++) {
++		acc += hist[i];
++		if (acc >= want) {
++			return i < SWEET_FB_HIST_FINE ? i : SWEET_FB_HIST_FINE + (i - SWEET_FB_HIST_FINE) * 10;
++		}
++	}
++	return 0;
++}
++
++void
++AppleCLCD::statLine(uint64_t now)
++{
++	uint64_t win;
++	nanoseconds_to_absolutetime(5000000000ULL, &win);
++	IOLockLock(fLock);
++	if (fStWin == 0) {
++		fStWin = now;
++	}
++	if (now - fStWin < win) {
++		IOLockUnlock(fLock);
++		return;
++	}
++	uint32_t swaps = fStSwaps, shown = fStShown, dropped = fStDropped, b[5];
++	memcpy(b, fStBucket, sizeof(b));
++	uint32_t p50 = sweet_fb_pct(fStHist, fStHistN, 50), p95 = sweet_fb_pct(fStHist, fStHistN, 95);
++	uint64_t blitq = 0, fence = 0, fenceN = 0;
++	absolutetime_to_nanoseconds(fStBlitqAbs, &blitq);
++	blitq = fStBlitqN ? blitq / 1000 / fStBlitqN : 0;
++	fStWin = now;
++	fStSwaps = fStShown = fStDropped = fStBlitqN = fStHistN = 0;
++	fStBlitqAbs = 0;
++	bzero(fStBucket, sizeof(fStBucket));
++	bzero(fStHist, sizeof(fStHist));
++	IOLockUnlock(fLock);
++	sweet_gpu_present_landed(&fence, &fenceN);
++	absolutetime_to_nanoseconds(fence, &fence);
++	fence = fenceN ? fence / 1000 / fenceN : 0;
++	if (swaps == 0 && shown == 0) {
++		return;
++	}
++	IOLog("SWEET FB: 5s: swaps %u shown %u dropped %u | le11 %u le18 %u le26 %u le35 %u gt35 %u | "
++	    "p50 %u.%u p95 %u.%u ms | blitq %llu us fence %llu us | hz %u\n", swaps, shown, dropped,
++	    b[0], b[1], b[2], b[3], b[4], p50 / 10, p50 % 10, p95 / 10, p95 % 10, blitq, fence, fHz);
++}
++
++/* sweetfbx & 2: has the CPU locked the surface for writing (IOSurface seed bumped) since its last present? */
++bool
++AppleCLCD::cpuWrote(SweetSurface *s)
++{
++	/* the seed: u32 at +0xc of the shared state page (SweetSurface.cpp SWEET_SURFACE_STATE_SEED), bumped by
++	 * every unlock that was not read-only */
++	uint32_t seed = s->state != NULL ? *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
++	static uint32_t logs;
++	for (uint32_t i = 0; i < sizeof(fSeen) / sizeof(fSeen[0]); i++) {
++		if (fSeen[i].s == s && fSeen[i].id == s->id) {
++			bool wrote = fSeen[i].seed != seed;
++			fSeen[i].seed = seed;
++			if (logs < 6) {
++				logs++;
++				IOLog("SWEET FB: surface %u seed %u: %s\n", s->id, seed, wrote ? "CPU-written, cleaned" : "clean skipped");
++			}
++			return wrote;
++		}
++	}
++	fSeen[fSeenNext].s = s;
++	fSeen[fSeenNext].id = s->id;
++	fSeen[fSeenNext].seed = seed;
++	fSeenNext = (fSeenNext + 1) % (sizeof(fSeen) / sizeof(fSeen[0]));
++	return true;    /* first present seen: clean */
++}
++
++static void
++sweet_fb_set_number(OSDictionary *d, const char *key, uint64_t v)
++{
++	OSNumber *n = OSNumber::withNumber(v, 32);
++	if (n != NULL) {
++		d->setObject(key, n);
++		n->release();
++	}
++}
++
++/*
++ * sweetfbx & 1: the display's mode as CoreAnimation reads it from IOMFB (TimingElements, ColorElements; the
++ * current one by GetBlock 0x40): one timing, the presented size at the panel's rate (16.16), 8-bit RGB.
++ * As upstream hackios MiniIOMobileFramebuffer (publishModes).
++ */
++#define SWEET_FB_TIMING_ID      1
++#define SWEET_FB_COLOR_ID       1
++void
++AppleCLCD::publishModes(void)
++{
++	OSDictionary *timing = OSDictionary::withCapacity(8), *horizontal = OSDictionary::withCapacity(4);
++	OSDictionary *vertical = OSDictionary::withCapacity(4), *color = OSDictionary::withCapacity(8);
++	OSArray *timings = OSArray::withCapacity(1), *colors = OSArray::withCapacity(1);
++	uint64_t rate = (uint64_t)fHz << 16;
++	if (timing != NULL && horizontal != NULL && vertical != NULL && color != NULL && timings != NULL && colors != NULL) {
++		sweet_fb_set_number(color, "ID", SWEET_FB_COLOR_ID);
++		sweet_fb_set_number(color, "PixelEncoding", 0);         /* RGB 4:4:4 */
++		sweet_fb_set_number(color, "Depth", 8);
++		sweet_fb_set_number(color, "Colorimetry", 1);
++		sweet_fb_set_number(color, "EOTF", 1);
++		sweet_fb_set_number(color, "DynamicRange", 0);
++		sweet_fb_set_number(color, "Score", 1);
++		color->setObject("IsVirtual", kOSBooleanFalse);
++		colors->setObject(color);
++		sweet_fb_set_number(horizontal, "Active", fLogicalW);
++		sweet_fb_set_number(horizontal, "Total", fLogicalW);
++		sweet_fb_set_number(horizontal, "SyncRate", rate);
++		sweet_fb_set_number(horizontal, "PreciseSyncRate", rate);
++		sweet_fb_set_number(vertical, "Active", fLogicalH);
++		sweet_fb_set_number(vertical, "Total", fLogicalH);
++		sweet_fb_set_number(vertical, "SyncRate", rate);
++		sweet_fb_set_number(vertical, "PreciseSyncRate", rate);
++		sweet_fb_set_number(timing, "ID", SWEET_FB_TIMING_ID);
++		sweet_fb_set_number(timing, "Score", 1);
++		timing->setObject("IsVirtual", kOSBooleanFalse);
++		timing->setObject("IsOverscanned", kOSBooleanFalse);
++		timing->setObject("HorizontalAttributes", horizontal);
++		timing->setObject("VerticalAttributes", vertical);
++		timing->setObject("ColorModes", colors);
++		timings->setObject(timing);
++		setProperty("TimingElements", timings);
++		setProperty("ColorElements", colors);
++		IOLog("SWEET FB: TimingElements %ux%u at %u Hz (SyncRate %#llx)\n", fLogicalW, fLogicalH, fHz, rate);
++	}
++	OSSafeReleaseNULL(timings);
++	OSSafeReleaseNULL(colors);
++	OSSafeReleaseNULL(timing);
++	OSSafeReleaseNULL(horizontal);
++	OSSafeReleaseNULL(vertical);
++	OSSafeReleaseNULL(color);
++}
++
++/*
++ * The S6E3HC2's refresh rate: DCS short write 0x53 0x28 = 60 Hz, 0x53 0x38 = 90 Hz, same DSI clock and porches
++ * (dsi-panel-s6e3hc2-dvt-dsc-1080p-cmd.dtsi, android-msm-redbull-4.19). Autorefresh starts one frame per TE, so
++ * the MDP follows the panel. Then the vsync ticks and SyncRate. tc: also scale INTF1's tear-check vsync_count
++ * (the line clock of its read pointer) by old/new rate, as the SDE driver does for a mode switch.
++ */
++bool
++AppleCLCD::setHz(uint32_t hz, bool tc)
++{
++	if (hz != 60 && hz != 90) {
++		return false;
++	}
++	if (fDsi == NULL) {
++		fDsi = (volatile uint8_t *)ml_io_map(SWEET_BL_DSI0_PA, 0x1000);
++	}
++	if (fBlPkt == NULL) {
++		fBlPkt = (volatile uint32_t *)ml_io_map(SWEET_BL_PKT_PA, 0x1000);
++	}
++	const uint8_t pkt[4] = { 0x53, (uint8_t)(hz == 90 ? 0x38 : 0x28), 0x15, 0x80 };   /* short write, last */
++	bool ok = dsiSend(pkt, sizeof(pkt));
++	IOLog("SWEET FB: hz %u: DCS 0x53 %#x %s\n", hz, pkt[1], ok ? "sent" : "NO DMA DONE");
++	if (!ok) {
++		return false;
++	}
++	uint32_t old = fHz;
++	uint64_t period;
++	nanoseconds_to_absolutetime(hz == 90 ? 11111111ULL : SWEET_FB_VSYNC_US * 1000ULL, &period);
++	fHz = hz;
++	if (fVsyncAbs != 0) {
++		fVsyncAbs = period;     /* from the next tick on */
++	}
++	if (sweet_fbx & SWEET_FBX_MODES) {
++		publishModes();
++	}
++	if (tc && old != hz) {
++		uint32_t v = sweet_mdp_rd(SWEET_INTF1 + INTF_TEAR_SYNC_VSYNC), cnt = v & 0x7ffff;
++		uint32_t ncnt = cnt * old / hz;
++		if (cnt != 0) {
++			sweet_mdp_wr(SWEET_INTF1 + INTF_TEAR_SYNC_VSYNC, (v & ~0x7ffffu) | ncnt);
++		}
++		IOLog("SWEET FB: hz %u: tear-check vsync %#x -> %#x\n", hz, v, sweet_mdp_rd(SWEET_INTF1 + INTF_TEAR_SYNC_VSYNC));
++	}
++	return true;
++}
++
++/*
++ * Poke commands (bsd/dev/sweet_poke.c "p WORD"):
++ *   p fc            INTF1's TE frame counter (and INTF frame counter) twice, 1 s apart: the panel's real rate,
++ *                   with the tear-check configuration
++ *   p hz 60|90 [tc] the panel's rate now (DCS 0x53), ticks and SyncRate with it; tc: tear-check line clock too
++ */
++void
++AppleCLCD::fbCmd(const char *s, const char *end)
++{
++	if (end - s >= 2 && s[0] == 'f' && s[1] == 'c') {
++		uint32_t a0 = sweet_mdp_rd(SWEET_INTF1 + INTF_TEAR_INT_COUNT), f0 = sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT);
++		uint64_t t0 = mach_absolute_time();
++		IOSleep(1000);
++		uint32_t a1 = sweet_mdp_rd(SWEET_INTF1 + INTF_TEAR_INT_COUNT), f1 = sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT);
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		uint64_t te = (uint16_t)((a1 >> 16) - (a0 >> 16)), fr = (uint32_t)(f1 - f0);
++		uint64_t te10 = ns ? te * 10000000000ULL / ns : 0, fr10 = ns ? fr * 10000000000ULL / ns : 0;
++		uint32_t vs = sweet_mdp_rd(SWEET_INTF1 + INTF_TEAR_SYNC_VSYNC);
++		IOLog("SWEET FB: fc: te %llu frames in %llu ms = %llu.%llu Hz (int_count %08x -> %08x); intf frame_count "
++		    "%u -> %u = %llu.%llu Hz; panel set to %u Hz\n", te, ns / 1000000, te10 / 10, te10 % 10, a0, a1, f0, f1,
++		    fr10 / 10, fr10 % 10, fHz);
++		IOLog("SWEET FB: fc: tear en %x vsync %08x (count %u = line %llu ns) height %x init %x line %x autorefresh %08x\n",
++		    sweet_mdp_rd(SWEET_INTF1 + INTF_TEAR_EN), vs, vs & 0x7ffff, (uint64_t)(vs & 0x7ffff) * 1000000000ULL / 19200000,
++		    sweet_mdp_rd(SWEET_INTF1 + INTF_TEAR_SYNC_HEIGHT), sweet_mdp_rd(SWEET_INTF1 + INTF_TEAR_INIT_VAL),
++		    sweet_mdp_rd(SWEET_INTF1 + INTF_TEAR_LINE_COUNT), sweet_mdp_rd(SWEET_INTF1 + INTF_TEAR_AUTOREFRESH));
++		return;
++	}
++	if (end - s >= 2 && s[0] == 'h' && s[1] == 'z') {
++		const char *q = s + 2;
++		uint32_t hz = 0;
++		while (q < end && *q == ' ') {
++			q++;
++		}
++		while (q < end && *q >= '0' && *q <= '9') {
++			hz = hz * 10 + (uint32_t)(*q++ - '0');
++		}
++		while (q < end && *q == ' ') {
++			q++;
++		}
++		bool tc = end - q >= 2 && q[0] == 't' && q[1] == 'c';
++		bool ok = setHz(hz, tc);
++		IOLog("SWEET FB: hz %u%s -> %s (panel %u Hz)\n", hz, tc ? " tc" : "", ok ? "ok" : "FAILED", fHz);
++		return;
++	}
++	IOLog("SWEET FB: poke p: fc | hz 60|90 [tc]\n");
++}
++
++extern "C" void sweet_fb_cmd(const char *s, const char *end);
++void
++sweet_fb_cmd(const char *s, const char *end)
++{
++	if (sweet_fb_instance == NULL) {
++		IOLog("SWEET FB: no framebuffer for p %.8s\n", s);
++		return;
++	}
++	sweet_fb_instance->fbCmd(s, end);
++}
++
+ static uint32_t sweet_fb_gpu_why_logged;
+ 
+ /* Why presentGPU fell back to the CPU copy, logged once per reason. */
+@@ -839,7 +1214,9 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 		IOLog("SWEET FB: frames now scaled to fit by the GPU (panel stride %u)\n", fRowBytes);
+ 	}
+ 	uint32_t dx = 0, dy = 0, dw = 0, dh = 0;
+-	int rc = sweet_gpu_present(slot, s->kernelAddress(), s->offset, s->width, s->height, s->bytesPerRow,
++	/* 0943 (sweetfbx & 2): no cache clean of a surface the CPU has not written (locked) since its last present */
++	uintptr_t clean = (sweet_fbx & SWEET_FBX_NOCLEAN) && !cpuWrote(s) ? 0 : s->kernelAddress();
++	int rc = sweet_gpu_present(slot, clean, s->offset, s->width, s->height, s->bytesPerRow,
+ 	    fRowBytes, fCornerRadius, &dx, &dy, &dw, &dh);
+ 	s->release();
+ 	if (rc == 1) {
+@@ -1026,7 +1403,7 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+ 	    kIOUserNotifyOptionCanDrop);
+ }
+ 
+-static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
++static uint64_t sweet_fb_logged[2];     /* selectors already logged (< 128; 0943: each once) */
+ 
+ IOReturn
+ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+@@ -1036,6 +1413,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	IOReturn ret = kIOReturnSuccess;
+ 	uint64_t out[2] = { 0, 0 };
+ 	uint32_t outCount = 0;
++	bool structDone = false;        /* 0943: structureOutput filled in, not to be zeroed */
+ 
+ 	switch (selector) {
+ 	case kSweetFBGetLayerDefaultSurface:
+@@ -1102,6 +1480,24 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
++	case kSweetFBGetCurrentAbsoluteTime:
++		/* 0943 (sweetfbx & 1): was 0 through the default case */
++		if (sweet_fbx & SWEET_FBX_MODES) {
++			out[0] = mach_absolute_time();
++			outCount = 1;
++		}
++		break;
++	case kSweetFBGetBlock:
++		/* 0943 (sweetfbx & 1): block 0x40 = the current mode: colour and timing ids at +4 */
++		if ((sweet_fbx & SWEET_FBX_MODES) && args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
++			bzero(args->structureOutput, args->structureOutputSize);
++			if (args->scalarInputCount >= 1 && args->scalarInput[0] == 0x40 && args->structureOutputSize >= 12) {
++				uint32_t ids[2] = { SWEET_FB_COLOR_ID, SWEET_FB_TIMING_ID };
++				memcpy((uint8_t *)args->structureOutput + 4, ids, sizeof(ids));
++			}
++			structDone = true;
++		}
++		break;
+ 	case kSweetFBSwapWait:
+ 	default:
+ 		break;
+@@ -1110,17 +1506,17 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+ 		args->scalarOutput[i] = i < outCount ? out[i] : 0;
+ 	}
+-	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
++	if (!structDone && args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
+ 		bzero(args->structureOutput, args->structureOutputSize);
+ 	}
+-	if (selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {
+-		if (selector < 64) {
+-			sweet_fb_logged |= 1ULL << selector;
++	if (selector >= 128 || !(sweet_fb_logged[selector / 64] & (1ULL << (selector % 64)))) {
++		if (selector < 128) {
++			sweet_fb_logged[selector / 64] |= 1ULL << (selector % 64);
+ 		}
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+-		IOLog("SWEET FB: %s sel %u in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-		    args->scalarInputCount, args->structureInputSize,
++		IOLog("SWEET FB: %s sel %u in %u/%u [%#llx] out %u/%u -> 0x%x\n", name, selector,
++		    args->scalarInputCount, args->structureInputSize, args->scalarInputCount ? args->scalarInput[0] : 0ULL,
+ 		    args->scalarOutputCount, args->structureOutputSize, ret);
+ 	}
+ 	return ret;
+-- 
+2.39.0
+

@@ -215,6 +215,7 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   (4 x, 2-16 ms), refusals log both prepare() results.
 - 0942 the `present:` line per 300-frame window: window ms and presents/s, per-frame clean/blit, put off / flips / late in
   the window, mode (single buffer / flip) and `sweetgpufreq`, totals in brackets.
+- 0943 `SWEET FB: 5s: swaps N shown N dropped N | le11 a le18 b le26 c le35 d gt35 e | p50 X.X p95 Y.Y ms | blitq Q us fence F us | hz H` (always); `sweetfbx=` 0x1 TimingElements/SyncRate + GetBlock(0x40) + sel 77, 0x2 no dcache clean unless the surface's seed moved; `sweetfb_hz=90` = DCS 0x53 0x38 + 11.1 ms ticks; poke `p fc`, `p hz 60|90 [tc]`.
 - 0950 ADSP FastRPC (WS-D): sweet_adsp.c answers `fastrpcglink-apps-dsp` (64 x 0x64 intents) and `glink_ssr`;
   `/dev/redwood-fastrpc` (0600, one opener) carries 40-byte messages / 16-32-byte answers for phone/fastrpc/fastrpcd;
   ioctls FASTRPC_SMMU_IDENTITY (SID 0x1403-5 -> apps SMMU bank with translation off, logged `SWEET FASTRPC: SMMU:`)
