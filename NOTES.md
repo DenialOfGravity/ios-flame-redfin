@@ -221,6 +221,11 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
 - 0981 /dev/btuart (`btuart=1`, no node by default): WCN3998 HCI UART on QUP0 SE5 (0x894000, SPI 606 via 0911) for
   phone/bt/btd: GENI FIFO mode, RTS/CTS, 16 KiB RX ring, baud/flow/drain/flush/timeout/stats ioctls; ENXIO without
   XBL-loaded UART firmware; `btuartos=16|32`; poke `b 0` state, `b 1` HCI version, `b 2` QCA EDL version.
-- 0982 stand-in Bluetooth nubs (`sweetbtnub=1` "bluetooth", `=2` "marconi-bt", `=3` both; off by default): SweetBTNub
-  services under the platform expert for bluetoothd's IONameMatch notifications; every property read from them logged
-  with found/MISSING, user-client requests refused + logged, setProperties keys logged (`SWEET BTNUB:`).
+- 0982 stand-in Bluetooth nubs + AppleOLYHAL (`sweetbtnub` bitmask: 1 "bluetooth", 2 "marconi-bt", 4 AppleOLYHAL;
+  off by default): SweetBTNub services for bluetoothd's IONameMatch notifications carrying the D22 bluetooth-node
+  properties (transport-encoding 3, 3 Mbaud, vendor/product/profiles/coex, compatible "bluetooth,n88"); AppleOLYHAL
+  is an empty IOService for BlueTool's IOProviderClass match. Property reads logged found/MISSING, user-client
+  requests refused + logged, setProperties keys logged (`SWEET BTNUB:`).
+- 0983 Bluetooth bridge (`btbridge=1`, no nodes by default): /dev/cu.bluetooth + /dev/uart.bluetooth (one H4 pipe
+  bluetoothd opens) <-> /dev/btbridge (btd --bridge) + dummy /dev/btwake. Two 16 KiB rings, blocking/O_NONBLOCK/
+  select; btd forwards standard HCI to the WCN3998 and fakes/logs vendor 0xFC__ commands (`SWEET BTBR:`, btd `BTD BRIDGE:`).
