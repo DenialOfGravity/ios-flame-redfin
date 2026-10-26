@@ -218,7 +218,8 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
 - 0950 ADSP FastRPC (WS-D): sweet_adsp.c answers `fastrpcglink-apps-dsp` (64 x 0x64 intents) and `glink_ssr`;
   `/dev/redwood-fastrpc` (0600, one opener) carries 40-byte messages / 16-32-byte answers for phone/fastrpc/fastrpcd;
   ioctls FASTRPC_SMMU_IDENTITY (SID 0x1403-5 -> apps SMMU bank with translation off, logged `SWEET FASTRPC: SMMU:`)
-  and FASTRPC_ALLOC (RAM < 4 GiB); `adsp_fastrpc=0` old way, `=2` log every message; poke `f 0` status, `f 1` DSP
+  and FASTRPC_ALLOC (RAM < 4 GiB from the GPU pool, zeroed, 32 buffers kept; `SWEET FASTRPC: N bytes for the DSP at PA
+  (GPU pool ...)`); `adsp=2` starts the DSP on the first open of the device (fastrpcd up first); `adsp_fastrpc=0` old way, `=2` log every message; poke `f 0` status, `f 1` DSP
   words + last words, `f 2` QRTR services/ports, `f 3 SID` identity, `f 5` SMMU faults (`f 9` help).
 - 0951 pd-mapper (QMI 0x40, port 0x4001) in the ADSP's kernel QRTR: msm/adsp/{root,sensor,audio}_pd + avs/audio,
   instance 74; announced after the DSP's HELLO and to its lookups; PD failure reports logged (`SWEET PDMAP:`);

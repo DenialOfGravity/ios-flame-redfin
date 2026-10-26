@@ -148,8 +148,17 @@ int main(int argc, char **argv)
 		}
 		if (off())
 			return EXIT_OFF;
+		if (ret == -1 && errno == ENOTCONN && tries < 240) {
+			/* the DSP is starting (adsp=2 starts it on our open): its sensors PD asks for files a few
+			 * seconds after the channel opens, so look every 250 ms for the first minute */
+			if (tries == 0)
+				flog("the DSP has not opened the channel yet: waiting");
+			usleep(250000);
+			continue;
+		}
 		backoff(&wait);
 	}
+	flog("attached after %d tries", tries + 1);
 
 	ifaces[0] = fastrpc_localctl_init(3, ifaces);
 	ifaces[1] = fastrpc_apps_std_init(root);

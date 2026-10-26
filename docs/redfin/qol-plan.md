@@ -137,6 +137,12 @@ was writable).
   relative ones in `<dir>/adsp/<name>` then `<dir>/<name>` for `$ADSP_LIBRARY_PATH` = /usr/lib/qcom/adsp,
   /vendor/lib/rfsa/adsp, /vendor/dsp and `$ADSP_AVS_CFG_PATH` = /vendor/etc/acdbdata. apps_std methods 0-5, 8-12,
   15, 16, 19, 22-24, 26-33; anything else (and any undecodable request) gets an error answer, the loop goes on.
+- r23a fixes (0950 regenerated, 0951/0956 rebased on it): FASTRPC_ALLOC now comes from the GPU pool below 4 GiB
+  (`sweet_gpu_pool_alloc`, as 0923's camera frames; XNU's RAM starts at 4 GiB, so `kmem_alloc_contig` never could),
+  zeroed by the kernel through a device mapping; fastrpcd's /dev/pmem accesses are 32-bit aligned (bounce for the
+  edges). Boot-arg `adsp=2`: the DSP is started by the first open of /dev/redwood-fastrpc (fastrpcd exists before
+  the sensors PD asks for files); the "given up" flag is cleared then, so write() says ENOTCONN and read() waits
+  until the channel opens; fastrpcd polls every 250 ms for the first minute while it sees ENOTCONN.
 - Exit codes: 0 `/var/local/fastrpcd.off`, 1 error, 2 no tree (after 30 s), 3 DSP gone (ECONNRESET), 4 refused.
   Waits (1-30 s back-off) for `/dev/pmem`, `/dev/redwood-fastrpc` (ENOENT/EBUSY) and the channel (ENOTCONN).
 - Install: `bash tools/redfin-install-hexagon-wsl.sh USERLAND.zip [recon/fw-adsp] [recon/fw-qol/persist.tar | recon/persist/sensors]` (root

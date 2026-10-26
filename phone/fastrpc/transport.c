@@ -530,6 +530,8 @@ static int attach(int fd, uint32_t pd)
 
 	T.session[fd].pd = pd;
 	ret = invoke(fd, FRPC_INIT_HANDLE, REMOTE_SCALARS_MAKE(0, 1, 0), &a);
+	if (ret == -1 && errno == ENOTCONN)
+		return ret;	/* the channel is not open yet: the caller waits (and says so once) */
 	flog("INIT_ATTACH%s (pd %u, tgid %d) -> %d%s%s", pd == FRPC_SENSORS_PD ? "_SNS" : "", pd, tgid, ret,
 	     ret == -1 ? ": " : "", ret == -1 ? strerror(errno) : "");
 	return ret;
@@ -609,22 +611,51 @@ static int dev_alloc(void *ctx, uint64_t size, uint64_t *pa)
 	return 0;
 }
 
+/*
+ * The buffers are GPU-pool RAM that XNU does not map: /dev/pmem reaches it through a device mapping
+ * (uncached: nothing to flush) and takes only 32-bit aligned offsets and lengths. Unaligned edges go
+ * through a bounce buffer (read, patch, write back).
+ */
+static int pmem_xfer(uint64_t pa, void *buf, size_t len, int write)
+{
+	uint64_t lo = pa & ~3ull, hi = (pa + len + 3) & ~3ull;
+	size_t n = (size_t)(hi - lo);
+	uint8_t *tmp;
+	int ok;
+
+	if (lo == pa && n == len) {
+		ssize_t r = write ? pwrite(pmem_fd, buf, len, (off_t)pa) : pread(pmem_fd, buf, len, (off_t)pa);
+
+		ok = r == (ssize_t)len;
+	} else {
+		tmp = malloc(n);
+		if (tmp == NULL)
+			return -1;
+		ok = pread(pmem_fd, tmp, n, (off_t)lo) == (ssize_t)n;
+		if (ok && write) {
+			memcpy(tmp + (pa - lo), buf, len);
+			ok = pwrite(pmem_fd, tmp, n, (off_t)lo) == (ssize_t)n;
+		} else if (ok) {
+			memcpy(buf, tmp + (pa - lo), len);
+		}
+		free(tmp);
+	}
+	if (ok)
+		return 0;
+	flog("pmem: %s %zu at %#llx: %s", write ? "write" : "read", len, (unsigned long long)pa, strerror(errno));
+	return -1;
+}
+
 static int pmem_wr(void *ctx, uint64_t pa, const void *buf, size_t len)
 {
 	(void)ctx;
-	if (pwrite(pmem_fd, buf, len, (off_t)pa) == (ssize_t)len)
-		return 0;
-	flog("pmem: write %zu at %#llx: %s", len, (unsigned long long)pa, strerror(errno));
-	return -1;
+	return pmem_xfer(pa, (void *)(uintptr_t)buf, len, 1);
 }
 
 static int pmem_rd(void *ctx, uint64_t pa, void *buf, size_t len)
 {
 	(void)ctx;
-	if (pread(pmem_fd, buf, len, (off_t)pa) == (ssize_t)len)
-		return 0;
-	flog("pmem: read %zu at %#llx: %s", len, (unsigned long long)pa, strerror(errno));
-	return -1;
+	return pmem_xfer(pa, buf, len, 0);
 }
 
 int frpc_open_device(const char *path, struct frpc_dev *dev, struct frpc_mem *mem)

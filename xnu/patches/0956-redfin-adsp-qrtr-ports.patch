@@ -1,7 +1,7 @@
-From c4777fefb540dc8795a9fa936c9e19e8df7c7dd1 Mon Sep 17 00:00:00 2001
+From 19a0615588f5e74559f6959fcbc94728cf79e8c4 Mon Sep 17 00:00:00 2001
 From: WS-D <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 00:38:49 +0100
-Subject: [PATCH] 0956 redfin: /dev/redwood-qrtr ports on the ADSP's QRTR,
+Subject: [PATCH 3/3] 0956 redfin: /dev/redwood-qrtr ports on the ADSP's QRTR,
  kern.sweet_adsp_services
 
 qol-plan.md 3.1: each open of /dev/redwood-qrtr (a devfs clone) is one QRTR
@@ -17,7 +17,7 @@ DSP's services as "svc:inst@node:port,...". Poke f 2 also lists open ports.
  1 file changed, 325 insertions(+)
 
 diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
-index dc3e013..a592080 100644
+index f27b855..aa87021 100644
 --- a/bsd/dev/sweet_adsp.c
 +++ b/bsd/dev/sweet_adsp.c
 @@ -122,6 +122,7 @@
@@ -28,7 +28,7 @@ index dc3e013..a592080 100644
  extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
  
  #if defined(ARM64_BOARD_CONFIG_SWEET)
-@@ -2616,6 +2617,8 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
+@@ -2619,6 +2620,8 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
  	}
  }
  
@@ -37,7 +37,7 @@ index dc3e013..a592080 100644
  static void
  qrtr_input(const uint8_t *data, uint32_t length)
  {
-@@ -2669,6 +2672,9 @@ qrtr_input(const uint8_t *data, uint32_t length)
+@@ -2672,6 +2675,9 @@ qrtr_input(const uint8_t *data, uint32_t length)
  		pdm_input(&header, data + at, header.size);     /* 0951 */
  		return;
  	}
@@ -47,7 +47,7 @@ index dc3e013..a592080 100644
  	printf("adsp: qrtr: a datagram of %u bytes from node %u port %u to our port %u: nobody here listens there\n", header.size,
  	    header.from_node, header.from_port, header.to_port);
  }
-@@ -3594,6 +3600,318 @@ ssr_input(const uint8_t *data, uint32_t length)
+@@ -3661,6 +3667,318 @@ ssr_input(const uint8_t *data, uint32_t length)
  	printf("SWEET FASTRPC: glink_ssr: %u bytes: %#x %#x %#x %#x\n", length, w[0], w[1], w[2], w[3]);
  }
  
@@ -366,7 +366,7 @@ index dc3e013..a592080 100644
  /* poke f N [A]: see NOTES.md (0950, 0951, 0956) */
  int sweet_adsp_poke(unsigned what, uint64_t a, uint64_t b);
  int
-@@ -3630,6 +3948,12 @@ sweet_adsp_poke(unsigned what, __unused uint64_t a, __unused uint64_t b)
+@@ -3697,6 +4015,12 @@ sweet_adsp_poke(unsigned what, __unused uint64_t a, __unused uint64_t b)
  				    qrtr_servers[i].node, qrtr_servers[i].port);
  			}
  		}
@@ -379,7 +379,7 @@ index dc3e013..a592080 100644
  		return 0;
  	case 3:
  		return fastrpc_smmu_identity((uint32_t)a);
-@@ -4023,6 +4347,7 @@ redwood_adsp_init(void)
+@@ -4090,6 +4414,7 @@ redwood_adsp_init(void)
  		return;
  	}
  	fastrpc_init();                         /* 0950: /dev/redwood-fastrpc (adsp_fastrpc=0: not) */
