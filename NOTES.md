@@ -298,3 +298,7 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
 - 0982 stand-in Bluetooth nubs (`sweetbtnub=1` "bluetooth", `=2` "marconi-bt", `=3` both; off by default): SweetBTNub
   services under the platform expert for bluetoothd's IONameMatch notifications; every property read from them logged
   with found/MISSING, user-client requests refused + logged, setProperties keys logged (`SWEET BTNUB:`).
+- 0973 AppleARMBacklight publishes the panel's nits for CoreBrightness (MinNits/MaxNits/MaxNitsPanel,
+  HardwareAccessibleMin/MaxNits, user-accessible-max-nits, digital-dimming-min-nits, brightness-nits(-cap),
+  DisplayPanel/ProductLuminanceMin/Mid/Max: 2..500, integer nits; 500 nits <-> level 1023): `sweetnits=0` off.
+  `tools/mkadt.py --backlight` (opt-in) also copies D22AP's /backlight node with max-nit-value/LmaxProduct = 500.
