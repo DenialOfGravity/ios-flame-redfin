@@ -190,25 +190,48 @@ int hci_send_cmd(struct hci *h, uint16_t op, const uint8_t *p, uint8_t n)
 	return hci_send(h, H4_CMD, b, 3u + n, 0);
 }
 
+static const char *ibs_name(uint8_t c)
+{
+	return c == IBS_WAKE_IND ? "wake indication" : c == IBS_SLEEP_IND ? "sleep indication" : "wake acknowledgement";
+}
+
 static void ibs_byte(struct hci *h, uint8_t c)
 {
 	h->n_ibs++;
 	if (h->tap)
 		h->tap(h, c, NULL, 0);
+	if (c == h->ibs_last && h->ibs_run) {
+		h->ibs_run++;
+	} else {
+		h->ibs_last = c;
+		h->ibs_run = 1;
+		h->ibs_first = now_ms();
+	}
+	/* the first three of a run one by one, then one line per 50: a flood is a stuck sleep state or bytes
+	   decoded at the wrong speed (one byte repeated at a mismatched baud also reads as the same value) */
+	if (h->ibs_run > 3) {
+		if (h->ibs_run % 50 == 0)
+			hci_log(h, "BTD < IBS %s x%lu in a row over %llu ms (flood: controller stuck asleep, or a baud "
+				"mismatch -- nothing else is getting through)\n", ibs_name(c), h->ibs_run,
+				(unsigned long long)(now_ms() - h->ibs_first));
+	}
 	switch (c) {
 	case IBS_WAKE_IND: {
-		hci_log(h, "BTD < IBS wake indication%s\n", h->ibs ? ": acknowledged" : " (IBS off: acknowledged anyway)");
+		if (h->ibs_run <= 3)
+			hci_log(h, "BTD < IBS wake indication%s\n", h->ibs ? ": acknowledged" : " (IBS off: acknowledged anyway)");
 		uint8_t a = IBS_WAKE_ACK;
 		h->u->write(h->u, &a, 1);
 		h->peer_asleep = 0;
 		break;
 	}
 	case IBS_SLEEP_IND:
-		hci_log(h, "BTD < IBS sleep indication\n");
+		if (h->ibs_run <= 3)
+			hci_log(h, "BTD < IBS sleep indication\n");
 		h->peer_asleep = 1;
 		break;
 	case IBS_WAKE_ACK:
-		hci_log(h, "BTD < IBS wake acknowledgement\n");
+		if (h->ibs_run <= 3)
+			hci_log(h, "BTD < IBS wake acknowledgement\n");
 		h->peer_asleep = 0;
 		break;
 	}
@@ -222,6 +245,9 @@ int hci_recv(struct hci *h, struct hci_pkt *p, unsigned ms)
 			uint8_t c = h->rbuf[h->rpos++];
 			int r = h4_feed(&h->rx, &c);
 			if (r == 1) {
+				if (h->ibs_run > 3)
+					hci_log(h, "BTD: IBS %s run ended after %lu bytes\n", ibs_name(h->ibs_last), h->ibs_run);
+				h->ibs_run = 0;
 				p->type = h->rx.type;
 				p->len = h->rx.got;
 				p->data = h->rx.data;

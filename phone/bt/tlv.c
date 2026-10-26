@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <string.h>
 #include "tlv.h"
 
@@ -159,4 +160,28 @@ unsigned qca_rom_ver(uint32_t soc_id, uint16_t rom_ver)
 {
 	uint32_t soc_ver = soc_id << 16 | rom_ver;
 	return ((soc_ver & 0x00000f00) >> 4) | (soc_ver & 0x0000000f);
+}
+
+int tlv_nvm_tag_hex(const uint8_t *buf, size_t n, uint16_t id, char *out, size_t cap)
+{
+	struct tlv_info ti;
+	snprintf(out, cap, "absent");
+	if (tlv_parse(buf, n, &ti, NULL) || ti.type != TLV_TYPE_NVM)
+		return -1;
+	const uint8_t *d = buf + ti.nvm_off;
+	uint32_t idx = 0;
+	while (idx + 12 <= ti.nvm_len) {
+		uint16_t tid = le16(d + idx), len = le16(d + idx + 2);
+		if (tid == 0xffff)
+			break;
+		if (tid == id) {
+			size_t o = 0;
+			out[0] = 0;
+			for (unsigned i = 0; i < len && o + 4 < cap; i++)
+				o += (size_t)snprintf(out + o, cap - o, "%s%02x", i ? " " : "", d[idx + 12 + i]);
+			return len;
+		}
+		idx += 12u + len;
+	}
+	return -1;
 }

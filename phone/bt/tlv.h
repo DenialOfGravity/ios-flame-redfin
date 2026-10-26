@@ -68,6 +68,9 @@ int tlv_nvm_edit(uint8_t *buf, size_t n, int baud_idx, int baud_pos, int ibs, co
  */
 size_t tlv_segments(size_t n, int dnld_mode, struct tlv_seg *out, size_t max);
 
+/* the bytes of NVM tag id as hex into out ("absent" if none); returns the tag length or -1 */
+int tlv_nvm_tag_hex(const uint8_t *buf, size_t n, uint16_t id, char *out, size_t cap);
+
 /* btqca.c firmware naming: rom_ver = ((soc_ver & 0xf00) >> 4) | (soc_ver & 0xf), soc_ver = soc_id << 16 | rom */
 unsigned qca_rom_ver(uint32_t soc_id, uint16_t rom_ver);
 

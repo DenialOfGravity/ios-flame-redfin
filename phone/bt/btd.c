@@ -13,7 +13,9 @@
  * Options: --baud N (operating speed, default 3000000; 115200 = no change), --os 16|32 (UART oversampling,
  *   default from the QUP version), --pmem (ignore /dev/btuart), --fwdir DIR (default /private/var/local/fw),
  *   --fw FILE, --nvm FILE, --ibs (keep the NVM's in-band sleep / deep sleep as Linux sets them),
- *   --bdaddr XX:XX:XX:XX:XX:XX, --noinit (controller already up at --baud: skip power-up and download),
+ *   --setaddr (write a BD address: --bdaddr's, else the ADT's; default: keep the controller's own -- on redfin
+ *   the 0xFC0B write was followed by the controller going silent), --bdaddr XX:XX:XX:XX:XX:XX (implies --setaddr),
+ *   --nvm-keep (NVM exactly as the file), --nvm-baud-pos N (tag 17 byte for the baud index), --noinit (controller already up at --baud: skip power-up and download),
  *   -v (full hex of every packet), -q (no per-packet log).
  * Every HCI packet is logged ("BTD >" to the controller, "BTD <" from it); result lines start with
  * "BTD PROBE", "BTD UP", "BTD ADV", "BTD SCAN", "BTD RAW", failures with "BTD FAIL <step>".
@@ -46,7 +48,7 @@ int btd_main(int argc, char **argv);
 struct opts {
 	int mode;		/* 'p' probe, 'u' up, 's' scan, 'r' raw */
 	unsigned secs, port, baud;
-	int os, pmem, ibs, noinit, verbose, have_addr;
+	int os, pmem, ibs, noinit, verbose, have_addr, setaddr, nvm_keep, nvm_pos;
 	const char *fwdir, *fw, *nvm;
 	uint8_t addr[6];
 };
@@ -54,7 +56,8 @@ struct opts {
 static void usage(void)
 {
 	fprintf(stderr, "usage: btd --probe | --up | --scan [SECS] | --raw [PORT]  [--baud N] [--os 16|32] [--pmem]\n"
-		"           [--fwdir DIR] [--fw FILE] [--nvm FILE] [--ibs] [--bdaddr XX:..] [--noinit] [-v|-q]\n");
+		"           [--fwdir DIR] [--fw FILE] [--nvm FILE] [--ibs] [--nvm-keep] [--nvm-baud-pos N] [--setaddr]\n"
+		"           [--bdaddr XX:..] [--noinit] [-v|-q]\n");
 	exit(2);
 }
 
@@ -175,6 +178,7 @@ static int le_scan(struct hci *h, unsigned secs)
 	if (hci_cmd(h, 0x0c01, evmask, 8, NULL, NULL, 2000) || hci_cmd(h, 0x2001, lemask, 8, NULL, NULL, 2000) ||
 	    hci_cmd(h, 0x200b, params, 7, NULL, NULL, 2000)) {
 		fail(h, "scan-setup", "the controller refused the event masks or scan parameters (firmware not running?)");
+		qca_baud_probe(h);
 		return -1;
 	}
 	if (hci_cmd(h, 0x200c, on, 2, NULL, NULL, 2000)) {
@@ -315,13 +319,14 @@ static int bring_up(struct hci *h, struct opts *o)
 		unsigned rv = qca_rom_ver(v.soc_id, v.rom_ver), segs;
 		snprintf(fw, sizeof(fw), "%s/crbtfw%02x.tlv", o->fwdir, rv);
 		snprintf(nvm, sizeof(nvm), "%s/crnv%02x%s.bin", o->fwdir, rv, v.soc_id == QCA_WCN3991_SOC_ID ? "u" : "");
-		if (qca_download(h, o->fw ? o->fw : fw, &v, bidx, o->ibs, &segs)) {
+		struct nvm_opts no = { o->ibs, o->nvm_keep, o->nvm_pos };
+		if (qca_download(h, o->fw ? o->fw : fw, &v, bidx, &no, &segs)) {
 			fail(h, "rampatch", "rampatch download failed (file missing, or a TLV result error: wrong file "
 				"for this ROM)");
 			return -1;
 		}
 		usleep(10000);
-		if (qca_download(h, o->nvm ? o->nvm : nvm, &v, bidx, o->ibs, &segs)) {
+		if (qca_download(h, o->nvm ? o->nvm : nvm, &v, bidx, &no, &segs)) {
 			fail(h, "nvm", "NVM download failed");
 			return -1;
 		}
@@ -337,16 +342,27 @@ static int bring_up(struct hci *h, struct opts *o)
 		fail(h, "version", "Read_Local_Version failed");
 		return -1;
 	}
-	uint8_t addr[6];
-	if (o->have_addr)
-		memcpy(addr, o->addr, 6);
-	else if (adt_addr(addr)) {
-		static const uint8_t def[6] = { 0x02, 0x50, 0x49, 0x58, 0x45, 0x4d };
-		memcpy(addr, def, 6);
-		hci_log(h, "BTD: no mac-address-bluetooth0 in the ADT; using the mkadt.py default\n");
+	uint8_t addr[6] = { 0 };
+	if (!o->setaddr) {
+		if (qca_read_bdaddr(h, addr))
+			hci_log(h, "BTD: Read_BD_ADDR failed\n");
+	} else {
+		if (o->have_addr)
+			memcpy(addr, o->addr, 6);
+		else if (adt_addr(addr)) {
+			static const uint8_t def[6] = { 0x02, 0x50, 0x49, 0x58, 0x45, 0x4d };
+			memcpy(addr, def, 6);
+			hci_log(h, "BTD: no mac-address-bluetooth0 in the ADT; using the mkadt.py default\n");
+		}
+		if (qca_set_bdaddr(h, addr, v.cc_style))
+			hci_log(h, "BTD: warning: BD address not changed\n");
 	}
-	if (qca_set_bdaddr(h, addr))
-		hci_log(h, "BTD: warning: BD address not changed (continuing with the controller's)\n");
+	/* the controller must still answer; if not, find out at which speed it does */
+	if (qca_local_version(h) < 0) {
+		fail(h, "after-up", "the controller stopped answering after the bring-up");
+		qca_baud_probe(h);
+		return -1;
+	}
 	hci_log(h, "BTD UP: manufacturer %d, %u Bd, BD_ADDR %02x:%02x:%02x:%02x:%02x:%02x, backend %s\n", manu,
 		h->u->baud, addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], h->u->name);
 	return 0;
@@ -361,6 +377,7 @@ int main(int argc, char **argv)
 	o.baud = 3000000;
 	o.verbose = 1;
 	o.fwdir = "/private/var/local/fw";
+	o.nvm_pos = -1;
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
 		int more = i + 1 < argc && argv[i + 1][0] != '-';
@@ -388,6 +405,12 @@ int main(int argc, char **argv)
 			o.fw = argv[++i];
 		else if (!strcmp(a, "--nvm") && more)
 			o.nvm = argv[++i];
+		else if (!strcmp(a, "--setaddr"))
+			o.setaddr = 1;
+		else if (!strcmp(a, "--nvm-keep"))
+			o.nvm_keep = 1;
+		else if (!strcmp(a, "--nvm-baud-pos") && more)
+			o.nvm_pos = atoi(argv[++i]);
 		else if (!strcmp(a, "--ibs"))
 			o.ibs = 1;
 		else if (!strcmp(a, "--noinit"))
@@ -395,7 +418,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--bdaddr") && more) {
 			if (parse_addr(argv[++i], o.addr))
 				usage();
-			o.have_addr = 1;
+			o.have_addr = o.setaddr = 1;
 		} else if (!strcmp(a, "-v"))
 			o.verbose = 2;
 		else if (!strcmp(a, "-q"))
