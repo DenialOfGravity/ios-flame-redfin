@@ -30,4 +30,8 @@ codesign -f -s - out/mg_test
 # vt_test: VideoToolbox's pixel transfer without Metal or the hardware scaler; `vt_test encode`: software encoding speed
 ../../work/userland/bin/ios-cc -O2 -Wall -framework CoreFoundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox -o out/vt_test vt_test.c
 codesign -f -s - out/vt_test
-ls -la out/vt_test out/RedwoodAudio.driver out/sound_test out/camera_test out/camera_avtest out/mg_test
+# mic_test: records the default input (RedwoodAudio.driver's Codec -> /dev/redwood-mic) and prints peak/RMS per second
+../../work/userland/bin/ios-cc -O2 -Wall -fobjc-arc -framework Foundation -framework AVFoundation -framework AudioToolbox \
+	-framework CoreFoundation -o out/mic_test mic_test.m
+codesign -f -s - out/mic_test
+ls -la out/mic_test out/vt_test out/RedwoodAudio.driver out/sound_test out/camera_test out/camera_avtest out/mg_test
