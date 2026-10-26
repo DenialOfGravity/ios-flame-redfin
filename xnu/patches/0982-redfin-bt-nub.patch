@@ -18,9 +18,9 @@ sweet_geniuart_init (0981).
 ---
  bsd/dev/sweet_geniuart.c        |   3 +
  iokit/Kernel/IOUserClient.cpp   |  36 +++++++++
- iokit/Kernel/arm/SweetBTNub.cpp | 132 ++++++++++++++++++++++++++++++++
+ iokit/Kernel/arm/SweetBTNub.cpp | 133 ++++++++++++++++++++++++++++++++
  iokit/conf/files.arm64          |   1 +
- 4 files changed, 172 insertions(+)
+ 4 files changed, 173 insertions(+)
  create mode 100644 iokit/Kernel/arm/SweetBTNub.cpp
 
 diff --git a/bsd/dev/sweet_geniuart.c b/bsd/dev/sweet_geniuart.c
@@ -124,10 +124,10 @@ index 56c0ad5..5911cb0 100644
  	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
 diff --git a/iokit/Kernel/arm/SweetBTNub.cpp b/iokit/Kernel/arm/SweetBTNub.cpp
 new file mode 100644
-index 0000000..ff5f6bf
+index 0000000..ac2e7d8
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetBTNub.cpp
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,133 @@
 +/*
 + * redfin 0982: stand-in Bluetooth nubs for the B2 probe. The r-probe boot showed bluetoothd registering
 + * IOKit notifications for IONameMatch "marconi-bt" and IONameMatch "bluetooth" (on an iPhone these are
@@ -143,6 +143,7 @@ index 0000000..ff5f6bf
 +#include <IOKit/IOService.h>
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IOUserClient.h>
++#include <IOKit/IOPlatformExpert.h>
 +#include <libkern/c++/OSData.h>
 +#include <libkern/c++/OSDictionary.h>
 +#include <libkern/c++/OSString.h>
