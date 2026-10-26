@@ -215,6 +215,18 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   (4 x, 2-16 ms), refusals log both prepare() results.
 - 0942 the `present:` line per 300-frame window: window ms and presents/s, per-frame clean/blit, put off / flips / late in
   the window, mode (single buffer / flip) and `sweetgpufreq`, totals in brackets.
+- 0952 speakers' path through the ADSP (`bsd/dev/sweet_sound.c`, HackiOS redwood_sound.c's APR layouts): `sound=1` LPASS
+  core votes (AFE 0x100f4 blocks 3/4), LPI gpio6-9 func2, QUIN TDM clock 0x208 6.144 MHz + port 0x9040 (4 x 32-bit slots,
+  mask 0x3; no group, as Android); `sound=2` + SMMU stream 0x1401 identity bank, ADM/ASM session 1, -30 dBFS tone with the
+  amps off, path left up; `sndsecs` `sndlpi=0`; poke `a status|tone [MS]`. Default off.
+- 0953 the two CS35L41 amps (`sweet_cs35l41.c`, SE9 via sweet_se9_xfer, ASP bypass, OTP trims, gain 17) + HackiOS guard
+  (`sweet_guard.c`): `sound=3` tone audible at <= -20 dB vs Android, amps only while playing (off after 2 s);
+  `sndbelow`, `sndgpio=1` (PMIC GPIO resets, allow-listed SPMI writes); poke `a gain DB|off|on`.
+- 0954 `/dev/redwood-audio` -> ring -> ASM (`sound=4`): `redwood_audio_set_sink()`/`redwood_audio_volume()` in
+  sweet_audio.c, iOS volume added to `sndbelow`, `sndgain` (guard gain, default 12 dB), amps gated after 2 s of silence.
+- 0955 microphones (`sweet_mic.c`, `mic=1`): ALC5513 (rt5514, plain TDM mode) on SE7 0x57, reset TLMM 91, PRI TDM TLMM
+  49-52, AFE 0x9001 (8 x 32, mask 1), ADM record + ASM session 2 reads, `/dev/redwood-mic` per the plug-in ABI;
+  `micgain`; poke `a mic SECS` -> `SWEET MIC: files read /dev/pmem PA LEN`.
 - 0960 TSENS temperatures (bsd/dev/sweet_thermal.c, read only): `SWEET THERMAL:` every 5 s (silver = hottest A55,
   gold = sensors 9/11, prime = 10/12, cpuss, gpu, ddr, camera, npu, aoss), sysctl `kern.sweet_temp_*` (deci-degC);
   once at 20 s the PM7250B charger/QG/SDAM registers (`SWEET BATTERY: boot regs ...` + decoded FCC/FV/JEITA/WD line);

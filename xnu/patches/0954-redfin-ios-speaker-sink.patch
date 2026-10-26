@@ -1,0 +1,378 @@
+From 9a283804c4bd39347e8afc2dd525e0f93b1537cb Mon Sep 17 00:00:00 2001
+From: WS-A <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 00:44:21 +0100
+Subject: [PATCH] redfin: /dev/redwood-audio to the speakers (sound=4: sink
+ ring, guard gain, iOS volume, amps gated after 2 s silence)
+
+---
+ bsd/dev/sweet_audio.c |  50 ++++++++++++--
+ bsd/dev/sweet_sound.c | 151 ++++++++++++++++++++++++++++++++++--------
+ 2 files changed, 167 insertions(+), 34 deletions(-)
+
+diff --git a/bsd/dev/sweet_audio.c b/bsd/dev/sweet_audio.c
+index 4471b28..b5baa50 100644
+--- a/bsd/dev/sweet_audio.c
++++ b/bsd/dev/sweet_audio.c
+@@ -4,9 +4,11 @@
+  * plug-in that gives iOS the iPhone X's built-in audio devices:
+  *
+  *   /dev/redwood-audio   the "Speaker" output: whole frames of 48 kHz 16-bit stereo, written by the
+- *                        audio server's real-time thread, never waited on. No sink yet (the speaker
+- *                        path is behind the ADSP): counted and dropped. ioctl _IOW('r', 1,
+- *                        {below, muted}) is the volume iOS sets, kept for the sink.
++ *                        audio server's real-time thread, never waited on. 0954 (WS-A): handed to the
++ *                        sink a driver sets with redwood_audio_set_sink() (sound=4: bsd/dev/sweet_sound.c,
++ *                        the speakers through the ADSP); without one, counted and dropped as before.
++ *                        ioctl _IOW('r', 1, {below, muted}) is the volume iOS sets, read by the sink with
++ *                        redwood_audio_volume().
+  *   /dev/redwood-haptic  the "Actuator" output: 48 kHz 16-bit mono, the waveforms iOS plays on an
+  *                        iPhone X's Taptic Engine (UIKit feedback, CoreHaptics, system vibrations).
+  *                        Each write's peak becomes a drive level for the DRV2624 (sweet_haptic_drive):
+@@ -26,6 +28,8 @@
+ #include <sys/uio.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <pexpert/pexpert.h>
++#include <kern/locks.h>
++#include <sys/redwood_audio.h>
+ 
+ void sweet_audio_init(void);
+ extern int sweet_haptic_drive(unsigned ms, unsigned strength);
+@@ -44,12 +48,40 @@ struct sweet_audio_volume {
+ #define HAP_MIN_MS              14      /* the shortest drive: one tap */
+ 
+ static struct {
+-	uint64_t audio_frames, haptic_frames;
++	uint64_t audio_frames, haptic_frames, sunk_frames;
+ 	uint32_t audio_writes, haptic_writes, haptic_drives;
+ 	struct sweet_audio_volume volume;
+ 	uint32_t volume_set;
+ } sa;
+ 
++/* 0954: the sink (a driver that plays the frames) and the lock that guards its replacement */
++static LCK_GRP_DECLARE(sa_lock_group, "sweet-audio");
++static LCK_MTX_DECLARE(sa_sink_lock, &sa_lock_group);
++static redwood_audio_sink_t sa_sink;
++static const char *sa_sink_name = "nothing";
++
++void
++redwood_audio_set_sink(const char *name, redwood_audio_sink_t sink)
++{
++	lck_mtx_lock(&sa_sink_lock);
++	sa_sink = sink;
++	sa_sink_name = sink != NULL ? name : "nothing";
++	lck_mtx_unlock(&sa_sink_lock);
++	printf("SWEET AUDIO: /dev/redwood-audio now goes to %s\n", sink != NULL ? name : "nothing (dropped)");
++}
++
++bool
++redwood_audio_volume(uint32_t *below, bool *muted, uint32_t *generation)
++{
++	if (sa.volume_set == 0) {
++		return false;
++	}
++	*below = sa.volume.below;
++	*muted = sa.volume.muted != 0;
++	*generation = sa.volume_set;
++	return true;
++}
++
+ static int
+ sa_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
+ {
+@@ -105,13 +137,18 @@ sa_write(dev_t dev, struct uio *uio, __unused int ioflag)
+ 			sa_haptic(buf, (unsigned)n / 2);
+ 		} else {
+ 			sa.audio_frames += (unsigned)n / 4;
++			lck_mtx_lock(&sa_sink_lock);
++			if (sa_sink != NULL) {
++				sa.sunk_frames += sa_sink(buf, (uint32_t)n / 4);
++			}
++			lck_mtx_unlock(&sa_sink_lock);
+ 		}
+ 	}
+ 	uint32_t w = haptic ? ++sa.haptic_writes : ++sa.audio_writes;
+ 	if (w == 1 || (w & 0xfff) == 0) {
+-		printf("SWEET AUDIO: %s: %u writes, %llu frames (%llu s)%s\n", haptic ? "actuator" : "speaker", w,
++		printf("SWEET AUDIO: %s: %u writes, %llu frames (%llu s)%s%s%s\n", haptic ? "actuator" : "speaker", w,
+ 		    haptic ? sa.haptic_frames : sa.audio_frames, (haptic ? sa.haptic_frames : sa.audio_frames) / AUDIO_RATE,
+-		    haptic ? "" : ": no speaker yet, dropped");
++		    haptic ? "" : ", to ", haptic ? "" : sa_sink_name, haptic || sa_sink != NULL ? "" : " (dropped)");
+ 	}
+ 	return 0;
+ }
+@@ -123,6 +160,7 @@ sa_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc_
+ 		return ENOTTY;
+ 	}
+ 	sa.volume = *(struct sweet_audio_volume *)data;
++	__asm__ volatile ("dmb ish" ::: "memory");      /* (the generation last: redwood_audio_volume() reads it) */
+ 	if (sa.volume_set++ < 8) {
+ 		printf("SWEET AUDIO: speaker volume %u.%u dB under the loudest%s\n", sa.volume.below / 8,
+ 		    sa.volume.below % 8 * 125 / 100, sa.volume.muted ? ", muted" : "");
+diff --git a/bsd/dev/sweet_sound.c b/bsd/dev/sweet_sound.c
+index 9329460..73c8fdc 100644
+--- a/bsd/dev/sweet_sound.c
++++ b/bsd/dev/sweet_sound.c
+@@ -44,11 +44,16 @@
+  *            down; HackiOS's speaker guard (bsd/dev/sweet_guard.c) armed at their level first; the tone
+  *            AUDIBLE for a second at sndbelow (default and loudest for sound=3: 20 dB under Android's
+  *            level); the amplifiers run only while something plays and stop after 2 s of silence
++ *   sound=4  what iOS plays (0954): /dev/redwood-audio (bsd/dev/sweet_audio.c) into a ring, the ring into
++ *            the periods (silence when iOS writes nothing; the stream never stops), through the guard
++ *            (with sndgain eighths of a dB of gain first, default and most 96: iOS keeps its peaks that
++ *            far under full scale), the amplifiers on when a write is not silence and off after 2 s of
++ *            silence; iOS's volume ioctl adds its `below' to sndbelow, and muted stops them; no boot tone
+  * Boot-args: sndsecs=S (sound=1 hold), sndlpi=0 (leave the LPI pins alone: no clock at the amps),
+- * sndbelow=E (eighths of a dB under Android's level, sound>=3), sndgpio=1 (sweet_cs35l41.c: let the
+- * kernel drive the amplifiers' PMIC reset lines).
++ * sndbelow=E (eighths of a dB under Android's level, sound>=3; default 160), sndgain=E (sound=4),
++ * sndgpio=1 (sweet_cs35l41.c: let the kernel drive the amplifiers' PMIC reset lines).
+  * poke (bsd/dev/sweet_poke.c, letter a): `a status`, `a tone [MS]` (default 1000, at most 5000),
+- * `a gain DB` (the amplifiers DB dB under Android's level; sound=3 no louder than 20), `a off` (the
++ * `a gain DB` (the amplifiers DB dB under Android's level; sound=3 no louder than 20, sound=4 than 0), `a off` (the
+  * amplifiers off and kept off), `a on` (allowed again).
+  *
+  * Log lines: "SWEET SOUND: ...". What is started is stopped before the DSP is shut down
+@@ -84,7 +89,8 @@ static LCK_MTX_DECLARE(sound_lock, &sound_lock_group);  /* the path being set up
+ 
+ static uint32_t level, hold_secs = 3, use_lpi = 1;
+ static uint32_t below = 160;            /* the amplifiers' level, eighths of a dB under Android's (sndbelow) */
+-static uint32_t below_min = 160;        /* the loudest allowed: sound=3 20 dB under */
++static uint32_t below_min = 160;        /* the loudest allowed: sound=3 20 dB under, sound=4 Android's own */
++static uint32_t guard_gain = REDWOOD_GUARD_MAX_GAIN;    /* sndgain, sound=4 */
+ 
+ /* bsd/dev/sweet_cs35l41.c */
+ extern bool sweet_amp_prepare(void);
+@@ -797,6 +803,45 @@ stream_off(void)
+ 	}
+ }
+ 
++/* ---- sound=4: what iOS writes to /dev/redwood-audio, in a ring (sweet_audio.c's writer never waits) ---------------- */
++
++#define RING_FRAMES             32768           /* 0.68 s; a power of two, the indices run on */
++#define SILENCE                 8               /* samples no larger are silence */
++
++static int16_t ring[RING_FRAMES * 2];
++static volatile uint32_t ring_head, ring_tail;  /* frames: written by the sink, taken by the feeder */
++static volatile uint64_t last_sound_us;         /* when the latest write that was not silence came */
++static uint64_t ios_frames, fed_frames, ios_dropped;
++static volatile uint32_t ios_peak;
++
++/* From the writer's thread, under sweet_audio.c's lock: never waits. */
++static uint32_t
++ios_sink(const int16_t *frames, uint32_t count)
++{
++	uint32_t head = ring_head, room = RING_FRAMES - (head - ring_tail), taken = count < room ? count : room;
++	bool sound = false;
++
++	for (uint32_t i = 0; i < taken; i++) {
++		int16_t l = frames[2 * i], r = frames[2 * i + 1];
++		uint32_t al = l < 0 ? (uint32_t)-(int32_t)l : (uint32_t)l, ar = r < 0 ? (uint32_t)-(int32_t)r : (uint32_t)r;
++
++		ring[2 * ((head + i) % RING_FRAMES)] = l;
++		ring[2 * ((head + i) % RING_FRAMES) + 1] = r;
++		sound |= al > SILENCE || ar > SILENCE;
++		if (al > ios_peak || ar > ios_peak) {
++			ios_peak = al > ar ? al : ar;
++		}
++	}
++	OSMemoryBarrier();
++	ring_head = head + taken;
++	ios_frames += taken;
++	ios_dropped += count - taken;
++	if (sound) {
++		last_sound_us = now_us();
++	}
++	return taken;
++}
++
+ /* ---- the feeder: every period the DSP gives back is filled and written again ------------------------------------ */
+ 
+ /* 1 kHz at 48 kHz, -30 dBFS (peak 1036): one cycle */
+@@ -816,8 +861,22 @@ period_fill(unsigned period)
+ {
+ 	int16_t *samples = (int16_t *)(buffer + 4096 * period);
+ 	bool toning = now_us() < tone_until_us;
++	uint32_t n = 0;
++
++	if (!toning && level >= 4) {
++		uint32_t tail = ring_tail, available = ring_head - tail;
+ 
+-	for (unsigned frame = 0; frame < PERIOD_FRAMES; frame++) {
++		n = available < PERIOD_FRAMES ? available : PERIOD_FRAMES;
++		OSMemoryBarrier();
++		for (uint32_t i = 0; i < n; i++) {
++			samples[2 * i] = ring[2 * ((tail + i) % RING_FRAMES)];
++			samples[2 * i + 1] = ring[2 * ((tail + i) % RING_FRAMES) + 1];
++		}
++		OSMemoryBarrier();
++		ring_tail = tail + n;
++		fed_frames += n;
++	}
++	for (unsigned frame = n; frame < PERIOD_FRAMES; frame++) {
+ 		int16_t sample = toning ? tone[tone_at++ % 48] : 0;
+ 
+ 		samples[2 * frame] = sample;
+@@ -895,8 +954,9 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
+ 			thread_block(THREAD_CONTINUE_NULL);
+ 		}
+ 	}
+-	SAY("feeder stops: %llu periods sent (%llu failed), %u done (%u errors), %u underflows; %llu tone, %llu silent\n",
+-	    sent_periods, failed_sends, written_done, write_errors, underflows, tone_periods, silent_periods);
++	SAY("feeder stops: %llu periods sent (%llu failed), %u done (%u errors), %u underflows; %llu tone, %llu silent; "
++	    "from iOS %llu frames (%llu dropped), %llu fed\n", sent_periods, failed_sends, written_done, write_errors, underflows,
++	    tone_periods, silent_periods, ios_frames, ios_dropped, fed_frames);
+ 	feeder_runs = false;
+ 	thread_terminate(current_thread());
+ }
+@@ -965,24 +1025,42 @@ static void
+ watch(void)
+ {
+ 	uint64_t last_look = 0;
+-	char t[16];
++	uint32_t generation = 0, ios_below = 0, changes = 0;
++	bool ios_muted = false;
++	char t[16], t2[16], t3[16];
+ 
+ 	watcher_runs = true;
+ 	while (!stopping) {
+-		uint64_t now = now_us(), until = tone_until_us;
+-		bool wanted = now < until + QUIET_BEFORE_OFF_US && until != 0;
+-
++		uint64_t now = now_us(), until = tone_until_us, sounded = last_sound_us;
++		bool wanted = (now < until + QUIET_BEFORE_OFF_US && until != 0) ||
++		    (level >= 4 && !ios_muted && sounded != 0 && now - sounded < QUIET_BEFORE_OFF_US);
++		uint32_t b, g;
++		bool m;
++
++		if (level >= 4 && redwood_audio_volume(&b, &m, &g) && g != generation) {
++			generation = g;
++			ios_below = b > 816 ? 816 : b;
++			ios_muted = m;
++			if (changes++ < 16) {
++				SAY("iOS volume: %s%s dB under the loudest\n", m ? "muted, " : "", db(t2, ios_below));
++			}
++			below = ~0u;            /* (applied just below, with iOS's part) */
++		}
+ 		if (below_wanted != below) {
++			uint32_t effective;
++
+ 			below = below_wanted;
+-			redwood_guard_attenuation(below);
++			effective = below + ios_below;
++			redwood_guard_attenuation(effective);
+ 			if (amps_on) {
+-				(void)sweet_amp_volume(below);
++				(void)sweet_amp_volume(effective);
+ 			}
+-			SAY("amplifiers' level: %s dB under Android's\n", db(t, below));
++			SAY("amplifiers' level: %s dB under Android's (sndbelow/gain %s + iOS %s)\n", db(t, effective), db(t2, below),
++			    db(t3, ios_below));
+ 		}
+ 		if (wanted && !amps_on && !amps_held_off && !amps_given_up && sweet_amp_ready()) {
+ 			/* the guard is armed at the level they will play at before they are started */
+-			redwood_guard_attenuation(below);
++			redwood_guard_attenuation(below + ios_below);
+ 			guard_say("(silence before)");
+ 			if (!sweet_amp_start()) {
+ 				SAY("THE AMPLIFIERS DID NOT START: given up\n");
+@@ -993,15 +1071,19 @@ watch(void)
+ 				amp_starts++;
+ 				/* faded in from 30 dB further down, 6 dB a step */
+ 				for (uint32_t extra = 240; extra > 0; extra -= 48) {
+-					(void)sweet_amp_volume(below + extra);
++					(void)sweet_amp_volume(below + ios_below + extra);
+ 					sleep_ms(8);
+ 				}
+-				(void)sweet_amp_volume(below);
++				(void)sweet_amp_volume(below + ios_below);
+ 				last_look = now_us();
+-				SAY("amplifiers ON at %s dB under Android's level (start %u)\n", db(t, below), amp_starts);
++				ios_peak = 0;
++				SAY("amplifiers ON at %s dB under Android's level (start %u)\n", db(t, below + ios_below), amp_starts);
+ 			}
+ 		} else if (amps_on && (!wanted || amps_held_off)) {
+-			amps_off(amps_held_off ? "poke a off" : "2 s of silence");
++			if (level >= 4) {
++				SAY("what iOS wrote while they were on peaked at %u of 32768\n", ios_peak);
++			}
++			amps_off(amps_held_off ? "poke a off" : ios_muted ? "iOS muted" : "2 s of silence");
+ 		} else if (amps_on && now - last_look >= 200000) {
+ 			last_look = now;
+ 			if (!sweet_amp_healthy()) {
+@@ -1027,6 +1109,9 @@ static void
+ take_down(void)
+ {
+ 	stopping = true;
++	if (level >= 4) {
++		redwood_audio_set_sink("nothing", NULL);
++	}
+ 	thread_wakeup(&feeder_wake);
+ 	for (unsigned ms = 0; ms < 2000 && (feeder_runs || watcher_runs); ms++) {
+ 		sleep_ms(1);
+@@ -1066,8 +1151,9 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
+ 
+ 	lck_mtx_lock(&sound_lock);
+ 	SAY("sound=%u: %s\n", level, level == 1 ? "votes, LPI pins, QUIN TDM clock/group/port only" : level == 2 ?
+-	    "the port and a stream with a -30 dBFS test tone, amplifiers OFF" :
+-	    "the port, a stream, the guard and the amplifiers: the test tone AUDIBLE");
++	    "the port and a stream with a -30 dBFS test tone, amplifiers OFF" : level == 3 ?
++	    "the port, a stream, the guard and the amplifiers: the test tone AUDIBLE" :
++	    "what iOS plays, through the port, a stream, the guard and the amplifiers");
+ 	if (!vote(LPASS_HW_MACRO_BLOCK, "LPASS_HW_MACRO") || !vote(LPASS_HW_DCODEC_BLOCK, "LPASS_HW_DCODEC")) {
+ 		SAY("the LPASS votes were not granted\n");
+ 	}
+@@ -1099,13 +1185,14 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
+ 	thread_deallocate(feeder);
+ 	path_up = true;
+ 	if (level >= 3) {
+-		char t[16];
++		char t[16], t2[16];
+ 
+ 		/* the guard first, at the amplifiers' level; then the amplifiers, powered down (sweet_cs35l41.c) */
+-		redwood_guard_configure(true, 0);
++		redwood_guard_configure(true, level >= 4 ? guard_gain : 0);
+ 		redwood_guard_attenuation(below);
+ 		below_wanted = below;
+-		SAY("guard armed: high-pass 200 Hz, no gain, limits reckoned at %s dB under Android's level\n", db(t, below));
++		SAY("guard armed: high-pass 200 Hz, gain %s dB, limits reckoned at %s dB under Android's level\n",
++		    db(t, level >= 4 ? guard_gain : 0), db(t2, below));
+ 		if (!sweet_amp_prepare()) {
+ 			SAY("no amplifier: the tone goes into the DSP unheard\n");
+ 		}
+@@ -1115,10 +1202,16 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
+ 	if (level >= 3) {
+ 		thread_t watcher;
+ 
+-		tone_until_us = now_us() + 300000ull + 1000000ull;      /* (the amplifiers come up meanwhile) */
++		if (level == 3) {
++			tone_until_us = now_us() + 300000ull + 1000000ull;      /* (the amplifiers come up meanwhile) */
++		}
+ 		if (kernel_thread_start(watcher_thread, NULL, &watcher) == KERN_SUCCESS) {
+ 			thread_deallocate(watcher);
+ 		}
++		if (level >= 4) {
++			redwood_audio_set_sink("the speakers (bsd/dev/sweet_sound.c, the ADSP)", ios_sink);
++			SAY("WHAT IOS PLAYS GOES TO THE SPEAKERS from here on (sound=4)\n");
++		}
+ 		sleep_ms(1500);
+ 		smmu_faults("after the tone");
+ 		SAY("sound=%u: LEVEL DONE (the path stays up; the amplifiers follow what plays)\n", level);
+@@ -1143,10 +1236,12 @@ redwood_sound_dsp_up(void)
+ 	if (!PE_parse_boot_argn("sound", &level, sizeof(level)) || level == 0) {
+ 		return;
+ 	}
+-	if (level > 3) {
+-		SAY("sound=%u: this kernel knows levels 1-3; doing 3\n", level);
+-		level = 3;
++	if (level > 4) {
++		level = 4;
+ 	}
++	below_min = level >= 4 ? 0 : 160;
++	PE_parse_boot_argn("sndgain", &guard_gain, sizeof(guard_gain));
++	guard_gain = guard_gain > REDWOOD_GUARD_MAX_GAIN ? REDWOOD_GUARD_MAX_GAIN : guard_gain;
+ 	PE_parse_boot_argn("sndsecs", &hold_secs, sizeof(hold_secs));
+ 	PE_parse_boot_argn("sndbelow", &below, sizeof(below));
+ 	below = below < below_min ? below_min : below;
+-- 
+2.43.0
+
