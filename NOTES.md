@@ -278,6 +278,7 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   `sweetchgpol=0` off; <= 200 writes/boot. `w chg` (decoded state), `w chg apsd`, `w chg pol 0|1`.
 - 0969 USB `ud_thread`: 10 ms polls after 200 quiet 1 ms polls (no event, no TX in flight), 1 ms again on the next event;
   `sweetudpoll=1` = always 1 ms.
+- 0970 big-core governor + boost (default off): `sweetgov=XXYY` (e.g. 4060) gold/prime up >= XX % busy, top >= YY %, down one step/tick after 100 ms hold under XX-10 %; touch (SweetHID down/move) and SwapEnds < 50 ms apart hold >= `sweetboost=MHZ` (1800) for `sweetboostms=MS` (200); 0964 caps stay the ceiling; `SWEET GOV: 5s: boosts N capped N | gold MHz:ms .. | prime ..`; poke `w boost 0|1` (needs the governor, `w gov 1` / flamecpufreq=2).
 - 0971 sensor HID services `SweetHIDAccel/Gyro/ALS/Prox/Compass/Pressure/Orientation` (SweetHID.cpp; usage pairs 0xff00/3,
   9, 4, 8, 0xa from IOHIDFamily-1035.70.7's AppleHIDUsageTables.h, filled in; pressure 0x20/0x31, orientation 0x20/0x8a
   with DeviceOrientationUsage 0x64 + UIDeviceOrientation, which locationd's CLOrientationNotifier matches/accepts):

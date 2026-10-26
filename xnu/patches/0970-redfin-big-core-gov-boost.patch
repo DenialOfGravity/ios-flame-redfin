@@ -1,0 +1,315 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Tue, 27 Oct 2026 01:30:00 +0100
+Subject: [PATCH] 0970 redfin: big-core governor thresholds, touch and
+ animation boost
+
+The 0963 rule (target = cur x util / 80 %) kept CoreAnimation's render
+thread, ~50 % busy a frame, at 652-940 MHz on the A76s. With sweetgov=XXYY
+(or "w boost 1"; default off = unchanged) gold and prime go up a step or more
+at >= XX % busy, to the top at >= YY %, and down one step a tick only after
+a 100 ms hold and under XX-10 %. A touch (SweetHID down/move) or SwapEnds
+under 50 ms apart hold both at >= sweetboost=MHZ (1800) for sweetboostms=MS
+(200). The 0964 thermal caps stay the ceiling. "SWEET GOV: 5s:" line with
+the time at each frequency, boosts started and cap hits. Numbered after 0964
+because it edits the code 0960-0968 add.
+---
+ bsd/dev/sweet_cpufreq.c               | 157 ++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_thermal.c               |  11 ++-
+ iokit/Kernel/arm/SweetFramebuffer.cpp |   8 ++
+ iokit/Kernel/arm/hid/SweetHID.cpp     |   5 ++
+ 4 files changed, 180 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index e270165..53006cd 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -99,6 +99,9 @@ struct cf_dom {
+ 	uint32_t cap_khz;       /* 0 = none */
+ 	bool capped;            /* not governed: req was lowered from pin */
+ 	unsigned pin;           /* the index before the cap */
++	/* 0970 big-core policy */
++	uint64_t last_up;       /* when the request last went up (the down hold runs from there) */
++	uint32_t at_ms[CF_ROWS]; /* time at each row in this log window */
+ };
+ 
+ static struct cf_dom cf[CF_NDOM] = {
+@@ -116,6 +119,39 @@ static unsigned cf_gov_ms = 30;
+ static bool cf_gov_thread;
+ static int cf_gov_chan;
+ 
++/*
++ * 0970: gold and prime under the governor, when on (boot-arg sweetgov=XXYY, or "w boost 1"; default off = the
++ * 0963 rule for every domain). Up at least one step when a core is >= XX % busy (default 40), proportionally
++ * further; straight to the top at >= YY % (default 60). Down one step a tick, only XX-10 % or less busy and 100 ms
++ * after the last step up. Boost: a touch (down or move, SweetHID) or SwapEnds less than 50 ms apart
++ * (SweetFramebuffer) hold both at >= sweetboost=MHZ (default 1800, 0 = none) for sweetboostms=MS (default 200)
++ * after the last one. The thermal caps (0964) stay the ceiling. "SWEET GOV:" every 5 s that saw a boost.
++ */
++static volatile int cf_boost_on;
++static unsigned cf_up = 40, cf_jump = 60, cf_boost_ms = 200;
++static uint32_t cf_boost_khz = 1800000;
++static volatile uint64_t cf_boost_until;
++static uint32_t cf_boosts, cf_caphits;
++static uint64_t cf_log_t;
++static bool cf_boost_seen;
++
++void sweet_cpufreq_boost(int why);
++void
++sweet_cpufreq_boost(int why __unused)
++{
++	if (!cf_boost_on || !cf_ready || cf_boost_khz == 0) {
++		return;
++	}
++	uint64_t now = mach_absolute_time(), d;
++	nanoseconds_to_absolutetime((uint64_t)cf_boost_ms * NSEC_PER_MSEC, &d);
++	bool was = now < cf_boost_until;
++	cf_boost_until = now + d;
++	if (!was) {
++		cf_boosts++;
++		thread_wakeup((event_t)&cf_gov_chan);   /* the governor acts now, not at its next tick */
++	}
++}
++
+ static LCK_GRP_DECLARE(cf_grp, "sweet_cpufreq");
+ static LCK_MTX_DECLARE(cf_lock, &cf_grp);
+ 
+@@ -308,11 +344,88 @@ sweet_cpufreq_log(void)
+ 	printf("%s\n", line);
+ }
+ 
++/* 0970: gold/prime position for this tick (see above). */
++static unsigned
++cf_big_want(struct cf_dom *d, unsigned util, unsigned cur, unsigned ceil, uint64_t now, bool boost)
++{
++	unsigned want = cur, top = d->nch - 1;
++	if (util >= cf_jump) {
++		want = top;
++	} else if (util >= cf_up) {
++		uint64_t target = (uint64_t)d->khz[d->ch[cur]] * util / cf_up;
++		want = cur < top ? cur + 1 : cur;
++		while (want < top && d->khz[d->ch[want]] < target) {
++			want++;
++		}
++	} else if (util + 10 < cf_up && cur > d->floor_pos) {
++		uint64_t hold;
++		nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &hold);
++		if (now - d->last_up >= hold) {
++			want = cur - 1;
++		}
++	}
++	if (boost) {
++		unsigned b = 0;
++		while (b < top && d->khz[d->ch[b]] < cf_boost_khz) {
++			b++;
++		}
++		want = want < b ? b : want;
++	}
++	if (want > ceil) {
++		cf_caphits++;
++		want = ceil;
++	}
++	if (want > cur) {
++		d->last_up = now;
++	}
++	return want;
++}
++
++static void
++cf_gov_log(uint64_t now)
++{
++	uint64_t win;
++	nanoseconds_to_absolutetime(5ULL * NSEC_PER_SEC, &win);
++	if (cf_log_t == 0) {
++		cf_log_t = now;
++	}
++	if (now - cf_log_t < win) {
++		return;
++	}
++	if (cf_boost_on && cf_boost_seen) {
++		char line[400];
++		int len = snprintf(line, sizeof(line), "SWEET GOV: 5s: boosts %u capped %u |", cf_boosts, cf_caphits);
++		for (unsigned i = 1; i < CF_NDOM; ++i) {
++			len += snprintf(line + len, sizeof(line) - len, " %s", cf[i].name);
++			for (unsigned r = 0; r < cf[i].n && len < (int)sizeof(line) - 16; ++r) {
++				if (cf[i].at_ms[r]) {
++					len += snprintf(line + len, sizeof(line) - len, " %u:%u", cf[i].khz[r] / 1000, cf[i].at_ms[r]);
++				}
++			}
++			len += snprintf(line + len, sizeof(line) - len, " ms%s", i + 1 < CF_NDOM ? " |" : "");
++		}
++		printf("%s\n", line);
++	}
++	for (unsigned i = 0; i < CF_NDOM; ++i) {
++		bzero(cf[i].at_ms, sizeof(cf[i].at_ms));
++	}
++	cf_boosts = cf_caphits = 0;
++	cf_boost_seen = false;
++	cf_log_t = now;
++}
++
+ static void
+ cf_gov_tick(struct cf_load *ld)
+ {
+ 	unsigned busy[CF_NCPU];
++	uint64_t now = mach_absolute_time(), tick_ms = 0;
++	if (ld->t) {
++		absolutetime_to_nanoseconds(now - ld->t, &tick_ms);
++		tick_ms /= NSEC_PER_MSEC;
++	}
+ 	cf_busy(ld, busy);
++	bool boost = cf_boost_on && now < cf_boost_until;
++	cf_boost_seen |= boost;
+ 	for (unsigned i = 0; i < CF_NDOM; ++i) {
+ 		struct cf_dom *d = &cf[i];
+ 		if (!d->base || d->nch == 0 || d->manual) {
+@@ -323,6 +436,18 @@ cf_gov_tick(struct cf_load *ld)
+ 			util = busy[c] > util ? busy[c] : util;
+ 		}
+ 		unsigned cur = cf_pos(d), ceil = cf_ceiling(d);
++		if (d->req < d->n) {
++			d->at_ms[d->req] += (uint32_t)tick_ms;
++		}
++		if (cf_boost_on && i > 0) {
++			/* 0970 */
++			unsigned bw = cf_big_want(d, util, cur, ceil, now, boost);
++			if (d->ch[bw] != d->req) {
++				(void)sweet_cpufreq_set(i, d->ch[bw], NULL);
++				d->changes++;
++			}
++			continue;
++		}
+ 		uint64_t target = (uint64_t)d->khz[d->ch[cur]] * util / 80;
+ 		if (util >= 95) {
+ 			target *= 2;            /* saturated: the real demand is unknown, ramp fast */
+@@ -351,6 +476,7 @@ cf_gov_tick(struct cf_load *ld)
+ 			d->changes++;
+ 		}
+ 	}
++	cf_gov_log(now);	/* 0970 */
+ }
+ 
+ static void
+@@ -439,6 +565,20 @@ sweet_cpufreq_cap(unsigned dom, uint32_t max_khz)
+ 	return 0;
+ }
+ 
++/* 0970: "w boost 0|1" (sweetgov's thresholds, or 40/60). */
++void sweet_cpufreq_boost_set(int on);
++void
++sweet_cpufreq_boost_set(int on)
++{
++	cf_boost_on = on ? 1 : 0;
++	cf_boost_until = 0;
++	for (unsigned i = 0; i < CF_NDOM; ++i) {
++		cf[i].down = 0;
++	}
++	printf("SWEET GOV: big-core policy and boost %s (up %u %%, top %u %%, boost %u MHz %u ms)%s\n", on ? "on" : "off",
++	    cf_up, cf_jump, cf_boost_khz / 1000, cf_boost_ms, cf_gov_on ? "" : "; the governor is off (w gov 1)");
++}
++
+ /* "w freq": the governor leaves this domain alone until the next "w gov 1". */
+ void
+ sweet_cpufreq_manual(unsigned dom)
+@@ -453,6 +593,23 @@ sweet_cpufreq_init(void)
+ {
+ 	unsigned want = 1;
+ 	(void)PE_parse_boot_argn("flamecpufreq", &want, sizeof(want));
++	{
++		/* 0970: sweetgov=XXYY (e.g. 4060), sweetboost=MHZ, sweetboostms=MS */
++		unsigned g = 0, mhz = 1800, ms = 200;
++		(void)PE_parse_boot_argn("sweetgov", &g, sizeof(g));
++		(void)PE_parse_boot_argn("sweetboost", &mhz, sizeof(mhz));
++		(void)PE_parse_boot_argn("sweetboostms", &ms, sizeof(ms));
++		cf_boost_khz = mhz * 1000;
++		cf_boost_ms = ms >= 20 && ms <= 2000 ? ms : 200;
++		if (g / 100 >= 5 && g / 100 < g % 100 && g % 100 <= 99) {
++			cf_up = g / 100;
++			cf_jump = g % 100;
++		}
++		if (g) {
++			cf_boost_on = 1;
++			printf("SWEET GOV: sweetgov=%u: up %u %%, top %u %%, boost %u MHz %u ms\n", g, cf_up, cf_jump, mhz, cf_boost_ms);
++		}
++	}
+ 	for (unsigned c = 0; c < CF_NDOM; ++c) {
+ 		struct cf_dom *d = &cf[c];
+ 		d->base = ml_io_map(d->pa, 0x1000);
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+index 27b5a03..b27d6ba 100644
+--- a/bsd/dev/sweet_thermal.c
++++ b/bsd/dev/sweet_thermal.c
+@@ -457,6 +457,15 @@ sweet_power_cmd(const char *s, const char *end)
+ 		if (sweet_cpufreq_gov(on != 0, ms) < 0) {
+ 			printf("SWEET POWER: governor unavailable\n");
+ 		}
++	} else if (pc_is(w, "boost")) {
++		/* 0970: w boost 0|1: the big-core policy and the touch/animation boost */
++		extern void sweet_cpufreq_boost_set(int on);
++		unsigned on = 0;
++		if (!pc_num(&s, end, &on)) {
++			printf("SWEET POWER: usage: w boost 0|1\n");
++			return;
++		}
++		sweet_cpufreq_boost_set(on != 0);
+ 	} else if (pc_is(w, "cap")) {
+ 		unsigned n = 0;
+ 		if (pc_num(&s, end, &n) && n <= 3) {
+@@ -498,7 +507,7 @@ sweet_power_cmd(const char *s, const char *end)
+ 		}
+ 		sweet_charger_dump();
+ 	} else {
+-		printf("SWEET POWER: unknown \"w %s\" (stat, freq, table, gov, cap, gpu, chg)\n", w);
++		printf("SWEET POWER: unknown \"w %s\" (stat, freq, table, gov, boost, cap, gpu, chg)\n", w);
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 96270ef..8ce055d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -59,6 +59,7 @@ void sweet_gpu_cpu_flip(void);
+ void sweet_gpu_present_tag(uint64_t swap_abs);
+ void sweet_gpu_present_visible(uint64_t *sum_abs, uint64_t *n);
+ void flush_dcache64(addr64_t addr, unsigned count, int phys);
++void sweet_cpufreq_boost(int why);              /* 0970: bsd/dev/sweet_cpufreq.c */
+ struct processor;                               /* 0946: the present thread on a big core (osfmk/kern/sched_prim.h) */
+ struct processor *thread_bind(struct processor *processor);
+ struct processor *cpu_to_processor(int cpu);
+@@ -917,6 +918,13 @@ AppleCLCD::swap(const uint8_t *rec)
+ 			fStBucket[t <= 111 ? 0 : t <= 180 ? 1 : t <= 260 ? 2 : t <= 350 ? 3 : 4]++;
+ 		}
+ 	}
++	static uint64_t flowing;
++	if (flowing == 0) {
++		nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &flowing);
++	}
++	if (fStLastSwap != 0 && now - fStLastSwap < flowing) {
++		sweet_cpufreq_boost(1);         /* 0970: frames flowing (< 50 ms apart): animation boost */
++	}
+ 	fStLastSwap = now;
+ 	fStSwaps++;
+ 	fStDropped += fDirty;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index f635a6b..5eb980e 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -561,10 +561,15 @@ sweetTouchStat(IOLock *lock, const bool *fingersDown, int finger, bool was, bool
+ 	}
+ }
+ 
++extern "C" void sweet_cpufreq_boost(int why);     /* 0970: bsd/dev/sweet_cpufreq.c */
++
+ void
+ SweetHIDTouch::touch(int finger, bool down, int x, int y, uint64_t stamp)
+ {
+ 	uint64_t now = stamp ? stamp : mach_absolute_time();
++	if (down) {
++		sweet_cpufreq_boost(0);         /* 0970: touch boost (w boost 1 / sweetgov) */
++	}
+ 	IOHIDEvent *collection;
+ 	bool any = false;
+ 
+-- 
+2.39.0
+
