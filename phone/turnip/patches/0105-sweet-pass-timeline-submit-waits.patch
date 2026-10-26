@@ -1,5 +1,5 @@
 diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
-index 60ad3a8..99aa367 100644
+index 60ad3a8..5c0888f 100644
 --- a/src/freedreno/vulkan/tu_cmd_buffer.cc
 +++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
 @@ -28,6 +28,10 @@
@@ -13,7 +13,7 @@ index 60ad3a8..99aa367 100644
  enum tu_cmd_buffer_status {
     TU_CMD_BUFFER_STATUS_IDLE = 0,
     TU_CMD_BUFFER_STATUS_ACTIVE = 1,
-@@ -3879,11 +3883,187 @@ tu_emit_subsampled(struct tu_cmd_buffer *cmd,
+@@ -3879,11 +3883,188 @@ tu_emit_subsampled(struct tu_cmd_buffer *cmd,
     free(dst);
  }
  
@@ -35,6 +35,7 @@ index 60ad3a8..99aa367 100644
 +static struct sweet_pt_meta sweet_pt_meta[SWEET_PT_SLOTS];
 +static uint32_t sweet_pt_next, sweet_pt_gen;
 +static int sweet_pt_state = -1;   /* -1 unknown, 0 off, 1 on */
++extern "C" __attribute__((visibility("default"))) size_t sweet_tu_pass_report(char *out, size_t size, unsigned top);
 +extern "C" {
 +uint64_t sweet_tu_submit_cpu_waits, sweet_tu_submit_cpu_wait_ns, sweet_tu_submit_gpu_waits, sweet_tu_submits;
 +}
@@ -202,7 +203,7 @@ index 60ad3a8..99aa367 100644
  {
     const struct tu_tiling_config *tiling = cmd->state.tiling;
     const struct tu_vsc_config *vsc = tu_vsc_config(cmd, tiling);
-@@ -3923,6 +4103,7 @@ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
+@@ -3923,6 +4104,7 @@ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
     tu6_emit_tile_store_cs<CHIP>(cmd, &cmd->tile_store_cs);
     tu_cs_end(&cmd->tile_store_cs);
  
@@ -210,7 +211,7 @@ index 60ad3a8..99aa367 100644
     tu6_tile_render_begin<CHIP>(cmd, &cmd->cs, rp_ctx, fdm_offsets);
  
     /* Note: we reverse the order of walking the pipes and tiles on every
-@@ -3977,6 +4158,7 @@ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
+@@ -3977,6 +4159,7 @@ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
     }
  
     tu6_tile_render_end<CHIP>(cmd, &cmd->cs, rp_ctx);
@@ -218,7 +219,7 @@ index 60ad3a8..99aa367 100644
  
     /* Outside of renderpasses we assume all draw states are disabled. We do
      * this outside the draw CS for the normal case where 3d gmem stores aren't
-@@ -4009,7 +4191,8 @@ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
+@@ -4009,7 +4192,8 @@ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
  template <chip CHIP>
  static void
  tu_cmd_render_sysmem(struct tu_cmd_buffer *cmd,
@@ -228,7 +229,7 @@ index 60ad3a8..99aa367 100644
  {
     VkResult result = tu_allocate_transient_attachments(cmd, true);
  
-@@ -4020,6 +4203,7 @@ tu_cmd_render_sysmem(struct tu_cmd_buffer *cmd,
+@@ -4020,6 +4204,7 @@ tu_cmd_render_sysmem(struct tu_cmd_buffer *cmd,
  
     tu_trace_start_render_pass(cmd);
  
@@ -236,7 +237,7 @@ index 60ad3a8..99aa367 100644
     tu6_sysmem_render_begin<CHIP>(cmd, &cmd->cs, rp_ctx);
  
     trace_start_draw_ib_sysmem(&cmd->trace, &cmd->cs, cmd);
-@@ -4029,6 +4213,7 @@ tu_cmd_render_sysmem(struct tu_cmd_buffer *cmd,
+@@ -4029,6 +4214,7 @@ tu_cmd_render_sysmem(struct tu_cmd_buffer *cmd,
     trace_end_draw_ib_sysmem(&cmd->trace, &cmd->cs);
  
     tu6_sysmem_render_end<CHIP>(cmd, &cmd->cs, rp_ctx);
@@ -244,7 +245,7 @@ index 60ad3a8..99aa367 100644
  
     /* Outside of renderpasses we assume all draw states are disabled. */
     tu_disable_draw_states(cmd, &cmd->cs);
-@@ -4051,9 +4236,9 @@ tu_cmd_render(struct tu_cmd_buffer *cmd_buffer,
+@@ -4051,9 +4237,9 @@ tu_cmd_render(struct tu_cmd_buffer *cmd_buffer,
  
     tu_autotune::rp_ctx_t rp_ctx = NULL;
     if (use_sysmem_rendering(cmd_buffer, &rp_ctx, rp_key))
@@ -257,7 +258,7 @@ index 60ad3a8..99aa367 100644
  
  static void tu_reset_render_pass(struct tu_cmd_buffer *cmd_buffer)
 diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
-index b03c6ee..468bec7 100644
+index b03c6ee..7cb0ebc 100644
 --- a/src/freedreno/vulkan/tu_knl_darwin.cc
 +++ b/src/freedreno/vulkan/tu_knl_darwin.cc
 @@ -851,6 +851,58 @@ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *e
@@ -356,7 +357,7 @@ index b03c6ee..468bec7 100644
 +      /* The GPU idles before this submission's work: its first buffer is the wait. */
 +      NativeAdrenoAbiSubmitBuffer wfi = {};
 +      darwin_wfi(dev, &wfi);
-+      util_dynarray_append(&submit->commands, NativeAdrenoAbiSubmitBuffer, wfi);
++      *util_dynarray_grow(&submit->commands, NativeAdrenoAbiSubmitBuffer, 1) = wfi;
 +      NativeAdrenoAbiSubmitBuffer *all = util_dynarray_element(&submit->commands, NativeAdrenoAbiSubmitBuffer, 0);
 +      memmove(all + 1, all, total * sizeof(*all));
 +      all[0] = wfi;
