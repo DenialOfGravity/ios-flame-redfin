@@ -21,10 +21,10 @@ user-space property read of a sensor service is logged (key, present/ABSENT,
 pid). Transport is "Sweet" (bit 0x100: "SPU").
 ---
  iokit/Kernel/arm/hid/AppleHIDUsageTables.h |  91 +++
- iokit/Kernel/arm/hid/SweetHID.cpp          | 744 ++++++++++++++++++++-
+ iokit/Kernel/arm/hid/SweetHID.cpp          | 745 ++++++++++++++++++++-
  iokit/Kernel/arm/hid/SweetMotion.h         |  53 ++
  iokit/KernelConfigTables.cpp               |  35 +
- 4 files changed, 922 insertions(+), 1 deletion(-)
+ 4 files changed, 923 insertions(+), 1 deletion(-)
  create mode 100644 iokit/Kernel/arm/hid/SweetMotion.h
 
 diff --git a/iokit/Kernel/arm/hid/AppleHIDUsageTables.h b/iokit/Kernel/arm/hid/AppleHIDUsageTables.h
@@ -127,7 +127,7 @@ index c00cbd4..8b0b292 100644
 +
 +#endif /* _APPLEHIDUSAGETABLES_H */
 diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
-index 6d98131..9339d96 100644
+index 6d98131..01c665d 100644
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp
 @@ -13,7 +13,9 @@
@@ -141,7 +141,7 @@ index 6d98131..9339d96 100644
   * every N seconds, to test the event path without input hardware.
   */
  #include <IOKit/IOLib.h>
-@@ -601,3 +603,743 @@ sweet_hid_touch(int finger, int down, int x, int y)
+@@ -601,3 +603,744 @@ sweet_hid_touch(int finger, int down, int x, int y)
  		gSweetTouch->touch(finger, down != 0, x, y);
  	}
  }
@@ -209,6 +209,7 @@ index 6d98131..9339d96 100644
 + */
 +#define SWEET_MOTION_SPU_TRANSPORT 0x100
 +static uint32_t gSweetMotionMask = 0x7b;
++static IOLock *gSweetReadLock;          /* SweetHIDSensor::logRead */
 +static bool gSweetMotionMaskRead;
 +
 +extern "C" uint32_t
@@ -575,7 +576,6 @@ index 6d98131..9339d96 100644
 +}
 +
 +/* User-space reads of the service's properties (IORegistryEntryCreateCFProperty), each key once. */
-+static IOLock *gSweetReadLock;
 +static struct {
 +	const void *svc;
 +	uint32_t hash;
@@ -611,7 +611,8 @@ index 6d98131..9339d96 100644
 +	if (!seen && gSweetReadCount < 256) {
 +		char who[32] = "?";
 +		proc_selfname(who, sizeof(who));
-+		IOLog("SWEET MOTION: %s property read %s: %s (pid %d %s)\n", gSweetSensorInfo[sensorIndex()].name, key,
++		IOLog("SWEET MOTION: %s property read %s: %s (pid %d %s)\n",
++		    gSweetSensorInfo[const_cast<SweetHIDSensor *>(this)->sensorIndex()].name, key,
 +		    found ? "present" : "ABSENT", pid, who);
 +	}
 +}
