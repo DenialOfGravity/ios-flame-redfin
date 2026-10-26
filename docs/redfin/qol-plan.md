@@ -438,3 +438,11 @@ Phone (images r21a-e = ws-p-power kernel + r19a ADT; r21a = r19a's command line,
   in the suspect group. **Phone left on r22d** (merged kernel, power on, accel+gyro only).
 - Charging: the 9.5 W seen on the power bank was with the phone reset (the ring ended at 287 s): the PMIC's own
   defaults with a real charger, not our policy. Policy test with a wall charger still open.
+
+### 2026-10-26 10:50 — r24b/r24c (merged kernel 2047b0d, PA 0x101d428d8)
+
+- **r24b** (`adsp=2 adsp_sleep=1`): the sensors PD survives (SMP2P sleepstate was the missing handshake);
+  `sensd --list` shows LSM6DSR accel/gyro, TCS3701 als/prox, LIS2MDL mag, BMP380 pressure.
+- **r24c** (`sweetmotion=0x7f`): the prox HID service still crashes backboardd with DisplayIntegrated/ProtectedAccess
+  published; default sweetmotion stays 0x77.
+- Next: r25a/r25b (r24b minus `adsp_qlog=1`, plus `sound=2` / `sound=3`), same kernel.
