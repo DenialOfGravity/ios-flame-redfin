@@ -10,15 +10,15 @@ thread, ~50 % busy a frame, at 652-940 MHz on the A76s. With sweetgov=XXYY
 at >= XX % busy, to the top at >= YY %, and down one step a tick only after
 a 100 ms hold and under XX-10 %. A touch (SweetHID down/move) or SwapEnds
 under 50 ms apart hold both at >= sweetboost=MHZ (1800) for sweetboostms=MS
-(200). The 0964 thermal caps stay the ceiling. "SWEET GOV: 5s:" line with
+(200), and so does each CPU present (0946). The 0964 thermal caps stay the ceiling. "SWEET GOV: 5s:" line with
 the time at each frequency, boosts started and cap hits. Numbered after 0964
 because it edits the code 0960-0968 add.
 ---
  bsd/dev/sweet_cpufreq.c               | 157 ++++++++++++++++++++++++++++++++++
  bsd/dev/sweet_thermal.c               |  11 ++-
- iokit/Kernel/arm/SweetFramebuffer.cpp |   8 ++
+ iokit/Kernel/arm/SweetFramebuffer.cpp |   9 ++
  iokit/Kernel/arm/hid/SweetHID.cpp     |   5 ++
- 4 files changed, 180 insertions(+), 1 deletion(-)
+ 4 files changed, 181 insertions(+), 1 deletion(-)
 
 diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
 index e270165..53006cd 100644
@@ -265,7 +265,7 @@ index 27b5a03..b27d6ba 100644
  }
  
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 96270ef..8ce055d 100644
+index a90fefb..78ed826 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -59,6 +59,7 @@ void sweet_gpu_cpu_flip(void);
@@ -290,6 +290,14 @@ index 96270ef..8ce055d 100644
  	fStLastSwap = now;
  	fStSwaps++;
  	fStDropped += fDirty;
+@@ -1448,6 +1456,7 @@ AppleCLCD::presentCPU(const uint8_t *rec)
+ 		}
+ 		fCpuXKey = key;
+ 	}
++	sweet_cpufreq_boost(2);         /* 0970: the copy on a boosted core (the gold idles at 650-900 MHz) */
+ 	uint64_t pa = 0;
+ 	if (sweet_gpu_cpu_target(&pa) == 1) {
+ 		fPresentBusy = true;    /* the last flip has not latched: again soon */
 diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
 index f635a6b..5eb980e 100644
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp

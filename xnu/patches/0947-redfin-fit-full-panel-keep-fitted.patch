@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Tue, 27 Oct 2026 02:00:00 +0100
+Subject: [PATCH] 0947 redfin: fit the whole panel, keep fitted frames
+
+The fit of 1125x2436 gave 1080x2339: panel row 2339 was never written and
+flickered between the flip buffers' old contents. Within 2 px the fit now
+takes the whole panel (GPU blit and CPU present). Once frames are fitted, a
+swap that sets no layer or only the panel's own surface, or one neither fit
+path takes, leaves the last frame on screen: it fell through to the crop
+copy, which flipped back to the first buffer and drew the cropped frame over
+the fitted ones (the tearing/flicker of the CPU present on r33a).
+---
+ bsd/dev/sweet_gpu.c                   |  4 ++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 33 +++++++++++++++++++++++++++++++++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index c998d97..e89bda0 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -932,6 +932,10 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 		frame.dw = PANEL_W;
+ 		frame.dh = (uint32_t)(((uint64_t)h * PANEL_W + w / 2) / w);
+ 	}
++	/* 0947: within 2 px of the panel: all of it (1125x2436 gave 1080x2339, and row 2339 was never written:
++	 * it flickered between the two flip buffers' old contents) */
++	frame.dh = PANEL_H - frame.dh <= 2 ? PANEL_H : frame.dh;
++	frame.dw = PANEL_W - frame.dw <= 2 ? PANEL_W : frame.dw;
+ 	frame.dx = (PANEL_W - frame.dw) / 2;
+ 	frame.dy = (PANEL_H - frame.dh) / 2;
+ 	uint32_t ext = corner_radius ? sweet_display_corner_extent(corner_radius) : 0;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 96270ef..a90fefb 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1437,6 +1437,8 @@ AppleCLCD::presentCPU(const uint8_t *rec)
+ 	}
+ 	dw = dw > pw ? pw : dw ? dw : 1;
+ 	dh = dh > ph ? ph : dh ? dh : 1;
++	dh = ph - dh <= 2 ? ph : dh;    /* 0947: as the GPU fit, the whole panel within 2 px */
++	dw = pw - dw <= 2 ? pw : dw;
+ 	uint32_t dx = (pw - dw) / 2, dy = (ph - dh) / 2;
+ 	uint64_t key = (uint64_t)w << 32 | (uint64_t)dw << 16 | dx;
+ 	if (key != fCpuXKey) {
+@@ -1717,12 +1719,43 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 	}
+ 
++	/*
++	 * 0947: once frames are fitted (GPU blit or CPU present), a swap that sets no layer (the others keep theirs)
++	 * or only the panel's own surface changes nothing: it used to fall through to the crop copy below, which flips
++	 * back to the first buffer and draws the cropped frame over the fitted ones: the tearing/flicker seen with
++	 * the CPU present, and with the GPU path whenever it fell back.
++	 */
++	if (fGPU || fCpuXKey) {
++		bool keep = mask == 0;
++		if (!keep && !(mask & (mask - 1))) {
++			uint32_t l = (uint32_t)__builtin_ctz(mask);
++			uint32_t id = l < SWEET_FB_LAYERS ? get32(rec, 0x54 + 4 * l) : 0;
++			keep = id == 0 || (fSurface != NULL && id == fSurface->id);
++		}
++		if (keep) {
++			static uint32_t logs;
++			if (logs < 4) {
++				logs++;
++				IOLog("SWEET FB: swap %u (layers %#x) kept the fitted frame on screen\n", get32(rec, 0x50), mask);
++			}
++			return;
++		}
++	}
+ 	if ((sweet_fbx & SWEET_FBX_CPUPRESENT) && presentCPU(rec)) {
+ 		return;         /* 0946 */
+ 	}
+ 	if (sweet_gpu_ready() && presentGPU(rec)) {
+ 		return;
+ 	}
++	if (fGPU || fCpuXKey) {
++		/* 0947: frames are fitted: a frame neither fit path takes is not cropped over them (see above) */
++		static uint32_t logs;
++		if (logs < 4) {
++			logs++;
++			IOLog("SWEET FB: swap %u (layers %#x) not fitted: the last frame stays\n", get32(rec, 0x50), mask);
++		}
++		return;
++	}
+ 	sweet_gpu_scanout_front();	/* 0905: the CPU copy below draws into the first panel buffer */
+ 	if (sweet_display_fit_w) {
+ 		sweet_display_fit_w = 0;        /* touch back to the crop mapping */
+-- 
+2.39.0
+
