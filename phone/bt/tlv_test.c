@@ -159,7 +159,7 @@ static struct chip {
 	const uint8_t *want[2];
 	size_t want_len[2];
 	uint8_t addr[6];
-	int scanning, adv_sent, garbled, cmds_before_power, reset, nvm_diff_want;
+	int scanning, adv_sent, garbled, cmds_before_power, reset, nvm_diff_want, fifo_overflows;
 	unsigned segs, vse_acks, cc_acks;
 } chip;
 
@@ -313,6 +313,11 @@ static int f_write(struct uart *u, const uint8_t *b, size_t n)
 		}
 		if (h4_feed(&chip.rx, &c) == 1) {
 			CHECK(chip.rx.type == H4_CMD, "host sent packet type %u", chip.rx.type);
+			/* a real SE5 RX FIFO holds 64 bytes, then RTS stops the controller, whose command
+			   processing then stalls behind its unsent events: the host must keep reading */
+			if (chip.olen - chip.opos > 64 && chip.fifo_overflows++ < 3)
+				CHECK(0, "host left %zu bytes of events unread (RX FIFO 64) before sending a command",
+				      chip.olen - chip.opos);
 			chip_cmd(chip.rx.data, chip.rx.got);
 		}
 	}

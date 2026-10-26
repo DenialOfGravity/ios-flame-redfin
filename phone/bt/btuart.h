@@ -28,4 +28,5 @@ struct btuart_stats {
 #define BTUART_FLUSH	_IO('B', 4)		/* drop buffered RX */
 #define BTUART_TIMEOUT	_IOW('B', 5, uint32_t)	/* read timeout in ms (default 100, 0 = forever) */
 #define BTUART_STATS	_IOR('B', 6, struct btuart_stats)
+#define BTUART_SET_OS	_IOW('B', 7, uint32_t)	/* UART oversampling 16 or 32; re-applies the baud */
 #endif

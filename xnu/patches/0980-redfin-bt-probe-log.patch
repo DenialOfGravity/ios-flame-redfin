@@ -20,9 +20,9 @@ without the boot-arg):
 Log lines "SWEET BTLOG:" (at most 300 of each kind) and "IOK <process>:".
 ---
  bsd/kern/kern_control.c       | 42 +++++++++++++++++++++++++++++++++++
- bsd/vfs/vfs_syscalls.c        | 36 +++++++++++++++++++++++++++++-
+ bsd/vfs/vfs_syscalls.c        | 34 ++++++++++++++++++++++++++++
  iokit/Kernel/IOUserClient.cpp | 10 +++++++--
- 3 files changed, 85 insertions(+), 3 deletions(-)
+ 3 files changed, 84 insertions(+), 2 deletions(-)
 
 diff --git a/bsd/kern/kern_control.c b/bsd/kern/kern_control.c
 index 539730e..aa93b93 100644
@@ -92,15 +92,14 @@ index 539730e..aa93b93 100644
  			error = ENOENT;
  			break;
 diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
-index 6b27234..20d92fa 100644
+index 6b27234..9e9fdf3 100644
 --- a/bsd/vfs/vfs_syscalls.c
 +++ b/bsd/vfs/vfs_syscalls.c
-@@ -5030,7 +5030,36 @@ open_dprotected_np(__unused proc_t p, struct open_dprotected_np_args *uap, int32
+@@ -5030,6 +5030,35 @@ open_dprotected_np(__unused proc_t p, struct open_dprotected_np_args *uap, int32
  	           uap->class, uap->dpflags, AT_FDCWD, AUTH_OPEN_NOAUTHFD, UIO_USERSPACE, retval);
  }
  
--static int
-+static #if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET)
 +/* redfin 0980 (sweetbtlog=1, bsd/kern/kern_control.c): failing opens of Bluetooth-looking device nodes */
 +extern int sweet_btlog_on(void);
 +
@@ -129,10 +128,9 @@ index 6b27234..20d92fa 100644
 +}
 +#endif
 +
-+int
+ static int
  openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
      int fd, enum uio_seg segflg, int *retval)
- {
 @@ -5060,6 +5089,11 @@ openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
  
  	kfree_type(typeof(*__open_data), __open_data);

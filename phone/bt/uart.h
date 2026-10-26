@@ -25,6 +25,9 @@ struct uart {
 	/* whatever arrived, up to n bytes, waiting at most ms for the first one; 0 = nothing */
 	int (*read)(struct uart *u, uint8_t *buf, size_t n, unsigned ms);
 	void (*flush_rx)(struct uart *u);
+	/* UART oversampling 16 or 32 (re-applies the current baud); NULL if the backend cannot */
+	int (*set_os)(struct uart *u, int os);
+	int os;
 	void (*close)(struct uart *u);
 	void *priv;
 };

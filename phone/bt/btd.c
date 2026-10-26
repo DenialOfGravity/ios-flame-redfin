@@ -267,22 +267,32 @@ static int bring_up(struct hci *h, struct opts *o)
 	struct qca_ver v;
 	int r = -1;
 	if (!o->noinit) {
-		for (int attempt = 0; attempt < 2 && r; attempt++) {
+		/* twice as Linux retries; then, unless --os was given, once more with the other UART oversampling
+		   (lito's QUP: Linux mainline would pick 16 from the QUP version, the redbull kernel always 32) */
+		for (int attempt = 0; attempt < 3 && r; attempt++) {
+			if (attempt == 2) {
+				if (o->os || !h->u->set_os)
+					break;
+				int os = h->u->os == 16 ? 32 : 16;
+				hci_log(h, "BTD: trying UART oversampling %d instead of %d\n", os, h->u->os);
+				if (h->u->set_os(h->u, os))
+					break;
+			}
 			if (qca_power_pulses(h)) {
 				fail(h, "pulse", "the UART could not send the power pulse");
 				return -1;
 			}
 			r = qca_read_version(h, &v, 3000);
 			if (r)
-				hci_log(h, "BTD: no EDL version answer (%d)%s\n", r, attempt ? "" : "; pulses again");
+				hci_log(h, "BTD: no EDL version answer (%d)\n", r);
 		}
 		if (r) {
 			fail(h, "version", "no answer to the EDL version request at 115200: chip unpowered (rails, "
 				"SW_CTRL), pins/flow control wrong, or the power pulse not decoded");
 			return -1;
 		}
-		hci_log(h, "BTD PROBE: SoC 0x%08x ROM 0x%04x patch 0x%04x product 0x%08x\n", v.soc_id, v.rom_ver,
-			v.patch_ver, v.product_id);
+		hci_log(h, "BTD PROBE: SoC 0x%08x ROM 0x%04x patch 0x%04x product 0x%08x (UART oversampling %d, backend %s)\n",
+			v.soc_id, v.rom_ver, v.patch_ver, v.product_id, h->u->os, h->u->name);
 		if (o->mode == 'p')
 			return 0;
 	}

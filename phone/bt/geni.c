@@ -195,9 +195,6 @@ static uint32_t rcg_set(struct geni *g, uint32_t desired, unsigned *div)
 
 static void stop_rx(struct geni *g)
 {
-	/* keep what is already in the FIFO */
-	uint32_t st = se_rd(RX_FIFO_STATUS);
-	(void)st;
 	if (se_rd(GENI_STATUS) & S_ACTIVE) {
 		se_wr(S_CMD_CTRL, 1u << 2);	/* cancel */
 		if (se_wait(S_IRQ_STATUS, CMD_CANCEL, 1, 2000)) {
@@ -242,6 +239,14 @@ static int g_set_baud(struct uart *u, unsigned baud)
 		printf("btd: UART %u Bd: source %u Hz / %u / %d oversampling (%s)\n", baud, src, div, g->os,
 			g->dfs ? "DFS level" : "RCG programmed");
 	return 0;
+}
+
+static int g_set_os(struct uart *u, int os)
+{
+	struct geni *g = u->priv;
+	g->os = os;
+	u->os = os;
+	return g_set_baud(u, u->baud);
 }
 
 static int g_set_flow(struct uart *u, int on)
@@ -473,6 +478,8 @@ struct uart *geni_open(int verbose, int oversampling)
 	g->u.drain = g_drain;
 	g->u.read = g_read;
 	g->u.flush_rx = g_flush_rx;
+	g->u.set_os = g_set_os;
+	g->u.os = g->os;
 	g->u.close = g_close;
 	g->u.priv = g;
 	g->u.baud = 115200;

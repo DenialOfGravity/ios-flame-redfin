@@ -25,10 +25,10 @@ version as Linux). poke "b 0" state, "b 1" HCI Read_Local_Version,
 No rails are voted here: btd does that through /dev/pmem.
 ---
  bsd/conf/files           |   1 +
- bsd/dev/sweet_geniuart.c | 883 +++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_geniuart.c | 898 +++++++++++++++++++++++++++++++++++++++
  bsd/dev/sweet_poke.c     |   8 +-
  bsd/dev/sweet_ufs.c      |   2 +
- 4 files changed, 893 insertions(+), 1 deletion(-)
+ 4 files changed, 908 insertions(+), 1 deletion(-)
  create mode 100644 bsd/dev/sweet_geniuart.c
 
 diff --git a/bsd/conf/files b/bsd/conf/files
@@ -45,10 +45,10 @@ index 678d45b..5e4e120 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_geniuart.c b/bsd/dev/sweet_geniuart.c
 new file mode 100644
-index 0000000..6d2f7bd
+index 0000000..6c1bb88
 --- /dev/null
 +++ b/bsd/dev/sweet_geniuart.c
-@@ -0,0 +1,883 @@
+@@ -0,0 +1,898 @@
 +/*
 + * redfin (Pixel 5) 0981: /dev/btuart, the WCN3998 Bluetooth HCI UART: QUPv3 wrapper 0 SE5 (0x894000,
 + * "qcom,msm-geni-serial-hs" in the stock DT), 4-wire (GPIO 38 CTS, 39 RTS, 40 TX, 41 RX, function qup05),
@@ -66,7 +66,7 @@ index 0000000..6d2f7bd
 + *           only costs latency); waits up to the read timeout (default 100 ms), then EAGAIN
 + *   write   every byte into the TX FIFO (TX watermark interrupt refills); ETIMEDOUT if no progress in 1 s
 + *           (CTS held "not ready")
-+ *   ioctl   BTUART_SET_BAUD, _SET_FLOW, _DRAIN, _FLUSH, _TIMEOUT, _STATS (phone/bt/btuart.h)
++ *   ioctl   BTUART_SET_BAUD, _SET_FLOW, _DRAIN, _FLUSH, _TIMEOUT, _STATS, _SET_OS (phone/bt/btuart.h)
 + *   close   SPI 606 masked at the GIC and at the SE; RX keeps filling the FIFO (RFR then stops the chip)
 + * RX flow control is the SE's own: RTS drops when the RX FIFO reaches depth - 2 words; when the ring is
 + * full the interrupt stops draining the FIFO until read makes room.
@@ -115,6 +115,7 @@ index 0000000..6d2f7bd
 +#define BTUART_FLUSH    _IO('B', 4)
 +#define BTUART_TIMEOUT  _IOW('B', 5, uint32_t)
 +#define BTUART_STATS    _IOR('B', 6, struct btuart_stats)
++#define BTUART_SET_OS   _IOW('B', 7, uint32_t)
 +
 +#define GU_SE_PA        0x00894000u     /* qcom,qup_uart@894000 */
 +#define GU_WRAP_PA      0x008c0000u     /* qcom,qupv3_0_geni_se@8c0000: QUP_HW_VER at +4 */
@@ -794,6 +795,20 @@ index 0000000..6d2f7bd
 +		if (e) {
 +			printf("SWEET BTUART: no clock for %u Bd x %u\n", b, gu.os);
 +		}
++		break;
++	}
++	case BTUART_SET_OS: {
++		uint32_t os = *(uint32_t *)data;
++		if (os != 16 && os != 32) {
++			e = EINVAL;
++			break;
++		}
++		(void)gu_drain_tx(100);
++		gu_stop_rx();
++		gu.os = os;
++		gu.st.oversampling = os;
++		e = gu_set_clock(gu.st.baud);
++		SE_WR(S_CMD0, UART_START);
 +		break;
 +	}
 +	case BTUART_SET_FLOW:

@@ -241,15 +241,15 @@ int hci_recv(struct hci *h, struct hci_pkt *p, unsigned ms)
 					hci_log(h, "BTD < junk byte 0x%02x outside a packet\n", c);
 			}
 		}
+		/* always one read, also with ms = 0 (a poll), then give up once the time is over */
 		uint64_t t = now_ms();
-		if (t >= end && ms != (unsigned)-1)
-			return 0;
-		int n = h->u->read(h->u, h->rbuf, sizeof(h->rbuf), (unsigned)(end > t ? end - t : 0));
+		unsigned left = ms == (unsigned)-1 ? 1000 : (unsigned)(end > t ? end - t : 0);
+		int n = h->u->read(h->u, h->rbuf, sizeof(h->rbuf), left);
 		if (n < 0)
 			return -1;
 		h->rpos = 0;
 		h->rlen = (size_t)n;
-		if (n == 0 && now_ms() >= end)
+		if (n == 0 && ms != (unsigned)-1 && now_ms() >= end)
 			return 0;
 	}
 }

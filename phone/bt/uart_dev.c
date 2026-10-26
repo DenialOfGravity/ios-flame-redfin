@@ -79,6 +79,16 @@ static void d_flush(struct uart *u)
 	ioctl(d->fd, BTUART_FLUSH);
 }
 
+static int d_set_os(struct uart *u, int os)
+{
+	struct dev *d = u->priv;
+	uint32_t v = (uint32_t)os;
+	if (ioctl(d->fd, BTUART_SET_OS, &v) < 0)
+		return -1;
+	u->os = os;
+	return 0;
+}
+
 static void d_close(struct uart *u)
 {
 	struct dev *d = u->priv;
@@ -108,12 +118,13 @@ struct uart *btuart_open(int verbose)
 	d->u.drain = d_drain;
 	d->u.read = d_read;
 	d->u.flush_rx = d_flush;
+	d->u.set_os = d_set_os;
 	d->u.close = d_close;
 	d->u.priv = d;
 	d->u.baud = 115200;
 	d->u.flow = 1;
 	struct btuart_stats s;
-	if (ioctl(fd, BTUART_STATS, &s) == 0)
+	if (ioctl(fd, BTUART_STATS, &s) == 0 && (d->u.os = (int)s.oversampling, 1))
 		printf("btd: /dev/btuart: SE5 fw %#x (protocol %u), QUP %#x, %u Bd, oversampling %u, irqs so far %u\n",
 			s.fw_revision, (s.fw_revision >> 8) & 0xff, s.qup_version, s.baud, s.oversampling, s.irqs);
 	(void)verbose;
