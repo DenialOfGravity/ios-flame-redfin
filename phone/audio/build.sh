@@ -33,5 +33,7 @@ codesign -f -s - out/vt_test
 # mic_test: records the default input (RedwoodAudio.driver's Codec -> /dev/redwood-mic) and prints peak/RMS per second
 ../../work/userland/bin/ios-cc -O2 -Wall -fobjc-arc -framework Foundation -framework AVFoundation -framework AudioToolbox \
 	-framework CoreFoundation -o out/mic_test mic_test.m
-codesign -f -s - out/mic_test
+# signed with mic_test-ents.plist (TCC microphone grant + audio-input + platform-application), like tools/build.sh's NAME-ents.plist
+codesign -f -s - --entitlements mic_test-ents.plist out/mic_test
+(codesign -d --entitlements - out/mic_test 2>&1 || ldid -e out/mic_test 2>&1) | head -20 || true
 ls -la out/mic_test out/vt_test out/RedwoodAudio.driver out/sound_test out/camera_test out/camera_avtest out/mg_test
