@@ -32,12 +32,12 @@ No rails are voted here: btd does that through /dev/pmem.
  create mode 100644 bsd/dev/sweet_geniuart.c
 
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 678d45b..5e4e120 100644
+index aaa3844..384ac70 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -124,6 +124,7 @@ bsd/dev/sweet_gpu.c			standard
- bsd/dev/sweet_rpmh.c			standard
+@@ -131,6 +131,7 @@ bsd/dev/sweet_rpmh.c			standard
  bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_charger.c			standard
  bsd/dev/sweet_usb.c			standard
 +bsd/dev/sweet_geniuart.c		standard
  bsd/dev/redwood_sta.c		standard
@@ -948,19 +948,19 @@ index 0000000..6c1bb88
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_poke.c b/bsd/dev/sweet_poke.c
-index 2b423c2..cfeda6d 100644
+index db1dc24..384836b 100644
 --- a/bsd/dev/sweet_poke.c
 +++ b/bsd/dev/sweet_poke.c
-@@ -135,7 +135,7 @@ poke_line(const char *s, const char *end, unsigned lineno)
- 	bool ha = poke_num(&s, end, &a), hb = poke_num(&s, end, &b);
- 	bool hc = poke_num(&s, end, &c), hd = poke_num(&s, end, &d);
+@@ -171,7 +171,7 @@ poke_line(const char *s, const char *end, unsigned lineno)
+ 		return;
+ 	}
  	volatile uint32_t *r = NULL;
 -	if (op != '@' && op != 's' && op != 'v' && op != 't' && op != 'c') {
 +	if (op != '@' && op != 's' && op != 'v' && op != 't' && op != 'c' && op != 'b') {
  		if (!ha || (a & 3) || !(r = poke_reg(a))) {
  			printf("POKE: line %u: bad address\n", lineno);
  			return;
-@@ -175,6 +175,12 @@ poke_line(const char *s, const char *end, unsigned lineno)
+@@ -211,6 +211,12 @@ poke_line(const char *s, const char *end, unsigned lineno)
  		printf("POKE: c %llu -> %d\n", a, sweet_cam_cmd_args((unsigned)a, b, c, d));
  		break;
  	}
@@ -974,10 +974,10 @@ index 2b423c2..cfeda6d 100644
  		uint64_t n = hb ? b : 1;
  		for (uint64_t i = 0; i < n && i < 256; i += 4) {
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 3a34dba..19fbbf8 100644
+index fc2e671..dccfe52 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -59,6 +59,7 @@ extern void sweet_torch_init(void);
+@@ -60,6 +60,7 @@ extern void sweet_torch_init(void);
  extern void sweet_cam_init(void);
  extern void sweet_audio_init(void);
  extern void redwood_adsp_init(void);
@@ -985,7 +985,7 @@ index 3a34dba..19fbbf8 100644
  extern void sweet_cpufreq_init(void);
  extern void sweet_pmem_init(void);
  extern void flame_wlan_init(void);
-@@ -681,6 +682,7 @@ sweet_ufs_init(void)
+@@ -683,6 +684,7 @@ sweet_ufs_init(void)
  	sweet_cam_init();	/* redfin camera sensors (sweetcam=1/2): bsd/dev/sweet_cam.c */
  	sweet_audio_init();	/* /dev/redwood-audio, /dev/redwood-haptic: bsd/dev/sweet_audio.c */
  	redwood_adsp_init();	/* the audio DSP (adsp=1): bsd/dev/sweet_adsp.c */
@@ -993,6 +993,3 @@ index 3a34dba..19fbbf8 100644
  	sweet_usb_probe();
  	return 0;
  }
--- 
-2.43.0
-

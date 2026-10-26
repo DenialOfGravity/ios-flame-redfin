@@ -342,7 +342,7 @@ index aa80269..67668bc 100644
  	extern void sweet_thermal_start(void);
  	sweet_thermal_start();  /* 0960: TSENS sampling, bsd/dev/sweet_thermal.c */
 diff --git a/bsd/dev/sweet_poke.c b/bsd/dev/sweet_poke.c
-index 2b423c2..dbdf6fe 100644
+index 7903fe2..af8d032 100644
 --- a/bsd/dev/sweet_poke.c
 +++ b/bsd/dev/sweet_poke.c
 @@ -131,6 +131,18 @@ poke_line(const char *s, const char *end, unsigned lineno)
@@ -361,9 +361,9 @@ index 2b423c2..dbdf6fe 100644
 +			return;
 +		}
 +	}
- 	uint64_t a = 0, b = 0, c = 0, d = 0;
- 	bool ha = poke_num(&s, end, &a), hb = poke_num(&s, end, &b);
- 	bool hc = poke_num(&s, end, &c), hd = poke_num(&s, end, &d);
+ 	if (op == 'a') {
+ 		/* redfin WS-A (0952): a status | a tone [MS] | ...: the speakers and the microphone (bsd/dev/sweet_sound.c) */
+ 		extern int sweet_sound_cmd(const char *s, const char *end);
 diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
 index a08971a..382b20e 100644
 --- a/bsd/dev/sweet_thermal.c
@@ -535,6 +535,3 @@ index a06a80c..fb6641e 100644
  /*
   *	choose_processor:
   *
--- 
-2.43.0
-

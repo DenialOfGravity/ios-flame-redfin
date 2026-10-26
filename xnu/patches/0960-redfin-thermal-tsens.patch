@@ -17,11 +17,11 @@ Boot-arg sweettherm=0: off.
  create mode 100644 bsd/dev/sweet_thermal.c
 
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 678d45b..9ed57c6 100644
+index 67dd184..ce965d3 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -116,6 +116,7 @@ bsd/dev/sweet_cam.c			standard
- bsd/dev/sweet_audio.c			standard
+@@ -120,6 +120,7 @@ bsd/dev/sweet_guard.c			standard
+ bsd/dev/sweet_mic.c			standard
  bsd/dev/sweet_adsp.c			standard
  bsd/dev/sweet_cpufreq.c			standard
 +bsd/dev/sweet_thermal.c			standard
@@ -320,6 +320,3 @@ index 0000000..a08971a
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
--- 
-2.43.0
-

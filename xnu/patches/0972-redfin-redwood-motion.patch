@@ -20,7 +20,7 @@ sensor's rate for 10 s by default.
  create mode 100644 bsd/dev/sweet_motion.c
 
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 678d45b..c8f14e6 100644
+index 3249a4b..aaa3844 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
 @@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
@@ -509,7 +509,7 @@ index 0000000..7fa5359
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_poke.c b/bsd/dev/sweet_poke.c
-index 2b423c2..52c037e 100644
+index af8d032..db1dc24 100644
 --- a/bsd/dev/sweet_poke.c
 +++ b/bsd/dev/sweet_poke.c
 @@ -131,6 +131,18 @@ poke_line(const char *s, const char *end, unsigned lineno)
@@ -528,9 +528,9 @@ index 2b423c2..52c037e 100644
 +			return;
 +		}
 +	}
- 	uint64_t a = 0, b = 0, c = 0, d = 0;
- 	bool ha = poke_num(&s, end, &a), hb = poke_num(&s, end, &b);
- 	bool hc = poke_num(&s, end, &c), hd = poke_num(&s, end, &d);
+ 	if (op == 'w') {
+ 		/* redfin (0961): "w WORD ..." = power/thermal commands (bsd/dev/sweet_thermal.c); "w ADDR VAL" stays a write */
+ 		const char *q = s;
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 index 3a34dba..fc2e671 100644
 --- a/bsd/dev/sweet_ufs.c
@@ -551,6 +551,3 @@ index 3a34dba..fc2e671 100644
  	sweet_fts_init();
  	sweet_sects_init();	/* redfin sec_ts (sectouch=1) */
  	sweet_haptic_init();	/* redfin DRV2624 (sweethaptic=1) */
--- 
-2.43.0
-
