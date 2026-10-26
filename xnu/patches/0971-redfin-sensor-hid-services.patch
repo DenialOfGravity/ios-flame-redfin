@@ -13,18 +13,19 @@ user client (pid, name), copyEvent type and setProperties key/value is logged
 ("SWEET MOTION:"); ReportInterval is kept and published. copyEvent returns the
 last sample. Samples arrive through sweet_hid_sensor() (SweetMotion.h) and are
 converted with integer arithmetic only (accel: Android m/s^2 -> -g). Boot-arg
-sweetmotion=MASK (default 0x03 = accel+gyro, 0x7f = all, 0 = none): with
-prox, pressure or orientation registered backboardd crash-loops
-(-[NSNull applyUIMode:]). Every user-space property read of a sensor service
+sweetmotion=MASK (default 0x77 = all but prox, 0x7f = all, 0 = none): with
+the prox service registered backboardd crash-looped (-[NSNull applyUIMode:]);
+prox now publishes DisplayIntegrated/ProtectedAccess/SensorPropertySupported
+and answers copyEvent with "far". Every user-space property read of a sensor service
 is logged (key, present/ABSENT, pid). The ALS (and with bit 0x200 every
 service) answers copyEvent with a neutral sample until a real one exists; the
 ALS posts 100 lux 500 ms after an open. Transport is "Sweet" (0x100: "SPU").
 ---
  iokit/Kernel/arm/hid/AppleHIDUsageTables.h |  91 +++
- iokit/Kernel/arm/hid/SweetHID.cpp          | 759 ++++++++++++++++++++-
+ iokit/Kernel/arm/hid/SweetHID.cpp          | 767 ++++++++++++++++++++-
  iokit/Kernel/arm/hid/SweetMotion.h         |  54 ++
  iokit/KernelConfigTables.cpp               |  35 +
- 4 files changed, 938 insertions(+), 1 deletion(-)
+ 4 files changed, 946 insertions(+), 1 deletion(-)
  create mode 100644 iokit/Kernel/arm/hid/SweetMotion.h
 
 diff --git a/iokit/Kernel/arm/hid/AppleHIDUsageTables.h b/iokit/Kernel/arm/hid/AppleHIDUsageTables.h
@@ -127,7 +128,7 @@ index c00cbd4..8b0b292 100644
 +
 +#endif /* _APPLEHIDUSAGETABLES_H */
 diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
-index 6d98131..fd1e970 100644
+index 6d98131..5b50a92 100644
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp
 @@ -13,7 +13,9 @@
@@ -141,7 +142,7 @@ index 6d98131..fd1e970 100644
   * every N seconds, to test the event path without input hardware.
   */
  #include <IOKit/IOLib.h>
-@@ -601,3 +603,758 @@ sweet_hid_touch(int finger, int down, int x, int y)
+@@ -601,3 +603,766 @@ sweet_hid_touch(int finger, int down, int x, int y)
  		gSweetTouch->touch(finger, down != 0, x, y);
  	}
  }
@@ -154,7 +155,7 @@ index 6d98131..fd1e970 100644
 + * `poke m fake` through sweet_hid_sensor() (SweetMotion.h). Every open, user client, copyEvent type and
 + * setProperties key/value is logged ("SWEET MOTION:"): that is how we learn what backboardd, locationd and
 + * CoreBrightness ask for; user-space property reads of the services are logged too. Boot-arg sweetmotion=MASK
-+ * (default 0x03 = accel+gyro, bit = service index, 0 = none; 0x100 = Transport "SPU" instead of "Sweet";
++ * (default 0x77 = all but prox, bit = service index, 0 = none; 0x100 = Transport "SPU" instead of "Sweet";
 + * 0x200 = initial copyEvent answers on every service).
 + */
 +#include <libkern/c++/OSSerialize.h>
@@ -202,15 +203,16 @@ index 6d98131..fd1e970 100644
 +} gSweetKnobs = { -1, 0, kIOHIDProximityDetectionLargeBodyContact | kIOHIDProximityDetectionReceiver, 0, 0, 64, 1000 };
 +
 +/*
-+ * Default: accel + gyro (0x03). On the phone (2026-10-26) backboardd crash-loops with -[NSNull applyUIMode:]
-+ * (after liblog_aop asserts) when prox (0x08), pressure (0x20) or orientation (0x40) is registered, whatever
-+ * the Transport (bisect: 0x03 fine; 0x7f, 0x7b, 0x6b crash). Bit 0x100: Transport "SPU" instead of "Sweet".
++ * Default: everything but prox (0x77). On the phone (2026-10-26) backboardd crash-loops with
++ * -[NSNull applyUIMode:] (after liblog_aop asserts) when the prox service (0x08) is registered (bisect: 0x43,
++ * 0x23 fine, 0x0b crash). It reads DisplayIntegrated, ProtectedAccess and SensorPropertySupported from prox
++ * (absent before): now published, and prox answers copyEvent with "far". Bit 0x100: Transport "SPU".
 + * Bit 0x200: every sensor service answers copyEvent with a neutral sample until a real one exists (the ALS
 + * always does), in case the NSNull is a nil copyEvent.
 + */
 +#define SWEET_MOTION_SPU_TRANSPORT 0x100
 +#define SWEET_MOTION_INITIAL_EVENTS 0x200
-+static uint32_t gSweetMotionMask = 0x03;
++static uint32_t gSweetMotionMask = 0x77;
 +static IOLock *gSweetReadLock;          /* SweetHIDSensor::logRead */
 +static bool gSweetMotionMaskRead;
 +
@@ -364,6 +366,12 @@ index 6d98131..fd1e970 100644
 +		}
 +	}
 +	setProperty("SweetSensor", info->name);
++	if (i == SWEET_SENSOR_PROX) {
++		/* What BackBoard's proximity handling read and found absent (r23c); values are guesses. */
++		setProperty("DisplayIntegrated", kOSBooleanTrue);
++		setProperty("ProtectedAccess", kOSBooleanFalse);
++		setProperty("SensorPropertySupported", kOSBooleanTrue);
++	}
 +	setProperty(kIOHIDBatchIntervalKey, 0ULL, 32);
 +	setProperty(kIOHIDSensorPropertySampleIntervalKey, (unsigned long long)info->interval, 32);
 +	gSweetSensors[i] = this;
@@ -548,7 +556,8 @@ index 6d98131..fd1e970 100644
 +		event->retain();
 +	}
 +	IOLockUnlock(fLock);
-+	if (!event && (sensorIndex() == SWEET_SENSOR_ALS || (sweet_motion_mask() & SWEET_MOTION_INITIAL_EVENTS)) &&
++	if (!event && (sensorIndex() == SWEET_SENSOR_ALS || sensorIndex() == SWEET_SENSOR_PROX ||
++	    (sweet_motion_mask() & SWEET_MOTION_INITIAL_EVENTS)) &&
 +	    (type == gSweetSensorInfo[sensorIndex()].eventType || type == kIOHIDEventTypeNULL)) {
 +		event = initialEvent();         /* a nil copyEvent may be the NSNull */
 +	}
@@ -902,7 +911,7 @@ index 6d98131..fd1e970 100644
 +}
 diff --git a/iokit/Kernel/arm/hid/SweetMotion.h b/iokit/Kernel/arm/hid/SweetMotion.h
 new file mode 100644
-index 0000000..1c68f52
+index 0000000..0d8e789
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/SweetMotion.h
 @@ -0,0 +1,54 @@
@@ -940,8 +949,8 @@ index 0000000..1c68f52
 +	uint32_t interval_set[8];
 +};
 +
-+/* Boot-arg sweetmotion: bit i enables sensor service i (default 0x03 = accel+gyro: prox, pressure or orientation
-+ * crash-looped backboardd on 2026-10-26; 0x7f all); 0 = no services, no device; 0x100 = Transport "SPU";
++/* Boot-arg sweetmotion: bit i enables sensor service i (default 0x77 = all but prox, which crash-looped
++ * backboardd on 2026-10-26; 0x7f all); 0 = no services, no device; 0x100 = Transport "SPU";
 + * 0x200 = every service answers copyEvent with a neutral sample until a real one exists. */
 +uint32_t sweet_motion_mask(void);
 +/* Post one sample from its service; 0, or ENODEV (no such service / disabled) / EINVAL (unknown type). */
