@@ -5,7 +5,7 @@ Only what the early boot path actually reads (see ios-sweet's NOTES.md); every
 MMIO address comes from the flame (Pixel 4, SM8150) live FDT. The kernel's
 built-in drivers still match the Redmi names (xiaomi,sweet, qcom,kryo470,
 sweet,display), so those stay next to the flame ones.
-Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--camera] [--flash]
+Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--camera] [--flash] [--backlight]
 """
 import hashlib, os, struct, sys
 
@@ -78,6 +78,27 @@ def d22ap_product_child(child, path=D22AP_ADT):
                     return [(k, v) for k, f, v in g.props if not f and k not in ('name', 'AAPL,phandle')]
     return None
 
+def d22ap_backlight(max_nits, path=D22AP_ADT):
+    """--backlight (redfin 0973, opt-in): the D22AP tree's /backlight node (max-nit-value, Nits2DAC and marketing
+    tables, restriction factors), for anything in the userland that reads the panel's nits from the device tree.
+    max-nit-value, aab-constraint-lmax and LmaxProduct (16.16) are redfin's panel (S6E3HC2, 500 nits, as
+    SweetFramebuffer.cpp's 500 nits <-> level 1023), not the iPhone X's; LminProduct (2 nits) and LmidProduct (155)
+    stay. The function-* references (iBoot callbacks into nodes we do not have) are left out."""
+    if not os.path.exists(path):
+        print(f'warning: {path} missing, no /backlight node', file=sys.stderr)
+        return None
+    root, _ = adt.parse(open(path, 'rb').read())
+    for c in root.children:
+        if dict((k, v) for k, f, v in c.props).get('name') == b'backlight\0':
+            props = [(k, v) for k, f, v in c.props
+                     if not f and k not in ('name', 'AAPL,phandle') and not k.startswith('function-')]
+            # nits (u32) and 16.16 nits: the panel's maximum instead of the iPhone X's 750 / 674 / 675
+            over = {'max-nit-value': struct.pack('<I', max_nits), 'aab-constraint-lmax': struct.pack('<I', max_nits),
+                    'LmaxProduct': struct.pack('<I', max_nits << 16)}
+            return [(k, over.get(k, v)) for k, v in props]
+    print(f'warning: {path}: no /backlight node', file=sys.stderr)
+    return None
+
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
 u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
@@ -110,7 +131,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, camera=False, flash=False):
+def build(seed=None, qemu=False, highmem=False, camera=False, flash=False, backlight=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
     camera=True: /arm-io/isp (Camera.app on the home screen); flash=True: /product/camera flash
     (the flashlight in Control Center). See CAMERA below."""
@@ -283,6 +304,9 @@ def build(seed=None, qemu=False, highmem=False, camera=False, flash=False):
     if flash or camera:
         product_children.append(product_camera_node(ph, flash))
     product = [node('product', [ph()] + product_props, product_children)] if product_props else []
+    bl_props = d22ap_backlight(500) if backlight else None
+    if bl_props:
+        product.append(node('backlight', [ph()] + bl_props))
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
@@ -301,7 +325,7 @@ def build(seed=None, qemu=False, highmem=False, camera=False, flash=False):
 
 if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 camera='--camera' in sys.argv, flash='--flash' in sys.argv)
+                 camera='--camera' in sys.argv, flash='--flash' in sys.argv, backlight='--backlight' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

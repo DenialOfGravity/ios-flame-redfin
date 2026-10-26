@@ -280,6 +280,13 @@ that look like capabilities (mkadt.py copies /product whole today, so anything t
 D22AP tree has a sensor node and backboardd/locationd log about a missing "accel"/"aop" service, the next step is
 to name our services after those nodes (`IOName`), not to add DT nodes.
 
+**Auto-brightness (0973).** CoreBrightness accepted our ALS (`Esensor=66`, kAABStateAutoBrightness) but
+computed `L_newtarget=1.000000` = `_L_minimum` and `systemShallUpdateBacklight=false`: it had no panel luminance.
+0973 publishes nit keys on AppleARMBacklight (`sweetnits=0` off); `mkadt.py --backlight` adds D22AP's /backlight
+node (LminProduct 2, LmidProduct 155, LmaxProduct/max-nit-value 500). Look for `oslog -l backboardd | grep -E
+'Panel luminance|L_newtarget|systemShallUpdateBacklight'` (CoreBrightness logs "Panel luminance: Nits min = %f,
+max = %f" at its start).
+
 **MobileGestalt** (`mg_test KEY...` on the phone; nil = MobileGestalt does not know the key):
 `accelerometer gyroscope magnetometer ambient-light-sensor proximity-sensor` (UIRequiredDeviceCapabilities names; the
 first three are certain, the last two candidates), plus `DeviceSupportsAutoBrightness`, `barometer`,
