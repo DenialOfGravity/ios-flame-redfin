@@ -221,3 +221,6 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
 - 0981 /dev/btuart (`btuart=1`, no node by default): WCN3998 HCI UART on QUP0 SE5 (0x894000, SPI 606 via 0911) for
   phone/bt/btd: GENI FIFO mode, RTS/CTS, 16 KiB RX ring, baud/flow/drain/flush/timeout/stats ioctls; ENXIO without
   XBL-loaded UART firmware; `btuartos=16|32`; poke `b 0` state, `b 1` HCI version, `b 2` QCA EDL version.
+- 0982 stand-in Bluetooth nubs (`sweetbtnub=1` "bluetooth", `=2` "marconi-bt", `=3` both; off by default): SweetBTNub
+  services under the platform expert for bluetoothd's IONameMatch notifications; every property read from them logged
+  with found/MISSING, user-client requests refused + logged, setProperties keys logged (`SWEET BTNUB:`).
