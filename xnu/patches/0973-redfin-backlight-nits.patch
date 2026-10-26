@@ -10,26 +10,35 @@ luminance. AppleARMBacklight now publishes MinNits/MaxNits/MaxNitsPanel,
 HardwareAccessibleMin/MaxNits, user-accessible-max-nits,
 digital-dimming-min-nits, brightness-nits(-cap) and
 DisplayPanel/ProductLuminanceMin/Mid/Max: 2..500 nits (integer), consistent
-with the existing 500 nits <-> level 1023. Boot-arg sweetnits=0: none.
+with the existing 500 nits <-> level 1023. CoreBrightness reads only
+IODisplayParameters from the service (r27a), so brightness-nits(-cap),
+user-accessible-max-nits and digital-dimming-min-nits also go in there as
+{min, max, value} dicts. Boot-arg sweetnits=0: none.
 ---
- iokit/Kernel/arm/SweetFramebuffer.cpp | 46 +++++++++++++++++++++++++++
- 1 file changed, 46 insertions(+)
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 83 +++++++++++++++++++++++++++
+ 1 file changed, 83 insertions(+)
 
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 1859d39..5b5d279 100644
+index 1859d39..d825cec 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -383,7 +383,9 @@ class AppleARMBacklight : public IOService {
+@@ -383,7 +383,10 @@ class AppleARMBacklight : public IOService {
  
  public:
  	AppleCLCD *fFB;
 +	bool fNitsDone;
  	void publish(uint32_t level);
 +	void publishNits(uint32_t level);
++	void addNitParameters(OSDictionary *p, uint32_t level);
  	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
  };
  
-@@ -404,6 +406,50 @@ AppleARMBacklight::publish(uint32_t level)
+@@ -400,10 +403,90 @@ AppleARMBacklight::publish(uint32_t level)
+ 		n = OSNumber::withNumber(SWEET_BL_MAX, 32); b->setObject("max", n); OSSafeReleaseNULL(n);
+ 		n = OSNumber::withNumber(level, 32); b->setObject("value", n); OSSafeReleaseNULL(n);
+ 		p->setObject("brightness", b);
++		addNitParameters(p, level);
+ 		setProperty("IODisplayParameters", p);
  	}
  	OSSafeReleaseNULL(b);
  	OSSafeReleaseNULL(p);
@@ -42,6 +51,41 @@ index 1859d39..5b5d279 100644
 + * at its 500 nits <-> level 1023 (SWEET_BL_MAX_NITS), 2 nits the floor. Integer nits; boot-arg sweetnits=0: none.
 + */
 +#define SWEET_BL_MIN_NITS       2u
++/*
++ * r27a: CoreBrightness reads only IODisplayParameters from this service ("display parameters = { brightness =
++ * {max, min, value} }") and ran with Lmax = 1 nit; the nit keys go in there too, as {min, max, value} like
++ * "brightness" (integer nits, a guess at the format). sweetnits=0: not added.
++ */
++static void
++sweetNitParam(OSDictionary *p, const char *key, uint32_t min, uint32_t max, uint32_t value)
++{
++	OSDictionary *d = OSDictionary::withCapacity(3);
++	if (d != NULL) {
++		OSNumber *n;
++		n = OSNumber::withNumber(min, 32); d->setObject("min", n); OSSafeReleaseNULL(n);
++		n = OSNumber::withNumber(max, 32); d->setObject("max", n); OSSafeReleaseNULL(n);
++		n = OSNumber::withNumber(value, 32); d->setObject("value", n); OSSafeReleaseNULL(n);
++		p->setObject(key, d);
++	}
++	OSSafeReleaseNULL(d);
++}
++
++void
++AppleARMBacklight::addNitParameters(OSDictionary *p, uint32_t level)
++{
++	uint32_t v = 1;
++	PE_parse_boot_argn("sweetnits", &v, sizeof(v));
++	if (!v) {
++		return;
++	}
++	uint32_t nits = level * SWEET_BL_MAX_NITS / SWEET_BL_MAX;
++	nits = nits < SWEET_BL_MIN_NITS ? SWEET_BL_MIN_NITS : nits;
++	sweetNitParam(p, "brightness-nits", SWEET_BL_MIN_NITS, SWEET_BL_MAX_NITS, nits);
++	sweetNitParam(p, "brightness-nits-cap", SWEET_BL_MIN_NITS, SWEET_BL_MAX_NITS, SWEET_BL_MAX_NITS);
++	sweetNitParam(p, "user-accessible-max-nits", SWEET_BL_MIN_NITS, SWEET_BL_MAX_NITS, SWEET_BL_MAX_NITS);
++	sweetNitParam(p, "digital-dimming-min-nits", SWEET_BL_MIN_NITS, SWEET_BL_MAX_NITS, SWEET_BL_MIN_NITS);
++}
++
 +void
 +AppleARMBacklight::publishNits(uint32_t level)
 +{
