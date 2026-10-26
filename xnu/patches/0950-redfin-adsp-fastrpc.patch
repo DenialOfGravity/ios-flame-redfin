@@ -1,4 +1,4 @@
-From 62abfbb8351f502db2b27c483d12dc02b319f75e Mon Sep 17 00:00:00 2001
+From 4612d4dfedd474b50606c905ea87b85bcbb2dc6f Mon Sep 17 00:00:00 2001
 From: WS-D <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 00:36:59 +0100
 Subject: [PATCH 1/3] 0950 redfin: ADSP FastRPC channel, /dev/redwood-fastrpc,
@@ -18,15 +18,18 @@ here), zeroed through a device mapping, kept for the DSP (32 buffers, reused
 at the same size); the range handed out is logged. Boot-arg adsp=2: the DSP
 is started when /dev/redwood-fastrpc is first opened (fastrpcd is up before
 the sensors PD asks for its files), adsp=1 as before; adsp_fastrpc=0: the
-old way; =2: every message logged. Poke f 0/1/2/3/5: status, the DSP's words
+old way; =2: every message logged. adsp_sleep=1: our SMP2P item
+also carries Android's other APPS entries, "sleepstate" = 1 (APPS awake)
+and "rdbg" = 0. adsp_qlog=1: IPCRTR datagrams and intent events logged
+(SWEET QLOG:, first 200 lines, then one line per 100 datagrams). Poke f 0/1/2/3/5: status, the DSP's words
 and last words, QRTR services, SMMU identity, SMMU faults.
 ---
- bsd/dev/sweet_adsp.c | 692 ++++++++++++++++++++++++++++++++++++++++++-
+ bsd/dev/sweet_adsp.c | 794 ++++++++++++++++++++++++++++++++++++++++++-
  bsd/dev/sweet_poke.c |   6 +
- 2 files changed, 693 insertions(+), 5 deletions(-)
+ 2 files changed, 794 insertions(+), 6 deletions(-)
 
 diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
-index c219cd8..eff1192 100644
+index c219cd8..ed004b1 100644
 --- a/bsd/dev/sweet_adsp.c
 +++ b/bsd/dev/sweet_adsp.c
 @@ -111,6 +111,18 @@
@@ -48,7 +51,60 @@ index c219cd8..eff1192 100644
  
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  /* (sys/redwood_input.h of HackiOS: what the battery manager below would hand on) */
-@@ -1856,7 +1868,7 @@ struct glink_packet {
+@@ -157,6 +169,26 @@ static uint32_t last_step, pause_ms = 2200, listen_seconds = 3;
+ static uint32_t step;                   /* the one being performed */
+ static uint32_t new_from;               /* the first of the steps that have not been seen to work: they wait */
+ static char last_write[96] = "nothing written";
++/*
++ * 0950: adsp_sleep=1: our SMP2P item carries every entry Android's kernel makes in it (dt: the children of
++ * qcom,smp2p-adsp with qcom,smem-state-cells, in order), at Android's boot values: "master-kernel" 0,
++ * "sleepstate" 1 (smp2p-sleepstate: bit 0 = APPS awake, set at its probe), "rdbg" 0. adsp_sleep=0 (the
++ * default): "master-kernel" only, as before.
++ * adsp_qlog=1: every QRTR datagram on IPCRTR (both ways: header and the first 48 bytes) and every intent
++ * event of that channel logged, the first 200 lines, then one line per 100 datagrams.
++ */
++static uint32_t adsp_sleep, adsp_qlog;
++static uint32_t qlog_lines, qlog_packets, qlog_in, qlog_out;
++
++static bool
++qlog_line(void)
++{
++	if (!adsp_qlog || qlog_lines >= 200) {
++		return false;
++	}
++	qlog_lines++;
++	return true;
++}
+ static bool leaving;                    /* on the way back to the loader after a panic: no lock is taken, nothing sleeps */
+ 
+ /*
+@@ -1654,7 +1686,24 @@ step_our_item(void)
+ 	for (uint32_t word = 0; word < 4; word++) {
+ 		smem_poke(our_item + SMP2P_AT_NAME(0) + 4 * word, name[word]);
+ 	}
+-	smem_poke(our_item + SMP2P_AT_COUNTS, 16 | 1u << 16);
++	uint32_t entries = 1;
++	if (adsp_sleep) {
++		static const struct {
++			const char *name;
++			uint32_t value;
++		} more[] = { { "sleepstate", 1 }, { "rdbg", 0 } };
++
++		for (unsigned e = 0; e < sizeof(more) / sizeof(more[0]); e++, entries++) {
++			bzero(name, sizeof(name));
++			strlcpy((char *)name, more[e].name, sizeof(name));
++			for (uint32_t word = 0; word < 4; word++) {
++				smem_poke(our_item + SMP2P_AT_NAME(entries) + 4 * word, name[word]);
++			}
++			smem_poke(our_item + SMP2P_AT_VALUE(entries), more[e].value);
++		}
++		printf("adsp: %u: adsp_sleep=1: our item also has \"sleepstate\" = 1 (APPS awake) and \"rdbg\" = 0, as Android's\n", step);
++	}
++	smem_poke(our_item + SMP2P_AT_COUNTS, 16 | entries << 16);
+ 	smem_poke(our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8);
+ 	settle();
+ 	smem_poke(our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8 | SMP2P_VERSION);
+@@ -1856,7 +1905,7 @@ struct glink_packet {
   * carries APR, the audio services' own protocol (below; Android's apr_tal_rpmsg.c asks for no
   * particular intents: what the DSP sends there is a few hundred bytes, up to a few kilobytes).
   */
@@ -57,7 +113,7 @@ index c219cd8..eff1192 100644
  
  struct glink_channel {
  	const char *name;
-@@ -1874,7 +1886,7 @@ struct glink_channel {
+@@ -1874,7 +1923,7 @@ struct glink_channel {
  	struct {
  		uint32_t size, fill;
  		uint8_t *data;
@@ -66,7 +122,7 @@ index c219cd8..eff1192 100644
  	uint32_t our_intent_count;
  	struct glink_packet *first, *last;      /* received, in order */
  };
-@@ -1894,9 +1906,35 @@ static struct {
+@@ -1894,9 +1943,35 @@ static struct {
  		[CHANNEL_APR] = { .name = "apr_audio_svc", .ours = 2, .intents = { { 0x200, 8 }, { 0x1000, 4 }, { 0x2000, 2 } } },
  		/* the battery manager's (battmgr below): answers of a few dozen bytes, a name of 128 */
  		[CHANNEL_PMIC] = { .name = "PMIC_RTR_ADSP_APPS", .ours = 3, .intents = { { 0x200, 6 }, { 0x1000, 2 }, { 0, 0 } } },
@@ -102,7 +158,7 @@ index c219cd8..eff1192 100644
  static struct glink_channel *
  glink_theirs(uint32_t theirs)
  {
-@@ -2114,7 +2152,7 @@ glink_pump(void)
+@@ -2114,7 +2189,7 @@ glink_pump(void)
  			glink_advance(length);
  			channel = NULL;
  			for (unsigned c = 0; c < CHANNELS; c++) {
@@ -111,7 +167,119 @@ index c219cd8..eff1192 100644
  					channel = &glink.channel[c];
  				}
  			}
-@@ -2899,6 +2937,623 @@ battmgr_stop(void)
+@@ -2160,6 +2235,10 @@ glink_pump(void)
+ 						channel->their_intents[n].in_use = false;
+ 						channel->their_intents[n].size = words[0];
+ 						channel->their_intents[n].id = words[1];
++						if (channel == &glink.channel[CHANNEL_QRTR] && qlog_line()) {
++							printf("SWEET QLOG: IPCRTR: the DSP offers intent %u of %u bytes (slot %u)\n", words[1],
++							    words[0], n);
++						}
+ 						break;
+ 					}
+ 				}
+@@ -2173,6 +2252,10 @@ glink_pump(void)
+ 				if (channel->their_intents[n].there && channel->their_intents[n].id == message.param2) {
+ 					channel->their_intents[n].in_use = false;
+ 					channel->their_intents[n].there = message.command == GLINK_DONE_REUSE;
++					if (channel == &glink.channel[CHANNEL_QRTR] && qlog_line()) {
++						printf("SWEET QLOG: IPCRTR: the DSP is done with intent %u%s\n", message.param2,
++						    message.command == GLINK_DONE_REUSE ? " (reused)" : " (gone)");
++					}
+ 				}
+ 			}
+ 			glink_advance(length);
+@@ -2191,6 +2274,9 @@ glink_pump(void)
+ 				if (message.param1 == glink.channel[c].theirs || message.param1 == glink.channel[c].ours) {
+ 					glink.channel[c].request_answered = true;
+ 					glink.channel[c].request_granted = message.param2 != 0;
++					if (c == CHANNEL_QRTR && qlog_line()) {
++						printf("SWEET QLOG: IPCRTR: our intent request %s\n", message.param2 ? "GRANTED" : "REFUSED");
++					}
+ 				}
+ 			}
+ 			break;
+@@ -2308,8 +2394,25 @@ glink_send(struct glink_channel *channel, const void *data, uint32_t length)
+ 			channel->request_answered = false;
+ 			glink_say(GLINK_INTENT_REQUEST, channel->ours, length, NULL, 0);
+ 			asked = true;
++			if (channel == &glink.channel[CHANNEL_QRTR] && qlog_line()) {
++				printf("SWEET QLOG: IPCRTR: no intent of the DSP's holds %u bytes: one asked for\n", length);
++			}
+ 		}
+ 		if (waited >= 5000 || (!fits && asked && channel->request_answered && !channel->request_granted)) {
++			if (channel == &glink.channel[CHANNEL_QRTR] && qlog_line()) {
++				unsigned there = 0, busy = 0;
++				uint32_t biggest = 0;
++
++				for (unsigned n = 0; n < sizeof(channel->their_intents) / sizeof(channel->their_intents[0]); n++) {
++					if (channel->their_intents[n].there) {
++						there++;
++						busy += channel->their_intents[n].in_use;
++						biggest = MAX(biggest, channel->their_intents[n].size);
++					}
++				}
++				printf("SWEET QLOG: IPCRTR: %u bytes NOT SENT after %u ms: %u intents of the DSP's (%u in use, the biggest %u "
++				    "bytes), %u bytes of room in our queue\n", length, waited, there, busy, biggest, glink_room());
++			}
+ 			lck_mtx_unlock(&glink_lock);
+ 			return found < 0 ? ENOBUFS : EAGAIN;
+ 		}
+@@ -2345,6 +2448,37 @@ static struct {
+ } qrtr_servers[64];
+ static uint32_t qrtr_peer, qrtr_in, qrtr_out, qrtr_hellos, qrtr_lookups;
+ 
++/* adsp_qlog=1: one datagram (dir "<" from the DSP, ">" to it) */
++static void
++qlog_packet(const char *dir, const struct qrtr_header *h, const uint8_t *data, uint32_t length, int error)
++{
++	char hex[3 * 48 + 1];
++	uint32_t n = MIN(length, 48u);
++
++	if (!adsp_qlog) {
++		return;
++	}
++	qlog_packets++;
++	if (*dir == '<') {
++		qlog_in++;
++	} else {
++		qlog_out++;
++	}
++	if (!qlog_line()) {
++		if (qlog_packets % 100 == 0) {
++			printf("SWEET QLOG: %u datagrams (%u from the DSP, %u to it)\n", qlog_packets, qlog_in, qlog_out);
++		}
++		return;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		snprintf(hex + 3 * i, 4, " %02x", data[i]);
++	}
++	hex[3 * n] = '\0';
++	printf("SWEET QLOG: %s type %u %u:%#x -> %u:%#x confirm %u, %u bytes%s%s:%s\n", dir, h->type, h->from_node, h->from_port,
++	    h->to_node, h->to_port, h->confirm, length, error ? ", NOT SENT: error " : "", error ? (error == ENOBUFS ? "ENOBUFS" :
++	    error == EAGAIN ? "EAGAIN" : error == ENOTCONN ? "ENOTCONN" : "other") : "", hex);
++}
++
+ static int
+ qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to_port, const void *data, uint32_t length)
+ {
+@@ -2365,6 +2499,7 @@ qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to
+ 	packet->to_port = to_port;
+ 	memcpy(packet + 1, data, length);
+ 	error = glink_send(&glink.channel[CHANNEL_QRTR], packet, (uint32_t)sizeof(*packet) + padded);
++	qlog_packet(">", packet, data, length, error);
+ 	kfree_data(packet, sizeof(*packet) + padded);
+ 	qrtr_out += error == 0;
+ 	return error;
+@@ -2461,6 +2596,7 @@ qrtr_input(const uint8_t *data, uint32_t length)
+ 	if (qrtr_peer == 0) {
+ 		qrtr_peer = header.from_node;
+ 	}
++	qlog_packet("<", &header, data + at, header.size, 0);
+ 	if (header.type == QRTR_RESUME_TX) {
+ 		return;
+ 	}
+@@ -2899,6 +3035,623 @@ battmgr_stop(void)
  
  static volatile bool link_wanted, link_runs;
  
@@ -735,7 +903,7 @@ index c219cd8..eff1192 100644
  static void
  link_thread(__unused void *parameter, __unused wait_result_t result)
  {
-@@ -2918,6 +3573,7 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
+@@ -2918,6 +3671,7 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
  				gave_up = true;
  				printf("adsp: link: THE AUDIO DSP SAYS IT HAS GIVEN UP (\"slave-kernel\" = %#x)\n", dsp_state(&words));
  				show_crash_reason();
@@ -743,7 +911,7 @@ index c219cd8..eff1192 100644
  			}
  		}
  		for (;;) {
-@@ -2943,6 +3599,10 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
+@@ -2943,6 +3697,10 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
  				qrtr_input(packet->data, packet->length);
  			} else if (from == CHANNEL_PMIC) {
  				battmgr_input(packet->data, packet->length);
@@ -754,7 +922,7 @@ index c219cd8..eff1192 100644
  			} else {
  				apr_input(packet->data, packet->length);
  			}
-@@ -2982,6 +3642,7 @@ link_stop(void)
+@@ -2982,6 +3740,7 @@ link_stop(void)
  	lck_mtx_unlock(&glink_lock);
  	bzero(qrtr_servers, sizeof(qrtr_servers));
  	qrtr_peer = 0;
@@ -762,7 +930,7 @@ index c219cd8..eff1192 100644
  }
  
  /* ---- step 8: GLINK's queues, looked at -------------------------------------------------------------- */
-@@ -3262,9 +3923,10 @@ redwood_adsp_init(void)
+@@ -3262,9 +4021,12 @@ redwood_adsp_init(void)
  	thread_t thread;
  
  	PE_parse_boot_argn("adsp_step", &last_step, sizeof(last_step));
@@ -770,11 +938,13 @@ index c219cd8..eff1192 100644
 +	if (last_step == 0 && (!PE_parse_boot_argn("adsp", &on, sizeof(on)) || (on != 1 && on != 2))) {
  		return;
  	}
++	PE_parse_boot_argn("adsp_sleep", &adsp_sleep, sizeof(adsp_sleep));    /* 0950: Android's SMP2P entries */
++	PE_parse_boot_argn("adsp_qlog", &adsp_qlog, sizeof(adsp_qlog));       /* 0950: IPCRTR datagrams logged */
 +	fastrpc_init();                         /* 0950: /dev/redwood-fastrpc (adsp_fastrpc=0: not) */
  	if (last_step == 0) {
  		/* all of it, on a thread of its own, and left up */
  		last_step = STEPS;
-@@ -3273,12 +3935,18 @@ redwood_adsp_init(void)
+@@ -3273,12 +4035,18 @@ redwood_adsp_init(void)
  		pause_ms = 0;
  		listen_seconds = 1;
  		new_from = STEPS + 1;
@@ -794,7 +964,7 @@ index c219cd8..eff1192 100644
  		return;
  	}
  	if (last_step > STEPS) {
-@@ -3297,4 +3965,18 @@ redwood_adsp_init(void)
+@@ -3297,4 +4065,18 @@ redwood_adsp_init(void)
  	}
  	thread_deallocate(thread);
  }
