@@ -39,6 +39,7 @@ struct tlv_info {
 	/* NVM */
 	int ntags;
 	int hci_tag_len;		/* -1: no tag 17 */
+	uint32_t nvm_off, nvm_len;	/* NVM: where the 12-byte tags start in the file and how many bytes they span */
 };
 
 struct tlv_seg {

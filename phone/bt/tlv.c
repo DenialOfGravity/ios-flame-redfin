@@ -47,17 +47,37 @@ int tlv_parse(const uint8_t *buf, size_t n, struct tlv_info *ti, const char **er
 		ti->entry = le32(buf + 24);
 		return 0;
 	case TLV_TYPE_NVM:
-	case 4: {	/* redfin's crnv32.bin says 4; Linux btqca.c only logs the file's type byte and goes by the caller's */
+	case 4: {
+		/* Type 2: the 12-byte tags follow the header. Type 4 (redfin's crnv32.bin, crnv32u.bin): a
+		 * wrapper whose first 4 bytes are a nested type-2 header (type in the low byte, length above),
+		 * then the tags, then 0xff padding to the outer length. Linux's btqca.c dispatches on the
+		 * caller's type and only logs the file's, so both download as they are. */
 		ti->type = TLV_TYPE_NVM;
-		const uint8_t *d = buf + 4;
+		ti->nvm_off = 4;
+		ti->nvm_len = ti->length;
+		if ((tl & 0xff) == 4) {
+			if (ti->length < 4 || (le32(buf + 4) & 0xff) != TLV_TYPE_NVM) {
+				*err = "type 4 without a nested NVM header";
+				return -1;
+			}
+			ti->nvm_off = 8;
+			ti->nvm_len = le32(buf + 4) >> 8;
+			if (ti->nvm_len + 4 > ti->length) {
+				*err = "nested NVM length beyond the outer one";
+				return -1;
+			}
+		}
+		const uint8_t *d = buf + ti->nvm_off;
 		uint32_t idx = 0;
-		while (idx < ti->length) {
-			if (idx + 12 > ti->length) {
+		while (idx < ti->nvm_len) {
+			if (idx + 12 > ti->nvm_len) {
 				*err = "NVM tag header crosses the end";
 				return -1;
 			}
 			uint16_t id = le16(d + idx), len = le16(d + idx + 2);
-			if (idx + 12 + len > ti->length) {
+			if (id == 0xffff)
+				break;		/* padding */
+			if (idx + 12 + len > ti->nvm_len) {
 				*err = "NVM tag data crosses the end";
 				return -1;
 			}
@@ -87,11 +107,13 @@ int tlv_nvm_edit(uint8_t *buf, size_t n, int baud_idx, int baud_pos, int ibs, co
 	struct tlv_info ti;
 	if (tlv_parse(buf, n, &ti, NULL) || ti.type != TLV_TYPE_NVM)
 		return -1;
-	uint8_t *d = buf + 4;
+	uint8_t *d = buf + ti.nvm_off;
 	uint32_t idx = 0;
 	int changed = 0;
-	while (idx < ti.length) {
+	while (idx < ti.nvm_len) {
 		uint16_t id = le16(d + idx), len = le16(d + idx + 2);
+		if (id == 0xffff)
+			break;
 		uint8_t *data = d + idx + 12;
 		switch (id) {
 		case TLV_TAG_HCI:
