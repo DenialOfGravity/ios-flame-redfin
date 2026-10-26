@@ -13,15 +13,18 @@ user client (pid, name), copyEvent type and setProperties key/value is logged
 ("SWEET MOTION:"); ReportInterval is kept and published. copyEvent returns the
 last sample. Samples arrive through sweet_hid_sensor() (SweetMotion.h) and are
 converted with integer arithmetic only (accel: Android m/s^2 -> -g). Boot-arg
-sweetmotion=MASK (default 0x03 = accel+gyro, 0x7f = all, 0 = none). The sensor
-services say Transport "Sweet": with "SPU" (bit 0x100) an AppleSPU plug-in in
-backboardd attached to them and crash-looped it (-[NSNull applyUIMode:]).
+sweetmotion=MASK (default 0x7b = all but the ALS, 0x7f = all, 0 = none): the
+ALS service crash-looped backboardd (CoreBrightness, -[NSNull applyUIMode:]
+after setting ALSLPannelValues). The ALS now answers copyEvent with 100 lux
+until a sample exists and posts a 100 lux event 500 ms after an open; every
+user-space property read of a sensor service is logged (key, present/ABSENT,
+pid). Transport is "Sweet" (bit 0x100: "SPU").
 ---
  iokit/Kernel/arm/hid/AppleHIDUsageTables.h |  91 +++
- iokit/Kernel/arm/hid/SweetHID.cpp          | 629 ++++++++++++++++++++-
+ iokit/Kernel/arm/hid/SweetHID.cpp          | 744 ++++++++++++++++++++-
  iokit/Kernel/arm/hid/SweetMotion.h         |  53 ++
- iokit/KernelConfigTables.cpp               |  35 ++
- 4 files changed, 807 insertions(+), 1 deletion(-)
+ iokit/KernelConfigTables.cpp               |  35 +
+ 4 files changed, 922 insertions(+), 1 deletion(-)
  create mode 100644 iokit/Kernel/arm/hid/SweetMotion.h
 
 diff --git a/iokit/Kernel/arm/hid/AppleHIDUsageTables.h b/iokit/Kernel/arm/hid/AppleHIDUsageTables.h
@@ -124,7 +127,7 @@ index c00cbd4..8b0b292 100644
 +
 +#endif /* _APPLEHIDUSAGETABLES_H */
 diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
-index 6d98131..ee090cc 100644
+index 6d98131..9339d96 100644
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp
 @@ -13,7 +13,9 @@
@@ -138,7 +141,7 @@ index 6d98131..ee090cc 100644
   * every N seconds, to test the event path without input hardware.
   */
  #include <IOKit/IOLib.h>
-@@ -601,3 +603,628 @@ sweet_hid_touch(int finger, int down, int x, int y)
+@@ -601,3 +603,743 @@ sweet_hid_touch(int finger, int down, int x, int y)
  		gSweetTouch->touch(finger, down != 0, x, y);
  	}
  }
@@ -150,8 +153,8 @@ index 6d98131..ee090cc 100644
 + * orientation: AppleVendorMotion 0xff0c usage 6). Samples come from /dev/redwood-motion (sensd, 0972) or
 + * `poke m fake` through sweet_hid_sensor() (SweetMotion.h). Every open, user client, copyEvent type and
 + * setProperties key/value is logged ("SWEET MOTION:"): that is how we learn what backboardd, locationd and
-+ * CoreBrightness ask for. Boot-arg sweetmotion=MASK (default 0x03 = accel+gyro, bit = service index, 0 = none;
-+ * 0x100 = Transport "SPU" instead of "Sweet").
++ * CoreBrightness ask for; user-space property reads of the services are logged too. Boot-arg sweetmotion=MASK
++ * (default 0x7b = all but the ALS, bit = service index, 0 = none; 0x100 = Transport "SPU" instead of "Sweet").
 + */
 +#include <libkern/c++/OSSerialize.h>
 +#include <libkern/c++/OSCollectionIterator.h>
@@ -198,13 +201,14 @@ index 6d98131..ee090cc 100644
 +} gSweetKnobs = { -1, 0, kIOHIDProximityDetectionLargeBodyContact | kIOHIDProximityDetectionReceiver, 0, 0, 64, 1000 };
 +
 +/*
-+ * Default: accel + gyro only. On the phone (2026-10-26) the full set with Transport "SPU" made backboardd
-+ * crash-loop: an AppleSPU HID plug-in (liblog_aop asserts) attached to our services and sent -applyUIMode: to
-+ * NSNull. Bit 0x100 keeps Transport "SPU" (the old behaviour) for a bisect; without it the sensor services
-+ * say Transport "Sweet", which Apple's SPU/AOP plug-ins do not match.
++ * Default: everything but the ALS (0x7b). On the phone (2026-10-26) the ALS service made backboardd crash-loop:
++ * right after CoreBrightness set ALSLPannelValues on it, -[NSNull applyUIMode:] (Transport "SPU" or "Sweet"
++ * alike). sweetmotion=0x7f brings the ALS back (with the initial-event and property-read logging below) to find
++ * out what it wants. Bit 0x100 makes the sensor services say Transport "SPU" (as first published) instead of
++ * "Sweet".
 + */
 +#define SWEET_MOTION_SPU_TRANSPORT 0x100
-+static uint32_t gSweetMotionMask = 0x03;
++static uint32_t gSweetMotionMask = 0x7b;
 +static bool gSweetMotionMaskRead;
 +
 +extern "C" uint32_t
@@ -276,6 +280,9 @@ index 6d98131..ee090cc 100644
 +	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching = 0, IOOptionBits options = 0) APPLE_KEXT_OVERRIDE;
 +	virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
 +	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++	using IOHIDEventService::copyProperty;
++	virtual OSPtr<OSObject> copyProperty(const char *aKey) const APPLE_KEXT_OVERRIDE;
++	virtual bool serializeProperties(OSSerialize *s) const APPLE_KEXT_OVERRIDE;
 +	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return gSweetSensorInfo[sensorIndex()].page; }
 +	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return gSweetSensorInfo[sensorIndex()].usage; }
 +
@@ -294,6 +301,10 @@ index 6d98131..ee090cc 100644
 +	}
 +private:
 +	void logProperty(const OSSymbol *key, OSObject *value, int pid, const char *who);
++	void logRead(const char *key, bool found) const;
++	IOHIDEvent *initialALSEvent();
++	static void initialFired(OSObject *owner, IOTimerEventSource *sender);
++	IOTimerEventSource *fInitTimer;
 +	IOLock         *fLock;
 +	IOHIDEvent     *fLast;
 +	OSDictionary   *fSeen;          /* key -> last logged value text */
@@ -331,12 +342,24 @@ index 6d98131..ee090cc 100644
 +		IOLog("SWEET MOTION: %s off (sweetmotion=0x%x)\n", info->name, sweet_motion_mask());
 +		return false;
 +	}
++	if (!gSweetReadLock) {
++		IOLock *l = IOLockAlloc();
++		if (l && !OSCompareAndSwapPtr(NULL, l, (void * volatile *)&gSweetReadLock)) {
++			IOLockFree(l);
++		}
++	}
 +	fLock = IOLockAlloc();
 +	fSeen = OSDictionary::withCapacity(8);
 +	if (!fLock || !fSeen || !IOHIDEventService::start(provider)) {
 +		return false;
 +	}
 +	fInterval = info->interval;
++	if (i == SWEET_SENSOR_ALS) {
++		fInitTimer = IOTimerEventSource::timerEventSource(this, &SweetHIDSensor::initialFired);
++		if (fInitTimer && _hidWorkLoop->addEventSource(fInitTimer) != kIOReturnSuccess) {
++			OSSafeReleaseNULL(fInitTimer);
++		}
++	}
 +	setProperty("SweetSensor", info->name);
 +	setProperty(kIOHIDBatchIntervalKey, 0ULL, 32);
 +	setProperty(kIOHIDSensorPropertySampleIntervalKey, (unsigned long long)info->interval, 32);
@@ -351,6 +374,13 @@ index 6d98131..ee090cc 100644
 +void
 +SweetHIDSensor::free(void)
 +{
++	if (fInitTimer) {
++		fInitTimer->cancelTimeout();
++		if (_hidWorkLoop) {
++			_hidWorkLoop->removeEventSource(fInitTimer);
++		}
++		OSSafeReleaseNULL(fInitTimer);
++	}
 +	OSSafeReleaseNULL(fLast);
 +	OSSafeReleaseNULL(fSeen);
 +	if (fLock) {
@@ -381,6 +411,9 @@ index 6d98131..ee090cc 100644
 +	bool ok = IOHIDEventService::open(client, options, context, action);
 +	if (ok) {
 +		OSIncrementAtomic((volatile SInt32 *)&fClients);
++		if (fInitTimer && fEvents == 0) {
++			fInitTimer->setTimeoutMS(500);     /* an ALS reading soon after each open, as a real ALS sends */
++		}
 +	}
 +	IOLog("SWEET MOTION: %s opened by pid %d (%s) options 0x%x -> %d, %u clients\n",
 +	    gSweetSensorInfo[sensorIndex()].name, proc_selfpid(), who, (unsigned)options, ok, fClients);
@@ -512,7 +545,92 @@ index 6d98131..ee090cc 100644
 +		event->retain();
 +	}
 +	IOLockUnlock(fLock);
++	if (!event && sensorIndex() == SWEET_SENSOR_ALS &&
++	    (type == kIOHIDEventTypeAmbientLightSensor || type == kIOHIDEventTypeNULL)) {
++		event = initialALSEvent();      /* never "none" for the ALS: a nil copyEvent may be the NSNull */
++	}
 +	return event;
++}
++
++/* 100 lux until a real (or poked) sample exists. */
++IOHIDEvent *
++SweetHIDSensor::initialALSEvent()
++{
++	IOHIDEvent *event = IOHIDEvent::ambientLightSensorEvent(mach_absolute_time(), 100, 100);
++	if (event) {
++		event->setIntegerValue(kIOHIDEventFieldAmbientLightSensorIlluminance, 100);
++	}
++	return event;
++}
++
++void
++SweetHIDSensor::initialFired(OSObject *owner, IOTimerEventSource *sender __unused)
++{
++	SweetHIDSensor *self = (SweetHIDSensor *)owner;
++	if (self->fEvents == 0) {
++		struct sweet_motion_sample s = { 12, 3, 0, { 0x42c80000 /* 100.0f */, 0, 0, 0 } };
++		IOLog("SWEET MOTION: als: initial 100 lux event (%u clients)\n", self->fClients);
++		self->post(&s);
++	}
++}
++
++/* User-space reads of the service's properties (IORegistryEntryCreateCFProperty), each key once. */
++static IOLock *gSweetReadLock;
++static struct {
++	const void *svc;
++	uint32_t hash;
++} gSweetReads[256];
++static uint32_t gSweetReadCount;
++
++void
++SweetHIDSensor::logRead(const char *key, bool found) const
++{
++	int pid = proc_selfpid();
++	if (pid <= 0 || !gSweetReadLock) {
++		return;         /* the kernel's own reads (matching, the user client) */
++	}
++	uint32_t h = 2166136261u;
++	for (const char *p = key; *p; p++) {
++		h = (h ^ (uint8_t)*p) * 16777619u;
++	}
++	h ^= found ? 1 : 0;
++	IOLockLock(gSweetReadLock);
++	bool seen = false;
++	for (uint32_t i = 0; i < gSweetReadCount; i++) {
++		if (gSweetReads[i].svc == this && gSweetReads[i].hash == h) {
++			seen = true;
++			break;
++		}
++	}
++	if (!seen && gSweetReadCount < 256) {
++		gSweetReads[gSweetReadCount].svc = this;
++		gSweetReads[gSweetReadCount].hash = h;
++		gSweetReadCount++;
++	}
++	IOLockUnlock(gSweetReadLock);
++	if (!seen && gSweetReadCount < 256) {
++		char who[32] = "?";
++		proc_selfname(who, sizeof(who));
++		IOLog("SWEET MOTION: %s property read %s: %s (pid %d %s)\n", gSweetSensorInfo[sensorIndex()].name, key,
++		    found ? "present" : "ABSENT", pid, who);
++	}
++}
++
++OSPtr<OSObject>
++SweetHIDSensor::copyProperty(const char *aKey) const
++{
++	OSPtr<OSObject> obj = IOHIDEventService::copyProperty(aKey);
++	if (aKey) {
++		logRead(aKey, obj != NULL);
++	}
++	return obj;
++}
++
++bool
++SweetHIDSensor::serializeProperties(OSSerialize *s) const
++{
++	logRead("(all properties)", true);
++	return IOHIDEventService::serializeProperties(s);
 +}
 +
 +void
@@ -769,7 +887,7 @@ index 6d98131..ee090cc 100644
 +}
 diff --git a/iokit/Kernel/arm/hid/SweetMotion.h b/iokit/Kernel/arm/hid/SweetMotion.h
 new file mode 100644
-index 0000000..2cd5da9
+index 0000000..64fd037
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/SweetMotion.h
 @@ -0,0 +1,53 @@
@@ -807,8 +925,8 @@ index 0000000..2cd5da9
 +	uint32_t interval_set[8];
 +};
 +
-+/* Boot-arg sweetmotion: bit i enables sensor service i (default 0x03 = accel+gyro; 0x7f all); 0 = no services,
-+ * no device; 0x100 = sensor services say Transport "SPU" (crashed backboardd on 2026-10-26). */
++/* Boot-arg sweetmotion: bit i enables sensor service i (default 0x7b = all but the ALS, which crash-looped
++ * backboardd on 2026-10-26; 0x7f all); 0 = no services, no device; 0x100 = sensor services say Transport "SPU". */
 +uint32_t sweet_motion_mask(void);
 +/* Post one sample from its service; 0, or ENODEV (no such service / disabled) / EINVAL (unknown type). */
 +int sweet_hid_sensor(const struct sweet_motion_sample *s);

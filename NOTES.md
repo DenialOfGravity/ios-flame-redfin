@@ -218,7 +218,8 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
 - 0971 sensor HID services `SweetHIDAccel/Gyro/ALS/Prox/Compass/Pressure/Orientation` (SweetHID.cpp; usage pairs 0xff00/3,
   9, 4, 8, 0xa from IOHIDFamily-1035.70.7's AppleHIDUsageTables.h, filled in; pressure 0x20/0x31, orientation 0xff0c/6):
   every open, user client (pid), copyEvent type and setProperties key/value logged `SWEET MOTION:`, ReportInterval kept;
-  `sweetmotion=MASK` (default 0x03 = accel+gyro; 0x7f all; 0x100 = Transport "SPU", which crash-looped backboardd).
+  `sweetmotion=MASK` (default 0x7b = all but the ALS, which crash-looped backboardd; 0x7f all; 0x100 = Transport "SPU");
+  ALS answers copyEvent with 100 lux and posts 100 lux 500 ms after an open; user-space property reads logged.
 - 0972 `/dev/redwood-motion` (sensd's samples, qol-plan §3.3; read() = status, ioctl MOTION_GET_WANT) and `poke m`
   (`m fake accel|gyro|als|prox|compass|pressure|orient [V..]`, `m rot N`, `m stop|secs|status|log|knob|knobs`):
   bsd/dev/sweet_motion.c.
