@@ -10,7 +10,8 @@ page 0xff00: accel 3, ALS 4, prox 8, gyro 9, compass 0xa, verified against
 IOHIDFamily-1035.70.7's AppleHIDUsageTables.h, now filled in here; pressure on
 the HID sensor page, orientation on the HID sensor page's device orientation
 0x20/0x8a with DeviceOrientationUsage 0x64 + UIDeviceOrientation: what
-locationd's CLOrientationNotifier matches and accepts). Every open,
+locationd's CLOrientationNotifier matches and accepts, with the AOP's
+timestamp child: vendor-defined 0xff15/2, 8 bytes). Every open,
 user client (pid, name), copyEvent type and setProperties key/value is logged
 ("SWEET MOTION:"); ReportInterval is kept and published. copyEvent returns the
 last sample. Samples arrive through sweet_hid_sensor() (SweetMotion.h) and are
@@ -24,10 +25,10 @@ is logged (key, present/ABSENT, pid). The ALS, prox and orientation (and with bi
 ALS posts 100 lux 500 ms after an open. Transport is "Sweet" (0x100: "SPU").
 ---
  iokit/Kernel/arm/hid/AppleHIDUsageTables.h |  91 +++
- iokit/Kernel/arm/hid/SweetHID.cpp          | 770 ++++++++++++++++++++-
+ iokit/Kernel/arm/hid/SweetHID.cpp          | 781 ++++++++++++++++++++-
  iokit/Kernel/arm/hid/SweetMotion.h         |  54 ++
  iokit/KernelConfigTables.cpp               |  35 +
- 4 files changed, 949 insertions(+), 1 deletion(-)
+ 4 files changed, 960 insertions(+), 1 deletion(-)
  create mode 100644 iokit/Kernel/arm/hid/SweetMotion.h
 
 diff --git a/iokit/Kernel/arm/hid/AppleHIDUsageTables.h b/iokit/Kernel/arm/hid/AppleHIDUsageTables.h
@@ -130,7 +131,7 @@ index c00cbd4..8b0b292 100644
 +
 +#endif /* _APPLEHIDUSAGETABLES_H */
 diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
-index 6d98131..57fb51a 100644
+index 6d98131..8c99f13 100644
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp
 @@ -13,7 +13,9 @@
@@ -144,7 +145,7 @@ index 6d98131..57fb51a 100644
   * every N seconds, to test the event path without input hardware.
   */
  #include <IOKit/IOLib.h>
-@@ -601,3 +603,769 @@ sweet_hid_touch(int finger, int down, int x, int y)
+@@ -601,3 +603,780 @@ sweet_hid_touch(int finger, int down, int x, int y)
  		gSweetTouch->touch(finger, down != 0, x, y);
  	}
  }
@@ -788,6 +789,17 @@ index 6d98131..57fb51a 100644
 +		if (event) {
 +			event->setIntegerValue(kIOHIDEventFieldOrientationDeviceOrientationUsage,
 +			    (SInt32)(gSweetKnobs.orientbase + o));
++			/*
++			 * locationd's CLOrientationNotifier takes the sample time from a vendor-defined child (usage page
++			 * 0xff15, usage 2, 8 bytes) as the AOP attaches it, and drops anything not newer than the last
++			 * ("Skipping stale orientation (3 @ 0)" without it).
++			 */
++			uint64_t when = ts;
++			IOHIDEvent *child = IOHIDEvent::vendorDefinedEvent(ts, 0xff15, 2, 0, (UInt8 *)&when, sizeof(when));
++			if (child) {
++				event->appendChild(child);
++				child->release();
++			}
 +		}
 +		snprintf(line, sizeof(line), "UIDeviceOrientation %lld (usage %lld)", o, gSweetKnobs.orientbase + o);
 +		break;
