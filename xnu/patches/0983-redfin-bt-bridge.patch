@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: WS-B <noreply@anthropic.com>
-Date: Mon, 26 Oct 2026 15:02:02 +0100
+Date: Mon, 26 Oct 2026 15:16:21 +0100
 Subject: [PATCH] 0983 redfin: /dev/cu.bluetooth etc. bridged to btd (btbridge)
 
 New bsd/dev/sweet_btbridge.c (boot-arg btbridge=1, default: no nodes): a byte
@@ -11,14 +11,6 @@ a dummy wake line that accepts everything. Two 16 KiB rings, blocking reads
 (PCATCH), O_NONBLOCK and select()/poll() supported, host side one opener at a
 time, rings cleared when btd opens btbridge. Nothing is interpreted here;
 btd owns H4. Called from sweet_ufs.c after sweet_geniuart_init.
-
-
----
- bsd/conf/files           |   1 +
- bsd/dev/sweet_btbridge.c | 319 +++++++++++++++++++++++++++++++++++++++
- bsd/dev/sweet_ufs.c      |   2 +
- 3 files changed, 322 insertions(+)
- create mode 100644 bsd/dev/sweet_btbridge.c
 
 diff --git a/bsd/conf/files b/bsd/conf/files
 index 5e4e120..5b702a5 100644
@@ -34,10 +26,10 @@ index 5e4e120..5b702a5 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_btbridge.c b/bsd/dev/sweet_btbridge.c
 new file mode 100644
-index 0000000..2a180ee
+index 0000000..8d20808
 --- /dev/null
 +++ b/bsd/dev/sweet_btbridge.c
-@@ -0,0 +1,319 @@
+@@ -0,0 +1,320 @@
 +/*
 + * redfin 0983: a byte pipe between iOS's Bluetooth stack and phone/bt/btd, so bluetoothd/BlueTool can be
 + * driven over the WCN3998's HCI without an Apple transport kext. Made only with boot-arg btbridge=1:
@@ -61,6 +53,7 @@ index 0000000..2a180ee
 +#include <sys/conf.h>
 +#include <sys/errno.h>
 +#include <sys/fcntl.h>
++#include <sys/vnode.h>
 +#include <sys/proc.h>
 +#include <sys/uio.h>
 +#include <sys/select.h>
