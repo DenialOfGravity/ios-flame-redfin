@@ -1,0 +1,64 @@
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index ae72a0f..a1376ea 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -3787,6 +3787,14 @@ tu6_emit_prim_mode_sysmem(struct tu_cs *cs,
+       FLUSH_PER_OVERLAP_AND_OVERWRITE : NO_FLUSH;
+    if (!sweet_prim_order)
+       sysmem_prim_mode = NO_FLUSH;
++   /* sweet 0107: SWEET_TU_ORDER_FETCHERS_ONLY=1: in a pass with rasterization-order access (metal2vulkan flags every
++    * pipeline of a pass in which any draw fetches), only the pipelines whose fragment shader reads an input
++    * attachment flush per overlap; the others draw unflushed, as the blob draws everything but its advanced-blend
++    * draws. A feedback loop keeps the flush. */
++   static const unsigned sweet_fetchers_only = debug_get_num_option("SWEET_TU_ORDER_FETCHERS_ONLY", 0);
++   if (sweet_fetchers_only && fs && !fs->fs.sweet_reads_input_attachments && !feedback_loops &&
++       !fs->fs.dynamic_input_attachments_used && !TU_DEBUG(RAST_ORDER))
++      sysmem_prim_mode = NO_FLUSH;
+ 
+    if (sysmem_prim_mode == FLUSH_PER_OVERLAP_AND_OVERWRITE)
+       *sysmem_single_prim_mode = true;
+@@ -4429,6 +4437,15 @@ tu_pipeline_builder_parse_rasterization_order(
+     * test of what it costs; overlapping fetch draws may then read a stale pixel) */
+    if (!debug_get_num_option("TU_SWEET_PRIM_ORDER", 1))
+       gmem_prim_mode = NO_FLUSH;
++   /* sweet 0107: SWEET_TU_ORDER_FETCHERS_ONLY=1, as in tu6_emit_prim_mode_sysmem: only fetching fragment shaders
++    * flush per overlap in GMEM (only where the pipeline has its fragment shader) */
++   {
++      static const unsigned sweet_fetchers_only = debug_get_num_option("SWEET_TU_ORDER_FETCHERS_ONLY", 0);
++      const struct tu_shader *sweet_fs = pipeline->shaders[MESA_SHADER_FRAGMENT];
++      if (sweet_fetchers_only && sweet_fs && !sweet_fs->fs.sweet_reads_input_attachments &&
++          !sweet_fs->fs.dynamic_input_attachments_used && !TU_DEBUG(RAST_ORDER))
++         gmem_prim_mode = NO_FLUSH;
++   }
+ 
+    struct tu_cs cs;
+ 
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 8c228e9..536e33c 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -533,6 +533,9 @@ build_bindless(struct tu_device *dev, nir_builder *b,
+    const struct tu_descriptor_set_binding_layout *bind_layout =
+       &layout->set[set].layout->binding[binding];
+ 
++   if (bind_layout->type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT && b->shader->info.stage == MESA_SHADER_FRAGMENT)
++      shader->fs.sweet_reads_input_attachments = true;
++
+    /* input attachments use non bindless workaround */
+    if (bind_layout->type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT &&
+        (!dynamic_renderpass ||
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index 1cd0e89..43dad96 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -108,6 +108,10 @@ struct tu_shader
+ 
+          uint16_t dynamic_input_attachments_used;
+ 
++         /* sweet 0107: the shader reads an input attachment (framebuffer fetch), in a render pass or with
++          * dynamic rendering; serialized with the rest of fs */
++         bool sweet_reads_input_attachments;
++
+          struct {
+             uint32_t status;
+             bool force_late_z;
