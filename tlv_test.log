@@ -1,0 +1,141 @@
+btd: backend fake
+[    0.000] BTD > power pulse 0xc0 at 2400 Bd (flow control off)
+[    0.042] BTD > power pulse 0xfc at 115200 Bd (flow control off)
+[    0.217] BTD: SW_CTRL (TLMM 73) 0 before the pulses, 1 after
+[    0.217] BTD: QCA product 0x00000008 soc 0x40010320 rom 0x0302 patch 0x0111 (vendor event: WCN3990/3998-style) -> firmware crbtfw32, NVM crnv32
+[    0.217] BTD PROBE: SoC 0x40010320 ROM 0x0302 patch 0x0111 product 0x00000008 (UART oversampling 0, backend fake)
+[    0.247] BTD: host UART now 3000000 Bd (0); controller told index 14
+[    0.297] BTD: QCA product 0x00000008 soc 0x40010320 rom 0x0302 patch 0x0111 (vendor event: WCN3990/3998-style) -> firmware crbtfw32, NVM crnv32
+[    0.297] BTD: /tmp/btd-test-fw.tlv: rampatch 118792 bytes, total 118788 data 118764, format 2 signature 3 download mode 0, product 0x0008 rom build 0x0302 patch 0x0123 entry 0x00080000
+[    0.297] BTD: /tmp/btd-test-fw.tlv: 489 segments in 0 ms
+[    0.345] BTD: /tmp/btd-test-nvm.bin: NVM as in the file: tag 17 (HCI) [00 33 00 33 33 33 33 33], tag 27 (deep sleep) [00 44 44 44]
+[    0.345] BTD: /tmp/btd-test-nvm.bin: NVM 5438 bytes, 65 tags, edited: baud index 14 at tag 17 [2], in-band sleep off: 1 bytes edited -> tag 17 [00 33 0e 33 33 33 33 33], tag 27 [00 44 44 44]
+[    0.345] BTD: /tmp/btd-test-nvm.bin: 23 segments in 0 ms
+[    0.345] BTD: HCI version 9 rev 0x0000, LMP version 9 subversion 0x0155, manufacturer 29 (Qualcomm)
+[    0.345] BTD: BD_ADDR 00:00:00:00:00:00
+[    0.345] BTD: 0xFC0B NVM tag 2 -> 0
+[    0.345] BTD: BD_ADDR 02:50:49:58:45:4d
+[    0.345] BTD: HCI version 9 rev 0x0000, LMP version 9 subversion 0x0155, manufacturer 29 (Qualcomm)
+[    0.345] BTD UP: manufacturer 29, 3000000 Bd, BD_ADDR 02:50:49:58:45:4d, backend fake
+[    0.345] BTD SCAN: passive LE scan for 1 s
+[    0.345] BTD ADV 11:22:33:44:55:66 public type 0 rssi -60 len 10 name Pixel
+[    1.345] BTD SCAN: 1 advertising reports from 1 devices in 1 s
+[    1.345] BTD: 526 packets out, 1039 in, 0 junk bytes, 0 IBS bytes, 0 hardware errors
+mode 0 baud 3000000: 512 segments, 512 vendor acks, 512 command completes, 1 garbled bytes
+btd: backend fake
+[    0.000] BTD > power pulse 0xc0 at 2400 Bd (flow control off)
+[    0.049] BTD > power pulse 0xfc at 115200 Bd (flow control off)
+[    0.158] BTD: SW_CTRL (TLMM 73) 0 before the pulses, 1 after
+[    0.158] BTD: QCA product 0x00000008 soc 0x40010320 rom 0x0302 patch 0x0111 (vendor event: WCN3990/3998-style) -> firmware crbtfw32, NVM crnv32
+[    0.158] BTD PROBE: SoC 0x40010320 ROM 0x0302 patch 0x0111 product 0x00000008 (UART oversampling 0, backend fake)
+[    0.177] BTD: host UART now 3000000 Bd (0); controller told index 14
+[    0.227] BTD: QCA product 0x00000008 soc 0x40010320 rom 0x0302 patch 0x0111 (vendor event: WCN3990/3998-style) -> firmware crbtfw32, NVM crnv32
+[    0.227] BTD: /tmp/btd-test-fw.tlv: rampatch 118792 bytes, total 118788 data 118764, format 2 signature 3 download mode 1, product 0x0008 rom build 0x0302 patch 0x0123 entry 0x00080000
+[    0.227] BTD: /tmp/btd-test-fw.tlv: 489 segments in 0 ms
+[    0.277] BTD: /tmp/btd-test-nvm.bin: NVM as in the file: tag 17 (HCI) [00 33 00 33 33 33 33 33], tag 27 (deep sleep) [00 44 44 44]
+[    0.277] BTD: /tmp/btd-test-nvm.bin: NVM 5438 bytes, 65 tags, edited: baud index 14 at tag 17 [2], in-band sleep off: 1 bytes edited -> tag 17 [00 33 0e 33 33 33 33 33], tag 27 [00 44 44 44]
+[    0.277] BTD: /tmp/btd-test-nvm.bin: 23 segments in 0 ms
+[    0.277] BTD: HCI version 9 rev 0x0000, LMP version 9 subversion 0x0155, manufacturer 29 (Qualcomm)
+[    0.277] BTD: BD_ADDR 00:00:00:00:00:00
+[    0.277] BTD: 0xFC0B NVM tag 2 -> 0
+[    0.277] BTD: BD_ADDR 02:50:49:58:45:4d
+[    0.277] BTD: HCI version 9 rev 0x0000, LMP version 9 subversion 0x0155, manufacturer 29 (Qualcomm)
+[    0.277] BTD UP: manufacturer 29, 3000000 Bd, BD_ADDR 02:50:49:58:45:4d, backend fake
+[    0.277] BTD SCAN: passive LE scan for 1 s
+[    0.277] BTD ADV 11:22:33:44:55:66 public type 0 rssi -60 len 10 name Pixel
+[    1.277] BTD SCAN: 1 advertising reports from 1 devices in 1 s
+[    1.277] BTD: 526 packets out, 551 in, 0 junk bytes, 0 IBS bytes, 0 hardware errors
+mode 1 baud 3000000: 512 segments, 24 vendor acks, 512 command completes, 1 garbled bytes
+btd: backend fake
+[    0.000] BTD > power pulse 0xc0 at 2400 Bd (flow control off)
+[    0.019] BTD > power pulse 0xfc at 115200 Bd (flow control off)
+[    0.178] BTD: SW_CTRL (TLMM 73) 0 before the pulses, 1 after
+[    0.178] BTD: QCA product 0x00000008 soc 0x40010320 rom 0x0302 patch 0x0111 (vendor event: WCN3990/3998-style) -> firmware crbtfw32, NVM crnv32
+[    0.178] BTD PROBE: SoC 0x40010320 ROM 0x0302 patch 0x0111 product 0x00000008 (UART oversampling 0, backend fake)
+[    0.223] BTD: host UART now 3000000 Bd (0); controller told index 14
+[    0.273] BTD: QCA product 0x00000008 soc 0x40010320 rom 0x0302 patch 0x0111 (vendor event: WCN3990/3998-style) -> firmware crbtfw32, NVM crnv32
+[    0.273] BTD: /tmp/btd-test-fw.tlv: rampatch 118792 bytes, total 118788 data 118764, format 2 signature 3 download mode 2, product 0x0008 rom build 0x0302 patch 0x0123 entry 0x00080000
+[    0.273] BTD: /tmp/btd-test-fw.tlv: 489 segments in 0 ms
+[    0.320] BTD: /tmp/btd-test-nvm.bin: NVM as in the file: tag 17 (HCI) [00 33 00 33 33 33 33 33], tag 27 (deep sleep) [00 44 44 44]
+[    0.320] BTD: /tmp/btd-test-nvm.bin: NVM 5438 bytes, 65 tags, edited: baud index 14 at tag 17 [2], in-band sleep off: 1 bytes edited -> tag 17 [00 33 0e 33 33 33 33 33], tag 27 [00 44 44 44]
+[    0.320] BTD: /tmp/btd-test-nvm.bin: 23 segments in 0 ms
+[    0.320] BTD: HCI version 9 rev 0x0000, LMP version 9 subversion 0x0155, manufacturer 29 (Qualcomm)
+[    0.320] BTD: BD_ADDR 00:00:00:00:00:00
+[    0.320] BTD: 0xFC0B NVM tag 2 -> 0
+[    0.320] BTD: BD_ADDR 02:50:49:58:45:4d
+[    0.320] BTD: HCI version 9 rev 0x0000, LMP version 9 subversion 0x0155, manufacturer 29 (Qualcomm)
+[    0.320] BTD UP: manufacturer 29, 3000000 Bd, BD_ADDR 02:50:49:58:45:4d, backend fake
+[    0.320] BTD SCAN: passive LE scan for 1 s
+[    0.320] BTD ADV 11:22:33:44:55:66 public type 0 rssi -60 len 10 name Pixel
+[    1.320] BTD SCAN: 1 advertising reports from 1 devices in 1 s
+[    1.320] BTD: 526 packets out, 551 in, 0 junk bytes, 0 IBS bytes, 0 hardware errors
+mode 2 baud 3000000: 512 segments, 512 vendor acks, 24 command completes, 1 garbled bytes
+btd: backend fake
+[    0.000] BTD > power pulse 0xc0 at 2400 Bd (flow control off)
+[    0.053] BTD > power pulse 0xfc at 115200 Bd (flow control off)
+[    0.184] BTD: SW_CTRL (TLMM 73) 0 before the pulses, 1 after
+[    0.184] BTD: QCA product 0x00000008 soc 0x40010320 rom 0x0302 patch 0x0111 (vendor event: WCN3990/3998-style) -> firmware crbtfw32, NVM crnv32
+[    0.184] BTD PROBE: SoC 0x40010320 ROM 0x0302 patch 0x0111 product 0x00000008 (UART oversampling 0, backend fake)
+[    0.196] BTD: host UART now 3000000 Bd (0); controller told index 14
+[    0.246] BTD: QCA product 0x00000008 soc 0x40010320 rom 0x0302 patch 0x0111 (vendor event: WCN3990/3998-style) -> firmware crbtfw32, NVM crnv32
+[    0.246] BTD: /tmp/btd-test-fw.tlv: rampatch 118792 bytes, total 118788 data 118764, format 2 signature 3 download mode 3, product 0x0008 rom build 0x0302 patch 0x0123 entry 0x00080000
+[    0.246] BTD: /tmp/btd-test-fw.tlv: 489 segments in 0 ms
+[    0.301] BTD: /tmp/btd-test-nvm.bin: NVM as in the file: tag 17 (HCI) [00 33 00 33 33 33 33 33], tag 27 (deep sleep) [00 44 44 44]
+[    0.301] BTD: /tmp/btd-test-nvm.bin: NVM 5438 bytes, 65 tags, edited: baud index 14 at tag 17 [2], in-band sleep off: 1 bytes edited -> tag 17 [00 33 0e 33 33 33 33 33], tag 27 [00 44 44 44]
+[    0.301] BTD: /tmp/btd-test-nvm.bin: 23 segments in 0 ms
+[    0.301] BTD: HCI version 9 rev 0x0000, LMP version 9 subversion 0x0155, manufacturer 29 (Qualcomm)
+[    0.301] BTD: BD_ADDR 00:00:00:00:00:00
+[    0.301] BTD: 0xFC0B NVM tag 2 -> 0
+[    0.301] BTD: BD_ADDR 02:50:49:58:45:4d
+[    0.301] BTD: HCI version 9 rev 0x0000, LMP version 9 subversion 0x0155, manufacturer 29 (Qualcomm)
+[    0.301] BTD UP: manufacturer 29, 3000000 Bd, BD_ADDR 02:50:49:58:45:4d, backend fake
+[    0.301] BTD SCAN: passive LE scan for 1 s
+[    0.301] BTD ADV 11:22:33:44:55:66 public type 0 rssi -60 len 10 name Pixel
+[    1.301] BTD SCAN: 1 advertising reports from 1 devices in 1 s
+[    1.301] BTD: 526 packets out, 63 in, 0 junk bytes, 0 IBS bytes, 0 hardware errors
+mode 3 baud 3000000: 512 segments, 24 vendor acks, 24 command completes, 1 garbled bytes
+btd: backend fake
+[    0.000] BTD > power pulse 0xc0 at 2400 Bd (flow control off)
+[    0.023] BTD > power pulse 0xfc at 115200 Bd (flow control off)
+[    0.208] BTD: SW_CTRL (TLMM 73) 0 before the pulses, 1 after
+[    0.208] BTD: QCA product 0x00000008 soc 0x40010320 rom 0x0302 patch 0x0111 (vendor event: WCN3990/3998-style) -> firmware crbtfw32, NVM crnv32
+[    0.208] BTD PROBE: SoC 0x40010320 ROM 0x0302 patch 0x0111 product 0x00000008 (UART oversampling 0, backend fake)
+[    0.208] BTD: /tmp/btd-test-fw.tlv: rampatch 118792 bytes, total 118788 data 118764, format 2 signature 3 download mode 3, product 0x0008 rom build 0x0302 patch 0x0123 entry 0x00080000
+[    0.210] BTD: /tmp/btd-test-fw.tlv: 489 segments in 1 ms
+[    0.262] BTD: /tmp/btd-test-nvm.bin: NVM as in the file: tag 17 (HCI) [00 33 00 33 33 33 33 33], tag 27 (deep sleep) [00 44 44 44]
+[    0.262] BTD: /tmp/btd-test-nvm.bin: NVM 5438 bytes, 65 tags, edited: baud index 0 at tag 17 [2], in-band sleep off: 0 bytes edited -> tag 17 [00 33 00 33 33 33 33 33], tag 27 [00 44 44 44]
+[    0.262] BTD: /tmp/btd-test-nvm.bin: 23 segments in 0 ms
+[    0.262] BTD: HCI version 9 rev 0x0000, LMP version 9 subversion 0x0155, manufacturer 29 (Qualcomm)
+[    0.262] BTD: BD_ADDR 00:00:00:00:00:00
+[    0.262] BTD: 0xFC0B NVM tag 2 -> 0
+[    0.262] BTD: BD_ADDR 02:50:49:58:45:4d
+[    0.262] BTD: HCI version 9 rev 0x0000, LMP version 9 subversion 0x0155, manufacturer 29 (Qualcomm)
+[    0.262] BTD UP: manufacturer 29, 115200 Bd, BD_ADDR 02:50:49:58:45:4d, backend fake
+[    0.262] BTD SCAN: passive LE scan for 1 s
+[    0.262] BTD ADV 11:22:33:44:55:66 public type 0 rssi -60 len 10 name Pixel
+[    1.262] BTD SCAN: 1 advertising reports from 1 devices in 1 s
+[    1.262] BTD: 524 packets out, 61 in, 0 junk bytes, 0 IBS bytes, 0 hardware errors
+mode 3 baud 115200: 512 segments, 24 vendor acks, 24 command completes, 1 garbled bytes
+btd: backend fake
+[    0.000] BTD > power pulse 0xc0 at 2400 Bd (flow control off)
+[    0.013] BTD > power pulse 0xfc at 115200 Bd (flow control off)
+[    0.145] BTD: SW_CTRL (TLMM 73) 0 before the pulses, 1 after
+[    0.145] BTD: QCA product 0x00000008 soc 0x40010320 rom 0x0302 patch 0x0111 (vendor event: WCN3990/3998-style) -> firmware crbtfw32, NVM crnv32
+[    0.145] BTD PROBE: SoC 0x40010320 ROM 0x0302 patch 0x0111 product 0x00000008 (UART oversampling 0, backend fake)
+[    0.174] BTD: host UART now 3000000 Bd (0); controller told index 14
+[    0.224] BTD: QCA product 0x00000008 soc 0x40010320 rom 0x0302 patch 0x0111 (vendor event: WCN3990/3998-style) -> firmware crbtfw32, NVM crnv32
+[    0.224] BTD: /tmp/btd-test-fw.tlv: rampatch 118792 bytes, total 118788 data 118764, format 2 signature 3 download mode 0, product 0x0008 rom build 0x0302 patch 0x0123 entry 0x00080000
+[    0.224] BTD: /tmp/btd-test-fw.tlv: 489 segments in 0 ms
+[    0.269] BTD: /tmp/btd-test-nvm.bin: NVM as in the file: tag 17 (HCI) [00 33 00 33 33 33 33 33], tag 27 (deep sleep) [00 44 44 44]
+[    0.269] BTD: /tmp/btd-test-nvm.bin: NVM 5438 bytes, 65 tags, edited: baud index 14 at tag 17 [2], in-band sleep off: 1 bytes edited -> tag 17 [00 33 0e 33 33 33 33 33], tag 27 [00 44 44 44]
+[    0.269] BTD: /tmp/btd-test-nvm.bin: 23 segments in 0 ms
+[    0.269] BTD: HCI version 9 rev 0x0000, LMP version 9 subversion 0x0155, manufacturer 29 (Qualcomm)
+[    0.269] BTD: BD_ADDR 00:00:00:00:00:00
+[    0.269] BTD: HCI version 9 rev 0x0000, LMP version 9 subversion 0x0155, manufacturer 29 (Qualcomm)
+[    0.269] BTD UP: manufacturer 29, 3000000 Bd, BD_ADDR 00:00:00:00:00:00, backend fake
+[    0.269] BTD SCAN: passive LE scan for 1 s
+[    0.269] BTD ADV 11:22:33:44:55:66 public type 0 rssi -60 len 10 name Pixel
+[    1.269] BTD SCAN: 1 advertising reports from 1 devices in 1 s
+[    1.269] BTD: 524 packets out, 1037 in, 0 junk bytes, 0 IBS bytes, 0 hardware errors
+mode 0 baud 3000000: 512 segments, 512 vendor acks, 512 command completes, 1 garbled bytes
+all passed (0 failures)
