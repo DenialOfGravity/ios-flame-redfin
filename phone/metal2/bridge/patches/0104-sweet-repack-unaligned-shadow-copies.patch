@@ -170,6 +170,67 @@ index c468031..13d45c3 100644
                  if !overwrites && !unchanged {
                      copies.push(ShadowCopy {
                          copies: Arc::clone(&shadow.copies),
+diff --git a/crates/metal2vulkan-runtime/src/sweet_counts.rs b/crates/metal2vulkan-runtime/src/sweet_counts.rs
+new file mode 100644
+index 0000000..bd87c5a
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/sweet_counts.rs
+@@ -0,0 +1,55 @@
++//! ios-on-pixel: process-wide counts of shadowed textures' copies (`shadow.rs`), which the
++//! SweetMetal2 bridge reads for its telemetry (`J copies` lines in the kernel's log).
++//!
++//! - **copies**, **bytes**: copies between a buffer's bytes and a 2D texture's shadow image
++//!   recorded, either way, and the texel bytes they moved;
++//! - **repacked**: of those, the ones made through the rotation kernel at rotation 0 into rows
++//!   64 bytes apart (`ShadowTarget::Image::repack`), which Turnip copies in one blit;
++//! - **skipped**: converted (two-plane YCbCr) copies in not made, the planes' generation held;
++//! - **refusals**: `DRM_FORMAT_MOD_LINEAR` layouts the driver refused, or that were refused
++//!   again unasked (`texture/pitch_refusals.rs`), each a texture made a shadow instead.
++
++use std::sync::atomic::{AtomicU64, Ordering};
++
++static COPIES: AtomicU64 = AtomicU64::new(0);
++static BYTES: AtomicU64 = AtomicU64::new(0);
++static REPACKED: AtomicU64 = AtomicU64::new(0);
++static SKIPPED: AtomicU64 = AtomicU64::new(0);
++static REFUSALS: AtomicU64 = AtomicU64::new(0);
++
++/// A copy of `bytes` texel bytes recorded, `repacked` through the kernel or not.
++pub(crate) fn copied(bytes: u64, repacked: bool) {
++    COPIES.fetch_add(1, Ordering::Relaxed);
++    BYTES.fetch_add(bytes, Ordering::Relaxed);
++    if repacked {
++        REPACKED.fetch_add(1, Ordering::Relaxed);
++    }
++}
++
++/// A converted copy in not made.
++pub(crate) fn skipped() {
++    SKIPPED.fetch_add(1, Ordering::Relaxed);
++}
++
++/// A linear layout refused.
++pub(crate) fn refused() {
++    REFUSALS.fetch_add(1, Ordering::Relaxed);
++}
++
++/// The counts since the process started: copies, bytes, repacked, skipped, refusals.
++pub fn snapshot() -> [u64; 5] {
++    [
++        COPIES.load(Ordering::Relaxed),
++        BYTES.load(Ordering::Relaxed),
++        REPACKED.load(Ordering::Relaxed),
++        SKIPPED.load(Ordering::Relaxed),
++        REFUSALS.load(Ordering::Relaxed),
++    ]
++}
++
++/// Whether textures whose rows Turnip copies a blit per row repack (env `SWEET_SHADOW_REPACK`,
++/// on unless `0`).
++pub(crate) fn repack_enabled() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("SWEET_SHADOW_REPACK").map_or(true, |v| v.trim() != "0"))
++}
 diff --git a/crates/metal2vulkan-runtime/src/tests/shadow.rs b/crates/metal2vulkan-runtime/src/tests/shadow.rs
 index 2120cac..4e645db 100644
 --- a/crates/metal2vulkan-runtime/src/tests/shadow.rs
