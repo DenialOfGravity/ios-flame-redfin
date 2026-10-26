@@ -274,8 +274,8 @@ index 0000000..f77138f
 +	static const char compat[] = "wlan-pcie,bcm4357\0wlan-pcie,bcm";    /* NUL-separated list, as in the tree */
 +	put_data(e, "compatible", compat, sizeof(compat));
 +	put_data(e, "module-instance", "herculese", 10);
-+	put_u32(e, "vendor-id", 0x14e4);
-+	put_u32(e, "device-id", 0x4488);
++	e->setProperty("vendor-id", 0x14e4ULL, 32);    /* OSNumber: AppleOLYHAL is a kext service, not a DT node */
++	e->setProperty("device-id", 0x4488ULL, 32);
 +}
 +
 +static SweetBTNub *
