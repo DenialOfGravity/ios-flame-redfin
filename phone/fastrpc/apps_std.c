@@ -38,10 +38,41 @@ struct apps_std_ctx {
 		char path[256];
 	} file[MAX_FILES];
 	struct {
-		DIR *d;
+		struct dent *ent;	/* the listing, sorted the DSP's way (see dent_cmp), read at opendir */
+		int n, at;		/* n < 0: not in use */
 		char path[256];
 	} dir[MAX_DIRS];
 };
+
+struct dent {
+	uint32_t ino;
+	char name[256];
+};
+
+/*
+ * The order readdir hands the names out in: the sensors PD reads the registry item by item (stat, fopen,
+ * fread, fclose each) and CHRE's SEE helper gives up if the sensors it needs have not been published within
+ * a few seconds of its start (r24a: sar.cc chre_utils fatal with the registry read up to "sns_d..."): the
+ * proximity/light sensor, the IMU and the framework's own items first, everything else after; by name within.
+ */
+static int dent_rank(const char *n)
+{
+	if (!strncmp(n, "tcs3701", 7))
+		return 0;
+	if (!strncmp(n, "lsm6dsr", 7))
+		return 1;
+	if (!strncmp(n, "sns_", 4))
+		return 2;
+	return 3;
+}
+
+static int dent_cmp(const void *a, const void *b)
+{
+	const struct dent *x = a, *y = b;
+	int rx = dent_rank(x->name), ry = dent_rank(y->name);
+
+	return rx != ry ? rx - ry : strcmp(x->name, y->name);
+}
 
 /* An errno for the DSP: its file code expects the small POSIX numbers (Android returns errno). */
 static uint32_t err_out(int e)
@@ -174,7 +205,16 @@ static int open_flags(const char *mode, int *for_write)
 }
 
 /* Open a DSP path. A handle, or 0 and *err. */
+static uint32_t file_open_q(struct apps_std_ctx *ctx, const char *how, const char *name, const char *mode, uint32_t *err,
+			    int probing);
 static uint32_t file_open(struct apps_std_ctx *ctx, const char *how, const char *name, const char *mode, uint32_t *err)
+{
+	return file_open_q(ctx, how, name, mode, err, 0);
+}
+
+/* probing: one of the places of a search path, a miss there is not news */
+static uint32_t file_open_q(struct apps_std_ctx *ctx, const char *how, const char *name, const char *mode, uint32_t *err,
+			    int probing)
 {
 	char host[PATH_MAX];
 	int for_write, flags = open_flags(mode, &for_write), fd, i;
@@ -193,7 +233,10 @@ static uint32_t file_open(struct apps_std_ctx *ctx, const char *how, const char 
 	if (fd < 0) {
 		int e = errno;
 
-		flog("%s %s (%s) -> %s: %s", how, name, mode, host, strerror(e));
+		if (probing && e == ENOENT)
+			vlog("%s %s (%s) -> %s: %s", how, name, mode, host, strerror(e));
+		else
+			flog("%s %s (%s) -> %s: %s", how, name, mode, host, strerror(e));
 		*err = err_out(e);
 		return 0;
 	}
@@ -205,7 +248,7 @@ static uint32_t file_open(struct apps_std_ctx *ctx, const char *how, const char 
 			ctx->file[i].eof = 0;
 			snprintf(ctx->file[i].path, sizeof(ctx->file[i].path), "%s", name);
 			fstat(fd, &st);
-			flog("%s %s (%s) -> handle %#x, %lld bytes", how, name, mode, HANDLE_BASE + i, (long long)st.st_size);
+			vlog("%s %s (%s) -> handle %#x, %lld bytes", how, name, mode, HANDLE_BASE + i, (long long)st.st_size);
 			*err = 0;
 			return HANDLE_BASE + (uint32_t)i;
 		}
@@ -510,12 +553,13 @@ static uint32_t m_fopen_with_env(void *data, const struct fastrpc_io_buffer *in,
 	/* Android: "<dir>/adsp/<name>" (the subsystem's directory) first, then "<dir>/<name>" */
 	for (i = 0; dirs[i]; i++) {
 		snprintf(path, sizeof(path), "%s/adsp/%s", dirs[i], name);
-		if ((*h = file_open(ctx, how, path, mode, &err)) != 0)
+		if ((*h = file_open_q(ctx, how, path, mode, &err, 1)) != 0)
 			return 0;
 		snprintf(path, sizeof(path), "%s/%s", dirs[i], name);
-		if ((*h = file_open(ctx, how, path, mode, &err)) != 0)
+		if ((*h = file_open_q(ctx, how, path, mode, &err, 1)) != 0)
 			return 0;
 	}
+	flog("%s %s (%s): not found in the search path", how, name, mode);
 	return err;
 }
 
@@ -530,7 +574,7 @@ static uint32_t m_fileExists(void *data, const struct fastrpc_io_buffer *in, str
 	if (!name)
 		return AEE_EBADPARM;
 	*exists = apps_std_map(ctx->root, name, 0, host, sizeof(host)) == 0 && stat(host, &st) == 0;
-	flog("fileExists %s -> %s", name, *exists ? "yes" : "no");
+	vlog("fileExists %s -> %s", name, *exists ? "yes" : "no");
 	return 0;
 }
 
@@ -582,8 +626,10 @@ static uint32_t m_opendir(void *data, const struct fastrpc_io_buffer *in, struct
 	const char *name = cstr(&in[1]);
 	uint64_t *h = out[0].p;
 	char host[PATH_MAX];
+	struct dirent *e;
+	struct dent *ent = NULL;
+	int n = 0, cap = 0, i;
 	DIR *d;
-	int i;
 
 	if (!name)
 		return AEE_EBADPARM;
@@ -591,44 +637,67 @@ static uint32_t m_opendir(void *data, const struct fastrpc_io_buffer *in, struct
 		flog("opendir %s: REFUSED (outside the served tree)", name);
 		return ENOENT;
 	}
+	for (i = 0; i < MAX_DIRS && ctx->dir[i].n >= 0; i++)
+		;
+	if (i == MAX_DIRS) {
+		flog("opendir %s: too many open directories", name);
+		return AEE_EOUTOFHANDLES;
+	}
 	d = opendir(host);
 	if (d == NULL) {
 		flog("opendir %s -> %s: %s", name, host, strerror(errno));
 		return err_out(errno);
 	}
-	for (i = 0; i < MAX_DIRS; i++)
-		if (ctx->dir[i].d == NULL) {
-			ctx->dir[i].d = d;
-			snprintf(ctx->dir[i].path, sizeof(ctx->dir[i].path), "%s", name);
-			*h = HANDLE_BASE + (uint64_t)i;
-			flog("opendir %s -> handle %#x", name, HANDLE_BASE + i);
-			return 0;
+	while ((e = readdir(d)) != NULL) {
+		if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+			continue;
+		if (n == cap) {
+			struct dent *bigger = realloc(ent, (size_t)(cap = cap ? cap * 2 : 64) * sizeof(*ent));
+
+			if (bigger == NULL) {
+				free(ent);
+				closedir(d);
+				return AEE_ENOMEMORY;
+			}
+			ent = bigger;
 		}
+		memset(&ent[n], 0, sizeof(ent[n]));
+		ent[n].ino = (uint32_t)e->d_ino;
+		memcpy(ent[n].name, e->d_name, strnlen(e->d_name, 254));	/* the DSP has name[255] */
+		n++;
+	}
 	closedir(d);
-	flog("opendir %s: too many open directories", name);
-	return AEE_EOUTOFHANDLES;
+	if (n > 1)
+		qsort(ent, (size_t)n, sizeof(*ent), dent_cmp);
+	ctx->dir[i].ent = ent;
+	ctx->dir[i].n = n;
+	ctx->dir[i].at = 0;
+	snprintf(ctx->dir[i].path, sizeof(ctx->dir[i].path), "%s", name);
+	*h = HANDLE_BASE + (uint64_t)i;
+	flog("opendir %s -> handle %#x, %d entries%s", name, HANDLE_BASE + i, n, n ? ", sensors first" : "");
+	return 0;
 }
 
-static DIR *dir_of(struct apps_std_ctx *ctx, uint64_t h)
+static int dir_ok(struct apps_std_ctx *ctx, uint64_t h)
 {
-	if (h < HANDLE_BASE || h >= HANDLE_BASE + MAX_DIRS || ctx->dir[h - HANDLE_BASE].d == NULL) {
+	if (h < HANDLE_BASE || h >= HANDLE_BASE + MAX_DIRS || ctx->dir[h - HANDLE_BASE].n < 0) {
 		flog("bad directory handle %#llx", (unsigned long long)h);
-		return NULL;
+		return 0;
 	}
-	return ctx->dir[h - HANDLE_BASE].d;
+	return 1;
 }
 
 static uint32_t m_closedir(void *data, const struct fastrpc_io_buffer *in, struct fastrpc_io_buffer *out)
 {
 	struct apps_std_ctx *ctx = data;
 	const uint64_t *h = in[0].p;
-	DIR *d = dir_of(ctx, *h);
 
 	(void)out;
-	if (d == NULL)
+	if (!dir_ok(ctx, *h))
 		return AEE_EBADPARM;
-	closedir(d);
-	ctx->dir[*h - HANDLE_BASE].d = NULL;
+	free(ctx->dir[*h - HANDLE_BASE].ent);
+	ctx->dir[*h - HANDLE_BASE].ent = NULL;
+	ctx->dir[*h - HANDLE_BASE].n = -1;
 	return 0;
 }
 
@@ -641,23 +710,22 @@ static uint32_t m_readdir(void *data, const struct fastrpc_io_buffer *in, struct
 		char name[256];
 		uint32_t eof;
 	} *r = out[0].p;
-	DIR *d = dir_of(ctx, *h);
-	struct dirent *e;
 
-	if (d == NULL)
+	if (!dir_ok(ctx, *h))
 		return AEE_EBADPARM;
 	memset(r, 0, sizeof(*r));
-	do
-		e = readdir(d);
-	while (e && (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")));
-	if (e == NULL) {
+	if (ctx->dir[*h - HANDLE_BASE].at >= ctx->dir[*h - HANDLE_BASE].n) {
 		r->eof = 1;
-		flog("readdir %s -> (end)", ctx->dir[*h - HANDLE_BASE].path);
+		flog("readdir %s -> (end, %d entries)", ctx->dir[*h - HANDLE_BASE].path, ctx->dir[*h - HANDLE_BASE].n);
 		return 0;
 	}
-	r->ino = (uint32_t)e->d_ino;
-	memcpy(r->name, e->d_name, strnlen(e->d_name, 254));	/* the DSP has name[255] */
-	flog("readdir %s -> %s", ctx->dir[*h - HANDLE_BASE].path, r->name);
+	{
+		const struct dent *e = &ctx->dir[*h - HANDLE_BASE].ent[ctx->dir[*h - HANDLE_BASE].at++];
+
+		r->ino = e->ino;
+		memcpy(r->name, e->name, sizeof(r->name));
+	}
+	vlog("readdir %s -> %s", ctx->dir[*h - HANDLE_BASE].path, r->name);
 	return 0;
 }
 
@@ -751,7 +819,7 @@ static uint32_t m_stat(void *data, const struct fastrpc_io_buffer *in, struct fa
 	r->ctime = st.st_ctim.tv_sec;
 	r->ctimensec = st.st_ctim.tv_nsec;
 #endif
-	flog("stat %s -> %s, %lld bytes", name, S_ISDIR(st.st_mode) ? "directory" : "file", (long long)st.st_size);
+	vlog("stat %s -> %s, %lld bytes", name, S_ISDIR(st.st_mode) ? "directory" : "file", (long long)st.st_size);
 	return 0;
 }
 
@@ -822,6 +890,8 @@ struct fastrpc_interface *fastrpc_apps_std_init(const char *root)
 	}
 	for (i = 0; i < MAX_FILES; i++)
 		ctx->file[i].fd = -1;
+	for (i = 0; i < MAX_DIRS; i++)
+		ctx->dir[i].n = -1;
 	memcpy(iface, &apps_std_interface, sizeof(*iface));
 	iface->data = ctx;
 	return iface;
@@ -839,8 +909,7 @@ void fastrpc_apps_std_deinit(struct fastrpc_interface *iface)
 		if (ctx->file[i].fd >= 0)
 			close(ctx->file[i].fd);
 	for (i = 0; i < MAX_DIRS; i++)
-		if (ctx->dir[i].d)
-			closedir(ctx->dir[i].d);
+		free(ctx->dir[i].ent);
 	free(ctx);
 	free(iface);
 }

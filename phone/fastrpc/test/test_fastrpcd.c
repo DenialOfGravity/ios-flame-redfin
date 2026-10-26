@@ -568,6 +568,35 @@ static void test_apps_std(void)
 	out[0] = B(&dh, 8);
 	CHECK(call(as, 26, in, out) != 0);
 
+	/* readdir order: tcs3701*, lsm6dsr*, sns_* first, then by name */
+	{
+		static const char *names[] = { "bmp380_0", "sns_cm", "tcs3701_0.prox", "lsm6dsr_0", "abc", "tcs3701_0", "sns_amd" };
+		static const char *want[] = { "tcs3701_0", "tcs3701_0.prox", "lsm6dsr_0", "sns_amd", "sns_cm", "abc", "bmp380_0" };
+		char rel[256];
+		unsigned k;
+
+		for (k = 0; k < 7; k++) {
+			snprintf(rel, sizeof(rel), "persist/sensors/registry/registry/%s", names[k]);
+			put_file(rel, "{}");
+		}
+		prim[0] = sizeof("/persist/sensors/registry/registry");
+		in[0] = B(prim, 4);
+		in[1] = B("/persist/sensors/registry/registry", sizeof("/persist/sensors/registry/registry"));
+		out[0] = B(&dh, 8);
+		CHECK(call(as, 26, in, out) == 0);
+		in[0] = B(&dh, 8);
+		out[0] = B(&de, sizeof(de));
+		for (k = 0, n = 0; n < 12; n++) {
+			CHECK(call(as, 28, in, out) == 0);
+			if (de.eof)
+				break;
+			CHECK(k < 7 && !strcmp(de.name, want[k]));	/* exactly this order, nothing else */
+			k++;
+		}
+		CHECK(k == 7 && de.eof);
+		CHECK(call(as, 27, in, out) == 0);
+	}
+
 	/* mkdir under persist, refused elsewhere */
 	prim[0] = sizeof("/persist/sensors/registry/new");
 	prim[1] = 0755;

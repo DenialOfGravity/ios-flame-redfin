@@ -7,7 +7,8 @@
   Binary /var/local/bin/fastrpcd; served tree /private/var/local/hexagon; log /var/local/fastrpcd.log.
   fastrpcd waits for /dev/redwood-fastrpc and for the DSP to open its channel itself, so it can start at boot
   before the DSP is up. When the DSP goes away it exits 3 and launchd starts it again (ThrottleInterval 5 s)
-  for the DSP that comes back. Off: /var/local/fastrpcd.off (it exits 0 and is not restarted).
+  for the DSP that comes back. Interactive, nice -20: every DSP call waits on us (r24a: 10 ms per call
+  under SpringBoard's start-up load). Off: /var/local/fastrpcd.off (it exits 0 and is not restarted).
 -->
 <plist version="1.0">
 <dict>
@@ -24,6 +25,10 @@
 		<key>SuccessfulExit</key>
 		<false/>
 	</dict>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>Nice</key>
+	<integer>-20</integer>
 	<key>ThrottleInterval</key>
 	<integer>5</integer>
 	<key>UserName</key>

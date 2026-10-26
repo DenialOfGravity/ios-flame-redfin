@@ -29,7 +29,7 @@
 #                   (its sensors/ is used) or a directory (the phone's /mnt/vendor/persist/sensors) may be given.
 #
 # recon/fw-adsp/hexagon may be laid out like the phone (vendor/etc/sensors/..., vendor/dsp/adsp, ...) or like
-# hexagonrpcd's -R directory (sensors/config, sensors/sns_reg.conf, acdb/, dsp/, socinfo/); both are understood.
+# hexagonrpcd's -R directory (sensors/config, sensors/sns_reg.conf, acdb/ or acdbdata/, dsp/, socinfo/); both are understood.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO=$PWD W=${REDFIN_WORK:-$HOME/redfin-work}
@@ -72,6 +72,7 @@ elif [[ -d $HEX/sensors ]]; then
 	done
 	copydir "$HEX/sensors/registry" "$S/persist/sensors/registry/registry"
 	copydir "$HEX/acdb" "$S/vendor/etc/acdbdata"
+	copydir "$HEX/acdbdata" "$S/vendor/etc/acdbdata"	# (the PC's recon names it acdbdata)
 	if [[ -d $HEX/dsp/adsp ]]; then copydir "$HEX/dsp/adsp" "$S/usr/lib/qcom/adsp"; else copydir "$HEX/dsp" "$S/usr/lib/qcom/adsp"; fi
 	copydir "$HEX/socinfo" "$S/sys/devices/soc0"
 else

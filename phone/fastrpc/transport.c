@@ -18,7 +18,11 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/time.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 
 #include <libhexagonrpc/hexagonrpc.h>
 #include "log.h"
@@ -149,11 +153,27 @@ int frpc_dead(void)
 	return T.dead;
 }
 
+void frpc_boost_thread(void)
+{
+	static int niced;
+
+	if (!niced) {
+		niced = 1;
+		if (setpriority(PRIO_PROCESS, 0, -20))
+			vlog("setpriority -20: %s", strerror(errno));
+	}
+#ifdef __APPLE__
+	if (pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0))
+		vlog("QoS USER_INTERACTIVE: refused");
+#endif
+}
+
 static void *reader_main(void *unused)
 {
 	uint8_t a[64];
 
 	(void)unused;
+	frpc_boost_thread();
 	for (;;) {
 		int n = T.dev.recv(T.dev.ctx, a, sizeof(a));
 		uint64_t ctx;
