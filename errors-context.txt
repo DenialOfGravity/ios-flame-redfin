@@ -1,0 +1,23 @@
+2375-        virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching = 0, IOOptionBits options = 0) APPLE_KEXT_OVERRIDE;
+2376-                                                                                  ^
+2377-                                                                                  nullptr
+2378:/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/iokit/Kernel/arm/hid/SweetHID.cpp:803:7: error: use of undeclared identifier 'gSweetReadLock'
+2379-        if (!gSweetReadLock) {
+2380-             ^
+2381:/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/iokit/Kernel/arm/hid/SweetHID.cpp:805:62: error: use of undeclared identifier 'gSweetReadLock'
+2382-                if (l && !OSCompareAndSwapPtr(NULL, l, (void * volatile *)&gSweetReadLock)) {
+2383-                                                                           ^
+2384:/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/iokit/Kernel/arm/hid/SweetHID.cpp:805:62: error: use of undeclared identifier 'gSweetReadLock'
+2385:/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/iokit/Kernel/arm/hid/SweetHID.cpp:1072:81: error: 'this' argument to member function 'sensorIndex' has type 'const SweetHIDSensor', but function is not marked const
+2386-                IOLog("SWEET MOTION: %s property read %s: %s (pid %d %s)\n", gSweetSensorInfo[sensorIndex()].name, key,
+2387-                                                                                              ^~~~~~~~~~~
+2388-/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/iokit/Kernel/arm/hid/SweetHID.cpp:752:14: note: 'sensorIndex' declared here
+2389-        virtual int sensorIndex() { return SWEET_SENSOR_ACCEL; }
+2390-                    ^
+2391-/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/iokit/Kernel/arm/hid/SweetHID.cpp:1080:2: warning: use of OSPtr outside of a return type [-Wossharedptr-misuse]
+2392-        OSPtr<OSObject> obj = IOHIDEventService::copyProperty(aKey);
+2393-        ^~~~~~~~~~~~~~~
+2394-17 warnings and 4 errors generated.
+2395-make[7]: *** [SweetHID.cpo] Error 1
+2396-make[7]: Target `do_build_all' not remade because of errors.
+2397-make[6]: *** [build_all] Error 2

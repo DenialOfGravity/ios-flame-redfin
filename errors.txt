@@ -1,0 +1,13 @@
+2378:/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/iokit/Kernel/arm/hid/SweetHID.cpp:803:7: error: use of undeclared identifier 'gSweetReadLock'
+2381:/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/iokit/Kernel/arm/hid/SweetHID.cpp:805:62: error: use of undeclared identifier 'gSweetReadLock'
+2384:/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/iokit/Kernel/arm/hid/SweetHID.cpp:805:62: error: use of undeclared identifier 'gSweetReadLock'
+2385:/Users/runner/work/ios-flame-redfin/ios-flame-redfin/dxb/xnu/iokit/Kernel/arm/hid/SweetHID.cpp:1072:81: error: 'this' argument to member function 'sensorIndex' has type 'const SweetHIDSensor', but function is not marked const
+2394:17 warnings and 4 errors generated.
+2395:make[7]: *** [SweetHID.cpo] Error 1
+2397:make[6]: *** [build_all] Error 2
+2398:make[5]: *** [do_all] Error 2
+2400:make[4]: *** [build_all] Error 2
+2401:make[3]: *** [build_all_recurse_into_conf] Error 2
+2403:make[2]: *** [build_all_recurse_into_iokit] Error 2
+2460:make[1]: *** [build_all_bootstrap_DEVELOPMENT^ARM64^SWEET] Error 2
+2462:make: *** [install] Error 2
