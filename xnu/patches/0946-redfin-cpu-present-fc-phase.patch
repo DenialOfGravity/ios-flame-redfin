@@ -13,10 +13,12 @@ tick phasing falls back to INTF1's frame counter (0x0ac) when the tear
 check's counter reads 0: edges found by 20 us polling at the first tick and
 every 32 ticks. The stats line gets "| vis V us cpu C us": mean SwapEnd ->
 panel-visible (blit landed or CPU copy done) and mean CPU copy time.
+While bit 0x8 is on the present thread is bound to CPU6 (sweetfbcpu=N).
+Poke "p fbx HEX" sets bits 0x2/0x4/0x8 live ("SWEET FB: fbx now 0x..").
 ---
- bsd/dev/sweet_gpu.c                   |  67 +++++++++
- iokit/Kernel/arm/SweetFramebuffer.cpp | 268 +++++++++++++++++++++++++++++++++-
- 2 files changed, 330 insertions(+), 5 deletions(-)
+ bsd/dev/sweet_gpu.c                   |  67 +++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 333 +++++++++++++++++++++++++++++++++-
+ 2 files changed, 392 insertions(+), 8 deletions(-)
 
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
 index c439593..c998d97 100644
@@ -125,10 +127,10 @@ index c439593..c998d97 100644
  		present_next++;
  		if (fb_flip > 0 && present_fence[k]) {
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 7b71882..49f478c 100644
+index 7b71882..96270ef 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -54,6 +54,11 @@ bool sweet_gpu_present_poll(void);      /* 0943: a present's blit still out (pol
+@@ -54,6 +54,14 @@ bool sweet_gpu_present_poll(void);      /* 0943: a present's blit still out (pol
  void sweet_gpu_present_landed(uint64_t *sum_abs, uint64_t *n);
  uint32_t sweet_mdp_rd(uint32_t off);    /* 0943: MDP registers, offset from 0x0ae00000 */
  void sweet_mdp_wr(uint32_t off, uint32_t v);
@@ -137,10 +139,13 @@ index 7b71882..49f478c 100644
 +void sweet_gpu_present_tag(uint64_t swap_abs);
 +void sweet_gpu_present_visible(uint64_t *sum_abs, uint64_t *n);
 +void flush_dcache64(addr64_t addr, unsigned count, int phys);
++struct processor;                               /* 0946: the present thread on a big core (osfmk/kern/sched_prim.h) */
++struct processor *thread_bind(struct processor *processor);
++struct processor *cpu_to_processor(int cpu);
  extern int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
  }
  #define SWEET_FB_GPU_ROWBYTES           4352    /* the 2D engine writes 64-byte multiples */
-@@ -91,11 +96,14 @@ enum {
+@@ -91,11 +99,14 @@ enum {
   *   0x1  publish TimingElements/ColorElements (SyncRate = the panel Hz), GetBlock(0x40), sel 77 = mach time
   *   0x2  no cache clean of a frame's surface unless the CPU locked it for writing since its last present
   *   0x4  (0944) present at SwapEnd (2 frames queued, SwapEnd held when full), vsync ticks phased to the TE
@@ -155,7 +160,7 @@ index 7b71882..49f478c 100644
  static uint32_t sweet_fbx;
  
  /* INTF1 (DSI0) and its tear check, offsets from the MDP (as shim/sde.c): the TE frame counter is INT_COUNT >> 16 */
-@@ -191,6 +199,22 @@ public:
+@@ -191,6 +202,22 @@ public:
  	void          statShown(uint64_t swapAbs);
  	void          statLine(uint64_t now);
  	void          fbCmd(const char *s, const char *end);
@@ -178,7 +183,20 @@ index 7b71882..49f478c 100644
  	/* 0944 (sweetfbx & 4): frames queued at SwapEnd for the present thread, ticks phased to the TE (fLock) */
  	bool          fSwapQ;
  	uint8_t      *fQ;             /* two swap records */
-@@ -719,6 +743,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -584,10 +611,10 @@ AppleCLCD::start(IOService *provider)
+ 	int pt = 1;
+ 	PE_parse_boot_argn("sweetfb_thread", &pt, sizeof(pt));
+ 	/* 0944: sweetfbx & 4 (needs the present thread) */
+-	fQ = (sweet_fbx & SWEET_FBX_SWAPQ) && pt ? (uint8_t *)IOMallocData(2 * SWEET_FB_SWAP_REC_SIZE) : NULL;
++	fQ = pt ? (uint8_t *)IOMallocData(2 * SWEET_FB_SWAP_REC_SIZE) : NULL;    /* 0946: always, for p fbx */
+ 	if (pt && fPresentRec != NULL && IOCreateThread(&AppleCLCD::presentLoop, this) != NULL) {
+ 		fPresentThread = true;
+-		fSwapQ = fQ != NULL;
++		fSwapQ = fQ != NULL && (sweet_fbx & SWEET_FBX_SWAPQ);
+ 	}
+ 	if ((sweet_fbx & SWEET_FBX_SWAPQ) && !fSwapQ) {
+ 		IOLog("SWEET FB: sweetfbx 0x4 needs the present thread (sweetfb_thread): off\n");
+@@ -719,6 +746,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	if (rec != NULL) {
  		uint64_t t0 = mach_absolute_time();
  		fb->fPresentBusy = false;
@@ -186,7 +204,31 @@ index 7b71882..49f478c 100644
  		fb->present(rec);
  		fb->fStatPresentAbs += mach_absolute_time() - t0;
  		if (fb->fPresentBusy) {
-@@ -767,6 +792,7 @@ AppleCLCD::presentLoop(void *arg)
+@@ -738,7 +766,23 @@ void
+ AppleCLCD::presentLoop(void *arg)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)arg;
++	bool bound = false;
+ 	for (;;) {
++		/*
++		 * 0946: while the CPU presents (sweetfbx & 8), this thread runs on a big core only: CPU6 (A76 gold; the
++		 * render server takes CPU7 first, 0147/0962), boot-arg sweetfbcpu=N. Takes effect when it next blocks.
++		 */
++		bool want = (sweet_fbx & SWEET_FBX_CPUPRESENT) != 0;
++		if (want != bound) {
++			uint32_t cpu = 6;
++			PE_parse_boot_argn("sweetfbcpu", &cpu, sizeof(cpu));
++			struct processor *p = want ? cpu_to_processor((int)cpu) : NULL;
++			if (!want || p != NULL) {
++				thread_bind(p);
++				IOLog("SWEET FB: present thread %s CPU%u\n", want ? "bound to" : "unbound from", cpu);
++			}
++			bound = want;
++		}
+ 		IOLockLock(fb->fLock);
+ 		for (;;) {
+ 			/* 0944: a queued frame goes at once (a put-off one again 1 ms later) */
+@@ -767,6 +811,7 @@ AppleCLCD::presentLoop(void *arg)
  			IOLockUnlock(fb->fLock);
  			uint64_t t0 = mach_absolute_time();
  			fb->fPresentBusy = false;
@@ -194,7 +236,7 @@ index 7b71882..49f478c 100644
  			fb->present(fb->fPresentRec);
  			fb->fStatPresentAbs += mach_absolute_time() - t0;
  			bool shown = !fb->fPresentBusy, pop = shown;
-@@ -806,6 +832,7 @@ AppleCLCD::presentLoop(void *arg)
+@@ -806,6 +851,7 @@ AppleCLCD::presentLoop(void *arg)
  		if (go) {
  			uint64_t t0 = mach_absolute_time();
  			fb->fPresentBusy = false;
@@ -202,7 +244,7 @@ index 7b71882..49f478c 100644
  			fb->present(fb->fPresentRec);
  			fb->fStatPresentAbs += mach_absolute_time() - t0;
  			if (fb->fPresentBusy) {
-@@ -951,7 +978,11 @@ AppleCLCD::statLine(uint64_t now)
+@@ -951,7 +997,11 @@ AppleCLCD::statLine(uint64_t now)
  	uint32_t swaps = fStSwaps, shown = fStShown, dropped = fStDropped, b[5];
  	memcpy(b, fStBucket, sizeof(b));
  	uint32_t p50 = sweet_fb_pct(fStHist, fStHistN, 50), p95 = sweet_fb_pct(fStHist, fStHistN, 95);
@@ -215,7 +257,7 @@ index 7b71882..49f478c 100644
  	absolutetime_to_nanoseconds(fStBlitqAbs, &blitq);
  	blitq = fStBlitqN ? blitq / 1000 / fStBlitqN : 0;
  	fStWin = now;
-@@ -963,12 +994,17 @@ AppleCLCD::statLine(uint64_t now)
+@@ -963,12 +1013,17 @@ AppleCLCD::statLine(uint64_t now)
  	sweet_gpu_present_landed(&fence, &fenceN);
  	absolutetime_to_nanoseconds(fence, &fence);
  	fence = fenceN ? fence / 1000 / fenceN : 0;
@@ -235,7 +277,56 @@ index 7b71882..49f478c 100644
  }
  
  /* sweetfbx & 2: has the CPU locked the surface for writing (IOSurface seed bumped) since its last present? */
-@@ -1218,7 +1254,11 @@ AppleCLCD::phaseTick(uint64_t now)
+@@ -1149,7 +1204,47 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+ 		IOLog("SWEET FB: hz %u%s -> %s (panel %u Hz)\n", hz, tc ? " tc" : "", ok ? "ok" : "FAILED", fHz);
+ 		return;
+ 	}
+-	IOLog("SWEET FB: poke p: fc | hz 60|90 [tc]\n");
++	if (end - s >= 3 && s[0] == 'f' && s[1] == 'b' && s[2] == 'x') {
++		/* 0946: p fbx HEX: bits 0x2, 0x4 and 0x8 live (0x1 is published at boot) */
++		const char *q = s + 3;
++		uint32_t v = 0;
++		while (q < end && *q == ' ') {
++			q++;
++		}
++		if (end - q >= 2 && q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) {
++			q += 2;
++		}
++		for (; q < end; q++) {
++			char c = *q;
++			uint32_t d = c >= '0' && c <= '9' ? (uint32_t)(c - '0') : c >= 'a' && c <= 'f' ? (uint32_t)(c - 'a' + 10) :
++			    c >= 'A' && c <= 'F' ? (uint32_t)(c - 'A' + 10) : 16;
++			if (d == 16) {
++				break;
++			}
++			v = v * 16 + d;
++		}
++		const uint32_t live = SWEET_FBX_NOCLEAN | SWEET_FBX_SWAPQ | SWEET_FBX_CPUPRESENT;
++		IOLockLock(fLock);
++		sweet_fbx = (sweet_fbx & ~live) | (v & live);
++		bool q4 = fQ != NULL && fPresentThread && (sweet_fbx & SWEET_FBX_SWAPQ);
++		if (fSwapQ && !q4 && fQn != 0) {
++			/* queue off: its newest frame is fPending already; show that the old way */
++			fDirty = true;
++		}
++		if (!q4) {
++			fQn = 0;
++			IOLockWakeup(fLock, &fQn, true);
++		}
++		fSwapQ = q4;
++		fTeStale = 0;
++		fFcEdge = 0;            /* the tick phase is found again */
++		fPresentReq = true;     /* the present thread (re)binds itself */
++		IOLockWakeup(fLock, &fPresentReq, true);
++		IOLockUnlock(fLock);
++		IOLog("SWEET FB: fbx now %#x (swap queue %s)\n", sweet_fbx, q4 ? "on" : "off");
++		return;
++	}
++	IOLog("SWEET FB: poke p: fc | hz 60|90 [tc] | fbx HEX\n");
+ }
+ 
+ extern "C" void sweet_fb_cmd(const char *s, const char *end);
+@@ -1218,7 +1313,11 @@ AppleCLCD::phaseTick(uint64_t now)
  	uint32_t frame = ic >> 16, line = ic & 0xffff;
  	if (frame == fTeFrame) {
  		if (++fTeStale == 4) {
@@ -248,7 +339,7 @@ index 7b71882..49f478c 100644
  		}
  		return;
  	}
-@@ -1250,6 +1290,220 @@ AppleCLCD::phaseTick(uint64_t now)
+@@ -1250,6 +1349,220 @@ AppleCLCD::phaseTick(uint64_t now)
  	fNextVsync = next;
  }
  
@@ -469,7 +560,7 @@ index 7b71882..49f478c 100644
  static uint32_t sweet_fb_gpu_why_logged;
  
  /* Why presentGPU fell back to the CPU copy, logged once per reason. */
-@@ -1271,7 +1525,7 @@ gpu_fallback(uint32_t why, const char *what)
+@@ -1271,7 +1584,7 @@ gpu_fallback(uint32_t why, const char *what)
  void
  AppleCLCD::copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n)
  {
@@ -478,7 +569,7 @@ index 7b71882..49f478c 100644
  	uint32_t e = fCornerExt;
  	const uint8_t *cov = NULL;
  
-@@ -1370,6 +1624,7 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+@@ -1370,6 +1683,7 @@ AppleCLCD::presentGPU(const uint8_t *rec)
  	uint32_t dx = 0, dy = 0, dw = 0, dh = 0;
  	/* 0943 (sweetfbx & 2): no cache clean of a surface the CPU has not written (locked) since its last present */
  	uintptr_t clean = (sweet_fbx & SWEET_FBX_NOCLEAN) && !cpuWrote(s) ? 0 : s->kernelAddress();
@@ -486,7 +577,7 @@ index 7b71882..49f478c 100644
  	int rc = sweet_gpu_present(slot, clean, s->offset, s->width, s->height, s->bytesPerRow,
  	    fRowBytes, fCornerRadius, &dx, &dy, &dw, &dh);
  	s->release();
-@@ -1403,6 +1658,9 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -1403,6 +1717,9 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  	}
  
