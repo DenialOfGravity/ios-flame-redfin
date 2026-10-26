@@ -17,9 +17,9 @@ user-client requests, are logged (IOUserClient.cpp). Default off.
 ---
  bsd/dev/sweet_geniuart.c        |   3 +
  iokit/Kernel/IOUserClient.cpp   |  36 ++++++
- iokit/Kernel/arm/SweetBTNub.cpp | 216 ++++ ++++++++++++++++++++++++++++
+ iokit/Kernel/arm/SweetBTNub.cpp | 232 ++++ ++++++++++++++++++++++++++++
  iokit/conf/files.arm64          |   1 +
- 4 files changed, 238 insertions(+)
+ 4 files changed, 254 insertions(+)
  create mode 100644 iokit/Kernel/arm/SweetBTNub.cpp
 
 diff --git a/bsd/dev/sweet_geniuart.c b/bsd/dev/sweet_geniuart.c
@@ -126,7 +126,7 @@ new file mode 100644
 index 0000000..f77138f
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetBTNub.cpp
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,232 @@
 +/*
 + * redfin 0982: stand-in Bluetooth nubs for bluetoothd / BlueTool. The probe boots showed them waiting on
 + * IOKit notifications for IONameMatch "marconi-bt" and "bluetooth" (device-tree nubs, the "bluetooth"
@@ -247,7 +247,7 @@ index 0000000..f77138f
 +}
 +
 +static void
-+put_data(SweetBTNub * nub, const char * key, const void * bytes, unsigned len)
++put_data(IORegistryEntry * nub, const char * key, const void * bytes, unsigned len)
 +{
 +	OSData * v = OSData::withBytes(bytes, len);
 +	if (v) {
@@ -257,10 +257,25 @@ index 0000000..f77138f
 +}
 +
 +static void
-+put_u32(SweetBTNub * nub, const char * key, uint32_t value)
++put_u32(IORegistryEntry * nub, const char * key, uint32_t value)
 +{
 +	const uint8_t b[4] = { (uint8_t)value, (uint8_t)(value >> 8), (uint8_t)(value >> 16), (uint8_t)(value >> 24) };
 +	put_data(nub, key, b, sizeof(b));       /* 4 bytes, little-endian */
++}
++
++/* D22AP WLAN identity (iPhone X tree: /arm-io/uart2/wlan, compatible "wlan-pcie-uart,bcm4357", and the apcie
++ * bridge3 "wlan" pcie-device; module-instance "herculese"). The tree has no vendor-id/device-id on the WLAN
++ * nodes (they come from PCIe config space), so those are the Broadcom PCI IDs: vendor 0x14e4, BCM4357 device
++ * 0x4488. libMobileGestalt (kMGQWifiVendor) and BlueTool read vendor-id from the AppleOLYHAL service. */
++static void
++put_wlan_identity(IORegistryEntry * e)
++{
++	put_data(e, "device_type", "wlan", 5);
++	static const char compat[] = "wlan-pcie,bcm4357\0wlan-pcie,bcm";    /* NUL-separated list, as in the tree */
++	put_data(e, "compatible", compat, sizeof(compat));
++	put_data(e, "module-instance", "herculese", 10);
++	put_u32(e, "vendor-id", 0x14e4);
++	put_u32(e, "device-id", 0x4488);
 +}
 +
 +static SweetBTNub *
@@ -329,6 +344,7 @@ index 0000000..f77138f
 +		if (oly && oly->init() && oly->attach(platform)) {
 +			oly->setName("AppleOLYHAL");
 +			oly->setProperty("SweetBTNub", true);
++			put_wlan_identity(oly);
 +			if (oly->start(platform)) {
 +				oly->registerService();
 +				sweet_olyhal = oly;
