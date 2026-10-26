@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The fastrpcd boot job (the ADSP sensors PD's file service). iOS 16's launchd reads its jobs from
+  /System/Library/xpc/launchd.plist, not from this file: tools/redfin-install-hexagon-wsl.sh merges this
+  dictionary into its LaunchDaemons under /System/Library/LaunchDaemons/org.iosonpixel.fastrpcd.plist.
+  Binary /var/local/bin/fastrpcd; served tree /private/var/local/hexagon; log /var/local/fastrpcd.log.
+  fastrpcd waits for /dev/redwood-fastrpc and for the DSP to open its channel itself, so it can start at boot
+  before the DSP is up. When the DSP goes away it exits 3 and launchd starts it again (ThrottleInterval 5 s)
+  for the DSP that comes back. Interactive, nice -20: every DSP call waits on us (r24a: 10 ms per call
+  under SpringBoard's start-up load). Off: /var/local/fastrpcd.off (it exits 0 and is not restarted).
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.iosonpixel.fastrpcd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/var/local/bin/fastrpcd</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>Nice</key>
+	<integer>-20</integer>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>UserName</key>
+	<string>root</string>
+	<key>StandardOutPath</key>
+	<string>/var/local/fastrpcd.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/local/fastrpcd.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+</dict>
+</plist>
