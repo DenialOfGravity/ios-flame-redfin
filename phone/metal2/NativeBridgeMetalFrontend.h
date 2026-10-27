@@ -19,6 +19,9 @@ size_t native_bridge_metal_telemetry(char *out, size_t size);
 // u-t: Turnip's pass timeline report (sweet_tu_pass_report, phone/turnip/patches/0105), set by the plugin once Turnip is loaded; null
 // where Turnip does not export it. Used by backboardd's "T 5s" frame timeline line (SWEET_TIMELINE).
 extern size_t (*native_bridge_metal_pass_report)(char *out, size_t size, unsigned top);
+// u-tr: Turnip's CPU profile (sweet_tu_cpu_report, phone/turnip/patches/0110, SWEET_TU_CPUPROF=1), logged as its own
+// "native-metal: T tu-cpu:" line after the "T 5s" line; null where Turnip does not export it.
+extern size_t (*native_bridge_metal_cpu_report)(char *out, size_t size);
 // Structured cumulative artifact/driver-cache counters for offline qualification.
 struct NmbShaderCacheStats;
 bool native_bridge_metal_shader_cache_stats(struct NmbShaderCacheStats *out);

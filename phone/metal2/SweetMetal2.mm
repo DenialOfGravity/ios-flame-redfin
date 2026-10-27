@@ -259,6 +259,8 @@ static bool listed(void)
 		/* u-t: Turnip's pass timeline report (phone/turnip/patches/0105) for the frontend's T line */
 		if (th) {
 			native_bridge_metal_pass_report = (size_t (*)(char *, size_t, unsigned))dlsym(th, "sweet_tu_pass_report");
+			/* u-tr: Turnip's CPU profile (phone/turnip/patches/0110, SWEET_TU_CPUPROF=1) */
+			native_bridge_metal_cpu_report = (size_t (*)(char *, size_t))dlsym(th, "sweet_tu_cpu_report");
 			if (!native_bridge_metal_pass_report && !strcmp(getprogname(), "backboardd"))
 				sm2_log("timeline: sweet_tu_pass_report not exported by Turnip: no pass times");
 		}

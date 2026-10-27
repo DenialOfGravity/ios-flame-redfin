@@ -2,10 +2,12 @@ sweet 0110 (u-tr): SWEET_TU_CPUPROF=1 - where Turnip's CPU time goes, for CA's f
 across threads) vkCmdDrawIndexed, its state emission (tu6_draw_common) and the consts+descriptor part of that,
 vkCmdBindPipeline / BindDescriptorSets2 / PushConstants2, vkCmdBeginRenderPass2 / EndRenderPass2 (and tu_cmd_render in
 it), vkCmdExecuteCommands, vkBegin/EndCommandBuffer and new command-stream BOs (tu_cs_add_bo: kernel alloc + map), and
-counts draws that re-emitted all state / changed program / had dirty consts / dirty sets. sweet_tu_pass_report appends
-" | tu cpu <name> calls/mean us/total ms ..." and restarts the sums. Off by default: one relaxed load per entry point.
+counts draws that re-emitted all state / changed program / had dirty consts / dirty sets. Exported
+sweet_tu_cpu_report() gives "<name> calls/mean us/total ms ..." since its last call (SweetMetal2 logs it every 5 s as
+"native-metal: T tu-cpu:"). Off by default: one relaxed load per entry point.
 diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
-index 14dad50..a5de4e9 100644
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 14dad50..2c5fcc1 100644
 --- a/src/freedreno/vulkan/tu_cmd_buffer.cc
 +++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
 @@ -28,6 +28,12 @@
@@ -21,32 +23,44 @@ index 14dad50..a5de4e9 100644
  #include <pthread.h>
  #include "util/format/u_format.h"
  #include "vk_format.h"
-@@ -4244,6 +4250,24 @@ sweet_tu_pass_report(char *out, size_t size, unsigned top)
-    SWEET_PUT(" | tu submits %llu, cpu-waited %llu (%.1fms), gpu-waited %llu", (unsigned long long) (now[0] - last[0]),
-              (unsigned long long) (now[1] - last[1]), (now[2] - last[2]) / 1e6, (unsigned long long) (now[3] - last[3]));
-    memcpy(last, now, sizeof(last));
-+   if (sweet_cp_enabled()) {
-+      /* sweet 0110 (u-tr): calls/mean us/total ms per entry point since the last report, then the draw counts */
-+      static const char *const names[SWEET_CP_COUNT] = {
-+         "draw", "state", "const+desc", "pipeline", "sets", "push", "rp-begin", "rp-end", "render", "exec",
-+         "begin-cb", "end-cb", "bo-new", "full", "prog", "consts", "desc",
-+      };
-+      SWEET_PUT(" | tu cpu");
-+      for (unsigned k = 0; k < SWEET_CP_COUNT; k++) {
-+         const uint64_t n = p_atomic_xchg(&sweet_cp_n[k], 0);
-+         const uint64_t ns = k < SWEET_CP_TIMED ? p_atomic_xchg(&sweet_cp_ns[k], 0) : 0;
-+         if (!n)
-+            continue;
-+         if (k < SWEET_CP_TIMED)
-+            SWEET_PUT(" %s %llu/%.1fus/%.1fms", names[k], (unsigned long long) n, ns / 1e3 / n, ns / 1e6);
-+         else
-+            SWEET_PUT(" %s %llu", names[k], (unsigned long long) n);
-+      }
-+   }
- #undef SWEET_PUT
+@@ -4248,6 +4254,36 @@ sweet_tu_pass_report(char *out, size_t size, unsigned top)
     return at < size ? at : size - 1;
  }
-@@ -4753,6 +4777,7 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+ 
++/* sweet 0110 (u-tr): SWEET_TU_CPUPROF=1: per entry point "name calls/mean us/total ms" since the last call, then the
++ * draw counts; "" when off. SweetMetal2's frontend logs it as its own T line ("native-metal: T tu-cpu:"). */
++extern "C" __attribute__((visibility("default"))) size_t
++sweet_tu_cpu_report(char *out, size_t size)
++{
++   if (!out || size == 0)
++      return 0;
++   out[0] = 0;
++   if (!sweet_cp_enabled())
++      return 0;
++   static const char *const names[SWEET_CP_COUNT] = {
++      "draw", "state", "const+desc", "pipeline", "sets", "push", "rp-begin", "rp-end", "render", "exec",
++      "begin-cb", "end-cb", "bo-new", "full", "prog", "consts", "desc",
++   };
++   size_t at = 0;
++#define SWEET_PUT(...) (at += snprintf(out + at, size > at ? size - at : 0, __VA_ARGS__))
++   for (unsigned k = 0; k < SWEET_CP_COUNT; k++) {
++      const uint64_t n = p_atomic_xchg(&sweet_cp_n[k], 0);
++      const uint64_t ns = k < SWEET_CP_TIMED ? p_atomic_xchg(&sweet_cp_ns[k], 0) : 0;
++      if (!n)
++         continue;
++      if (k < SWEET_CP_TIMED)
++         SWEET_PUT("%s%s %llu/%.1fus/%.1fms", at ? " " : "", names[k], (unsigned long long) n, ns / 1e3 / n, ns / 1e6);
++      else
++         SWEET_PUT("%s%s %llu", at ? " " : "", names[k], (unsigned long long) n);
++   }
++#undef SWEET_PUT
++   return at < size ? at : size - 1;
++}
++
+ template <chip CHIP>
+ static void
+ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
+@@ -4753,6 +4789,7 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
                        const VkCommandBufferBeginInfo *pBeginInfo)
  {
     VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
@@ -54,7 +68,7 @@ index 14dad50..a5de4e9 100644
     VkResult result = tu_cmd_buffer_begin(cmd_buffer, pBeginInfo);
     if (result != VK_SUCCESS)
        return result;
-@@ -5245,6 +5270,7 @@ tu_CmdBindDescriptorSets2KHR(
+@@ -5245,6 +5282,7 @@ tu_CmdBindDescriptorSets2KHR(
     const VkBindDescriptorSetsInfoKHR *pBindDescriptorSetsInfo)
  {
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
@@ -62,7 +76,7 @@ index 14dad50..a5de4e9 100644
  
     if (pBindDescriptorSetsInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT) {
        tu_bind_descriptor_sets<CHIP>(cmd, pBindDescriptorSetsInfo,
-@@ -5660,6 +5686,7 @@ tu_CmdPushConstants2KHR(VkCommandBuffer commandBuffer,
+@@ -5660,6 +5698,7 @@ tu_CmdPushConstants2KHR(VkCommandBuffer commandBuffer,
                          const VkPushConstantsInfoKHR *pPushConstantsInfo)
  {
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
@@ -70,7 +84,7 @@ index 14dad50..a5de4e9 100644
     memcpy((char *) cmd->push_constants + pPushConstantsInfo->offset,
            pPushConstantsInfo->pValues, pPushConstantsInfo->size);
     cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;
-@@ -5680,6 +5707,7 @@ VKAPI_ATTR VkResult VKAPI_CALL
+@@ -5680,6 +5719,7 @@ VKAPI_ATTR VkResult VKAPI_CALL
  tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
  {
     VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
@@ -78,7 +92,7 @@ index 14dad50..a5de4e9 100644
  
     /* We currently flush CCU at the end of the command buffer, like
      * what the blob does. There's implicit synchronization around every
-@@ -5838,6 +5866,7 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
+@@ -5838,6 +5878,7 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
  {
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
     VK_FROM_HANDLE(tu_pipeline, pipeline, _pipeline);
@@ -86,7 +100,7 @@ index 14dad50..a5de4e9 100644
  
     if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
        cmd->state.shaders[MESA_SHADER_COMPUTE] =
-@@ -6655,6 +6684,7 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+@@ -6655,6 +6696,7 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
                        const VkCommandBuffer *pCmdBuffers)
  {
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
@@ -94,7 +108,7 @@ index 14dad50..a5de4e9 100644
     VkResult result;
  
     assert(commandBufferCount > 0);
-@@ -7302,6 +7332,7 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+@@ -7302,6 +7344,7 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
                         const VkSubpassBeginInfo *pSubpassBeginInfo)
  {
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
@@ -102,7 +116,7 @@ index 14dad50..a5de4e9 100644
  
     if (TU_DEBUG(DYNAMIC)) {
        vk_common_CmdBeginRenderPass2(commandBuffer, pRenderPassBegin,
-@@ -8680,8 +8711,8 @@ tu_flush_dynamic_input_attachments(struct tu_cmd_buffer *cmd)
+@@ -8680,8 +8723,8 @@ tu_flush_dynamic_input_attachments(struct tu_cmd_buffer *cmd)
  
  template <chip CHIP>
  static VkResult
@@ -113,7 +127,7 @@ index 14dad50..a5de4e9 100644
                  bool indexed,
                  /* note: draw_count is 0 for indirect */
                  uint32_t draw_count)
-@@ -8858,11 +8889,14 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
+@@ -8858,11 +8901,14 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
        }
     }
  
@@ -132,7 +146,7 @@ index 14dad50..a5de4e9 100644
  
     if (BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
                     MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES) ||
-@@ -8974,6 +9008,29 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
+@@ -8974,6 +9020,29 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
     return VK_SUCCESS;
  }
  
@@ -162,7 +176,7 @@ index 14dad50..a5de4e9 100644
  static uint32_t
  tu_draw_initiator(struct tu_cmd_buffer *cmd, enum pc_di_src_sel src_sel)
  {
-@@ -9222,6 +9279,7 @@ tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+@@ -9222,6 +9291,7 @@ tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
                    uint32_t firstInstance)
  {
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
@@ -170,7 +184,7 @@ index 14dad50..a5de4e9 100644
     struct tu_cs *cs = &cmd->draw_cs;
  
     tu6_emit_vs_params(cmd, 0, vertexOffset, firstInstance);
-@@ -10080,6 +10138,7 @@ tu_CmdEndRenderPass2(VkCommandBuffer commandBuffer,
+@@ -10080,6 +10150,7 @@ tu_CmdEndRenderPass2(VkCommandBuffer commandBuffer,
                       const VkSubpassEndInfo *pSubpassEndInfo)
  {
     VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
@@ -178,7 +192,7 @@ index 14dad50..a5de4e9 100644
  
     if (TU_DEBUG(DYNAMIC)) {
        vk_common_CmdEndRenderPass2(commandBuffer, pSubpassEndInfo);
-@@ -10105,7 +10164,10 @@ tu_CmdEndRenderPass2(VkCommandBuffer commandBuffer,
+@@ -10105,7 +10176,10 @@ tu_CmdEndRenderPass2(VkCommandBuffer commandBuffer,
  
     tu_cs_end(&cmd_buffer->draw_cs);
     tu_cs_end(&cmd_buffer->draw_epilogue_cs);
@@ -204,7 +218,7 @@ index 95a28bd..e413806 100644
     assert(cs->mode != TU_CS_MODE_EXTERNAL);
     /* No adding more BOs if suballocating from a suballoc_bo. */
 diff --git a/src/freedreno/vulkan/tu_cs.h b/src/freedreno/vulkan/tu_cs.h
-index 6a66de1..9f0ac89 100644
+index 6a66de1..9c9e946 100644
 --- a/src/freedreno/vulkan/tu_cs.h
 +++ b/src/freedreno/vulkan/tu_cs.h
 @@ -12,6 +12,8 @@
@@ -221,8 +235,8 @@ index 6a66de1..9f0ac89 100644
  }
  
 +/* sweet 0110 (u-tr): SWEET_TU_CPUPROF=1 times Turnip's own CPU work per entry point (os_time_get_nano around each, summed
-+ * with atomics across recording threads) and counts what made draws re-emit state; sweet_tu_pass_report appends it
-+ * (" | tu cpu ...", per entry: calls/mean us/total ms since the last report) and starts the sums again. Off: one load. */
++ * with atomics across recording threads) and counts what made draws re-emit state; sweet_tu_cpu_report (tu_cmd_buffer.cc)
++ * gives per entry calls/mean us/total ms since its last call and starts the sums again. Off: one relaxed load. */
 +enum sweet_cp {
 +   SWEET_CP_DRAW,        /* vkCmdDrawIndexed, all of it */
 +   SWEET_CP_STATE,       /* tu6_draw_common: state emission of a draw (any vkCmdDraw*) */

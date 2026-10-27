@@ -71,6 +71,7 @@ static Timed gTimeSurfaceFlush;
 // "native-metal: T 5s: ..." (and a "T2" line of the runtime's scheduler counts) goes to the console and /var/local/mtl2.log.
 // /var/local/mtl2-env SWEET_TIMELINE=0 turns it off (the plugin sets 1 for backboardd).
 size_t (*native_bridge_metal_pass_report)(char *,size_t,unsigned);
+size_t (*native_bridge_metal_cpu_report)(char *,size_t);
 static bool timelineOn() {
  static int on=-1;
  if(on<0){const char *e=getenv("SWEET_TIMELINE");on=!strcmp(getprogname(),"backboardd") && e && *e && strcmp(e,"0")?1:0;}
@@ -2812,6 +2813,13 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
   (unsigned long long)(waits[2]-lastWaits[2]),(unsigned long long)((waits[3]-lastWaits[3])/1000),passes);
  memcpy(lastWaits,waits,sizeof lastWaits);
  sm2_logs(line);
+ if(native_bridge_metal_cpu_report) {
+  char cpu[1100];
+  if(native_bridge_metal_cpu_report(cpu,sizeof cpu)) {
+   snprintf(line,sizeof line,"native-metal: T tu-cpu: %s",cpu);
+   sm2_logs(line);
+  }
+ }
  std::sort(hitches.begin(),hitches.end(),[](const Hitch &a,const Hitch &b){return a.every>b.every;});
  {
   size_t at=(size_t)snprintf(line,sizeof line,"native-metal: T worst 5s: fb surfaces %zu |",surfaces.size());
