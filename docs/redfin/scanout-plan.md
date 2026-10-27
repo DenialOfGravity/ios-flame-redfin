@@ -178,3 +178,13 @@ bit 8, OUT_XY, SMMU bank M bit.
   by chain depth (N = 2: SwapEnd waits until its own frame is on screen). SwapWait (CA calls it with the previous
   swap id, scalars `id, 0x80000000, ?`) waits until that swap is retired, and returns at once on the normal path.
   Latch = INTF1 frame counter past the flush and VIG bits clear, or 2 frames.
+
+## 2026-10-27, r38a and 0985/0986
+
+- r38a (0983): SwapWait timeouts gone, but CA stays at 2 surfaces (`chain 2-2`) even with the use counts published,
+  and back pressure held every SwapEnd: SwapEnd K always arrives before K's fence and latch. 0985 replaces it with
+  a gate on the swapper's GPU submits (K+1's work enters the ring only once K is on screen). This is double buffering
+  that leaves CA's CPU free. `p scanout gate 0` reverts to the back pressure.
+- What makes CA allocate a third surface is still open. It needs the QuartzCore strings from the phone's dyld cache
+  (IOMFB property and env names around the swap-chain/buffer count).
+- 0986 `p scanout corners 1`: CPU mattes in each frame's corners after its fence (no DMA-pipe overlay yet).
