@@ -15,10 +15,23 @@ way; displayUse counts held frames, userland use counts go to clientUse.
 p scanout 1 switches on live, p scanout 0 off. Inert without the boot-arg.
 ---
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 642637c..27cc1d5 100644
+index 642637c..24a55d2 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -712,6 +712,9 @@ AppleCLCD::start(IOService *provider)
+@@ -263,6 +263,12 @@ public:
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++/* 0976: the direct scanout (below) */
++static bool sweet_scan_live(void);
++static bool sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence);
++static void sweet_scan_wait(AppleCLCD *fb, uint32_t id);
++static void sweet_scan_set(AppleCLCD *fb, bool on, const char *why);
++
+ static AppleCLCD *sweet_fb_instance;    /* 0943: for the poke commands (p fc, p hz) */
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+@@ -712,6 +718,9 @@ AppleCLCD::start(IOService *provider)
  		publishModes();
  	}
  	sweet_fb_instance = this;
@@ -28,19 +41,7 @@ index 642637c..27cc1d5 100644
  	IOLog("SWEET FB: sweetfbx %#x, panel %u Hz\n", sweet_fbx, fHz);
  	registerService();
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
-@@ -950,6 +953,11 @@ get32(const uint8_t *p, uint32_t off)
- }
- 
- static uint32_t sweet_fb_swaps_logged;
-+/* 0976: the direct scanout (below) */
-+static bool sweet_scan_live(void);
-+static bool sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence);
-+static void sweet_scan_wait(AppleCLCD *fb, uint32_t id);
-+static void sweet_scan_set(AppleCLCD *fb, bool on, const char *why);
- 
- /* Copy each enabled layer's surface into the panel memory (no scaling). */
- /*
-@@ -986,6 +994,14 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -986,6 +995,14 @@ AppleCLCD::swap(const uint8_t *rec)
  	fStLastSwap = now;
  	fStSwaps++;
  	fStDropped += fDirty;
@@ -55,7 +56,7 @@ index 642637c..27cc1d5 100644
  	if (fSwapQ && queueSwap(rec, now)) {
  		IOLockUnlock(fLock);
  		return;
-@@ -1304,6 +1320,7 @@ static struct {
+@@ -1304,6 +1321,7 @@ static struct {
  	IOLock             *lock;
  	IOTimerEventSource *timer;
  	bool                active;         /* the pipes are ours; old[] holds what goes back */
@@ -63,7 +64,7 @@ index 642637c..27cc1d5 100644
  	uint32_t            old[2][SWEET_MDP_NREGS];
  	vm_offset_t         smmu_va[6];
  	uint64_t            smmu_pa[6];
-@@ -1603,6 +1620,7 @@ sweet_mdp_restore_locked(AppleCLCD *fb, const char *why)
+@@ -1603,6 +1621,7 @@ sweet_mdp_restore_locked(AppleCLCD *fb, const char *why)
  	sweet_mdp_flush("restore");
  	sweet_mdp_pipes("restored");
  	sweet_mdp.active = false;
@@ -71,7 +72,7 @@ index 642637c..27cc1d5 100644
  	sweet_mdp_busy = false;
  	sweet_gpu_mdp_own(0);
  	IOLockLock(fb->fLock);
-@@ -1825,19 +1843,432 @@ AppleCLCD::mdpCmd(const char *s, const char *end)
+@@ -1825,19 +1844,432 @@ AppleCLCD::mdpCmd(const char *s, const char *end)
  			}
  		}
  	} else if (wl == 7 && !strncmp(w, "restore", 7)) {
@@ -505,7 +506,7 @@ index 642637c..27cc1d5 100644
   */
  void
  AppleCLCD::fbCmd(const char *s, const char *end)
-@@ -1922,7 +2353,20 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+@@ -1922,7 +2354,20 @@ AppleCLCD::fbCmd(const char *s, const char *end)
  		mdpCmd(s + 3, end);     /* 0948 */
  		return;
  	}
@@ -527,7 +528,7 @@ index 642637c..27cc1d5 100644
  }
  
  extern "C" void sweet_fb_cmd(const char *s, const char *end);
-@@ -2708,6 +3152,20 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -2708,6 +3153,20 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  		}
  		break;
  	case kSweetFBSwapWait:
