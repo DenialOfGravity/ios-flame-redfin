@@ -1,7 +1,7 @@
 From a1cd383038bde66c03c8689f48a3fb4cc971988e Mon Sep 17 00:00:00 2001
 From: Rory Axton <roryaxton@gmail.com>
 Date: Tue, 27 Oct 2026 09:15:07 +0100
-Subject: [PATCH] 0991 redfin: sampling profiler for one process (p prof), p
+Subject: [PATCH] 0992 redfin: sampling profiler for one process (p prof), p
  disp, p phase
 
 p prof start NAME|PID [HZ [SECS [DEPTH [WAITHZ]]]] samples the process's threads:
