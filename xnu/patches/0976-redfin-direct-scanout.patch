@@ -1,0 +1,621 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Tue, 27 Oct 2026 03:00:00 +0100
+Subject: [PATCH] 0976 redfin: direct scanout of CA's frames (sweetscanout, p scanout 0|1)
+
+Step (e). A SwapEnd on a scanout-slot surface is not copied: the scanout
+thread waits for the GPU fence submitted at that SwapEnd (0949), points
+VIG0/VIG1 at the surface (scaled geometry of p mdp scale) and flushes CTL0;
+one flip at a time, the next after the latch (flush bits clear or INTF1
+frame counter +2). A frame on any other surface puts the pipes back on the
+panel buffer and goes the normal way. Back pressure: SwapEnd K returns once
+frame K-1 is on screen (50 ms at most); SwapWait waits for its swap the same
+way; displayUse counts held frames, userland use counts go to clientUse.
+5 s line SWEET SCANOUT: 5s. sweetscanout=1: on at boot; 2: slots only,
+p scanout 1 switches on live, p scanout 0 off. Inert without the boot-arg.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 642637c..27cc1d5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -712,6 +712,9 @@ AppleCLCD::start(IOService *provider)
+ 		publishModes();
+ 	}
+ 	sweet_fb_instance = this;
++	if (sweet_surface_scan_mode() == 1) {
++		sweet_scan_set(this, true, "boot-arg sweetscanout=1");  /* 0976 */
++	}
+ 	IOLog("SWEET FB: sweetfbx %#x, panel %u Hz\n", sweet_fbx, fHz);
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+@@ -950,6 +953,11 @@ get32(const uint8_t *p, uint32_t off)
+ }
+ 
+ static uint32_t sweet_fb_swaps_logged;
++/* 0976: the direct scanout (below) */
++static bool sweet_scan_live(void);
++static bool sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence);
++static void sweet_scan_wait(AppleCLCD *fb, uint32_t id);
++static void sweet_scan_set(AppleCLCD *fb, bool on, const char *why);
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+@@ -986,6 +994,14 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	fStLastSwap = now;
+ 	fStSwaps++;
+ 	fStDropped += fDirty;
++	if (sweet_scan_live()) {
++		/* 0976: a frame on a scanout-slot surface goes to the display engine itself */
++		IOLockUnlock(fLock);
++		if (sweet_scan_swap(this, rec, now, fence)) {
++			return;
++		}
++		IOLockLock(fLock);
++	}
+ 	if (fSwapQ && queueSwap(rec, now)) {
+ 		IOLockUnlock(fLock);
+ 		return;
+@@ -1304,6 +1320,7 @@ static struct {
+ 	IOLock             *lock;
+ 	IOTimerEventSource *timer;
+ 	bool                active;         /* the pipes are ours; old[] holds what goes back */
++	bool                scan;           /* 0976: ... for the direct scanout (p scanout 0 gives them back) */
+ 	uint32_t            old[2][SWEET_MDP_NREGS];
+ 	vm_offset_t         smmu_va[6];
+ 	uint64_t            smmu_pa[6];
+@@ -1603,6 +1620,7 @@ sweet_mdp_restore_locked(AppleCLCD *fb, const char *why)
+ 	sweet_mdp_flush("restore");
+ 	sweet_mdp_pipes("restored");
+ 	sweet_mdp.active = false;
++	sweet_mdp.scan = false;
+ 	sweet_mdp_busy = false;
+ 	sweet_gpu_mdp_own(0);
+ 	IOLockLock(fb->fLock);
+@@ -1825,19 +1843,432 @@ AppleCLCD::mdpCmd(const char *s, const char *end)
+ 			}
+ 		}
+ 	} else if (wl == 7 && !strncmp(w, "restore", 7)) {
+-		sweet_mdp_restore_locked(this, "poke");
++		if (sweet_mdp.scan) {
++			IOLog("SWEET MDP: restore: the direct scanout owns the pipes (p scanout 0)\n");
++		} else {
++			sweet_mdp_restore_locked(this, "poke");
++		}
+ 	} else {
+ 		IOLog("SWEET MDP: p mdp dump | smmu [walk] | test [SECS] | scale [SECS] | ca [SLOT [SECS]] | restore\n");
+ 	}
+ 	IOLockUnlock(sweet_mdp.lock);
+ }
+ 
++/*
++ * ---- 0976: direct scanout (step e of docs/redfin/scanout-plan.md): boot-arg sweetscanout=1 (on) or 2 (slots
++ * only, off until p scanout 1); p scanout 0|1 switches live. Inert with sweetscanout=0 (the default). ----
++ *
++ * A SwapEnd whose single layer is a CA surface in a scanout slot (0975) is not copied: it waits for the GPU fence
++ * submitted at its SwapEnd (0949: SwapEnd comes when CA has queued the rendering, not when the GPU has drawn it),
++ * then VIG0/VIG1 are pointed at it (SRC0_ADDR, CTL0 flush) and the next frame start latches both. The first such
++ * frame switches the pipes to the scaled geometry of p mdp scale (registers saved as by p mdp test); a frame on any
++ * other surface switches them back to the panel buffer (saved registers, flush) and goes the normal way.
++ *
++ * Never shown before its fence has landed, never written while the GPU may draw: the scanout thread (1 ms polls)
++ * flips a frame only after a6 fence >= its SwapEnd fence, and one flip at a time (the next waits for the latch:
++ * CTL0's VIG flush bits clear, or INTF1 frame counter +2). Back pressure: SwapEnd K returns once frame K-1 (or a
++ * later one) is on screen (at most 50 ms), so with CA's surfaces used in turn CA never draws into the one shown.
++ * SwapWait(id) waits (50 ms at most) until swap id or a later one is on screen. Each held frame counts in the
++ * surface's displayUse; IOSurfaceIncrementUseCount/Decrement go to clientUse (logged: who uses them).
++ */
++static struct {
++	volatile bool on;               /* frames go direct (p scanout / boot-arg) */
++	bool          geom;             /* the pipes are in the scaled direct geometry (fLock) */
++	bool          entering;
++	bool          thread;
++	uint32_t      stride;           /* rows of the surfaces the geometry was set for */
++	SweetSurface *next, *flipping, *shown;  /* retained, displayUse held (fLock) */
++	uint32_t      nextFence, nextSwap, flipSwap, flipFrame, shownSwap;
++	uint64_t      nextSeq, flipSeq, shownSeq, seq;
++	uint64_t      nextAbs, flipSwapAbs, flipAbs;
++	uint32_t      seed[SWEET_SCAN_SLOTS];
++	/* 5 s statistics (fLock) */
++	uint64_t      stWin, stFenceAbs, stLatchAbs, stLatchMax;
++	uint32_t      stFrames, stFlips, stLatched, stDropped, stNonslot, stLate, stBp, stBpTimeout, stWait, stWaitTimeout;
++	uint32_t      stEnter, stLeave, stClean, stLatchN;
++} sweet_scan;
++
++static bool
++sweet_scan_live(void)
++{
++	return sweet_scan.on;
++}
++
++static bool
++sweet_mdp_lock_ready(void)
++{
++	if (sweet_mdp.lock == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (l != NULL && !OSCompareAndSwapPtr(NULL, l, (void * volatile *)&sweet_mdp.lock)) {
++			IOLockFree(l);
++		}
++	}
++	return sweet_mdp.lock != NULL;
++}
++
++static void
++sweet_scan_hold(SweetSurface *s)
++{
++	s->retain();
++	OSIncrementAtomic(&s->displayUse);
++}
++
++static void
++sweet_scan_drop(SweetSurface **sp)
++{
++	if (*sp != NULL) {
++		OSDecrementAtomic(&(*sp)->displayUse);
++		(*sp)->release();
++		*sp = NULL;
++	}
++}
++
++/* With fLock: everything the display holds goes back. */
++static void
++sweet_scan_drop_all_locked(void)
++{
++	sweet_scan_drop(&sweet_scan.next);
++	sweet_scan_drop(&sweet_scan.flipping);
++	sweet_scan_drop(&sweet_scan.shown);
++}
++
++/* The pipes into the direct geometry, showing surface s (its fence has landed). Without fLock. */
++static bool
++sweet_scan_enter(AppleCLCD *fb, SweetSurface *s)
++{
++	if (!sweet_mdp_lock_ready()) {
++		return false;
++	}
++	IOLockLock(sweet_mdp.lock);
++	bool ok = sweet_mdp_take(fb, "scanout");
++	if (ok) {
++		sweet_mdp.scan = true;
++		if (!sweet_mdp_scale_regs((uint32_t)s->scanPA, s->bytesPerRow, true)) {
++			sweet_mdp_restore_locked(fb, "scanout geometry refused");
++			ok = false;
++		} else {
++			sweet_mdp_flush("scanout on");
++			IOLockLock(fb->fLock);
++			sweet_scan.geom = true;
++			sweet_scan.stride = s->bytesPerRow;
++			sweet_scan.stEnter++;
++			IOLockUnlock(fb->fLock);
++		}
++	}
++	IOLockUnlock(sweet_mdp.lock);
++	return ok;
++}
++
++/* The pipes back to the panel buffer (presents resume). Without fLock. */
++static void
++sweet_scan_leave(AppleCLCD *fb, const char *why)
++{
++	if (!sweet_mdp_lock_ready()) {
++		return;
++	}
++	IOLockLock(sweet_mdp.lock);
++	IOLockLock(fb->fLock);
++	bool was = sweet_scan.geom;
++	sweet_scan.geom = false;
++	sweet_scan_drop_all_locked();
++	if (was) {
++		sweet_scan.stLeave++;
++	}
++	IOLockWakeup(fb->fLock, &sweet_scan.shownSeq, false);
++	IOLockUnlock(fb->fLock);
++	if (was && sweet_mdp.active && sweet_mdp.scan) {
++		sweet_mdp_restore_locked(fb, why);      /* fDirty: the latest frame the normal way */
++	}
++	IOLockUnlock(sweet_mdp.lock);
++}
++
++/* SwapEnd (without fLock): true if the frame went direct, false for the normal path. */
++static bool
++sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
++{
++	uint32_t mask = get32(rec, 0x104);
++	if (mask == 0) {
++		return sweet_scan.geom;         /* changes no layer: the frame on screen stays */
++	}
++	SweetSurface *s = NULL;
++	if (!(mask & (mask - 1))) {
++		uint32_t l = (uint32_t)__builtin_ctz(mask);
++		uint32_t id = l < SWEET_FB_LAYERS ? get32(rec, 0x54 + 4 * l) : 0;
++		s = id != 0 ? sweet_surface_copy(id) : NULL;
++	}
++	if (s == NULL || s->scanSlot == 0 || s->width != SWEET_FB_LOGICAL_W || s->height != SWEET_FB_LOGICAL_H ||
++	    (sweet_scan.geom && s->bytesPerRow != sweet_scan.stride)) {
++		static uint32_t logs;
++		if (logs < 8) {
++			logs++;
++			IOLog("SWEET SCANOUT: swap %u (layers %#x, surface %u, slot %u): not a scanout surface: the normal path\n",
++			    get32(rec, 0x50), mask, s != NULL ? s->id : 0, s != NULL ? s->scanSlot : 0);
++		}
++		OSSafeReleaseNULL(s);
++		IOLockLock(fb->fLock);
++		sweet_scan.stNonslot++;
++		bool geom = sweet_scan.geom;
++		IOLockUnlock(fb->fLock);
++		if (geom) {
++			sweet_scan_leave(fb, "non-slot frame");
++		}
++		return false;
++	}
++	IOLockLock(fb->fLock);
++	if (!sweet_scan.on) {
++		IOLockUnlock(fb->fLock);
++		s->release();
++		return false;
++	}
++	if (sweet_scan.next != NULL) {
++		sweet_scan.stDropped++;         /* a newer frame before the last one was flipped */
++		sweet_scan_drop(&sweet_scan.next);
++	}
++	sweet_scan_hold(s);
++	s->release();
++	uint64_t seq = ++sweet_scan.seq;
++	sweet_scan.next = s;
++	sweet_scan.nextFence = fence;
++	sweet_scan.nextSwap = get32(rec, 0x50);
++	sweet_scan.nextSeq = seq;
++	sweet_scan.nextAbs = now;
++	sweet_scan.stFrames++;
++	IOLockWakeup(fb->fLock, &sweet_scan, false);
++	/* back pressure: return once frame seq - 1 (or later) is on screen */
++	if (sweet_scan.shownSeq + 1 < seq && sweet_scan.geom) {
++		uint64_t dl;
++		clock_interval_to_deadline(50, kMillisecondScale, &dl);
++		sweet_scan.stBp++;
++		while (sweet_scan.on && sweet_scan.geom && sweet_scan.shownSeq + 1 < seq) {
++			if (IOLockSleepDeadline(fb->fLock, &sweet_scan.shownSeq, dl, THREAD_UNINT) == THREAD_TIMED_OUT) {
++				sweet_scan.stBpTimeout++;
++				break;
++			}
++		}
++	}
++	IOLockUnlock(fb->fLock);
++	return true;
++}
++
++/* SwapWait(id): until swap id (or a later one) is on screen, 50 ms at most. */
++static void
++sweet_scan_wait(AppleCLCD *fb, uint32_t id)
++{
++	if (!sweet_scan.on) {
++		return;
++	}
++	uint64_t dl;
++	clock_interval_to_deadline(50, kMillisecondScale, &dl);
++	IOLockLock(fb->fLock);
++	sweet_scan.stWait++;
++	while (sweet_scan.on && sweet_scan.geom && (int32_t)(sweet_scan.shownSwap - id) < 0) {
++		if (IOLockSleepDeadline(fb->fLock, &sweet_scan.shownSeq, dl, THREAD_UNINT) == THREAD_TIMED_OUT) {
++			sweet_scan.stWaitTimeout++;
++			break;
++		}
++	}
++	IOLockUnlock(fb->fLock);
++}
++
++/* With fLock, from the scanout thread: latch, then the next flip. False: nothing in flight. */
++static bool
++sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
++{
++	if (sweet_scan.flipping != NULL) {
++		uint32_t frames = sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT) - sweet_scan.flipFrame;
++		if ((sweet_mdp_rd(MDP_CTL(0) + MDP_CTL_FLUSH) & MDP_FLUSH_VIG01) != 0 && frames < 2) {
++			return true;
++		}
++		sweet_scan_drop(&sweet_scan.shown);
++		sweet_scan.shown = sweet_scan.flipping;
++		sweet_scan.flipping = NULL;
++		sweet_scan.shownSeq = sweet_scan.flipSeq;
++		sweet_scan.shownSwap = sweet_scan.flipSwap;
++		uint64_t l = now - sweet_scan.flipSwapAbs;
++		sweet_scan.stLatched++;
++		sweet_scan.stLatchN++;
++		sweet_scan.stLatchAbs += l;
++		if (l > sweet_scan.stLatchMax) {
++			sweet_scan.stLatchMax = l;
++		}
++		IOLockWakeup(fb->fLock, &sweet_scan.shownSeq, false);
++	}
++	SweetSurface *s = sweet_scan.next;
++	if (s == NULL) {
++		return false;
++	}
++	if (sweet_gpu_fence_wait_soft(sweet_scan.nextFence, 0) != 0) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(now - sweet_scan.nextAbs, &ns);
++		if (ns > 200 * NSEC_PER_MSEC) {
++			sweet_scan.stLate++;            /* the GPU never got there: not shown */
++			sweet_scan_drop(&sweet_scan.next);
++			IOLockWakeup(fb->fLock, &sweet_scan.shownSeq, false);
++			return false;
++		}
++		return true;
++	}
++	sweet_scan.stFenceAbs += now - sweet_scan.nextAbs;
++	/* drawn: a frame the CPU wrote (seed bumped) is cleaned first, for a RAM slot (cached) */
++	uint32_t n = s->scanSlot - 1;
++	uint32_t seed = s->state != NULL ? *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
++	if (n < SWEET_SCAN_SLOTS && sweet_scan.seed[n] != seed) {
++		sweet_scan.seed[n] = seed;
++		if (OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL) {
++			uintptr_t va = s->kernelAddress();
++			if (va != 0) {
++				flush_dcache64((addr64_t)va, (unsigned)((uint64_t)s->bytesPerRow * s->height), FALSE);
++				sweet_scan.stClean++;
++			}
++		}
++	}
++	sweet_scan.next = NULL;
++	if (!sweet_scan.geom) {
++		/* the first direct frame: switch the pipes (they show s once it returns) */
++		sweet_scan.entering = true;
++		IOLockUnlock(fb->fLock);
++		bool ok = sweet_scan_enter(fb, s);
++		IOLockLock(fb->fLock);
++		sweet_scan.entering = false;
++		if (!ok || !sweet_scan.on) {
++			sweet_scan_drop(&s);
++			if (ok) {
++				IOLockUnlock(fb->fLock);
++				sweet_scan_leave(fb, "scanout off");
++				IOLockLock(fb->fLock);
++			} else {
++				sweet_scan.on = false;
++				IOLog("SWEET SCANOUT: the pipes could not be switched: off\n");
++			}
++			IOLockWakeup(fb->fLock, &sweet_scan.shownSeq, false);
++			return false;
++		}
++		if (!sweet_scan.geom) {
++			sweet_scan_drop(&s);            /* switched back meanwhile (a non-slot frame) */
++			return false;
++		}
++		sweet_scan_drop(&sweet_scan.shown);
++		sweet_scan.shown = s;
++		sweet_scan.shownSeq = sweet_scan.nextSeq;
++		sweet_scan.shownSwap = sweet_scan.nextSwap;
++		sweet_scan.stFlips++;
++		IOLockWakeup(fb->fLock, &sweet_scan.shownSeq, false);
++		return sweet_scan.next != NULL;
++	}
++	sweet_mdp_wr(MDP_VIG(0) + SSPP_SRC0, (uint32_t)s->scanPA);
++	sweet_mdp_wr(MDP_VIG(1) + SSPP_SRC0, (uint32_t)s->scanPA);
++	sweet_scan.flipFrame = sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT);
++	sweet_mdp_wr(MDP_CTL(0) + MDP_CTL_FLUSH, MDP_FLUSH_VIG01);
++	sweet_scan.flipping = s;
++	sweet_scan.flipSeq = sweet_scan.nextSeq;
++	sweet_scan.flipSwap = sweet_scan.nextSwap;
++	sweet_scan.flipSwapAbs = sweet_scan.nextAbs;
++	sweet_scan.flipAbs = now;
++	sweet_scan.stFlips++;
++	return true;
++}
++
++/* With fLock: one line every 5 s while frames come. */
++static void
++sweet_scan_stats_locked(uint64_t now)
++{
++	uint64_t ns;
++	if (sweet_scan.stWin == 0) {
++		sweet_scan.stWin = now;
++		return;
++	}
++	absolutetime_to_nanoseconds(now - sweet_scan.stWin, &ns);
++	if (ns < 5 * NSEC_PER_SEC) {
++		return;
++	}
++	sweet_scan.stWin = now;
++	if (sweet_scan.stFrames == 0 && sweet_scan.stNonslot == 0) {
++		return;
++	}
++	uint64_t fw = 0, lat = 0, lmax = 0;
++	absolutetime_to_nanoseconds(sweet_scan.stFenceAbs, &fw);
++	absolutetime_to_nanoseconds(sweet_scan.stLatchAbs, &lat);
++	absolutetime_to_nanoseconds(sweet_scan.stLatchMax, &lmax);
++	IOLog("SWEET SCANOUT: 5s: frames %u flips %u latched %u dropped %u nonslot %u late %u | fence %llu us swap->latch %llu "
++	    "us max %llu us | bp %u timeout %u | swapwait %u timeout %u | clean %u enter %u leave %u | %s\n",
++	    sweet_scan.stFrames, sweet_scan.stFlips, sweet_scan.stLatched, sweet_scan.stDropped, sweet_scan.stNonslot,
++	    sweet_scan.stLate, sweet_scan.stFlips ? fw / 1000 / sweet_scan.stFlips : 0,
++	    sweet_scan.stLatchN ? lat / 1000 / sweet_scan.stLatchN : 0, lmax / 1000, sweet_scan.stBp, sweet_scan.stBpTimeout,
++	    sweet_scan.stWait, sweet_scan.stWaitTimeout, sweet_scan.stClean, sweet_scan.stEnter, sweet_scan.stLeave,
++	    sweet_scan.geom ? "direct" : "panel buffer");
++	sweet_scan.stFenceAbs = sweet_scan.stLatchAbs = sweet_scan.stLatchMax = 0;
++	sweet_scan.stFrames = sweet_scan.stFlips = sweet_scan.stLatched = sweet_scan.stDropped = sweet_scan.stNonslot = 0;
++	sweet_scan.stLate = sweet_scan.stBp = sweet_scan.stBpTimeout = sweet_scan.stWait = sweet_scan.stWaitTimeout = 0;
++	sweet_scan.stClean = sweet_scan.stEnter = sweet_scan.stLeave = sweet_scan.stLatchN = 0;
++}
++
++static void
++sweet_scan_thread(void *arg)
++{
++	AppleCLCD *fb = (AppleCLCD *)arg;
++	IOLockLock(fb->fLock);
++	for (;;) {
++		uint64_t now = mach_absolute_time();
++		bool busy = sweet_scan.on && sweet_scan_step_locked(fb, now);
++		if (sweet_scan.on) {
++			sweet_scan_stats_locked(now);
++		}
++		if (busy || sweet_scan.flipping != NULL) {
++			uint64_t dl;
++			clock_interval_to_deadline(1, kMillisecondScale, &dl);
++			IOLockSleepDeadline(fb->fLock, &sweet_scan, dl, THREAD_UNINT);
++		} else {
++			uint64_t dl;
++			clock_interval_to_deadline(100, kMillisecondScale, &dl);
++			IOLockSleepDeadline(fb->fLock, &sweet_scan, dl, THREAD_UNINT);
++		}
++	}
++}
++
++/* p scanout 0|1 and the boot-arg: frames direct or the normal way. */
++static void
++sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
++{
++	if (on && sweet_surface_scan_mode() == 0) {
++		IOLog("SWEET SCANOUT: no scanout slots (boot-arg sweetscanout=1 or 2): stays off\n");
++		return;
++	}
++	if (on && !sweet_scan.thread) {
++		sweet_scan.thread = IOCreateThread(sweet_scan_thread, fb) != NULL;
++		if (!sweet_scan.thread) {
++			IOLog("SWEET SCANOUT: no thread: stays off\n");
++			return;
++		}
++	}
++	IOLockLock(fb->fLock);
++	sweet_scan.on = on;
++	IOLockWakeup(fb->fLock, &sweet_scan, false);
++	IOLockWakeup(fb->fLock, &sweet_scan.shownSeq, false);
++	IOLockUnlock(fb->fLock);
++	if (!on) {
++		sweet_scan_leave(fb, "scanout off");
++	}
++	uint64_t pa = 0;
++	uint32_t held = 0;
++	for (uint32_t n = 0; n < SWEET_SCAN_SLOTS; n++) {
++		SweetSurface *s = sweet_surface_scan_copy(n, &pa);
++		if (s != NULL) {
++			IOLog("SWEET SCANOUT: slot %u PA %#llx: surface %u, display use %d, client use %d\n", n, pa, s->id,
++			    (int)s->displayUse, (int)s->clientUse);
++			s->release();
++			held++;
++		}
++	}
++	IOLog("SWEET SCANOUT: %s (%s), %u slot surfaces\n", on ? "on" : "off", why, held);
++}
++
+ /*
+  * Poke commands (bsd/dev/sweet_poke.c "p WORD"):
+  *   p fc            INTF1's TE frame counter (and INTF frame counter) twice, 1 s apart: the panel's real rate,
+  *                   with the tear-check configuration
+  *   p hz 60|90 [tc] the panel's rate now (DCS 0x53), ticks and SyncRate with it; tc: tear-check line clock too
+  *   p mdp ...       0948: display-engine dump and scanout tests (above)
++ *   p scanout 0|1   0976: the direct scanout off / on (needs boot-arg sweetscanout=1|2); no argument: the state
+  */
+ void
+ AppleCLCD::fbCmd(const char *s, const char *end)
+@@ -1922,7 +2353,20 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+ 		mdpCmd(s + 3, end);     /* 0948 */
+ 		return;
+ 	}
+-	IOLog("SWEET FB: poke p: fc | hz 60|90 [tc] | fbx HEX | mdp dump|smmu|test|scale|restore\n");
++	if (end - s >= 7 && !strncmp(s, "scanout", 7)) {
++		/* 0976: p scanout 0|1 */
++		const char *q = s + 7;
++		while (q < end && *q == ' ') {
++			q++;
++		}
++		if (q < end && (*q == '0' || *q == '1')) {
++			sweet_scan_set(this, *q == '1', "p scanout");
++		} else {
++			sweet_scan_set(this, sweet_scan.on, "p scanout (state)");
++		}
++		return;
++	}
++	IOLog("SWEET FB: poke p: fc | hz 60|90 [tc] | fbx HEX | mdp dump|smmu|test|scale|ca|restore | scanout 0|1\n");
+ }
+ 
+ extern "C" void sweet_fb_cmd(const char *s, const char *end);
+@@ -2708,6 +3152,20 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
++		/* 0976: with the direct scanout, until that swap is on screen (50 ms at most) */
++		if (sweet_scan_live() && args->scalarInputCount >= 1) {
++			static uint32_t logs;
++			uint32_t id = (uint32_t)args->scalarInput[0], last = fFB->fSwapID;
++			if (logs < 4) {
++				logs++;
++				IOLog("SWEET SCANOUT: SwapWait scalars %u: %#llx %#llx (last swap %u)\n", args->scalarInputCount,
++				    args->scalarInput[0], args->scalarInputCount > 1 ? args->scalarInput[1] : 0, last);
++			}
++			if ((uint32_t)(last - id) < 16) {
++				sweet_scan_wait(fFB, id);
++			}
++		}
++		break;
+ 	default:
+ 		break;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7b51944..f68011d 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -692,6 +692,8 @@ public:
+ 	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+ 
+ 	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapIncUse(void *id, void *category, void *, void *, void *, void *);    /* 0976 */
++	IOReturn trapDecUse(void *id, void *category, void *, void *, void *, void *);
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
+@@ -1075,6 +1077,43 @@ IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category
+ 	return kIOReturnSuccess;
+ }
+ 
++/* 0976: with scanout slots (sweetscanout), userland's use counts are kept in clientUse (and the first logged). */
++static void
++sweet_surface_client_use(void *id, void *category, int delta)
++{
++	static uint32_t logs;
++	if (sweet_surface_scan_mode() == 0) {
++		return;
++	}
++	SweetSurface *s = sweet_surface_copy((uint32_t)(uintptr_t)id);
++	if (s == NULL) {
++		return;
++	}
++	SInt32 v = OSAddAtomic(delta, &s->clientUse) + delta;
++	if (logs < 16) {
++		char name[32];
++		logs++;
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET SURF: %s use count %s surface %u (slot %u) category %#llx -> %d\n", name, delta > 0 ? "+1" : "-1",
++		    s->id, s->scanSlot, (uint64_t)(uintptr_t)category, (int)v);
++	}
++	s->release();
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapIncUse(void *id, void *category, void *, void *, void *, void *)
++{
++	sweet_surface_client_use(id, category, 1);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapDecUse(void *id, void *category, void *, void *, void *, void *)
++{
++	sweet_surface_client_use(id, category, -1);
++	return kIOReturnSuccess;
++}
++
+ static IOReturn
+ sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
+ {
+@@ -1145,8 +1184,8 @@ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, v
+ }
+ 
+ static IOExternalTrap sweet_surface_traps[] = {
+-	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+-	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapIncUse },
++	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDecUse },
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+ 	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+-- 
+2.43.0
+

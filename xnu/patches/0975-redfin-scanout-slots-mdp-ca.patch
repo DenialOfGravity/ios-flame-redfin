@@ -1,0 +1,425 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Tue, 27 Oct 2026 03:00:00 +0100
+Subject: [PATCH] 0975 redfin: scanout slots for backboardd's framebuffer surfaces; p mdp ca
+
+Step (d) of docs/redfin/scanout-plan.md. With boot-arg sweetscanout=1|2,
+backboardd's 1125x2436 BGRA one-plane surfaces get physically contiguous
+memory the display engine reads directly (its apps-SMMU bank has translation
+off, r35a): slot 0 in the splash carve-out at 0xa1400000, slots 1-6
+contiguous RAM below 4 GB, made on first use and kept. p mdp ca [SLOT [SECS]]
+shows the surface in a slot through the scalers (a still frame) and puts the
+pipes back after SECS. p mdp test/scale refuse while slot 0 holds a surface.
+Inert without the boot-arg.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4cd1230..642637c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1242,6 +1242,8 @@ AppleCLCD::setHz(uint32_t hz, bool tc)
+  *                       the current geometry, no scaler; put back after SECS (default 10, 0 = at p mdp restore)
+  *   p mdp scale [SECS]  a 1125x2436 pattern (4608-byte rows, like CA's surfaces) through both scalers to 2 x 540x2340:
+  *                       overlapping source crops (0 and 562, 563 wide), the right pipe's initial phase 0.5
++ *   p mdp ca [SLOT [SECS]] 0975: the CA surface in scanout slot SLOT (default 0; boot-arg sweetscanout) scaled the
++ *                       same way, as a still frame
+  *   p mdp restore       every pipe register written goes back, one CTL0 flush, presents resume
+  *
+  * Registers only inside the MDP's 2 MB window (sweet_mdp_rd/wr); the SMMU through its own 4 KB pages. While a test
+@@ -1649,19 +1651,16 @@ sweet_mdp_test(void)
+  * mode needs no coefficient tables (as upstream DPU: _dpu_plane_setup_scaler3, dpu_hw_setup_scaler3).
+  */
+ static bool
+-sweet_mdp_scale(void)
++sweet_mdp_scale_regs(uint32_t pa, uint32_t stride, bool quiet)
+ {
+ 	const uint32_t sw = SWEET_FB_LOGICAL_W, sh = SWEET_FB_LOGICAL_H;
+ 	uint32_t ver = sweet_mdp_rd(MDP_VIG(0) + QS_VERSION), ver1 = sweet_mdp_rd(MDP_VIG(1) + QS_VERSION);
+ 	uint32_t dw0 = sweet_mdp.old[0][MR_OUT_SIZE] & 0xffff, dw1 = sweet_mdp.old[1][MR_OUT_SIZE] & 0xffff;
+ 	uint32_t dh = sweet_mdp.old[0][MR_OUT_SIZE] >> 16, W = dw0 + dw1;
+-	if (ver < 0x2000 || ver != ver1 || dh == 0 || W == 0 || dh != sweet_mdp.old[1][MR_OUT_SIZE] >> 16) {
+-		IOLog("SWEET MDP: scale: scaler version %x/%x or outputs %x/%x not handled\n", ver, ver1,
+-		    sweet_mdp.old[0][MR_OUT_SIZE], sweet_mdp.old[1][MR_OUT_SIZE]);
+-		return false;
+-	}
+-	if (!sweet_mdp_pattern(sw, sh, SWEET_MDP_SURF_STRIDE, sw / 2 + 1)) {
+-		IOLog("SWEET MDP: scale: no pattern\n");
++	if (ver < 0x2000 || ver != ver1 || dh == 0 || W == 0 || dh != sweet_mdp.old[1][MR_OUT_SIZE] >> 16 ||
++	    stride < sw * 4 || stride > 0xffff) {
++		IOLog("SWEET MDP: scale: scaler version %x/%x, outputs %x/%x or stride %u not handled\n", ver, ver1,
++		    sweet_mdp.old[0][MR_OUT_SIZE], sweet_mdp.old[1][MR_OUT_SIZE], stride);
+ 		return false;
+ 	}
+ 	uint64_t step_x = ((1ULL << 21) * sw + W / 2) / W, step_y = ((1ULL << 21) * sh + dh / 2) / dh;
+@@ -1678,8 +1677,8 @@ sweet_mdp_scale(void)
+ 		if (sweet_mdp_rd(b + SSPP_FORMAT) & (1u << 8)) {
+ 			op |= 1u << 10 | 1u << 29;                      /* alpha through the scaler, bilinear */
+ 		}
+-		sweet_mdp_wr(b + SSPP_SRC0, (uint32_t)SWEET_MDP_TEST_PA);
+-		sweet_mdp_wr(b + SSPP_YSTRIDE0, (sweet_mdp.old[p][MR_YSTRIDE0] & 0xffff0000u) | SWEET_MDP_SURF_STRIDE);
++		sweet_mdp_wr(b + SSPP_SRC0, pa);
++		sweet_mdp_wr(b + SSPP_YSTRIDE0, (sweet_mdp.old[p][MR_YSTRIDE0] & 0xffff0000u) | stride);
+ 		sweet_mdp_wr(b + SSPP_SRC_IMG, sh << 16 | sw);
+ 		sweet_mdp_wr(b + SSPP_SRC_XY, sx);
+ 		sweet_mdp_wr(b + SSPP_SRC_SIZE, src);
+@@ -1701,14 +1700,57 @@ sweet_mdp_scale(void)
+ 		sweet_mdp_wr(b + QS_SRC_SIZE_UV, src);
+ 		sweet_mdp_wr(b + QS_DST_SIZE, dh << 16 | dw);
+ 		sweet_mdp_wr(b + QS_OP_MODE, op);
+-		IOLog("SWEET MDP: scale: vig%u source x %u w %u phase %#x -> %ux%u, step %#llx/%#llx op %#x\n", p, sx, cw,
+-		    phase, dw, dh, step_x, step_y, op);
++		if (!quiet) {
++			IOLog("SWEET MDP: scale: vig%u source x %u w %u phase %#x -> %ux%u, step %#llx/%#llx op %#x\n", p, sx, cw,
++			    phase, dw, dh, step_x, step_y, op);
++		}
++	}
++	return true;
++}
++
++static bool
++sweet_mdp_scale(void)
++{
++	if (!sweet_mdp_pattern(SWEET_FB_LOGICAL_W, SWEET_FB_LOGICAL_H, SWEET_MDP_SURF_STRIDE, SWEET_FB_LOGICAL_W / 2 + 1)) {
++		IOLog("SWEET MDP: scale: no pattern\n");
++		return false;
++	}
++	if (!sweet_mdp_scale_regs((uint32_t)SWEET_MDP_TEST_PA, SWEET_MDP_SURF_STRIDE, false)) {
++		return false;
+ 	}
+ 	sweet_mdp_flush("scale");
+ 	sweet_mdp_pipes("scale");
+ 	return true;
+ }
+ 
++/* 0975 (step d): one of CA's surfaces in a scanout slot, scaled, as it is now (a still frame). */
++static bool
++sweet_mdp_ca(uint32_t slot)
++{
++	uint64_t pa = 0;
++	SweetSurface *s = sweet_surface_scan_copy(slot, &pa);
++	if (s == NULL) {
++		IOLog("SWEET MDP: ca: no surface in scanout slot %u (PA %#llx; boot-arg sweetscanout=1|2)\n", slot, pa);
++		return false;
++	}
++	uint32_t id = s->id, bpr = s->bytesPerRow, seed = s->state != NULL ?
++	    *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
++	if (OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL) {
++		uintptr_t va = s->kernelAddress();
++		if (va != 0) {
++			flush_dcache64((addr64_t)va, (unsigned)((uint64_t)bpr * s->height), FALSE);
++		}
++	}
++	s->release();
++	bool ok = sweet_mdp_scale_regs((uint32_t)pa, bpr, false);
++	if (ok) {
++		sweet_mdp_flush("ca");
++		sweet_mdp_pipes("ca");
++		IOLog("SWEET MDP: ca: slot %u = surface %u (PA %#llx, %u-byte rows, seed %u) on screen\n", slot, id, pa, bpr, seed);
++	}
++	return ok;
++}
++
+ void
+ AppleCLCD::mdpCmd(const char *s, const char *end)
+ {
+@@ -1724,16 +1766,22 @@ AppleCLCD::mdpCmd(const char *s, const char *end)
+ 	while (q < end && *q == ' ') {
+ 		q++;
+ 	}
+-	uint32_t secs = 10;
+-	if (q < end && *q >= '0' && *q <= '9') {
+-		secs = 0;
++	uint32_t num[2] = { 0, 0 }, nums = 0;
++	while (nums < 2 && q < end && *q >= '0' && *q <= '9') {
+ 		while (q < end && *q >= '0' && *q <= '9') {
+-			secs = secs * 10 + (uint32_t)(*q++ - '0');
++			num[nums] = num[nums] * 10 + (uint32_t)(*q++ - '0');
+ 		}
+-		if (secs > 600) {
+-			secs = 600;
++		nums++;
++		while (q < end && *q == ' ') {
++			q++;
+ 		}
+ 	}
++	bool ca = wl == 2 && !strncmp(w, "ca", 2);
++	uint32_t slot = ca && nums >= 1 ? num[0] : 0;           /* 0975: p mdp ca [SLOT [SECS]] */
++	uint32_t secs = ca ? (nums >= 2 ? num[1] : 10) : (nums >= 1 ? num[0] : 10);
++	if (secs > 600) {
++		secs = 600;
++	}
+ 	if (sweet_mdp.lock == NULL) {
+ 		IOLock *l = IOLockAlloc();
+ 		if (l != NULL && !OSCompareAndSwapPtr(NULL, l, (void * volatile *)&sweet_mdp.lock)) {
+@@ -1748,29 +1796,38 @@ AppleCLCD::mdpCmd(const char *s, const char *end)
+ 		sweet_mdp_dump();
+ 	} else if (wl == 4 && !strncmp(w, "smmu", 4)) {
+ 		sweet_mdp_smmu(end - q >= 4 && !strncmp(q, "walk", 4));
+-	} else if ((wl == 4 && !strncmp(w, "test", 4)) || (wl == 5 && !strncmp(w, "scale", 5))) {
++	} else if ((wl == 4 && !strncmp(w, "test", 4)) || (wl == 5 && !strncmp(w, "scale", 5)) || ca) {
+ 		bool scale = wl == 5;
++		const char *what = ca ? "ca" : scale ? "scale" : "test";
++		uint64_t slot0 = 0;
++		SweetSurface *held = ca ? NULL : sweet_surface_scan_copy(0, &slot0);
++		if (held != NULL) {
++			/* 0975: the test pattern would draw over CA's surface in scanout slot 0 (same memory) */
++			IOLog("SWEET MDP: %s: scanout slot 0 (%#llx) holds surface %u: use p mdp ca\n", what, slot0, held->id);
++			held->release();
++			IOLockUnlock(sweet_mdp.lock);
++			return;
++		}
+ 		if (sweet_mdp.timer == NULL) {
+ 			sweet_mdp.timer = IOTimerEventSource::timerEventSource(this, sweet_mdp_timer_fired);
+ 			if (sweet_mdp.timer != NULL && fWorkLoop->addEventSource(sweet_mdp.timer) != kIOReturnSuccess) {
+ 				OSSafeReleaseNULL(sweet_mdp.timer);
+ 			}
+ 		}
+-		if (sweet_mdp_take(this, scale ? "scale" : "test")) {
+-			if (!(scale ? sweet_mdp_scale() : sweet_mdp_test())) {
++		if (sweet_mdp_take(this, what)) {
++			if (!(ca ? sweet_mdp_ca(slot) : scale ? sweet_mdp_scale() : sweet_mdp_test())) {
+ 				sweet_mdp_restore_locked(this, "failed");
+ 			} else if (secs != 0 && sweet_mdp.timer != NULL) {
+ 				sweet_mdp.timer->setTimeoutMS(secs * 1000);
+-				IOLog("SWEET MDP: %s on screen for %u s (p mdp restore puts it back sooner)\n",
+-				    scale ? "scale" : "test", secs);
++				IOLog("SWEET MDP: %s on screen for %u s (p mdp restore puts it back sooner)\n", what, secs);
+ 			} else {
+-				IOLog("SWEET MDP: %s on screen until p mdp restore\n", scale ? "scale" : "test");
++				IOLog("SWEET MDP: %s on screen until p mdp restore\n", what);
+ 			}
+ 		}
+ 	} else if (wl == 7 && !strncmp(w, "restore", 7)) {
+ 		sweet_mdp_restore_locked(this, "poke");
+ 	} else {
+-		IOLog("SWEET MDP: p mdp dump | smmu [walk] | test [SECS] | scale [SECS] | restore\n");
++		IOLog("SWEET MDP: p mdp dump | smmu [walk] | test [SECS] | scale [SECS] | ca [SLOT [SECS]] | restore\n");
+ 	}
+ 	IOLockUnlock(sweet_mdp.lock);
+ }
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 1f2447f..7b51944 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -39,6 +39,7 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#include <pexpert/pexpert.h>
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -78,10 +79,166 @@ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
++/*
++ * 0975: scanout slots (boot-arg sweetscanout=1 or 2; docs/redfin/scanout-plan.md step d). backboardd's
++ * framebuffer-sized surfaces (1125x2436 'BGRA', one plane, offset 0) get physically contiguous memory below 4 GB,
++ * which the display engine reads directly: its apps-SMMU bank (SMR3 0xb40/0x402 -> bank 2) has translation off
++ * (r35a, p mdp smmu). Slot 0 is the splash carve-out at 0xa1400000 (where p mdp test/scale drew), slots 1-6 come from
++ * RAM, each allocated on first use and kept for the next surface. Every other create, and every create once the
++ * slots are taken, gets ordinary memory as before.
++ */
++#define SWEET_SCAN_CARVE_PA     0xa1400000ULL
++extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
++static struct {
++	IOMemoryDescriptor *md;
++	uint64_t            pa;
++	SweetSurface       *owner;          /* not retained: SweetSurface::free gives the slot back */
++} sweet_scan_slot[SWEET_SCAN_SLOTS];
++static IOLock *sweet_scan_lock;
++static int sweet_scan_boot = -1;
++static bool sweet_scan_ram_failed;
++
++uint32_t
++sweet_surface_scan_mode(void)
++{
++	if (sweet_scan_boot < 0) {
++		int m = 0;
++		PE_parse_boot_argn("sweetscanout", &m, sizeof(m));
++		sweet_scan_boot = m < 0 ? 0 : m;
++	}
++	return (uint32_t)sweet_scan_boot;
++}
++
++static void
++sweet_scan_release(SweetSurface *s)
++{
++	uint32_t n = s->scanSlot - 1;
++	if (sweet_scan_lock != NULL && n < SWEET_SCAN_SLOTS) {
++		IOLockLock(sweet_scan_lock);
++		if (sweet_scan_slot[n].owner == s) {
++			sweet_scan_slot[n].owner = NULL;
++		}
++		IOLockUnlock(sweet_scan_lock);
++	}
++	s->scanSlot = 0;
++}
++
++/* The slot's memory, made on first use: the carve-out (slot 0) or contiguous RAM below 4 GB (32-bit SRC0_ADDR). */
++static bool
++sweet_scan_make_locked(uint32_t n)
++{
++	if (n == 0) {
++		sweet_scan_slot[0].md = IOMemoryDescriptor::withPhysicalAddress(SWEET_SCAN_CARVE_PA, SWEET_SCAN_SLOT_LEN,
++		    kIODirectionInOut);
++		sweet_scan_slot[0].pa = SWEET_SCAN_CARVE_PA;
++		return sweet_scan_slot[0].md != NULL;
++	}
++	if (sweet_scan_ram_failed) {
++		return false;
++	}
++	IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryKernelUserShared, SWEET_SCAN_SLOT_LEN,
++	    0x00000000ffffc000ULL);
++	uint64_t pa = b != NULL ? (uint64_t)b->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
++	if (b == NULL || pa == 0 || pa + SWEET_SCAN_SLOT_LEN > (1ULL << 32)) {
++		IOLog("SWEET SURF: scanout slot %u: no contiguous %#llx bytes below 4 GB (%#llx): RAM slots off\n", n,
++		    SWEET_SCAN_SLOT_LEN, pa);
++		OSSafeReleaseNULL(b);
++		sweet_scan_ram_failed = true;
++		return false;
++	}
++	sweet_scan_slot[n].md = b;
++	sweet_scan_slot[n].pa = pa;
++	return true;
++}
++
++/* create(): a framebuffer-sized backboardd surface goes into a free slot (zeroed), or false. */
++static bool
++sweet_scan_claim(SweetSurface *s)
++{
++	char name[32];
++	if (sweet_surface_scan_mode() == 0 || s->width != 1125 || s->height != 2436 || s->pixelFormat != 0x42475241 ||
++	    s->planeCount > 1 || s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1 || s->offset != 0 ||
++	    (s->bytesPerRow & 63) != 0 || s->bytesPerRow > 0xffff || s->allocSize > SWEET_SCAN_SLOT_LEN) {
++		return false;
++	}
++	proc_selfname(name, sizeof(name));
++	if (strcmp(name, "backboardd") != 0) {
++		return false;
++	}
++	if (sweet_scan_lock == NULL) {
++		IOLock *lock = IOLockAlloc();
++		if (lock != NULL && !OSCompareAndSwapPtr(NULL, lock, (void * volatile *)&sweet_scan_lock)) {
++			IOLockFree(lock);
++		}
++		if (sweet_scan_lock == NULL) {
++			return false;
++		}
++	}
++	IOLockLock(sweet_scan_lock);
++	uint32_t n;
++	for (n = 0; n < SWEET_SCAN_SLOTS; n++) {
++		if (sweet_scan_slot[n].owner == NULL && (sweet_scan_slot[n].md != NULL || sweet_scan_make_locked(n))) {
++			break;
++		}
++	}
++	if (n == SWEET_SCAN_SLOTS) {
++		IOLockUnlock(sweet_scan_lock);
++		IOLog("SWEET SURF: scanout slots full: surface %ux%u in ordinary memory\n", s->width, s->height);
++		return false;
++	}
++	sweet_scan_slot[n].owner = s;
++	sweet_scan_slot[n].md->retain();
++	s->memory = sweet_scan_slot[n].md;
++	s->scanSlot = n + 1;
++	s->scanPA = sweet_scan_slot[n].pa;
++	IOLockUnlock(sweet_scan_lock);
++	IOBufferMemoryDescriptor *b = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
++	if (b != NULL) {
++		s->mapCache = kIOMapDefaultCache;       /* as every surface; the scanout cleans CPU-written frames */
++		bzero(b->getBytesNoCopy(), (size_t)SWEET_SCAN_SLOT_LEN);
++		flush_dcache64((addr64_t)(uintptr_t)b->getBytesNoCopy(), (unsigned)SWEET_SCAN_SLOT_LEN, FALSE);
++	} else {
++		s->mapCache = kIOMapWriteCombineCache;  /* as the panel's own surface */
++		uintptr_t va = s->kernelAddress();
++		if (va != 0) {
++			bzero((void *)va, (size_t)SWEET_SCAN_SLOT_LEN);
++			__asm__ volatile ("dsb sy" ::: "memory");
++		}
++	}
++	IOLog("SWEET SURF: scanout slot %u (%s, PA %#llx) for a %ux%u surface, %u-byte rows\n", n, b != NULL ? "RAM" : "carve-out",
++	    s->scanPA, s->width, s->height, s->bytesPerRow);
++	return true;
++}
++
++SweetSurface *
++sweet_surface_scan_copy(uint32_t slot, uint64_t *pa)
++{
++	uint32_t id = 0;
++	*pa = 0;
++	if (slot >= SWEET_SCAN_SLOTS || sweet_scan_lock == NULL) {
++		return NULL;
++	}
++	IOLockLock(sweet_scan_lock);
++	if (sweet_scan_slot[slot].owner != NULL) {
++		id = sweet_scan_slot[slot].owner->id;
++	}
++	*pa = sweet_scan_slot[slot].pa;
++	IOLockUnlock(sweet_scan_lock);
++	SweetSurface *s = id != 0 ? sweet_surface_copy(id) : NULL;
++	if (s != NULL && s->scanSlot != slot + 1) {
++		s->release();
++		s = NULL;
++	}
++	return s;
++}
++
+ void
+ SweetSurface::free()
+ {
+-	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
++	if (scanSlot != 0) {
++		sweet_scan_release(this);       /* 0975: the slot's memory stays allocated for the next surface */
++	} else if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
+@@ -806,7 +963,11 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
++	if (ret == kIOReturnSuccess && sweet_scan_claim(s)) {
++		if (!sweet_surface_publish(s)) {        /* 0975: in a scanout slot */
++			ret = kIOReturnNoResources;
++		}
++	} else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..84e50aa 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -39,6 +39,10 @@ public:
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	uint32_t                  scanSlot;     /* 0975: 1 + its scanout slot (sweetscanout), 0 = ordinary memory */
++	uint64_t                  scanPA;       /* 0975: the slot's physical address (contiguous, below 4 GB) */
++	volatile SInt32           displayUse;   /* 0976: frames of it the display holds (queued, flipping, shown) */
++	volatile SInt32           clientUse;    /* 0976: IOSurfaceIncrementUseCount - Decrement from userland */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -50,6 +54,15 @@ public:
+ /* Retained surface for an id, or NULL. */
+ SweetSurface *sweet_surface_copy(uint32_t id);
+ 
++/*
++ * 0975: scanout slots (boot-arg sweetscanout, SweetSurface.cpp). The surface in slot n, retained, and the slot's
++ * address (also when it is free: slots are never given back), or NULL.
++ */
++#define SWEET_SCAN_SLOTS                7
++#define SWEET_SCAN_SLOT_LEN             0xab8000ULL     /* 4608 x 2436, 16 KB pages */
++uint32_t sweet_surface_scan_mode(void);
++SweetSurface *sweet_surface_scan_copy(uint32_t slot, uint64_t *pa);
++
+ /*
+  * Publish physical memory (the panel framebuffer) as a surface. Returns a
+  * retained surface that stays in the id table until released by the caller
+-- 
+2.43.0
+

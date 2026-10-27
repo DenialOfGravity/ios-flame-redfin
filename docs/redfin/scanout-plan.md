@@ -148,3 +148,20 @@ smmu lines; "test: flush latched after ~0-17 ms, intf1 frames +1"; the pattern f
 UI back. Look for: QSEED version (0x2004.. = 3LITE), VIG1 SRC_XY (x 540 = source split from one address), FORMAT
 bit 8, OUT_XY, SMMU bank M bit.
 
+
+## Status 2026-10-27: steps a-c passed (r35a), d and e written (0975, 0976)
+
+- r35a (kernel f3ce8ca): `smmu: SMR3 0x84020b40 (id 0xb40 mask 0x402) S2CR 0x2 (translate, bank 2)`, bank 2
+  `SCTLR 0xe0 (M 0)`: **the MDP's bank does not translate; it reads physical addresses.** `p mdp test` and
+  `p mdp scale` showed the patterns with a continuous seam, no artefacts, auto-restore worked. (The eighth colour bar
+  is black by design: the bars "stop" 12.5 % short of the right edge.)
+- Memory, final: **slot 0 = carve-out 0xa1400000, slots 1-6 = contiguous RAM below 4 GB** (SRC0_ADDR is 32-bit),
+  made on first use and never freed. 0905's panel buffers stay, so `p scanout 0` (GPU blit / CPU present) works in
+  the same boot. 7 slots cover CA's deepest chain.
+- 0975 (`sweetscanout=1|2`): the slot allocator in SweetSurface create (backboardd, 1125x2436 'BGRA', one plane)
+  and `p mdp ca [SLOT [SECS]]`.
+- 0976: the direct path. Flip only after the frame's SwapEnd fence (0949's lesson: SwapEnd = queued, not drawn),
+  one flip in flight, latch = CTL0 VIG bits clear or INTF1 frames +2, back pressure (SwapEnd K waits for K-1 on
+  screen), SwapWait, displayUse/clientUse, `SWEET SCANOUT: 5s:` line, live `p scanout 0|1`. Non-slot frames switch
+  the pipes back to the panel buffer and go the normal way. Not handled yet: the power-off fade (it draws into the
+  panel buffer, which is not on screen in direct mode) and corner mattes.
