@@ -188,3 +188,12 @@ bit 8, OUT_XY, SMMU bank M bit.
 - What makes CA allocate a third surface is still open. It needs the QuartzCore strings from the phone's dyld cache
   (IOMFB property and env names around the swap-chain/buffer count).
 - 0986 `p scanout corners 1`: CPU mattes in each frame's corners after its fence (no DMA-pipe overlay yet).
+
+## 2026-10-27, r39a and 0989
+
+- r39a "gate 0 deadlock": the power key was pressed at 491.4 s (`SWEET KEYS: key=0`), and backboardd turned the
+  display off at 491.742 (`SWEET FB: display off`), 20 s before `gate 0`. No frames come while the display is off.
+  0989 now leaves the direct geometry on display off, so the fade shows.
+- 0989 `p scanout gate 2`: CP_WAIT_REG_MEM on a latched-frame word (scratch + 0x3000). It is released on any change
+  or after 50 ms. Flips wait for the swapper's own last fence. The gate 1 cap is now 50 ms.
+- Third surface, phone step (read only): `imgdump grep` in QuartzCore / IOMobileFramebuffer for the swap-chain keys.
