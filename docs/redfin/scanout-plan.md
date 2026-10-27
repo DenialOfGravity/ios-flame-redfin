@@ -165,3 +165,16 @@ bit 8, OUT_XY, SMMU bank M bit.
   screen), SwapWait, displayUse/clientUse, `SWEET SCANOUT: 5s:` line, live `p scanout 0|1`. Non-slot frames switch
   the pipes back to the panel buffer and go the normal way. Not handled yet: the power-off fade (it draws into the
   panel buffer, which is not on screen in direct mode) and corner mattes.
+
+## 2026-10-27, r36a findings and 0979
+
+- CA's swap chain on r36a was **two** surfaces (ids 2/3; after backboardd restarts 11/12 and 28/29). Slot 0 took one;
+  the RAM slot for the other failed: **XNU's RAM on redfin is all above 4 GB** (`mkadt.py --highmem`), SRC0_ADDR is
+  32-bit and the MDP bank does not translate, so XNU can never give the MDP contiguous RAM. Every other frame was
+  non-slot, and the pipes switched geometry on every frame (enter 70 / leave 69 per 5 s): p95 257 ms.
+- 0979: slots 1-6 come from the **GPU pool** (`gpool_ranges`: HLOS RAM 0xc4000000.. below 4 GB that XNU does not
+  manage, write-combined like the carve-out), reserved in AppleCLCD::start (`sweetscanslots`, default 6). 0905's
+  flip buffers stay. One log line per panel-sized surface. Direct only after 3 slot frames in a row. Back pressure
+  by chain depth (N = 2: SwapEnd waits until its own frame is on screen). SwapWait (CA calls it with the previous
+  swap id, scalars `id, 0x80000000, ?`) waits until that swap is retired, and returns at once on the normal path.
+  Latch = INTF1 frame counter past the flush and VIG bits clear, or 2 frames.
