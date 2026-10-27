@@ -276,6 +276,12 @@ def main():
     disp = disp_threads.most_common(1)[0][0] if disp_threads else None
     if disp:
         print(f'display thread (SwapEnd caller): {tname(disp)}; {len(swapends)} SwapEnds')
+    else:
+        # no 0994 events (an older kernel): CA's display thread by name, else backboardd's busiest thread
+        cand = [(('coreanimation.display' in v[2]), oncpu_abs[t], t) for t, v in threads.items() if v[0] in bb]
+        if cand:
+            disp = max(cand)[2]
+            print(f'no SwapEnd events (kernel without 0994?): display thread taken as {tname(disp)}')
     # the app's main thread: its busiest thread (the main thread does the scrolling work)
     app_main = None
     if app:
@@ -487,6 +493,13 @@ def main():
                 led += 1
         print(f'after a vsync notification, before the next: display thread woke {woke}/{len(vsend)} '
               f'(latency {stats(lat)}), a SwapEnd followed {led}/{len(vsend)}')
+    def wake_iv(tid):
+        w = [x[0] for x in wakes.get(tid, [])]
+        return stats([ms(T.start_abs + w[i + 1] - w[i]) for i in range(len(w) - 1)])
+    if disp:
+        print(f'display thread wake-to-wake interval: {wake_iv(disp)}')
+    if app_main:
+        print(f'app main thread wake-to-wake interval: {wake_iv(app_main)}')
     if app_main:
         aw = wakes.get(app_main, [])
         c = collections.Counter(wdesc(w) for w in aw)
