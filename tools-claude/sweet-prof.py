@@ -273,8 +273,16 @@ def main():
           'ticks %d (%d late), dropped %d, xcall busy %d fail %d' % (h['name'], h['pid'], dur, h['hz'], h['depth'],
           h['wait_hz'], h['samples'], h['ksamples'], h['wsamples'], h['marks'], h['ticks'], h['overruns'],
           h['dropped'], h['xbusy'], h['xfail']))
-    if h['dropped']:
-        print('  WARNING: the buffer filled; later samples are missing (lower HZ, DEPTH or SECS)')
+    # the sampling rate: HZ, or (0992 parse bug: hz 0 = a tick as fast as the timer refires) ticks over the run
+    hz = h['hz'] or (h['ticks'] / dur if dur else 1)
+    span = dur
+    if h['dropped'] and len(recs) > 1:
+        span = (recs[-1][0] - recs[0][0]) * tbns / 1e9     # samples only cover the run until the buffer filled
+        print('  WARNING: the buffer filled after %.2f s; %d later samples are missing (lower HZ, DEPTH or SECS)'
+              % (span, h['dropped']))
+    if not h['hz']:
+        print('  hz 0 in the header: rate taken as ticks / run time = %.0f Hz' % hz)
+    span = max(span, 1e-9)
     on = [r for r in sel if r[2] in (1, 2)]
     off = [r for r in sel if r[2] == 4]
     # per thread
@@ -282,8 +290,8 @@ def main():
     perk = collections.Counter(r[1] for r in on if r[2] == 2)
     print('\nthreads (on-CPU samples; CPU ms/s = samples / HZ / s * 1000):')
     for t, n in per.most_common(top):
-        print('  %6d  %5.1f%%  %6.1f ms/s  kernel %4.1f%%  %s' % (n, 100 * n / len(on), n / h['hz'] / max(dur, 1e-9)
-              * 1000, 100 * perk[t] / n, tname(t)))
+        print('  %6d  %5.1f%%  %6.1f ms/s  kernel %4.1f%%  %s' % (n, 100 * n / len(on), n / hz / span * 1000,
+              100 * perk[t] / n, tname(t)))
     if marks:
         print('\nphases (on-CPU samples per mark):')
         ph = collections.Counter(phase_of(r[0]) for r in on)
