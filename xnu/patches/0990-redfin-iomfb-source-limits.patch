@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Tue, 27 Oct 2026 12:00:00 +0100
+Subject: [PATCH] 0990 redfin: IOMFB source-limit properties (sweetiomfbprops=1)
+
+QuartzCore os_logs "kIOMFBSourceSurface(Width/Height)LimitKey missing!" and
+four more when AppleCLCD lacks the display pipe's source limits. The key
+strings are not known yet: published under the Apple Silicon AppleCLCD2
+names (IOMFBMaxSrcPixels dict) and the constants' names without k/Key
+(flat and in IOMFBSourceLimits). Default off.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 74ab102..3e845c2 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -278,6 +278,7 @@ public:
+ 	struct { const void *s; uint32_t id, seed; } fSeen[8];  /* 0943: surfaces' seeds at their last present */
+ 	uint32_t      fSeenNext;
+ 	void          publishModes(void);
++	void          publishSourceLimits(void);     /* 0990 */
+ 	bool          setHz(uint32_t hz, bool tc);
+ 	bool          dsiSend(const uint8_t *pkt, uint32_t size);
+ 	bool          cpuWrote(SweetSurface *s);
+@@ -809,6 +810,7 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	OSSafeReleaseNULL(linear);
+ 	OSSafeReleaseNULL(align);
++	publishSourceLimits();          /* 0990: sweetiomfbprops=1 */
+ 	if (blStart()) {
+ 		uint32_t blOn = 0;
+ 		PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
+@@ -1435,6 +1437,55 @@ sweet_fb_set_number(OSDictionary *d, const char *key, uint64_t v)
+ 	}
+ }
+ 
++/*
++ * 0990 (boot-arg sweetiomfbprops=1): the display pipe's source limits. QuartzCore logs (os_log, not the klog)
++ * "kIOMFBSourceSurface(Width/Height)LimitKey missing!", "...SourceRectangleLimitWidthKey", "...LimitTotalKey",
++ * "kIOMFBMaxCompressedSizeInBytes", "kIOMFBSourceLimitsKey missing!" when the framebuffer service lacks them. The
++ * strings behind those constants are not known yet (an imgdump grep on the phone will tell): published under the
++ * names an Apple Silicon AppleCLCD2 uses (IOMFBMaxSrcPixels: MaxSrcRectWidthForPipe, MaxSrcBufferWidth/Height,
++ * MaxSrcRectTotal) and under the constants' own names without k/Key, flat and in an IOMFBSourceLimits dictionary.
++ * Values for one 2-pipe display engine: buffers up to 16384, a 4096-wide source rectangle per pipe (lito: 2880 SSPP
++ * line width, 2 pipes), 8192 in all, no compression (0).
++ */
++void
++AppleCLCD::publishSourceLimits(void)
++{
++	uint32_t on = 0;
++	PE_parse_boot_argn("sweetiomfbprops", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	static const struct { const char *key; uint64_t v; } apple[] = {
++		{ "MaxSrcRectWidthForPipe", 4096 }, { "MaxSrcBufferWidth", 16384 }, { "MaxSrcBufferHeight", 16384 },
++		{ "MaxSrcRectTotal", 8192 },
++	}, flat[] = {
++		{ "IOMFBSourceSurfaceWidthLimit", 16384 }, { "IOMFBSourceSurfaceHeightLimit", 16384 },
++		{ "IOMFBSourceRectangleLimitWidth", 4096 }, { "IOMFBSourceRectangleLimitTotal", 8192 },
++		{ "IOMFBMaxCompressedSizeInBytes", 0 },
++	};
++	OSDictionary *px = OSDictionary::withCapacity(4), *lim = OSDictionary::withCapacity(5);
++	for (uint32_t i = 0; px != NULL && i < sizeof(apple) / sizeof(apple[0]); i++) {
++		sweet_fb_set_number(px, apple[i].key, apple[i].v);
++	}
++	for (uint32_t i = 0; lim != NULL && i < sizeof(flat) / sizeof(flat[0]); i++) {
++		sweet_fb_set_number(lim, flat[i].key, flat[i].v);
++		OSNumber *n = OSNumber::withNumber(flat[i].v, 32);
++		if (n != NULL) {
++			setProperty(flat[i].key, n);
++			n->release();
++		}
++	}
++	if (px != NULL) {
++		setProperty("IOMFBMaxSrcPixels", px);
++	}
++	if (lim != NULL) {
++		setProperty("IOMFBSourceLimits", lim);
++	}
++	OSSafeReleaseNULL(px);
++	OSSafeReleaseNULL(lim);
++	IOLog("SWEET FB: source limits published (IOMFBMaxSrcPixels, IOMFBSourceLimits and 5 flat keys)\n");
++}
++
+ /*
+  * sweetfbx & 1: the display's mode as CoreAnimation reads it from IOMFB (TimingElements, ColorElements; the
+  * current one by GetBlock 0x40): one timing, the presented size at the panel's rate (16.16), 8-bit RGB.
+-- 
+2.43.0
+
