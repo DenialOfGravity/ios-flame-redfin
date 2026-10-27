@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Tue, 27 Oct 2026 05:00:00 +0100
+Subject: [PATCH] 0983 redfin: vsync pacing modes (p pace N [MIN_US], sweetpace, sweetpace_min)
+
+r37 (0977 hold): in Settings the held ticks went out ~4.4 ms before the
+next tick, yet frame intervals stayed at 22 ms (le26 dominant, T every
+22.1 ms, notice->next -10.9 as with pace 0); 70% of held ticks lapsed
+(idle 10 Hz frames, and >22 ms Control/Notification Centre frames whose
+present blits then queued behind the next render: fence 13 -> 27-37 ms).
+Modes (N & 7): 1 hold (0977), 2 extra tick at SwapEnd, 3 tick at
+max(SwapEnd, last + MIN), 4 quiet (for a CA on its own clock; 100 ms
+watchdog); +16 gates early ticks on an empty 0944 swap queue.
+MIN defaults to 8000 us. Default 0: unchanged.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 11e2bac..2628af7 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -123,6 +123,22 @@ static uint32_t sweet_fbx;
+  *        the next tick (that one, fresh), so CA never waits longer than today.
+  */
+ static uint32_t sweet_pace;
++/*
++ * 0983 (ws-u-pacing2): p pace N [MIN_US] / boot-args sweetpace=N sweetpace_min=US. N & 7 is the mode:
++ *   0  as before 0977: a notification on every tick
++ *   1  0977: a tick that finds the frame its predecessor started still in flight is held for that SwapEnd
++ *   2  render-ahead: every tick as before, plus one at each SwapEnd (CA wants ticks and none went out for MIN);
++ *      a tick less than MIN after the last notification is skipped
++ *   3  as 2, but a SwapEnd less than MIN after the last notification arms one at last + MIN:
++ *      notifications at max(SwapEnd, last + MIN) and on the ticks, never closer than MIN
++ *   4  quiet: no notifications, but for one when CA has them on and none went out for 100 ms (for a CA that keeps
++ *      a clock of its own, CA_FORCE_TIMER unset; with it set this caps CA at 10 frames/s, p pace 0 restores)
++ *   +16 (gate, modes 1-3) the early tick only while the 0944 swap queue is empty (the GPU has taken the frame
++ *      before): r37 Control Centre / Notification Centre frames (GPU 23 ms) got slower with 0977, their present
++ *      blits queued behind the next frame's render on the one ring (fence 13 -> 27-37 ms, dropped 1 -> 11)
++ * MIN defaults to 8000 us. Line SWEET FB: pace 5s.
++ */
++static uint32_t sweet_pace_min = 8000;
+ 
+ /* INTF1 (DSI0) and its tear check, offsets from the MDP (as shim/sde.c): the TE frame counter is INT_COUNT >> 16 */
+ #define SWEET_INTF1             0x6b800u
+@@ -258,6 +274,14 @@ public:
+ 	uint64_t      fPaceAheadAbs;          /* at-swap ticks: sum of (next tick - delivery) */
+ 	bool          vsyncOn(void);
+ 	void          sendVsync(uint64_t count, uint64_t now);
++	/* 0983 (fLock) */
++	IOTimerEventSource *fPaceTimer;       /* mode 3: the notification at last + MIN */
++	bool          fPaceArmed;
++	uint64_t      fPaceLastAbs;           /* the last notification sent */
++	uint32_t      fPaceEarly, fPaceSkipped, fPaceGated, fPaceDog;
++	static void   paceFired(OSObject *owner, IOTimerEventSource *sender);
++	bool          paceGate(void);
++	uint64_t      paceMinAbs(void);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -684,8 +708,15 @@ AppleCLCD::start(IOService *provider)
+ 	/* 0943: sweetfb_hz=90 also runs the panel and the ticks at 90 Hz (the DCS command goes out below) */
+ 	PE_parse_boot_argn("sweetfbx", &sweet_fbx, sizeof(sweet_fbx));
+ 	PE_parse_boot_argn("sweetpace", &sweet_pace, sizeof(sweet_pace));      /* 0977 */
++	PE_parse_boot_argn("sweetpace_min", &sweet_pace_min, sizeof(sweet_pace_min));      /* 0983 */
++	fPaceTimer = IOTimerEventSource::timerEventSource(this, &AppleCLCD::paceFired);
++	if (fPaceTimer != NULL && fWorkLoop->addEventSource(fPaceTimer) != kIOReturnSuccess) {
++		fPaceTimer->release();
++		fPaceTimer = NULL;
++	}
+ 	if (sweet_pace) {
+-		IOLog("SWEET FB: pace %#x (ticks held for the SwapEnd of a frame in flight)\n", sweet_pace);
++		IOLog("SWEET FB: pace %u min %u us (0983 modes: 1 hold, 2 at SwapEnd, 3 max(SwapEnd, last+min), 4 quiet; +16 gate)%s\n",
++		    sweet_pace, sweet_pace_min, fPaceTimer ? "" : " (no pace timer)");
+ 	}
+ 	fHz = hz == 90 ? 90 : 60;
+ 	fDsiLock = IOLockAlloc();
+@@ -790,7 +821,20 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	 */
+ 	IOLockLock(fb->fLock);
+ 	bool send = true;
+-	if ((sweet_pace & 1) && !fb->fPowerOff) {
++	uint32_t mode = sweet_pace & 7;
++	if ((mode == 2 || mode == 3) && !fb->fPowerOff && fb->fPaceLastAbs != 0 && now - fb->fPaceLastAbs < fb->paceMinAbs()) {
++		/* 0983: a notification went out at a SwapEnd less than MIN ago */
++		fb->fPaceSkipped++;
++		send = false;
++	} else if (mode == 4 && !fb->fPowerOff) {
++		/* 0983 quiet: one only when CA has them on and none went out for 100 ms */
++		uint64_t dog;
++		nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &dog);
++		send = fb->vsyncOn() && (fb->fPaceLastAbs == 0 || now - fb->fPaceLastAbs >= dog);
++		fb->fPaceDog += send;
++		fb->fPaceSkipped += !send;
++	}
++	if (mode == 1 && !fb->fPowerOff) {
+ 		/* 0977: CA still drawing the frame the last tick started (no SwapEnd since), frames flowing: hold this one */
+ 		bool flowing = fb->fStLastSwap != 0 && now - fb->fStLastSwap < 3 * fb->fVsyncAbs;
+ 		if (fb->fPaceOwed) {
+@@ -870,6 +914,7 @@ AppleCLCD::sendVsync(uint64_t count, uint64_t now)
+ 	};
+ 
+ 	fPaceSwapped = false;
++	fPaceLastAbs = now;     /* 0983 */
+ 	for (unsigned int i = 0; i < fClients->getCount(); i++) {
+ 		IOMobileFramebufferUserClient *client =
+ 		    (IOMobileFramebufferUserClient *)fClients->getObject(i);
+@@ -891,6 +936,45 @@ AppleCLCD::vsyncOn(void)
+ 	return false;
+ }
+ 
++/* 0983: with the fLock. MIN in absolute time (at least 1 ms). */
++uint64_t
++AppleCLCD::paceMinAbs(void)
++{
++	uint64_t abs;
++	nanoseconds_to_absolutetime((uint64_t)(sweet_pace_min < 1000 ? 1000 : sweet_pace_min) * 1000ULL, &abs);
++	return abs;
++}
++
++/* 0983: with the fLock. May a tick go early (at a SwapEnd)? With +16 only while the swap queue is empty. */
++bool
++AppleCLCD::paceGate(void)
++{
++	if (!(sweet_pace & 16) || !fSwapQ || fQn == 0) {
++		return true;
++	}
++	fPaceGated++;
++	return false;
++}
++
++/* 0983 mode 3: the notification at last + MIN (unless a tick went out meanwhile). On the work loop. */
++void
++AppleCLCD::paceFired(OSObject *owner, __unused IOTimerEventSource *sender)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++	uint64_t now = mach_absolute_time();
++	IOLockLock(fb->fLock);
++	if (fb->fPaceArmed) {
++		fb->fPaceArmed = false;
++		uint64_t min = fb->paceMinAbs();
++		if ((sweet_pace & 7) == 3 && !fb->fPowerOff && fb->vsyncOn() &&
++		    (fb->fPaceLastAbs == 0 || now - fb->fPaceLastAbs >= min - min / 8)) {
++			fb->fPaceEarly++;
++			fb->sendVsync(fb->fVsyncCount, now);
++		}
++	}
++	IOLockUnlock(fb->fLock);
++}
++
+ void
+ AppleCLCD::presentLoop(void *arg)
+ {
+@@ -1060,10 +1144,10 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	fStLastSwap = now;
+ 	fStSwaps++;
+ 	fStDropped += fDirty;
+-	if (sweet_pace & 1) {
+-		/* 0977: the frame in flight is done: a tick held for it goes now */
++	if ((sweet_pace & 7) == 1) {
++		/* 0977: the frame in flight is done: a tick held for it goes now (0983 +16: if the queue is empty) */
+ 		fPaceSwapped = true;
+-		if (fPaceOwed && !fPowerOff) {
++		if (fPaceOwed && !fPowerOff && paceGate()) {
+ 			fPaceOwed = false;
+ 			fPaceAtSwap++;
+ 			if (fNextVsync > now) {
+@@ -1071,6 +1155,20 @@ AppleCLCD::swap(const uint8_t *rec)
+ 			}
+ 			sendVsync(fPaceOwedCount, now);
+ 		}
++	} else if (((sweet_pace & 7) == 2 || (sweet_pace & 7) == 3) && !fPowerOff && vsyncOn() && paceGate()) {
++		/* 0983: render-ahead: CA may start its next frame now rather than at the next tick */
++		uint64_t min = paceMinAbs();
++		if (fPaceLastAbs == 0 || now - fPaceLastAbs >= min) {
++			fPaceEarly++;
++			fPaceAtSwap++;
++			if (fNextVsync > now) {
++				fPaceAheadAbs += fNextVsync - now;
++			}
++			sendVsync(fVsyncCount, now);
++		} else if ((sweet_pace & 7) == 3 && !fPaceArmed && fPaceTimer != NULL && fPaceLastAbs + min < fNextVsync) {
++			fPaceArmed = true;
++			fPaceTimer->wakeAtTime(fPaceLastAbs + min);
++		}
+ 	}
+ 	if (sweet_scan_live()) {
+ 		/* 0976: a frame on a scanout-slot surface goes to the display engine itself */
+@@ -1169,6 +1267,8 @@ AppleCLCD::statLine(uint64_t now)
+ 	absolutetime_to_nanoseconds(fStBlitqAbs, &blitq);
+ 	blitq = fStBlitqN ? blitq / 1000 / fStBlitqN : 0;
+ 	uint32_t pHeld = fPaceHeld, pAt = fPaceAtSwap, pLapsed = fPaceLapsed;   /* 0977 */
++	uint32_t pEarly = fPaceEarly, pSkip = fPaceSkipped, pGated = fPaceGated, pDog = fPaceDog;      /* 0983 */
++	fPaceEarly = fPaceSkipped = fPaceGated = fPaceDog = 0;
+ 	uint64_t pAhead = 0;
+ 	absolutetime_to_nanoseconds(fPaceAheadAbs, &pAhead);
+ 	fPaceHeld = fPaceAtSwap = fPaceLapsed = 0;
+@@ -1196,8 +1296,9 @@ AppleCLCD::statLine(uint64_t now)
+ 	    dropped, b[0], b[1], b[2], b[3], b[4], p50 / 10, p50 % 10, p95 / 10, p95 % 10, blitq, fence, fHz, vis, cpu, gw, gwLate);
+ 	if (sweet_pace) {
+ 		/* 0977: ticks held for a SwapEnd, sent at one (and how much before the next tick), lapsed to the next tick */
+-		IOLog("SWEET FB: pace 5s: held %u at-swap %u (%llu us before the next tick) lapsed %u | pace %#x\n", pHeld, pAt,
+-		    pAt ? pAhead / 1000 / pAt : 0, pLapsed, sweet_pace);
++		IOLog("SWEET FB: pace 5s: held %u at-swap %u (%llu us before the next tick) lapsed %u | early %u skipped %u "
++		    "gated %u dog %u | pace %u min %u\n", pHeld, pAt, pAt ? pAhead / 1000 / pAt : 0, pLapsed, pEarly, pSkip,
++		    pGated, pDog, sweet_pace, sweet_pace_min);
+ 	}
+ }
+ 
+@@ -2514,17 +2615,27 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+ 		return;
+ 	}
+ 	if (end - s >= 4 && !strncmp(s, "pace", 4)) {
+-		/* 0977: p pace N (0 = as before, 1 = ticks held for the SwapEnd of a frame in flight) */
++		/* 0977: p pace N (0 = as before, 1 = ticks held for the SwapEnd of a frame in flight); 0983: p pace N [MIN_US] */
+ 		const char *q = s + 4;
+-		uint32_t v = 0;
++		uint32_t v = 0, min = 0;
+ 		while (q < end && *q == ' ') {
+ 			q++;
+ 		}
+ 		while (q < end && *q >= '0' && *q <= '9') {
+ 			v = v * 10 + (uint32_t)(*q++ - '0');
+ 		}
++		while (q < end && *q == ' ') {
++			q++;
++		}
++		while (q < end && *q >= '0' && *q <= '9') {
++			min = min * 10 + (uint32_t)(*q++ - '0');
++		}
+ 		IOLockLock(fLock);
+ 		sweet_pace = v;
++		if (min != 0) {
++			sweet_pace_min = min;
++		}
++		fPaceArmed = false;     /* a pending mode-3 timer finds nothing to do */
+ 		bool owed = fPaceOwed;
+ 		fPaceOwed = false;
+ 		fPaceSwapped = false;
+@@ -2532,7 +2643,7 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+ 			sendVsync(fPaceOwedCount, mach_absolute_time());       /* nothing stays held */
+ 		}
+ 		IOLockUnlock(fLock);
+-		IOLog("SWEET FB: pace now %#x\n", sweet_pace);
++		IOLog("SWEET FB: pace now %u min %u us\n", sweet_pace, sweet_pace_min);
+ 		return;
+ 	}
+ 	if (end - s >= 7 && !strncmp(s, "scanout", 7)) {
+@@ -2548,7 +2659,7 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+ 		}
+ 		return;
+ 	}
+-	IOLog("SWEET FB: poke p: fc | hz 60|90 [tc] | fbx HEX | mdp dump|smmu|test|scale|ca|restore | scanout 0|1 | pace N\n");
++	IOLog("SWEET FB: poke p: fc | hz 60|90 [tc] | fbx HEX | mdp dump|smmu|test|scale|ca|restore | scanout 0|1 | pace N [MIN_US]\n");
+ }
+ 
+ extern "C" void sweet_fb_cmd(const char *s, const char *end);
