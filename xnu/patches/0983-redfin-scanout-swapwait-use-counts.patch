@@ -1,0 +1,221 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Tue, 27 Oct 2026 06:00:00 +0100
+Subject: [PATCH] 0983 redfin: direct scanout: SwapWait on the newest swap returns at
+ once; use counts in the shared page; chain depth by recurrence
+
+r37a ran at ~10 fps: CA calls SwapWait for the previous swap and for the
+one it just ended; 0979 waited until a swap was retired (a later one on
+screen), which for the newest swap needs the next frame: a 50 ms timeout
+every frame. Now SwapWait waits (20 ms at most) only for an older swap to
+be on screen; the newest returns at once, as upstream HakiOS does.
+Slot surfaces publish their use counts in the shared state page (+0x18,
+as IOSurfaceIsInUse reads them), category 0 including the frames the
+display holds: CA's chain can see the surface on screen as in use, as on
+an iPhone, and take another one. Back pressure uses the chain depth seen
+as the distance since the frame's surface was last swapped (2 if unknown).
+5 s line: swapwait ... newest N | chain MIN-MAX.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 11e2bac..f91eb15 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1999,10 +1999,14 @@ static struct {
+ 	uint32_t      seed[SWEET_SCAN_SLOTS];
+ 	uint32_t      slotRun;          /* 0979: slot frames in a row (direct only from 3: no switching every frame) */
+ 	uint32_t      chain[8], chainNext;      /* 0979: the last slot frames' surfaces: CA's chain depth */
++	uint64_t      chainSeq[8];              /* 0983: ... and their frame numbers */
++	uint32_t      depth;                    /* 0983: frames since this frame's surface was last shown */
++	uint32_t      stDepthMax, stDepthMin;
+ 	/* 5 s statistics (fLock) */
+ 	uint64_t      stWin, stFenceAbs, stLatchAbs, stLatchMax;
+ 	uint32_t      stFrames, stFlips, stLatched, stDropped, stNonslot, stLate, stBp, stBpTimeout, stWait, stWaitTimeout;
+ 	uint32_t      stEnter, stLeave, stClean, stLatchN, stLatchFc, stHold;
++	uint32_t      lastSwap, stWaitNewest;   /* 0983: the newest slot swap's id; SwapWaits on it (not waited) */
+ } sweet_scan;
+ 
+ static bool
+@@ -2028,6 +2032,7 @@ sweet_scan_hold(SweetSurface *s)
+ {
+ 	s->retain();
+ 	OSIncrementAtomic(&s->displayUse);
++	sweet_surface_publish_use(s);   /* 0983: in use for CA's swap chain */
+ }
+ 
+ static void
+@@ -2035,6 +2040,7 @@ sweet_scan_drop(SweetSurface **sp)
+ {
+ 	if (*sp != NULL) {
+ 		OSDecrementAtomic(&(*sp)->displayUse);
++		sweet_surface_publish_use(*sp);
+ 		(*sp)->release();
+ 		*sp = NULL;
+ 	}
+@@ -2143,8 +2149,28 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+ 	 * leave 69 in 5 s). Direct only after 3 slot frames in a row; until then the normal path.
+ 	 */
+ 	sweet_scan.slotRun++;
++	/*
++	 * 0983: CA's chain depth = how many frames ago this frame's surface was last swapped (round robin). 0979 counted
++	 * distinct surfaces in the last 8 frames, which after a backboardd restart (new ids next to old ones) overcounts.
++	 * Unknown (first use of a surface): 2, the safe value.
++	 */
++	uint32_t d = 0;
++	for (uint32_t i = 1; i <= 8 && d == 0; i++) {
++		uint32_t k = (sweet_scan.chainNext + 8 - i) % 8;
++		if (sweet_scan.chain[k] == s->id && sweet_scan.chainSeq[k] != 0) {
++			d = (uint32_t)(sweet_scan.seq + 1 - sweet_scan.chainSeq[k]);
++		}
++	}
++	sweet_scan.depth = d >= 2 ? d : 2;
+ 	sweet_scan.chain[sweet_scan.chainNext] = s->id;
++	sweet_scan.chainSeq[sweet_scan.chainNext] = sweet_scan.seq + 1;
+ 	sweet_scan.chainNext = (sweet_scan.chainNext + 1) % 8;
++	if (sweet_scan.depth > sweet_scan.stDepthMax) {
++		sweet_scan.stDepthMax = sweet_scan.depth;
++	}
++	if (sweet_scan.stDepthMin == 0 || sweet_scan.depth < sweet_scan.stDepthMin) {
++		sweet_scan.stDepthMin = sweet_scan.depth;
++	}
+ 	if (!sweet_scan.geom && (sweet_scan.slotRun < 3 || sweet_scan.entering)) {
+ 		sweet_scan.stHold++;
+ 		IOLockUnlock(fb->fLock);
+@@ -2161,6 +2187,7 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+ 	sweet_scan.next = s;
+ 	sweet_scan.nextFence = fence;
+ 	sweet_scan.nextSwap = get32(rec, 0x50);
++	sweet_scan.lastSwap = sweet_scan.nextSwap;
+ 	sweet_scan.nextSeq = seq;
+ 	sweet_scan.nextAbs = now;
+ 	sweet_scan.stFrames++;
+@@ -2170,17 +2197,7 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+ 	 * seq + 1 into the surface of frame seq + 1 - N, which must be off screen: return once frame seq + 2 - N (or a
+ 	 * later one) is on screen. N = 2 (r36a): this frame itself; N = 3: the one before.
+ 	 */
+-	uint32_t depth = 0;
+-	for (uint32_t i = 0; i < 8; i++) {
+-		bool seen = sweet_scan.chain[i] == 0;
+-		for (uint32_t j = 0; j < i && !seen; j++) {
+-			seen = sweet_scan.chain[j] == sweet_scan.chain[i];
+-		}
+-		depth += !seen;
+-	}
+-	if (depth < 2) {
+-		depth = 2;
+-	}
++	uint32_t depth = sweet_scan.depth;
+ 	uint64_t need = seq + 2 > depth ? seq + 2 - depth : 0;
+ 	if (sweet_scan.shownSeq < need && sweet_scan.geom) {
+ 		uint64_t dl;
+@@ -2204,12 +2221,24 @@ sweet_scan_wait(AppleCLCD *fb, uint32_t id)
+ 	if (!sweet_scan.on) {
+ 		return;
+ 	}
++	/*
++	 * 0983: r37a: CA calls SwapWait twice per frame, for the previous swap and for the one it just ended (scalars
++	 * id, 0x80000000, ...). 0979 waited until a swap was *retired* (a later one on screen): for the newest swap that
++	 * needs the next frame, which CA only makes after this returns: 50 ms timeout on every frame (10 fps). Now:
++	 * until the swap is on screen (latched), and the newest one never waits (as upstream HakiOS: "a swap is on the
++	 * screen as soon as it is made"). Reuse of a surface on screen is kept away by SwapEnd's back pressure and the
++	 * use counts, not here.
++	 */
+ 	uint64_t dl;
+-	clock_interval_to_deadline(50, kMillisecondScale, &dl);
++	clock_interval_to_deadline(20, kMillisecondScale, &dl);
+ 	IOLockLock(fb->fLock);
+ 	sweet_scan.stWait++;
+-	/* 0979: until the swap is retired (a later one on screen: its surface is free); the normal path: at once */
+-	while (sweet_scan.on && sweet_scan.geom && (int32_t)(sweet_scan.shownSwap - id) <= 0) {
++	if (id == sweet_scan.nextSwap || id == sweet_scan.flipSwap || (int32_t)(id - sweet_scan.lastSwap) >= 0) {
++		sweet_scan.stWaitNewest++;
++		IOLockUnlock(fb->fLock);
++		return;
++	}
++	while (sweet_scan.on && sweet_scan.geom && (int32_t)(sweet_scan.shownSwap - id) < 0) {
+ 		if (IOLockSleepDeadline(fb->fLock, &sweet_scan.shownSeq, dl, THREAD_UNINT) == THREAD_TIMED_OUT) {
+ 			sweet_scan.stWaitTimeout++;
+ 			break;
+@@ -2349,17 +2378,20 @@ sweet_scan_stats_locked(uint64_t now)
+ 	absolutetime_to_nanoseconds(sweet_scan.stLatchAbs, &lat);
+ 	absolutetime_to_nanoseconds(sweet_scan.stLatchMax, &lmax);
+ 	IOLog("SWEET SCANOUT: 5s: frames %u flips %u latched %u dropped %u nonslot %u late %u | fence %llu us swap->latch %llu "
+-	    "us max %llu us | bp %u timeout %u | swapwait %u timeout %u | clean %u enter %u leave %u held %u latch-fc %u | %s\n",
++	    "us max %llu us | bp %u timeout %u | swapwait %u timeout %u newest %u | chain %u-%u | clean %u enter %u leave %u held %u "
++	    "latch-fc %u | %s\n",
+ 	    sweet_scan.stFrames, sweet_scan.stFlips, sweet_scan.stLatched, sweet_scan.stDropped, sweet_scan.stNonslot,
+ 	    sweet_scan.stLate, sweet_scan.stFlips ? fw / 1000 / sweet_scan.stFlips : 0,
+ 	    sweet_scan.stLatchN ? lat / 1000 / sweet_scan.stLatchN : 0, lmax / 1000, sweet_scan.stBp, sweet_scan.stBpTimeout,
+-	    sweet_scan.stWait, sweet_scan.stWaitTimeout, sweet_scan.stClean, sweet_scan.stEnter, sweet_scan.stLeave,
++	    sweet_scan.stWait, sweet_scan.stWaitTimeout, sweet_scan.stWaitNewest, sweet_scan.stDepthMin, sweet_scan.stDepthMax,
++	    sweet_scan.stClean, sweet_scan.stEnter, sweet_scan.stLeave,
+ 	    sweet_scan.stHold, sweet_scan.stLatchFc, sweet_scan.geom ? "direct" : "panel buffer");
+ 	sweet_scan.stFenceAbs = sweet_scan.stLatchAbs = sweet_scan.stLatchMax = 0;
+ 	sweet_scan.stFrames = sweet_scan.stFlips = sweet_scan.stLatched = sweet_scan.stDropped = sweet_scan.stNonslot = 0;
+ 	sweet_scan.stLate = sweet_scan.stBp = sweet_scan.stBpTimeout = sweet_scan.stWait = sweet_scan.stWaitTimeout = 0;
+ 	sweet_scan.stClean = sweet_scan.stEnter = sweet_scan.stLeave = sweet_scan.stLatchN = 0;
+ 	sweet_scan.stHold = sweet_scan.stLatchFc = 0;
++	sweet_scan.stWaitNewest = sweet_scan.stDepthMin = sweet_scan.stDepthMax = 0;
+ }
+ 
+ static void
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 021aa6f..f1979df 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1169,7 +1169,8 @@ sweet_surface_client_use(void *id, void *category, int delta)
+ 	if (s == NULL) {
+ 		return;
+ 	}
+-	SInt32 v = OSAddAtomic(delta, &s->clientUse) + delta;
++	SInt32 v = OSAddAtomic(delta, (uintptr_t)category == 1 ? &s->clientUse1 : &s->clientUse) + delta;
++	sweet_surface_publish_use(s);   /* 0983 */
+ 	if (logs < 16 && (s->scanSlot != 0 || strcmp(name, "backboardd") == 0)) {
+ 		logs++;     /* 0979: the display's surfaces only (SpringBoard's layer surfaces filled the 16 lines) */
+ 		IOLog("SWEET SURF: %s use count %s surface %u (%s %u) category %#llx -> %d\n", name, delta > 0 ? "+1" : "-1",
+@@ -1179,6 +1180,18 @@ sweet_surface_client_use(void *id, void *category, int delta)
+ 	s->release();
+ }
+ 
++#define SWEET_SURFACE_STATE_USE         0x18    /* 0983: u64 use counts, category 1 << 32 | category 0 */
++void
++sweet_surface_publish_use(SweetSurface *s)
++{
++	if (s == NULL || s->state == NULL || s->scanSlot == 0) {
++		return;         /* only the display's own surfaces: the others stay as before (never in use) */
++	}
++	int32_t c0 = s->clientUse + s->displayUse, c1 = s->clientUse1;
++	uint64_t v = (uint64_t)(uint32_t)(c1 < 0 ? 0 : c1) << 32 | (uint32_t)(c0 < 0 ? 0 : c0);
++	*(volatile uint64_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_USE) = v;
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::trapIncUse(void *id, void *category, void *, void *, void *, void *)
+ {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 93450c0..8acc451 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -43,6 +43,7 @@ public:
+ 	uint64_t                  scanPA;       /* 0975: the slot's physical address (contiguous, below 4 GB) */
+ 	volatile SInt32           displayUse;   /* 0976: frames of it the display holds (queued, flipping, shown) */
+ 	volatile SInt32           clientUse;    /* 0976: IOSurfaceIncrementUseCount - Decrement from userland */
++	volatile SInt32           clientUse1;   /* 0983: ... category 1 */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -64,6 +65,12 @@ uint32_t sweet_surface_scan_mode(void);
+ SweetSurface *sweet_surface_scan_copy(uint32_t slot, uint64_t *pa);
+ /* 0979: the slots' memory made at boot (AppleCLCD::start, before userland fragments RAM); a slot's memory (retained) */
+ void sweet_surface_scan_reserve(void);
++/*
++ * 0983: a scanout-slot surface's use counts into its shared state page (+0x18: category 0 low, 1 high), as
++ * IOSurfaceIsInUse reads them: category 0 = userland's + the frames the display holds. CA's swap chain then sees
++ * the surface on screen as in use, as on an iPhone (IOMFB keeps a use count on what it scans out).
++ */
++void sweet_surface_publish_use(SweetSurface *s);
+ IOMemoryDescriptor *sweet_surface_scan_md(uint32_t slot, uint64_t *pa);
+ 
+ /*
+-- 
+2.43.0
+
