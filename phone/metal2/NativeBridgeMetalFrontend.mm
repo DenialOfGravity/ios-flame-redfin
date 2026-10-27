@@ -72,6 +72,7 @@ static Timed gTimeSurfaceFlush;
 // /var/local/mtl2-env SWEET_TIMELINE=0 turns it off (the plugin sets 1 for backboardd).
 size_t (*native_bridge_metal_pass_report)(char *,size_t,unsigned);
 size_t (*native_bridge_metal_cpu_report)(char *,size_t);
+size_t (*native_bridge_metal_ubwc_report)(char *,size_t);
 static bool timelineOn() {
  static int on=-1;
  if(on<0){const char *e=getenv("SWEET_TIMELINE");on=!strcmp(getprogname(),"backboardd") && e && *e && strcmp(e,"0")?1:0;}
@@ -2817,6 +2818,13 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
   char cpu[1100];
   if(native_bridge_metal_cpu_report(cpu,sizeof cpu)) {
    snprintf(line,sizeof line,"native-metal: T tu-cpu: %s",cpu);
+   sm2_logs(line);
+  }
+ }
+ if(native_bridge_metal_ubwc_report) {
+  char ubwc[1100];
+  if(native_bridge_metal_ubwc_report(ubwc,sizeof ubwc)) {
+   snprintf(line,sizeof line,"native-metal: T tu-ubwc: %s",ubwc);
    sm2_logs(line);
   }
  }

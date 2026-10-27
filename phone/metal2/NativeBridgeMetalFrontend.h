@@ -22,6 +22,9 @@ extern size_t (*native_bridge_metal_pass_report)(char *out, size_t size, unsigne
 // u-tr: Turnip's CPU profile (sweet_tu_cpu_report, phone/turnip/patches/0110, SWEET_TU_CPUPROF=1), logged as its own
 // "native-metal: T tu-cpu:" line after the "T 5s" line; null where Turnip does not export it.
 extern size_t (*native_bridge_metal_cpu_report)(char *out, size_t size);
+// u-ub: Turnip's UBWC census (sweet_tu_ubwc_report, phone/turnip/patches/0111, policy SWEET_UBWC), logged as its own
+// "native-metal: T tu-ubwc:" line when images were made since the last; null where Turnip does not export it.
+extern size_t (*native_bridge_metal_ubwc_report)(char *out, size_t size);
 // Structured cumulative artifact/driver-cache counters for offline qualification.
 struct NmbShaderCacheStats;
 bool native_bridge_metal_shader_cache_stats(struct NmbShaderCacheStats *out);
