@@ -265,18 +265,18 @@ index 27b5a03..b27d6ba 100644
  }
  
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index a90fefb..78ed826 100644
+index 291bfe2..ad9b489 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -59,6 +59,7 @@ void sweet_gpu_cpu_flip(void);
+@@ -59,6 +59,7 @@ int sweet_gpu_cpu_target(uint64_t *pa);         /* 0946 (sweetfbx & 8) */
+ void sweet_gpu_cpu_flip(void);
  void sweet_gpu_present_tag(uint64_t swap_abs);
  void sweet_gpu_present_visible(uint64_t *sum_abs, uint64_t *n);
- void flush_dcache64(addr64_t addr, unsigned count, int phys);
 +void sweet_cpufreq_boost(int why);              /* 0970: bsd/dev/sweet_cpufreq.c */
- struct processor;                               /* 0946: the present thread on a big core (osfmk/kern/sched_prim.h) */
- struct processor *thread_bind(struct processor *processor);
- struct processor *cpu_to_processor(int cpu);
-@@ -917,6 +918,13 @@ AppleCLCD::swap(const uint8_t *rec)
+ void flush_dcache64(addr64_t addr, unsigned count, int phys);
+ uint32_t sweet_gpu_fence_submitted(void);       /* 0949: CPU present after the GPU has drawn the frame */
+ int sweet_gpu_fence_wait_soft(uint32_t fence, unsigned ms);
+@@ -929,6 +930,13 @@ AppleCLCD::swap(const uint8_t *rec)
  			fStBucket[t <= 111 ? 0 : t <= 180 ? 1 : t <= 260 ? 2 : t <= 350 ? 3 : 4]++;
  		}
  	}
@@ -290,7 +290,7 @@ index a90fefb..78ed826 100644
  	fStLastSwap = now;
  	fStSwaps++;
  	fStDropped += fDirty;
-@@ -1448,6 +1456,7 @@ AppleCLCD::presentCPU(const uint8_t *rec)
+@@ -2015,6 +2023,7 @@ AppleCLCD::presentCPU(const uint8_t *rec)
  		}
  		fCpuXKey = key;
  	}
