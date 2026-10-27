@@ -309,6 +309,7 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   services under the platform expert for bluetoothd's IONameMatch notifications; every property read from them logged
   with found/MISSING, user-client requests refused + logged, setProperties keys logged (`SWEET BTNUB:`).
 - 0973 AppleARMBacklight publishes the panel's nits for CoreBrightness (MinNits/MaxNits/MaxNitsPanel,
+- 0983 vsync pacing modes, `p pace N [MIN_US]` / `sweetpace=N sweetpace_min=US` (N & 7: 0 as before, 1 0977 hold, 2 extra tick at each SwapEnd, 3 tick at max(SwapEnd, last + MIN), 4 quiet with a 100 ms watchdog for a CA on its own clock; +16 early ticks only while the 0944 swap queue is empty; MIN 8000 us). Line `SWEET FB: pace 5s: held .. at-swap .. lapsed .. | early E skipped S gated G dog D | pace N min M`.
   HardwareAccessibleMin/MaxNits, user-accessible-max-nits, digital-dimming-min-nits, brightness-nits(-cap),
   DisplayPanel/ProductLuminanceMin/Mid/Max: 2..500, integer nits; 500 nits <-> level 1023): `sweetnits=0` off.
   `tools/mkadt.py --backlight` (opt-in) also copies D22AP's /backlight node with max-nit-value/LmaxProduct = 500.
