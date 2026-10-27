@@ -1,8 +1,8 @@
-From e49dd14a1ac2b9a1d6bf920ff98fde2cd210713a Mon Sep 17 00:00:00 2001
+From a1cd383038bde66c03c8689f48a3fb4cc971988e Mon Sep 17 00:00:00 2001
 From: Rory Axton <roryaxton@gmail.com>
 Date: Tue, 27 Oct 2026 09:15:07 +0100
 Subject: [PATCH] 0991 redfin: sampling profiler for one process (p prof), p
- disp
+ disp, p phase
 
 p prof start NAME|PID [HZ [SECS [DEPTH [WAITHZ]]]] samples the process's threads:
 a local timer at HZ cross-calls only the CPUs whose active thread belongs to the
@@ -10,16 +10,68 @@ task; the handler records the interrupted user pc/lr (or the kernel pc plus the
 user state saved at entry) and a fault-free frame-pointer walk (AT S1E0R + the
 physical aperture). WAITHZ adds off-CPU samples from a kernel thread. The buffer
 (8 MiB contiguous) is read over /dev/pmem; tools-claude/sweet-prof.py makes the
-profile. p disp logs the display power state.
+profile. p disp logs the display power state. p phase NAME flushes the FB,
+SCANOUT and GPU stats windows, logs SWEET PHASE: NAME and marks the profile, so
+bench stats lines align with gesture phases.
 ---
+ bsd/dev/sweet_gpu.c                   |  22 +-
  bsd/dev/sweet_poke.c                  |   6 +
  bsd/dev/sweet_sample.c                |  53 +++
- iokit/Kernel/arm/SweetFramebuffer.cpp |   5 +
+ iokit/Kernel/arm/SweetFramebuffer.cpp |  37 ++
  osfmk/arm64/sweet_prof.c              | 625 ++++++++++++++++++++++++++
  osfmk/conf/files.arm64                |   1 +
- 5 files changed, 690 insertions(+)
+ 6 files changed, 743 insertions(+), 1 deletion(-)
  create mode 100644 osfmk/arm64/sweet_prof.c
 
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index f754b2d..bbce154 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -407,6 +407,7 @@ static struct { uint32_t lo, hi; int culprit; } lost[LOST_RING];	/* 0941: culpri
+ #define GSTAT_OWNERS    6
+ static uint32_t gstat_next = 1;
+ static uint64_t gstat_abs;
++static bool gstat_force;     /* 0991: p phase: the line now, whatever the window */
+ static int gstat_pid[A6_TS_SLOTS];
+ static struct { int pid; uint32_t n; uint64_t busy; } gstat_own[GSTAT_OWNERS + 1];     /* last: everyone else */
+ static uint32_t gstat_n, gstat_missed;
+@@ -447,9 +448,13 @@ gpu_stats_locked(void)
+ 		gstat_abs = now;
+ 	}
+ 	absolutetime_to_nanoseconds(now - gstat_abs, &ns);
+-	if (ns < 5000000000ULL) {
++	if (ns < 5000000000ULL && !gstat_force) {
+ 		return;
+ 	}
++	gstat_force = false;
++	if (ns < 1000000) {
++		ns = 1000000;
++	}
+ 	if (gstat_n) {
+ 		char who[160] = "", name[24];
+ 		size_t w = 0;
+@@ -472,6 +477,21 @@ gpu_stats_locked(void)
+ 	gstat_abs = now;
+ }
+ 
++/* 0991: p phase (SweetFramebuffer.cpp): the GPU stats line for the phase that ends; the window restarts now */
++void sweet_gpu_stats_flush(void);
++void
++sweet_gpu_stats_flush(void)
++{
++	if (!gpu_ready) {
++		return;
++	}
++	lck_mtx_lock(&sweet_gpu_lock);
++	gstat_force = true;
++	gpu_stats_locked();
++	gstat_force = false;
++	lck_mtx_unlock(&sweet_gpu_lock);
++}
++
+ static void
+ gpu_note_submit_locked(void)
+ {
 diff --git a/bsd/dev/sweet_poke.c b/bsd/dev/sweet_poke.c
 index 60d78b0..1ffdea4 100644
 --- a/bsd/dev/sweet_poke.c
@@ -102,10 +154,16 @@ index b40eccd..9d591ab 100644
  sweet_sample_start(void)
  {
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 682a868..b96fe9b 100644
+index 682a868..33a0f92 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -2869,6 +2869,11 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+@@ -2866,9 +2866,46 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+  *                          CP waits for the latch (2; boot-arg sweetscangate)
+  *   p scanout corners 0|1  0986: corner mattes drawn into each direct frame (default off)
+  */
++extern "C" void sweet_gpu_stats_flush(void);     /* 0991 */
++extern "C" void sweet_prof_cmd(const char *s, const char *end);   /* 0991 */
++
  void
  AppleCLCD::fbCmd(const char *s, const char *end)
  {
@@ -114,12 +172,41 @@ index 682a868..b96fe9b 100644
 +		IOLog("SWEET FB: display %s (p disp; scanout %s)\n", fPowerOff ? "off" : "on", sweet_scan_live() ? "direct" : "panel buffer");
 +		return;
 +	}
++	if (end - s >= 5 && !strncmp(s, "phase", 5)) {
++		/*
++		 * 0991: p phase NAME: the FB, SCANOUT and GPU stats lines of the phase that ends now (when it had frames),
++		 * their windows restart, then "SWEET PHASE: NAME" (and a profiler mark). Every stats line between two
++		 * PHASE lines covers only that phase (tools-claude/fps-parse.py).
++		 */
++		const char *q = s + 5;
++		while (q < end && *q == ' ') {
++			q++;
++		}
++		uint64_t now = mach_absolute_time();
++		IOLockLock(fLock);
++		fStWin = 1;
++		IOLockUnlock(fLock);
++		statLine(now);
++		IOLockLock(fLock);
++		if (sweet_scan.on) {
++			sweet_scan.stWin = 1;
++			sweet_scan_stats_locked(now);
++		}
++		sweet_scan.stWin = now;
++		IOLockUnlock(fLock);
++		sweet_gpu_stats_flush();
++		IOLog("SWEET PHASE: %.*s\n", (int)(end - q > 60 ? 60 : end - q), q);
++		char mk[72];
++		snprintf(mk, sizeof(mk), "prof mark %.*s", (int)(end - q > 56 ? 56 : end - q), q);
++		sweet_prof_cmd(mk, mk + strlen(mk));
++		return;
++	}
  	if (end - s >= 8 && !strncmp(s, "swapdone", 8)) {
  		/* 0987: p swapdone [MASK | trace]: 1 swap-complete tick, 2 trace (trace = re-arm with 2 set); no argument: state */
  		const char *q = s + 8;
 diff --git a/osfmk/arm64/sweet_prof.c b/osfmk/arm64/sweet_prof.c
 new file mode 100644
-index 0000000..090764e
+index 0000000..1460f34
 --- /dev/null
 +++ b/osfmk/arm64/sweet_prof.c
 @@ -0,0 +1,625 @@
@@ -481,7 +568,7 @@ index 0000000..090764e
 +	task_unlock(task);
 +	/* dyld_all_image_infos (64-bit): version, infoArrayCount, infoArray -> {load address, path, mod date} */
 +	uint64_t aii = task->all_image_info_addr, hdr[2] = { 0, 0 };
-+	if (aii != 0 && vm_map_read_user(map, aii, hdr, sizeof(hdr)) == KERN_SUCCESS) {
++	if (task->active && aii != 0 && vm_map_read_user(map, aii, hdr, sizeof(hdr)) == KERN_SUCCESS) {
 +		uint32_t count = PMIN((uint32_t)(hdr[0] >> 32), 4096u), shown = 0;
 +		for (uint32_t i = 0; i < count && shown < 48; i++) {
 +			uint64_t e[3];
