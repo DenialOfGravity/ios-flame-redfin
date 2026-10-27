@@ -30,8 +30,27 @@
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <mach/mach.h>
+#include <os/lock.h>
 #include "bridge/NativeMetalObjects.h"
 #include "NativeBridgeMetalFrontend.h"
+
+// u-cpu: CPU savings of the frontend, env SWEET_CPUFAST (a bitmask, from /var/local/mtl2-env; unset = kCpuFastDefault):
+//  0x1 answers   the device queries that take an argument (supportsFamily:, supportsTextureSampleCount:, ...) answered once per
+//                selector and argument, then from a table. They are functions of the device alone (its properties and format
+//                answers, fixed at open). prof2 (Settings flings): Metal's MTLPixelFormatGetInfoForDevice, which Core Animation calls
+//                through MTLGetTextureLevelInfoForDeviceWithOptions, asked supportsFamily: and the runtime audited every row of the
+//                family each time (families::audit, its format answers cloned) = 23% of the display thread's samples.
+//  0x2 viewport  setViewport:/setScissorRect: with the value the encoder's last accepted call of it set is not sent again: the
+//                state is the same, the runtime logs no call, and its fast draw (SWEET_FASTDRAW) keeps its entries.
+// "native-metal: T cpufast 5s:" counts them.
+enum : uint32_t {CPUFAST_ANSWERS=0x1,CPUFAST_VIEWPORT=0x2};
+static const uint32_t kCpuFastDefault=CPUFAST_ANSWERS|CPUFAST_VIEWPORT;
+static uint32_t cpuFast() {
+ static const uint32_t bits=[]{const char *e=getenv("SWEET_CPUFAST");return e && *e?(uint32_t)strtoul(e,nullptr,0):kCpuFastDefault;}();
+ return bits;
+}
+static std::atomic<uint64_t> gCfAnswerHits{0},gCfAnswerAsks{0},gCfViewportSkips{0},gCfScissorSkips{0},gCfViewportSent{0},gCfScissorSent{0};
+
 
 extern "C" void sys_dcache_flush(void *start, size_t length);
 
@@ -1145,6 +1164,8 @@ static void waitForResource(id resource) {
 @public
  char encPipeline[80];   // u-e: the bound pipeline's function names (copied: "E slow" draws name it)
  uint64_t rasterCull,rasterWinding,rasterFill;   // Metal's defaults (0) until set (were associated objects: a global lock and an NSNumber each)
+ // u-cpu 0x2: the values the last accepted setViewport:/setScissorRect: set (have*: one was accepted)
+ bool haveViewport,haveScissor;double lastViewport[6];uint64_t lastScissor[4];
 }
 @end
 @implementation NBRenderEncoder
@@ -1186,11 +1207,20 @@ static void waitForResource(id resource) {
 }
 - (void)setViewport:(MTLViewport)v {ENC_SCOPE(EC_BIND,"setViewport");
  const double values[6]={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
- [self check:nmb_render_set_viewport(self.handle,values) what:"setViewport"];
+ // u-cpu 0x2: the same bits as the viewport set last (bitwise: a NaN or -0 is sent again unless it is the very value)
+ const bool fast=cpuFast()&CPUFAST_VIEWPORT;
+ if(fast && haveViewport && !memcmp(values,lastViewport,sizeof values)){gCfViewportSkips.fetch_add(1,std::memory_order_relaxed);return;}
+ haveViewport=false;
+ if([self check:nmb_render_set_viewport(self.handle,values) what:"setViewport"] && fast){memcpy(lastViewport,values,sizeof values);haveViewport=true;}
+ gCfViewportSent.fetch_add(1,std::memory_order_relaxed);
 }
 - (void)setScissorRect:(MTLScissorRect)r {ENC_SCOPE(EC_BIND,"setScissorRect");
  const uint64_t values[4]={r.x,r.y,r.width,r.height};
- [self check:nmb_render_set_scissor(self.handle,values) what:"setScissorRect"];
+ const bool fast=cpuFast()&CPUFAST_VIEWPORT;
+ if(fast && haveScissor && !memcmp(values,lastScissor,sizeof values)){gCfScissorSkips.fetch_add(1,std::memory_order_relaxed);return;}
+ haveScissor=false;
+ if([self check:nmb_render_set_scissor(self.handle,values) what:"setScissorRect"] && fast){memcpy(lastScissor,values,sizeof values);haveScissor=true;}
+ gCfScissorSent.fetch_add(1,std::memory_order_relaxed);
 }
 // The runtime takes cull mode, winding and fill mode together; this encoder keeps Metal's defaults until each is set.
 - (void)raster {ENC_SCOPE(EC_BIND,"raster state");
@@ -2501,9 +2531,31 @@ static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
 static std::unordered_map<SEL,uint64_t> gAnswers;
 static NSUInteger countAnswer(id,SEL cmd) {return (NSUInteger)gAnswers.at(cmd);}
 static BOOL flagAnswer(id,SEL cmd) {return gAnswers.at(cmd)!=0;}
+struct AnswerKey {
+ SEL sel;NSUInteger arg;
+ bool operator==(const AnswerKey &o) const {return sel==o.sel && arg==o.arg;}
+};
+struct AnswerKeyHash {size_t operator()(const AnswerKey &k) const {return std::hash<uintptr_t>()((uintptr_t)k.sel)*31u ^ std::hash<NSUInteger>()(k.arg);}};
+static os_unfair_lock gArgAnswersLock=OS_UNFAIR_LOCK_INIT;
+static std::unordered_map<AnswerKey,uint64_t,AnswerKeyHash> gArgAnswers;   // u-cpu 0x1: (selector, argument) -> answer (0 = refused)
 static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
+ const bool memo=cpuFast()&CPUFAST_ANSWERS;
+ const AnswerKey key{cmd,arg};
+ if(memo) {
+  os_unfair_lock_lock(&gArgAnswersLock);
+  const auto found=gArgAnswers.find(key);
+  const bool have=found!=gArgAnswers.end();const uint64_t kept=have?found->second:0;
+  os_unfair_lock_unlock(&gArgAnswersLock);
+  if(have){gCfAnswerHits.fetch_add(1,std::memory_order_relaxed);return kept;}
+ }
+ gCfAnswerAsks.fetch_add(1,std::memory_order_relaxed);
  uint64_t value=0;
- if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());return 0;}
+ if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());value=0;}
+ if(memo) {
+  os_unfair_lock_lock(&gArgAnswersLock);
+  if(gArgAnswers.size()<4096)gArgAnswers.emplace(key,value);
+  os_unfair_lock_unlock(&gArgAnswersLock);
+ }
  return value;
 }
 static NSUInteger countArgAnswer(id,SEL cmd,NSUInteger arg) {return (NSUInteger)askAnswer(cmd,arg);}
@@ -2827,6 +2879,17 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
    snprintf(line,sizeof line,"native-metal: T tu-ubwc: %s",ubwc);
    sm2_logs(line);
   }
+ }
+ {  // u-cpu: SWEET_CPUFAST's savings in the window
+  static uint64_t lastCf[6];
+  const uint64_t cf[6]={gCfAnswerHits.load(),gCfAnswerAsks.load(),gCfViewportSkips.load(),gCfViewportSent.load(),gCfScissorSkips.load(),
+   gCfScissorSent.load()};
+  uint64_t d[6];for(int i=0;i<6;i++)d[i]=cf[i]-lastCf[i];
+  memcpy(lastCf,cf,sizeof lastCf);
+  snprintf(line,sizeof line,"native-metal: T cpufast 5s: bits 0x%x | answers memo %llu asked %llu | viewport skipped %llu sent %llu | scissor skipped %llu sent %llu",
+   cpuFast(),(unsigned long long)d[0],(unsigned long long)d[1],(unsigned long long)d[2],(unsigned long long)d[3],(unsigned long long)d[4],
+   (unsigned long long)d[5]);
+  sm2_logs(line);
  }
  std::sort(hitches.begin(),hitches.end(),[](const Hitch &a,const Hitch &b){return a.every>b.every;});
  {
