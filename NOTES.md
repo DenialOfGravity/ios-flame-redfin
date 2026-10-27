@@ -292,6 +292,7 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
 - 0972 `/dev/redwood-motion` (sensd's samples, qol-plan §3.3; read() = status, ioctl MOTION_GET_WANT) and `poke m`
   (`m fake accel|gyro|als|prox|compass|pressure|orient [V..]`, `m rot N`, `m stop|secs|status|log|knob|knobs`):
   bsd/dev/sweet_motion.c.
+- 0978 CPU present maps the source surface copyback-cacheable (kernelAddress() is write-combined = uncached for non-IOBMD surfaces: 41 ms vs 4.3 ms copies on r36a); last 4 maps kept.
 - 0980 Bluetooth probe logging (`sweetbtlog=1`, off by default): every kernel-control `CTLIOCGINFO` name, every failing
   open() of /dev bt*/uart*/cu.*/*bluetooth* nodes (`SWEET BTLOG:`, 300 each), and the sweetiolog IOKit trace (`IOK name:`,
   1000 lines) on bluetoothd, BlueTool, wirelessproxd, bluetoothuserd, BTLEServer.

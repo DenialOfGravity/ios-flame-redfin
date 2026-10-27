@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Tue, 27 Oct 2026 09:00:00 +0100
+Subject: [PATCH] 0978 redfin: CPU present reads the frame through a cacheable
+ mapping
+
+r36a: the copy alternated 41 ms (surface 11) and 4.3 ms (surface 12).
+SweetSurface::kernelAddress() maps surfaces that are not kernel buffers
+write-combined, i.e. uncached, and the scaled copy read every pixel of such
+a frame from DRAM uncached. The CPU present now maps the surface's memory
+copyback-cacheable itself (last 4 kept), and cleans+invalidates it before
+the copy as before.
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 39 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 9ed47e0..3100f76 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -237,6 +237,9 @@ public:
+ 	bool          fFcCal, fFcDead;
+ 	bool          presentCPU(const uint8_t *rec);
+ 	uintptr_t     cpuBuffer(uint64_t pa);
++	uintptr_t     cpuSource(SweetSurface *s);       /* 0978 */
++	struct { IOMemoryDescriptor *md; IOMemoryMap *map; } fCpuSrc[4];
++	uint32_t      fCpuSrcNext;
+ 	void          phaseFrameCount(uint64_t now);
+ 	/* 0944 (sweetfbx & 4): frames queued at SwapEnd for the present thread, ticks phased to the TE (fLock) */
+ 	bool          fSwapQ;
+@@ -2588,6 +2591,40 @@ AppleCLCD::phaseTick(uint64_t now)
+  * frame start, no tearing); else into the scanned one. Not exactly one full-frame BGRA layer: the GPU / old CPU
+  * path as before.
+  */
++/*
++ * 0978: the source frame through a cacheable kernel mapping. SweetSurface::kernelAddress() maps a surface that is
++ * not a kernel buffer (CA's, every other one on r36a) write-combined, i.e. uncached: the scaled copy read it at
++ * 41 ms a frame against 4.3 ms for the cacheable one. Kept for the last 4 surfaces' memory (the map holds it);
++ * the copy cleans+invalidates the lines first, as before.
++ */
++uintptr_t
++AppleCLCD::cpuSource(SweetSurface *s)
++{
++	if (OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL) {
++		return s->kernelAddress();      /* already a cacheable kernel buffer */
++	}
++	for (uint32_t i = 0; i < 4; i++) {
++		if (fCpuSrc[i].md == s->memory && fCpuSrc[i].map != NULL) {
++			return (uintptr_t)fCpuSrc[i].map->getVirtualAddress();
++		}
++	}
++	IOMemoryMap *map = s->memory->map(kIOMapCopybackCache);
++	if (map == NULL) {
++		return s->kernelAddress();
++	}
++	uint32_t k = fCpuSrcNext;
++	fCpuSrcNext = (k + 1) % 4;
++	OSSafeReleaseNULL(fCpuSrc[k].map);
++	fCpuSrc[k].md = s->memory;
++	fCpuSrc[k].map = map;
++	static uint32_t logs;
++	if (logs < 4) {
++		logs++;
++		IOLog("SWEET FB: CPU present: surface %u mapped cacheable for the copy\n", s->id);
++	}
++	return (uintptr_t)map->getVirtualAddress();
++}
++
+ uintptr_t
+ AppleCLCD::cpuBuffer(uint64_t pa)
+ {
+@@ -2638,7 +2675,7 @@ AppleCLCD::presentCPU(const uint8_t *rec)
+ 		    s->width == 0 || s->height == 0 || s->bytesPerRow < s->width * 4 ||
+ 		    (uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height > s->memory->getLength()) {
+ 			why = 3;
+-		} else if ((src = s->kernelAddress()) == 0) {
++		} else if ((src = cpuSource(s)) == 0) {
+ 			why = 4;
+ 		}
+ 	}
+-- 
+2.39.0
+
