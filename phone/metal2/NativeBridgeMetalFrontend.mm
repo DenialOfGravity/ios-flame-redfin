@@ -639,6 +639,7 @@ NB_RESOURCE_SPI
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
  if(!nmb_texture_replace(_handle,region,level,slice,bytes,row,image,length))NBLOG(@"native-metal: replaceRegion refused: %@",lastError());
+ if(shadowSeedOn() && self.surface)nmb_texture_set_bytes_generation(_handle,0);   // u-f: bytes changed with no seed
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row {
  [self replaceRegion:r mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:row bytesPerImage:row*r.size.height];
@@ -677,6 +678,16 @@ static void surfaceDrop(IOSurfaceRef surface) {
  if(it!=gSurfaceStates.end() && --it->second.refs==0)gSurfaceStates.erase(it);
 }
 // completion: false at commit (clean what the CPU wrote since), true at completion (flush what the GPU wrote: `surfaces` holds those).
+// u-f (r36): SWEET_SHADOW_SEED=1 (off by default). The runtime skips a surface texture's shadow copy in while its image holds the
+// bytes of the seed the texture is bound at (bridge patch 0107): setTexture gives it the seed + 1, replaceRegion 0. As the GPU's
+// writes of surfaces complete, their seeds are moved on (a lock/unlock pair), so another process's shadow of them copies in again; the
+// clean-flush state takes the new seed (the bytes were just invalidated).
+static bool shadowSeedOn() {
+ static int on=-1;
+ if(on<0){const char *e=getenv("SWEET_SHADOW_SEED");on=e && *e && strcmp(e,"0")?1:0;}
+ return on;
+}
+static void bumpWrittenSeeds(NSSet *surfaces);
 static void flushSurfaces(NSSet *surfaces,bool completion) {
  if(!surfaces.count)return;
  const bool all=flushAll();
@@ -701,6 +712,22 @@ static void flushSurfaces(NSSet *surfaces,bool completion) {
   std::lock_guard<std::mutex> l(gSurfaceStateLock);
   auto state=gSurfaceStates.find(surface);
   if(state!=gSurfaceStates.end()){state->second.seed=seed;state->second.known=true;}
+ }
+}
+static void bumpWrittenSeeds(NSSet *surfaces) {
+ if(!surfaces.count)return;
+ std::vector<IOSurfaceRef> distinct;
+ for(NBTexture *texture in surfaces)if(texture.surface)distinct.push_back(texture.surface);
+ std::sort(distinct.begin(),distinct.end());
+ distinct.erase(std::unique(distinct.begin(),distinct.end()),distinct.end());
+ for(IOSurfaceRef surface:distinct) {
+  uint32_t seed=0;
+  if(IOSurfaceLock(surface,0,&seed)!=kIOReturnSuccess)continue;
+  IOSurfaceUnlock(surface,0,&seed);
+  seed=IOSurfaceGetSeed(surface);
+  std::lock_guard<std::mutex> l(gSurfaceStateLock);
+  auto state=gSurfaceStates.find(surface);
+  if(state!=gSurfaceStates.end() && state->second.known)state->second.seed=seed;
  }
 }
 // Whether a texture bound to a shader may be written by it (a storage texture): such a surface is flushed at completion too.
@@ -1055,6 +1082,8 @@ static void waitForResource(id resource) {
   if(shaderWritable((NBTexture *)texture))[_commandBuffer.writtenSurfaces addObject:texture];
  }
  if(texture)ycbcrRefresh((NBTexture *)texture,_commandBuffer);
+ if(texture && shadowSeedOn() && [(NBTexture *)texture surface] && !((NBTexture *)texture).ycbcrGPU)
+  nmb_texture_set_bytes_generation([(NBTexture *)texture handle],(uint64_t)IOSurfaceGetSeed([(NBTexture *)texture surface])+1);
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
 }
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setSamplerState");
@@ -1446,6 +1475,7 @@ static void noteDeviceLost(const char *why) {
  }
  // C3: what the GPU wrote (every surface with SWEET_FLUSH=all), invalidated for the CPU.
  flushSurfaces(flushAll()?_surfaces:_writtenSurfaces,true);
+ if(shadowSeedOn())bumpWrittenSeeds(_writtenSurfaces);
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
  [_surfaces removeAllObjects];[_writtenSurfaces removeAllObjects];[_resourceOwners removeAllObjects];

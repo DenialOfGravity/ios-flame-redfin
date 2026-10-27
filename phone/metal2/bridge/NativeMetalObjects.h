@@ -94,6 +94,8 @@ NmbTexture *nmb_texture_new_on_surface(NmbBuffer *, const struct NmbTextureDescr
                                        const struct NmbSurfaceFacts *facts);
 /* The surface seed + 1 a two-plane YCbCr texture's planes hold now: converted again only when it changes. False for other textures. */
 bool nmb_texture_set_converted_generation(const NmbTexture *, uint64_t generation);
+/* SweetMetal2 (patch 0107, SWEET_SHADOW_SEED=1): the surface seed + 1 (0 = changed another way) a shadowed surface texture is bound at. */
+bool nmb_texture_set_bytes_generation(const NmbTexture *, uint64_t generation);
 /* SweetMetal2: shadow copy counts since start (patch 0104): copies, texel bytes, repacked, YCbCr copies skipped, layouts refused. */
 bool nmb_sweet_shadow_counts(uint64_t out[5]);
 /* SweetMetal2: render encoder step times (patch 0106, env SWEET_DRAWSTAT=1): (ns, count) pairs since start into out[2*capacity];

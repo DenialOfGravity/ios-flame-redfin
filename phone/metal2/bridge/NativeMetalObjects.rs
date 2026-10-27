@@ -776,6 +776,14 @@ pub extern "C" fn nmb_texture_set_converted_generation(texture: *const NmbTextur
     guard(false, || Ok(get(texture)?.0.set_converted_generation(generation)))
 }
 
+/// SweetMetal2: the surface seed + 1 (0 = the bytes changed some other way) a shadowed texture over a surface's bytes is bound at: its
+/// copy in is skipped while its image holds that seed's bytes (bridge patch 0107, env SWEET_SHADOW_SEED=1). False for any other texture
+/// or with the knob off.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_set_bytes_generation(texture: *const NmbTexture, generation: u64) -> bool {
+    guard(false, || Ok(get(texture)?.0.set_bytes_generation(generation)))
+}
+
 /// SweetMetal2: the runtime's shadow copy counts since the process started (bridge patch 0104), into the caller's five words:
 /// copies recorded, their texel bytes, of them repacked through the kernel, YCbCr copies in skipped, linear layouts refused.
 #[unsafe(no_mangle)]
