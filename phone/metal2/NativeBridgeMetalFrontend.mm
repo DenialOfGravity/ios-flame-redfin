@@ -51,6 +51,12 @@ static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBigg
 // last commits with what each held and how long the GPU took (commit to completion).
 static uint64_t nowUs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;}
 static void noteShadowCopies();   // WS-U: backboardd's 5 s "J copies" line (defined by the telemetry table)
+// u-f (r36): SWEET_SHADOW_SEED=1, surface-seed shadow copy skip (bridge patch 0107; see bumpWrittenSeeds).
+static bool shadowSeedOn() {
+ static int on=-1;
+ if(on<0){const char *e=getenv("SWEET_SHADOW_SEED");on=e && *e && strcmp(e,"0")?1:0;}
+ return on;
+}
 struct Timed {std::atomic<uint64_t> count{0},total{0},slowest{0};
  void add(uint64_t began){const uint64_t took=nowUs()-began;count++;total+=took;uint64_t seen=slowest.load();while(took>seen && !slowest.compare_exchange_weak(seen,took)){}}};
 static Timed gTimePipeline,gTimeLibrary,gTimeFunction,gTimeEncodeToCommit;
@@ -682,11 +688,6 @@ static void surfaceDrop(IOSurfaceRef surface) {
 // bytes of the seed the texture is bound at (bridge patch 0107): setTexture gives it the seed + 1, replaceRegion 0. As the GPU's
 // writes of surfaces complete, their seeds are moved on (a lock/unlock pair), so another process's shadow of them copies in again; the
 // clean-flush state takes the new seed (the bytes were just invalidated).
-static bool shadowSeedOn() {
- static int on=-1;
- if(on<0){const char *e=getenv("SWEET_SHADOW_SEED");on=e && *e && strcmp(e,"0")?1:0;}
- return on;
-}
 static void bumpWrittenSeeds(NSSet *surfaces);
 static void flushSurfaces(NSSet *surfaces,bool completion) {
  if(!surfaces.count)return;
@@ -722,7 +723,7 @@ static void bumpWrittenSeeds(NSSet *surfaces) {
  distinct.erase(std::unique(distinct.begin(),distinct.end()),distinct.end());
  for(IOSurfaceRef surface:distinct) {
   uint32_t seed=0;
-  if(IOSurfaceLock(surface,0,&seed)!=kIOReturnSuccess)continue;
+  if(IOSurfaceLock(surface,0,&seed)!=0)continue;
   IOSurfaceUnlock(surface,0,&seed);
   seed=IOSurfaceGetSeed(surface);
   std::lock_guard<std::mutex> l(gSurfaceStateLock);
