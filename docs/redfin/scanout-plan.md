@@ -197,3 +197,11 @@ bit 8, OUT_XY, SMMU bank M bit.
 - 0989 `p scanout gate 2`: CP_WAIT_REG_MEM on a latched-frame word (scratch + 0x3000). It is released on any change
   or after 50 ms. Flips wait for the swapper's own last fence. The gate 1 cap is now 50 ms.
 - Third surface, phone step (read only): `imgdump grep` in QuartzCore / IOMobileFramebuffer for the swap-chain keys.
+
+## 2026-10-27, r40 and 0991
+
+- Gate 2 bug: frame K+1's GPU work waits in the CP for K on screen, but K+1's SwapEnd replaced K (still waiting for
+  its fence), so K was never shown and K+1 never drew until the 50 ms release. 0991 queues frames in gate 2 instead.
+- r40b "stall after sweetiomfbprops": `SWEET CMD: key 0 100` at 156.685 (a power-key press) and then `display off`
+  at 157.073. No frames come while the display is off. The source limits changed nothing visible (chain 2-2). The
+  "nonslot 2" were backboardd's display-off swaps (surface 0, layers 0x1 / 0x80000007).
