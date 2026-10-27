@@ -3,14 +3,14 @@ From: Rory Axton <roryaxton@gmail.com>
 Date: Tue, 27 Oct 2026 12:00:00 +0100
 Subject: [PATCH] 0990 redfin: IOMFB source-limit properties (sweetiomfbprops=1)
 
-QuartzCore os_logs "kIOMFBSourceSurface(Width/Height)LimitKey missing!" and
-four more when AppleCLCD lacks the display pipe's source limits. The key
-strings are not known yet: published under the Apple Silicon AppleCLCD2
-names (IOMFBMaxSrcPixels dict) and the constants' names without k/Key
-(flat and in IOMFBSourceLimits). Default off.
+QuartzCore os_logs "kIOMFB... missing!" when AppleCLCD lacks the display
+pipe's source limits. Key strings from imgdump: IOMFBMaxSrcPixels =
+{MaxSrcBufferWidth 16384, MaxSrcBufferHeight 16384, MaxSrcRectWidth 4096,
+MaxSrcRectTotal 2 x 1125 x 2436} and IOMFBMaxCompressedSizeInBytes
+(1125 x 2436 x 4). Default off.
 ---
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 74ab102..3e845c2 100644
+index 74ab102..682a868 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -278,6 +278,7 @@ public:
@@ -29,19 +29,16 @@ index 74ab102..3e845c2 100644
  	if (blStart()) {
  		uint32_t blOn = 0;
  		PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
-@@ -1435,6 +1437,55 @@ sweet_fb_set_number(OSDictionary *d, const char *key, uint64_t v)
+@@ -1435,6 +1437,38 @@ sweet_fb_set_number(OSDictionary *d, const char *key, uint64_t v)
  	}
  }
  
 +/*
-+ * 0990 (boot-arg sweetiomfbprops=1): the display pipe's source limits. QuartzCore logs (os_log, not the klog)
-+ * "kIOMFBSourceSurface(Width/Height)LimitKey missing!", "...SourceRectangleLimitWidthKey", "...LimitTotalKey",
-+ * "kIOMFBMaxCompressedSizeInBytes", "kIOMFBSourceLimitsKey missing!" when the framebuffer service lacks them. The
-+ * strings behind those constants are not known yet (an imgdump grep on the phone will tell): published under the
-+ * names an Apple Silicon AppleCLCD2 uses (IOMFBMaxSrcPixels: MaxSrcRectWidthForPipe, MaxSrcBufferWidth/Height,
-+ * MaxSrcRectTotal) and under the constants' own names without k/Key, flat and in an IOMFBSourceLimits dictionary.
-+ * Values for one 2-pipe display engine: buffers up to 16384, a 4096-wide source rectangle per pipe (lito: 2880 SSPP
-+ * line width, 2 pipes), 8192 in all, no compression (0).
++ * 0990 (boot-arg sweetiomfbprops=1): the display pipe's source limits. QuartzCore os_logs "kIOMFB... missing!" when
++ * the framebuffer service lacks them; the key strings (imgdump grep in QuartzCore and IOMobileFramebuffer, r39):
++ * IOMFBMaxSrcPixels = { MaxSrcBufferWidth, MaxSrcBufferHeight, MaxSrcRectWidth, MaxSrcRectTotal } (read by CA's
++ * maximumSourceRectPixels / maximumSourceRectWidth) and IOMFBMaxCompressedSizeInBytes. Values: buffers up to 16384,
++ * a 4096-wide source rectangle, two 1125x2436 frames of source pixels in all, one uncompressed frame's bytes.
 + */
 +void
 +AppleCLCD::publishSourceLimits(void)
@@ -51,35 +48,21 @@ index 74ab102..3e845c2 100644
 +	if (!on) {
 +		return;
 +	}
-+	static const struct { const char *key; uint64_t v; } apple[] = {
-+		{ "MaxSrcRectWidthForPipe", 4096 }, { "MaxSrcBufferWidth", 16384 }, { "MaxSrcBufferHeight", 16384 },
-+		{ "MaxSrcRectTotal", 8192 },
-+	}, flat[] = {
-+		{ "IOMFBSourceSurfaceWidthLimit", 16384 }, { "IOMFBSourceSurfaceHeightLimit", 16384 },
-+		{ "IOMFBSourceRectangleLimitWidth", 4096 }, { "IOMFBSourceRectangleLimitTotal", 8192 },
-+		{ "IOMFBMaxCompressedSizeInBytes", 0 },
-+	};
-+	OSDictionary *px = OSDictionary::withCapacity(4), *lim = OSDictionary::withCapacity(5);
-+	for (uint32_t i = 0; px != NULL && i < sizeof(apple) / sizeof(apple[0]); i++) {
-+		sweet_fb_set_number(px, apple[i].key, apple[i].v);
-+	}
-+	for (uint32_t i = 0; lim != NULL && i < sizeof(flat) / sizeof(flat[0]); i++) {
-+		sweet_fb_set_number(lim, flat[i].key, flat[i].v);
-+		OSNumber *n = OSNumber::withNumber(flat[i].v, 32);
-+		if (n != NULL) {
-+			setProperty(flat[i].key, n);
-+			n->release();
-+		}
-+	}
++	OSDictionary *px = OSDictionary::withCapacity(4);
 +	if (px != NULL) {
++		sweet_fb_set_number(px, "MaxSrcBufferWidth", 16384);
++		sweet_fb_set_number(px, "MaxSrcBufferHeight", 16384);
++		sweet_fb_set_number(px, "MaxSrcRectWidth", 4096);
++		sweet_fb_set_number(px, "MaxSrcRectTotal", 2ULL * SWEET_FB_LOGICAL_W * SWEET_FB_LOGICAL_H);
 +		setProperty("IOMFBMaxSrcPixels", px);
++		px->release();
 +	}
-+	if (lim != NULL) {
-+		setProperty("IOMFBSourceLimits", lim);
++	OSNumber *n = OSNumber::withNumber(4ULL * SWEET_FB_LOGICAL_W * SWEET_FB_LOGICAL_H, 32);
++	if (n != NULL) {
++		setProperty("IOMFBMaxCompressedSizeInBytes", n);
++		n->release();
 +	}
-+	OSSafeReleaseNULL(px);
-+	OSSafeReleaseNULL(lim);
-+	IOLog("SWEET FB: source limits published (IOMFBMaxSrcPixels, IOMFBSourceLimits and 5 flat keys)\n");
++	IOLog("SWEET FB: source limits published (IOMFBMaxSrcPixels, IOMFBMaxCompressedSizeInBytes)\n");
 +}
 +
  /*
