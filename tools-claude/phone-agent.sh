@@ -16,9 +16,12 @@
 #   boot-twrp                  fastboot boot twrp-3.7.0_11-0-redfin.img
 #   to-fastboot                the running iOS kernel resets into fastboot (flame-cmd.py reboot)
 #   adb-to-fastboot            TWRP: adb reboot bootloader
+#   fb-info                    fastboot getvar of a few read-only variables (no writes)
+#   fb-reboot-bootloader       fastboot reboot bootloader (from the bootloader or fastbootd; no flashing)
 #   files VERB ARGS            tools/flame-files.py VERB ARGS   (VERB: put get mkdir read chmod link)
 #   poke TEXT                  tools/flame-cmd.py TEXT          (the phone's command server)
 #   install-audio NAME         tools/redfin-install-audio.sh NAME
+#   fpsbench [LABEL [PA]]     touch-driven UI benchmark (tools-claude/redfin-fpsbench.sh) -> one row, logs/fpsbench.tsv
 #   klog [PA]                  the kernel log ring -> logs/klog.txt (tools-claude/klog.py)
 #   twrp-pull                  TWRP: /vendor mounted read-only, ADSP + amplifier firmware and the audio
 #                              configuration copied to ios-redfin-tree/ios-redfin/recon/fw-adsp
@@ -36,6 +39,26 @@
 #   reload                     start this script again (after Claude updated it)
 #   ssh-key                    make the key for the phone (~/.ssh/redfin-claude) and put its public half in agent/stage
 #   phone CMD                  run CMD on the phone over SSH (dropbear on 192.168.7.2): the phone only, never this PC
+#   pull REMOTE LOCAL [gunzip] copy a phone file to the project folder over SSH (cat; size checked against the phone's
+#                              toybox stat; the kernel file server only as the fallback); gunzip: also write LOCAL
+#                              without .gz decompressed (sweettrace -z traces). Prints MB/s.
+#   exp PLAN                   background: tools-claude/exp-run.py PLAN (an A/B experiment, no LLM in the loop; PLAN a
+#                              path in the project folder, e.g. agent/exp/x.plan) -> logs/exp-NAME-*/ (summary.tsv, ab.txt)
+#   exp-status                 the running/last experiment: alive?, the last lines of its log, its A/B table when done
+#   exp-stop                   stop it after the current step (STOP file; the env is restored); exp-kill: at once
+#   mkimage NAME KDIR [BASE] [CMDLINE_FILE]
+#                              tools-claude/mkimage.py: NAME/redfin-NAME.img = BASE (default r47a) repacked with
+#                              KDIR/kernel.development.sweet(.gz) (shim, ADT/GPU firmware, cmdline, AVB salt from BASE;
+#                              refuses DO-NOT-BOOT / no COMPILER.txt / no "ISA check ok" / NAME existing)
+#
+# Local builds (tools-claude/localbuild, in WSL as this user, never root; output and logs in builds/):
+#   build-env                  what the build host has (cores, memory, disk, toolchain, SDKs)
+#   build-apt                  sudo apt-get install the fixed package list below (the only step that uses sudo)
+#   build-setup STEP           background: lb.sh setup STEP  (toolchain into ~/redfin-build/toolchain)
+#   build TARGET [REF]         background: lb.sh build TARGET REF  (TARGET shim|userland|metal2|xnu, REF a branch
+#                              or commit of DenialOfGravity/ios-flame-redfin, default redfin-qol)
+#   build-jobs                 running local builds;   build-kill  stops them all
+#   build-diag                 run localbuild/diag.sh (a throwaway inspection script Claude writes; foreground)
 set -uo pipefail
 P=/mnt/c/ClaudeProjects/iOS_Pixel5
 REPO=${REPO:-$HOME/ios-redfin}
@@ -125,7 +148,32 @@ net() {
 # fastboot.exe / adb.exe (Windows) take Windows paths
 winpath() { case $1 in *.exe) wslpath -w "$2";; *) echo "$2";; esac; }
 
+LB=$P/tools-claude/localbuild/lb.sh
+BUILD_APT="build-essential pkg-config ninja-build python3 python3-dev python3-venv python3-pip xz-utils libssl-dev
+ zlib1g-dev libbsd-dev uuid-dev llvm llvm-dev libclang-dev clang lld device-tree-compiler git patch flex bison bzip2
+ cpio rsync curl wget ca-certificates tcsh unifdef cmake mtools lz4 m4 jq file libxml2-dev glslang-tools meson
+ libplist-dev libplist-2.0-dev ldid rustup ruby"
+lb_bg() {	# KIND ARGS...: start lb.sh detached, log in builds/logs
+	mkdir -p "$P/builds/logs"
+	local log=$P/builds/logs/$1-$(echo "${*:2}" | tr ' /' '__')-$(date +%Y%m%d-%H%M%S).log
+	setsid nohup bash "$LB" "$@" </dev/null >"$log" 2>&1 &
+	echo "started pid $! -> ${log#$P/}"
+}
+
 ok_name() { [[ $1 =~ ^r[0-9a-z]+(-[0-9a-z]+)*$ ]]; }
+
+# u-lab: SSH to the phone (as `phone`), a project-folder path check, the experiment runner's state
+PSSH=(ssh -i ~/.ssh/redfin-claude -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10
+	-o LogLevel=ERROR -o BatchMode=yes root@192.168.7.2)
+in_p() {	# PATH (absolute or relative to the project folder) -> absolute, only inside the project folder
+	local d; case $1 in /*) d=$1;; *) d=$P/$1;; esac
+	d=$(realpath -m -- "$d") || return 1
+	[[ $d == "$P"/* ]] || { echo "not in the project folder: $1" >&2; return 1; }
+	echo "$d"
+}
+EXPPID=/tmp/phone-agent-exp.pid EXPLOG=/tmp/phone-agent-exp.log
+exp_running() { [ -f $EXPPID ] && kill -0 "$(cat $EXPPID)" 2>/dev/null; }
+exp_dir() { [ -f $EXPLOG ] && sed -n 's/.* -> \(\/.*\)$/\1/p' "$(cat $EXPLOG)" 2>/dev/null | head -1; }
 
 run() {	# one request line
 	read -r act rest <<<"$1"
@@ -148,6 +196,8 @@ run() {	# one request line
 	boot-twrp) timeout 120 "$FB" boot "$(winpath "$FB" "$P/twrp-3.7.0_11-0-redfin.img")";;
 	to-fastboot) (cd "$REPO" && timeout 20 python3 -I tools/flame-cmd.py --wait 2 reboot);;
 	adb-to-fastboot) timeout 20 "$ADB" -d reboot bootloader;;
+	fb-info) for v in product current-slot is-userspace battery-voltage battery-soc-ok off-mode-charge unlocked; do timeout 10 "$FB" getvar $v 2>&1 | grep -v -E '^(Finished|Total time)'; done;;
+	fb-reboot-bootloader) timeout 30 "$FB" reboot bootloader;;
 	files)
 		read -r verb args <<<"$rest"
 		case $verb in put|get|mkdir|read|chmod|link) ;; *) echo "verb not allowed"; return 1;; esac
@@ -157,6 +207,7 @@ run() {	# one request line
 	install-audio)
 		ok_name "$rest" || { echo "bad name"; return 1; }
 		(cd "$REPO" && timeout 300 bash tools/redfin-install-audio.sh "$P/$rest");;
+	fpsbench) read -r l pa <<<"$rest"; REPO=$REPO timeout 280 bash "$P/tools-claude/redfin-fpsbench.sh" "${l:-run}" ${pa:-};;
 	klog) (cd "$REPO" && timeout 300 python3 "$P/tools-claude/klog.py" $rest);;
 	twrp-pull)
 		local dst=$P/ios-redfin-tree/ios-redfin/recon/fw-adsp
@@ -209,6 +260,70 @@ run() {	# one request line
 	phone)
 		timeout 300 ssh -i ~/.ssh/redfin-claude -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
 			-o ConnectTimeout=10 -o LogLevel=ERROR root@192.168.7.2 "$rest";;
+	pull)
+		local src dst gz d size t0 t1 got
+		read -r src dst gz <<<"$rest"
+		[[ $src =~ ^/[A-Za-z0-9._/+-]+$ && $src != *..* ]] || { echo "REMOTE: an absolute path"; return 1; }
+		[ -n "$dst" ] && d=$(in_p "$dst") || { echo "LOCAL: a path in the project folder"; return 1; }
+		mkdir -p "$(dirname "$d")"
+		size=$(timeout 30 "${PSSH[@]}" "toybox stat -c %s $src" | tr -d '\r') || true
+		[[ $size =~ ^[0-9]+$ ]] || { echo "no $src on the phone (or no ssh)"; return 1; }
+		t0=$(date +%s.%N)
+		timeout 900 "${PSSH[@]}" "cat $src" > "$d.part"
+		got=$(stat -c %s "$d.part")
+		if [ "$got" != "$size" ]; then
+			echo "ssh gave $got of $size bytes: file server instead"
+			(cd "$REPO" && timeout 900 python3 -I tools/flame-files.py get "$src" "$d.part")
+			got=$(stat -c %s "$d.part")
+			[ "$got" = "$size" ] || { echo "pull failed: $got of $size bytes"; return 1; }
+		fi
+		t1=$(date +%s.%N)
+		mv -f "$d.part" "$d"
+		awk -v b="$size" -v t0="$t0" -v t1="$t1" 'BEGIN { s = t1 - t0; printf "pulled %d bytes in %.1f s (%.2f MB/s)\n", b, s, b / 1e6 / (s > 0 ? s : 1e-3) }'
+		if [ "$gz" = gunzip ] && [[ $d == *.gz ]]; then
+			gzip -dc "$d" > "${d%.gz}" && echo "-> ${d%.gz} ($(stat -c %s "${d%.gz}") bytes)"
+		fi;;
+	exp)
+		exp_running && { echo "an experiment runs already (pid $(cat $EXPPID)): exp-status / exp-stop"; return 1; }
+		local plan log; plan=$(in_p "$rest") && [ -f "$plan" ] || { echo "PLAN: a file in the project folder"; return 1; }
+		log=$P/logs/exp-run-$(date +%Y%m%d-%H%M%S).log
+		REPO=$REPO setsid nohup python3 -I "$P/tools-claude/exp-run.py" "$plan" </dev/null >"$log" 2>&1 &
+		echo $! > $EXPPID; echo "$log" > $EXPLOG
+		sleep 2; echo "started pid $(cat $EXPPID) -> ${log#$P/}"; head -20 "$log";;
+	exp-status)
+		[ -f $EXPLOG ] || { echo "no experiment started by this agent"; return 0; }
+		exp_running && echo "running (pid $(cat $EXPPID))" || echo "not running"
+		echo "log $(cat $EXPLOG)"; tail -n 25 "$(cat $EXPLOG)"
+		local xd; xd=$(exp_dir); [ -n "$xd" ] && [ -f "$xd/ab.txt" ] && ! exp_running && cat "$xd/ab.txt";;
+	exp-stop)
+		exp_running || { echo "not running"; return 0; }
+		local xd; xd=$(exp_dir); [ -n "$xd" ] && [ -d "$xd" ] && touch "$xd/STOP" && echo "STOP -> $xd (stops after the current step, then restores the env)";;
+	exp-kill)
+		exp_running && kill -TERM -- "-$(cat $EXPPID)" 2>/dev/null && echo "killed (env NOT restored: check /var/local/mtl2-env)" || echo "not running";;
+	mkimage)
+		[[ $rest =~ ^[A-Za-z0-9._/\ -]+$ && $rest != *..* ]] || { echo "usage: mkimage NAME KERNEL_DIR [BASE] [CMDLINE_FILE]"; return 1; }
+		# shellcheck disable=SC2086
+		REPO=$REPO timeout 600 python3 -I "$P/tools-claude/mkimage.py" $rest;;
+	build-env) timeout 120 bash "$LB" env;;
+	build-diag) timeout 170 bash "$LB" diag;;	# runs localbuild/diag.sh: one-off checks while porting a build
+	build-apt)
+		sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update -q 2>&1 | tail -2
+		local have=() p; for p in $BUILD_APT; do
+			if apt-cache show "$p" >/dev/null 2>&1; then have+=("$p"); else echo "(no package $p here)"; fi
+		done
+		timeout 1500 sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "${have[@]}" 2>&1 | tail -8;;
+	build-setup)
+		[[ $rest =~ ^[a-z0-9-]+$ ]] || { echo "bad step"; return 1; }
+		lb_bg setup "$rest";;
+	build)
+		read -r tgt ref <<<"$rest"
+		[[ $tgt =~ ^(shim|userland|metal2|xnu)$ ]] || { echo "TARGET: shim userland metal2 xnu"; return 1; }
+		[[ ${ref:-x} =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad ref"; return 1; }
+		lb_bg build "$tgt" ${ref:-redfin-qol};;
+	build-jobs) pgrep -af "localbuild/lb.sh" || echo "no local builds running";;
+	build-kill)	# lb.sh runs under setsid: its pid is the process group of the whole build
+		local k=0; for pid in $(pgrep -f "localbuild/lb.sh"); do kill -TERM -- "-$pid" 2>/dev/null && k=1; done
+		[ $k = 1 ] && echo killed || echo "nothing running";;
 	*) echo "unknown action: $act"; return 1;;
 	esac
 }
