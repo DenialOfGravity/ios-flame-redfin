@@ -1,0 +1,111 @@
+diff --git a/crates/metal2vulkan-runtime/src/shader_cache/mod.rs b/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
+index 513fe37f..5f5cc9cd 100644
+--- a/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
++++ b/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
+@@ -217,6 +217,8 @@ pub(crate) fn this_build() -> Hash256 {
+     hash.update(metal2vulkan::cache::SEMANTICS_VERSION.to_le_bytes());
+     hash.update(metal2vulkan::cache::SOURCE_DIGEST.as_bytes());
+     hash.update(env!("M2V_RUNTIME_SOURCE_ID").as_bytes());
++    // sweet: the knobs that change compiled modules (empty with all off: the same build id).
++    hash.update(metal2vulkan::env_vars::sweet_key_tag());
+     hash.finalize().into()
+ }
+ 
+diff --git a/crates/metal2vulkan/src/env_vars.rs b/crates/metal2vulkan/src/env_vars.rs
+index ebb04f4f..1610d4c3 100644
+--- a/crates/metal2vulkan/src/env_vars.rs
++++ b/crates/metal2vulkan/src/env_vars.rs
+@@ -34,6 +34,14 @@ pub const REGISTRY: &[EnvVar] = &[
+                  validation with shader accesses; `load-store`: load operations after earlier \
+                  stores)",
+     },
++    EnvVar {
++        name: "SWEET_M2V_COLOR_WRITES",
++        default: "unset (Metal's rounding of each float color output, in the shader)",
++        effect: "sweet 0109: `device` (or `1`): a float color output is stored by the device's own \
++                 conversion (unorm, snorm, sRGB, half), not rounded to Metal's code in the \
++                 fragment function first; the two differ only at the exact ties between two \
++                 codes. Changes the SPIR-V (and every cache key)",
++    },
+     EnvVar {
+         name: "METAL2VULKAN_LOG_PIPELINES",
+         default: "unset (off)",
+@@ -76,6 +84,30 @@ pub fn log_pipelines() -> bool {
+         .is_some_and(|value| !value.is_empty() && value != "0")
+ }
+ 
++/// sweet 0109: whether float color outputs keep the device's conversion (`REGISTRY`):
++/// `SWEET_M2V_COLOR_WRITES` is `device` or `1`. Read once per process. It changes what the
++/// library compiles, so every cache key includes it ([`sweet_key_tag`]).
++pub fn sweet_color_writes_device() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        std::env::var("SWEET_M2V_COLOR_WRITES").is_ok_and(|v| v == "device" || v == "1")
++    })
++}
++
++/// sweet: the bytes the sweet knobs that change compiled modules add to every cache key (the
++/// compile layer's keys, the runtime's shader cache build); empty with every knob off, so the
++/// keys are then upstream's.
++pub fn sweet_key_tag() -> &'static [u8] {
++    static TAG: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
++    TAG.get_or_init(|| {
++        let mut t = Vec::new();
++        if sweet_color_writes_device() {
++            t.extend_from_slice(b"sweet-color-writes-device\0");
++        }
++        t
++    })
++}
++
+ /// Optional path override for an external tool `cmd` (`llvm-as`, `spirv-val`, …), read from
+ /// `METAL2VULKAN_<CMD>` (uppercased, `-`→`_`). A dynamic family — one var per tool the binary or
+ /// the crate's test support runs — documented in `REGISTRY` as a single `METAL2VULKAN_<TOOL>`
+diff --git a/crates/metal2vulkan/src/pipeline/color_writes.rs b/crates/metal2vulkan/src/pipeline/color_writes.rs
+index 86f6acba..6ad79869 100644
+--- a/crates/metal2vulkan/src/pipeline/color_writes.rs
++++ b/crates/metal2vulkan/src/pipeline/color_writes.rs
+@@ -113,6 +113,13 @@ pub(crate) fn exact_writes(
+             }
+             _ => write,
+         };
++        // sweet 0109: under SWEET_M2V_COLOR_WRITES=device every channel the function would round
++        // to Metal's code itself is left to the device's conversion instead (it differs only at
++        // the exact ties between two codes), so the module carries no rounding and no rule word.
++        let write = match crate::env_vars::sweet_color_writes_device() {
++            true => write.map(|w| w.map(|r| r.map(sweet_device_rule))),
++            false => write,
++        };
+         if let Some(write) = write {
+             out.insert(attachment, write);
+         }
+@@ -120,6 +127,16 @@ pub(crate) fn exact_writes(
+     out
+ }
+ 
++/// sweet 0109: the rule a channel of rule `r` takes under SWEET_M2V_COLOR_WRITES=device: the
++/// device's conversion for every rounding the function would compute (unorm, snorm, sRGB, the
++/// small floats' and the packed formats'); a blended channel's rule is kept.
++fn sweet_device_rule(r: ChannelWrite) -> ChannelWrite {
++    match r {
++        ChannelWrite::BlendedNearestEven { .. } | ChannelWrite::Device => r,
++        _ => ChannelWrite::Device,
++    }
++}
++
+ /// A rule word's code of a channel that takes no rule: the output as written.
+ pub(crate) const NO_RULE_CODE: u32 = 0;
+ 
+diff --git a/crates/metal2vulkan/src/pipeline/compile/key.rs b/crates/metal2vulkan/src/pipeline/compile/key.rs
+index 835f77e1..060bf25b 100644
+--- a/crates/metal2vulkan/src/pipeline/compile/key.rs
++++ b/crates/metal2vulkan/src/pipeline/compile/key.rs
+@@ -56,6 +56,8 @@ impl KeyHasher {
+         h.update(domain);
+         h.update([0]);
+         h.update(SEMANTICS_VERSION.to_le_bytes());
++        // sweet: the knobs that change compiled modules (empty with all off: upstream's keys).
++        h.update(crate::env_vars::sweet_key_tag());
+         KeyHasher(h)
+     }
+ 
