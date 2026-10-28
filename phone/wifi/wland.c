@@ -865,10 +865,28 @@ static int auto_up(void)
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
-		fprintf(stderr, "usage: wland smem | smp2p | vote RES LVL | levels RES | boot\n");
+		fprintf(stderr, "usage: wland smem | smp2p | vote RES LVL | levels RES | boot | sysctl NAME [VALUE]\n");
 		return 2;
 	}
 	setvbuf(stdout, NULL, _IONBF, 0);	/* a stalled bus access must not swallow the output */
+	if (!strcmp(argv[1], "sysctl") && argc > 2) {
+		/* wland sysctl NAME [VALUE]: an int sysctl (kern.sweet_wifi_lqm, kern.sweet_wifi_rssi); iOS has no sysctl(8) */
+		int v = 0, nv;
+		size_t n = sizeof(v);
+		if (argc > 3) {
+			nv = (int)strtol(argv[3], NULL, 0);
+			if (sysctlbyname(argv[2], NULL, NULL, &nv, sizeof(nv))) {
+				perror(argv[2]);
+				return 1;
+			}
+		}
+		if (sysctlbyname(argv[2], &v, &n, NULL, 0)) {
+			perror(argv[2]);
+			return 1;
+		}
+		printf("%s = %d (%#x)\n", argv[2], v, v);
+		return 0;
+	}
 	pm_init();
 	if (smem_init())
 		return 1;
