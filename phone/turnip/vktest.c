@@ -15,6 +15,8 @@
 
 static PFN_vkGetInstanceProcAddr gipa;
 static PFN_vkGetDeviceProcAddr gdpa;
+/* u-perfctr: Turnip 0113's counter report (SWEET_TIMELINE=1 SWEET_TU_PERFCTR=<preset> [SWEET_TU_PERFCTR_DRAW=1]) */
+static size_t (*perf_report)(char *, size_t, unsigned);
 static VkInstance inst;
 static VkDevice dev;
 #define IFN(n) PFN_##n n = (PFN_##n)gipa(inst, #n)
@@ -192,7 +194,10 @@ static int test_compute(void)
 
 /* u-gpudraw: fill rate. vktest bench [N]: N (default 40) full-target triangles of tri.frag into a 1125x2436 BGRA8
  * image (CA's framebuffer size), blend off and src-alpha blend on, in one render pass; the GPU time per draw is the
- * submit time of N draws minus that of 1 draw, over N-1. TU_DEBUG=sysmem|gmem picks the mode. */
+ * submit time of N draws minus that of 1 draw, over N-1. TU_DEBUG=sysmem|gmem picks the mode.
+ * u-perfctr: then alu.frag (16 dependent vec4 mul+fma steps: ~128 fp32 ALU instructions a pixel) and alu16.frag (the
+ * same in mediump), blend off, to calibrate the ALU counters; with Turnip 0113's counters on, a "PERF" report after
+ * each variant. */
 static double fill_run(VkPipeline p, VkImageView view, uint32_t W, uint32_t H, VkImage img, int draws)
 {
 	DFN(vkCmdPipelineBarrier); DFN(vkCmdBeginRendering); DFN(vkCmdEndRendering); DFN(vkCmdBindPipeline);
@@ -265,7 +270,16 @@ static int bench_fill(int n)
 		.pDynamicStates = dyn };
 	VkPipelineRenderingCreateInfo ri = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1,
 		.pColorAttachmentFormats = &fmt };
-	for (int blend = 0; blend < 2; blend++) {
+	static const char *names[4] = { "fill", "fill", "alu32", "alu16" };
+	if (perf_report) {	/* what ran before the bench is not its */
+		char drop[1400];
+		for (unsigned part = 0; part < 3; part++)
+			perf_report(drop, sizeof(drop), part);
+	}
+	for (int variant = 0; variant < 4; variant++) {
+		const int blend = variant == 1;
+		st[1].module = variant < 2 ? module(tri_frag, sizeof(tri_frag)) :
+			variant == 2 ? module(alu_frag, sizeof(alu_frag)) : module(alu16_frag, sizeof(alu16_frag));
 		VkPipelineColorBlendAttachmentState cba = { .colorWriteMask = 0xf, .blendEnable = (VkBool32)blend,
 			.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
 			.colorBlendOp = VK_BLEND_OP_ADD, .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
@@ -284,8 +298,14 @@ static int bench_fill(int n)
 			if (b < many) many = b;
 		}
 		const double per = (many - one) / (n - 1);
-		printf("BENCH fill %ux%u blend %d: 1 draw %.2f ms, %d draws %.2f ms -> %.3f ms per full-target draw, %.3f ns/px, %.2f px/clk at 625 MHz\n",
-		       W, H, blend, one, n, many, per, per * 1e6 / ((double)W * H), (double)W * H / (per * 1e-3 * 625e6));
+		printf("BENCH %s %ux%u blend %d: 1 draw %.2f ms, %d draws %.2f ms -> %.3f ms per full-target draw, %.3f ns/px, %.2f px/clk at 625 MHz\n",
+		       names[variant], W, H, blend, one, n, many, per, per * 1e6 / ((double)W * H), (double)W * H / (per * 1e-3 * 625e6));
+		if (perf_report) {	/* the counters of this variant's 5 + 5 passes (1 and N draws) */
+			char text[1400];
+			for (unsigned part = 0; part < 3; part++)
+				if (perf_report(text, sizeof(text), part))
+					printf("PERF %s blend %d part %u: %s\n", names[variant], blend, part, text);
+		}
 	}
 	return 0;
 }
@@ -417,6 +437,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	printf("loaded %s in %.0f ms\n", lib, now_ms() - t0);
+	perf_report = (size_t (*)(char *, size_t, unsigned))dlsym(h, "sweet_tu_perf_report");
 	PFN_vkCreateInstance vkCreateInstance = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
 	VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "vktest", .apiVersion = VK_API_VERSION_1_3 };
 	VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
