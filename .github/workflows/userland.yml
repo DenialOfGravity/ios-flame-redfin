@@ -93,7 +93,7 @@ jobs:
           cp phone/wifi/out/wland ../out/
           sh phone/sensors/test.sh > ../out/sensd-test.log 2>&1 || { echo "::warning::sensd host tests failed"; tail -20 ../out/sensd-test.log; }
           sh phone/sensors/build.sh && cp phone/sensors/out/sensd ../out/ || echo "::warning::sensd failed"
-          sh phone/bt/build.sh && cp phone/bt/out/btd phone/bt/out/tlv_test.log ../out/
+          sh phone/bt/build.sh && cp phone/bt/out/btd phone/bt/out/bluetool phone/bt/out/tlv_test.log ../out/
           sh phone/fastrpc/test.sh > ../out/fastrpcd-test.log 2>&1 || { echo "::warning::fastrpcd host tests failed"; tail -20 ../out/fastrpcd-test.log; }
           sh phone/fastrpc/build.sh
           cp phone/fastrpc/out/fastrpcd phone/fastrpc/org.iosonpixel.fastrpcd.plist ../out/

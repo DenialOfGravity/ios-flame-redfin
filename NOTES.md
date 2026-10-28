@@ -342,3 +342,9 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   default 9; `kern.sweet_wifi_rssi` last told); a link wland made by itself posts SSID/BSSID/LINK (`sweetwifilink=0` off).
   `SWEET WIFI: signal` lines. wland (same branch): re-auth when the AP kicks a stale association (reason 8, the
   first auto-join after a reboot), 2 retries of a failed wifid join, uptime-stamped wland.log.
+- 1015 kernel control `com.apple.uart.bluetooth` on the BT bridge (with `btbridge=1`; `btbridge=3` nodes only): iOS 16
+  bluetoothd/BlueTool use a PF_SYSTEM control, not a tty (ios-asteroids docs/BT_IOS_TRANSPORT.md). Client bytes -> h2b
+  (btd), btd's -> the socket; termios get/set kept and logged (`SWEET BTBR: kernel control ...`). Needs bluetoothd's
+  `BT_HCI_TRANSPORT=H4BC:POSIX:com.apple.uart.bluetooth,3000000` (tools-claude/bt-launchd.py --transport). Userland:
+  phone/bt/bluetool.c (BlueTool stand-in: every request result 0 after btd is up; `--bluetool`), btd bridge HCI compat
+  (vendor answers carry the sub-opcode, Unknown Command / LE Command Disallowed -> success; `--bridge-raw` off).
