@@ -263,6 +263,7 @@ static bool listed(void)
 			native_bridge_metal_cpu_report = (size_t (*)(char *, size_t))dlsym(th, "sweet_tu_cpu_report");
 			/* u-ub: Turnip's UBWC census (phone/turnip/patches/0111; SWEET_UBWC from /var/local/mtl2-env) */
 			native_bridge_metal_ubwc_report = (size_t (*)(char *, size_t))dlsym(th, "sweet_tu_ubwc_report");
+			native_bridge_metal_draw_report = (size_t (*)(char *, size_t))dlsym(th, "sweet_tu_draw_report");
 			if (!native_bridge_metal_pass_report && !strcmp(getprogname(), "backboardd"))
 				sm2_log("timeline: sweet_tu_pass_report not exported by Turnip: no pass times");
 		}

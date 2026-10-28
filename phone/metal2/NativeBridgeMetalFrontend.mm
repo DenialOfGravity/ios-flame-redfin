@@ -92,6 +92,7 @@ static Timed gTimeSurfaceFlush;
 size_t (*native_bridge_metal_pass_report)(char *,size_t,unsigned);
 size_t (*native_bridge_metal_cpu_report)(char *,size_t);
 size_t (*native_bridge_metal_ubwc_report)(char *,size_t);
+size_t (*native_bridge_metal_draw_report)(char *,size_t);   // u-gpudraw: Turnip 0112 "T tu-draw"
 static bool timelineOn() {
  static int on=-1;
  if(on<0){const char *e=getenv("SWEET_TIMELINE");on=!strcmp(getprogname(),"backboardd") && e && *e && strcmp(e,"0")?1:0;}
@@ -2853,7 +2854,7 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
  // CA's own waits in the window (the J rows' totals, as deltas)
  static uint64_t lastWaits[4];
  const uint64_t waits[4]={gTimeWaitCompleted.count.load(),gTimeWaitCompleted.total.load(),gTimeWaitScheduled.count.load(),gTimeWaitScheduled.total.load()};
- char passes[420]="n/a (Turnip has no sweet_tu_pass_report)";
+ char passes[680]="n/a (Turnip has no sweet_tu_pass_report)";   // u-gpudraw: 420 before (the SEQ census)
  if(native_bridge_metal_pass_report)native_bridge_metal_pass_report(passes,sizeof passes,3);
  char line[1400];
  snprintf(line,sizeof line,"native-metal: T 5s: frames %u (every %.1f/%.1f) | encode %.1f/%.1f ms | commit->submit %.2f | submit->gpu-start %.2f"
@@ -2870,6 +2871,13 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
   char cpu[1100];
   if(native_bridge_metal_cpu_report(cpu,sizeof cpu)) {
    snprintf(line,sizeof line,"native-metal: T tu-cpu: %s",cpu);
+   sm2_logs(line);
+  }
+ }
+ if(native_bridge_metal_draw_report) {   // u-gpudraw: Turnip 0112's draw census (fragment shaders, draw times)
+  char draw[1300];
+  if(native_bridge_metal_draw_report(draw,sizeof draw)) {
+   snprintf(line,sizeof line,"native-metal: T tu-draw: %s",draw);
    sm2_logs(line);
   }
  }
