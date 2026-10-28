@@ -1,0 +1,295 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Mon, 26 Oct 2026 00:00:00 +0200
+Subject: [PATCH] 0990 redfin: Sandbox op 4 answers the container path (extensions run)
+
+PlugInKit's -[PKService checkEnvironment:] asks the Sandbox policy for the
+container path of the extension's pid (op 4, libsystem_sandbox's
+sandbox_container_path_for_pid). 0050/0924 answered ENOENT, so every .appex
+(MacinTalkAUSP, ...) died with "plugin has invalid sandbox or container:
+error 2 path ?".
+
+bsd/kern/redfin_sandbox_container.c answers it from the CFFIXED_USER_HOME
+string in the target's exec environment (found at the top of its user stack,
+the way sysctl_procargsx reads it); a process without it still gets ENOENT.
+Code: HackiOS kern_minimac.c minisandbox_container_path() (APSL 2.0) via
+ios-topaz 0936, with bounds checks, a boot-arg sweetcontainer=0 (old ENOENT)
+and a "SWEET SANDBOX:" log, once per pid, 300 lines at most.
+
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -415,6 +415,7 @@ bsd/kern/kern_credential.c		standard
+ bsd/kern/kern_crossarch.c		standard
+ bsd/kern/kern_cs.c			standard
+ bsd/kern/sweet_amfi.c			standard
++bsd/kern/redfin_sandbox_container.c	standard
+ 
+ # Apple OSS hfs-627.100.6, staged by xnu/patches/0026-stage-hfs.sh
+ bsd/sweet_hfs/core/BTree.c		optional sweet_hfs
+diff --git a/bsd/kern/redfin_sandbox_container.c b/bsd/kern/redfin_sandbox_container.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/kern/redfin_sandbox_container.c
+@@ -0,0 +1,227 @@
++/*
++ * Sandbox request 4, "container path of a process" (redfin 0990).
++ *
++ * Derived from HackiOS's bsd/kern/kern_minimac.c, minisandbox_container_path()
++ * (OOSEX GANG, https://github.com/oosexgang/hackios-xnu-kernel, Apple Public
++ * Source License 2.0), through ios-topaz's patch 0936 (MakrSas), which has the
++ * same code as bsd/kern/topaz_sandbox_container.c. Changes: the request is
++ * answered with ENOENT (as 0050 did) when the process has no container, the
++ * value is bounds-checked before the target's strings are looked at and copied
++ * out of a local buffer, the boot-arg sweetcontainer=0 turns it off, and what
++ * was asked and answered is logged (once per pid, at most 300 lines in all).
++ *
++ * PlugInKit (-[PKService checkEnvironment:]) asks libsystem_sandbox for the
++ * container of every extension it hosts; the stand-in policy in sweet_amfi.c
++ * answered ENOENT and every .appex died with "plugin has invalid sandbox or
++ * container: error 2 path ?" (MacinTalkAUSP and the other audio units
++ * included). Whoever starts a program that lives in a container -- RunningBoard
++ * an application, pkd an extension -- has the path from containermanagerd and
++ * hands it over in the environment as CFFIXED_USER_HOME (Foundation takes the
++ * home directory from there), so that is the answer: it is looked up among the
++ * strings exec left at the top of the stack of the process.
++ *
++ * libsystem_sandbox's argument block: { s64 pid, u64 pid version, user buffer,
++ * user buffer size, u64 compare the pid version }; the caller starts with "?"
++ * in the buffer and wants a longer string back.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/proc_internal.h>
++#include <kern/task.h>
++#include <mach/vm_param.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_map.h>
++#include <libkern/libkern.h>
++#include <libkern/OSAtomic.h>
++#include <pexpert/pexpert.h>
++
++extern vm_map_t get_task_map_reference(task_t);
++int sweet_sandbox_container_path(user_addr_t arg);
++
++#define REDFIN_CONTAINER_VARIABLE       "CFFIXED_USER_HOME="
++#define REDFIN_CONTAINER_MAX_ARGS       (1024 * 1024)   /* exec's own limit is ARG_MAX */
++#define REDFIN_CONTAINER_LOG_PIDS       64
++#define REDFIN_CONTAINER_LOG_LINES      300
++
++static volatile int redfin_container_on = -1;           /* sweetcontainer, read at the first request */
++static int redfin_container_logged[REDFIN_CONTAINER_LOG_PIDS]; /* pid + 1 */
++static volatile SInt32 redfin_container_next;
++static volatile SInt32 redfin_container_lines;
++
++/* true for the first request about a pid, while the log has room (races only cost a duplicate line) */
++static boolean_t
++redfin_container_log_wanted(int pid)
++{
++	SInt32 n;
++
++	for (int i = 0; i < REDFIN_CONTAINER_LOG_PIDS; i++) {
++		if (redfin_container_logged[i] == pid + 1) {
++			return FALSE;
++		}
++	}
++	n = OSIncrementAtomic(&redfin_container_lines);
++	if (n >= REDFIN_CONTAINER_LOG_LINES) {
++		if (n == REDFIN_CONTAINER_LOG_LINES) {
++			printf("SWEET SANDBOX: container path log limit reached\n");
++		}
++		return FALSE;
++	}
++	redfin_container_logged[(uint32_t)OSIncrementAtomic(&redfin_container_next) % REDFIN_CONTAINER_LOG_PIDS] = pid + 1;
++	return TRUE;
++}
++
++static boolean_t
++redfin_container_enabled(void)
++{
++	int on = redfin_container_on;
++
++	if (on < 0) {
++		on = 1;
++		PE_parse_boot_argn("sweetcontainer", &on, sizeof(on));
++		redfin_container_on = on ? 1 : 0;
++		printf("SWEET SANDBOX: container path from %s %s (sweetcontainer=%d)\n", REDFIN_CONTAINER_VARIABLE,
++		    on ? "on" : "off, ENOENT as before", on);
++	}
++	return on != 0;
++}
++
++/*
++ * Looks CFFIXED_USER_HOME up in the process's strings. 0 with home filled in, ENOENT if it
++ * has none, another error if the strings could not be read.
++ */
++static int
++redfin_container_lookup(int pid, uint64_t pidversion, uint64_t check_pidversion, char *home, size_t home_size,
++    char *tname, size_t tname_size, size_t *argslen_out)
++{
++	const size_t prefix_len = sizeof(REDFIN_CONTAINER_VARIABLE) - 1;
++	proc_t p;
++	task_t task;
++	vm_map_t map;
++	vm_map_copy_t copy = NULL;
++	vm_offset_t strings = 0;
++	vm_size_t strings_size;
++	user_addr_t user_stack;
++	size_t argslen, len;
++	const char *s, *end;
++	int error = ENOENT;
++
++	p = proc_find(pid);
++	if (p == PROC_NULL) {
++		return ESRCH;
++	}
++	if (check_pidversion && (uint64_t)proc_pidversion(p) != pidversion) {
++		proc_rele(p);
++		return ESRCH;
++	}
++	strlcpy(tname, p->p_comm, tname_size);
++	user_stack = p->user_stack;
++	argslen = p->p_argslen;
++	task = proc_task(p);
++	*argslen_out = argslen;
++	if (user_stack == 0 || argslen == 0 || argslen > REDFIN_CONTAINER_MAX_ARGS || task == TASK_NULL) {
++		proc_rele(p);
++		return ENOENT;
++	}
++	/* the same way as sysctl_procargsx(): the task keeps the map alive once the process is let go */
++	task_reference(task);
++	proc_rele(p);
++	map = get_task_map_reference(task);
++	task_deallocate(task);
++	if (map == VM_MAP_NULL) {
++		return ENOENT;
++	}
++	strings_size = vm_map_round_page(argslen, vm_map_page_mask(map));
++	if (user_stack <= strings_size) {
++		vm_map_deallocate(map);
++		return ENOENT;
++	}
++	if (kmem_alloc(kernel_map, &strings, strings_size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		vm_map_deallocate(map);
++		return ENOMEM;
++	}
++	if (vm_map_copyin(map, (vm_map_address_t)(user_stack - strings_size), strings_size, FALSE, &copy) != KERN_SUCCESS) {
++		copy = NULL;
++	}
++	vm_map_deallocate(map);
++	if (copy == NULL || vm_map_copy_overwrite(kernel_map, strings, copy, strings_size, FALSE) != KERN_SUCCESS) {
++		if (copy != NULL) {
++			vm_map_copy_discard(copy);
++		}
++		kmem_free(kernel_map, strings, strings_size);
++		return ENOENT;                  /* the process is on its way out, or has unmapped its own stack */
++	}
++
++	/* exec_path, argv and envp, each terminated, in the last argslen bytes below the stack top */
++	end = (const char *)(strings + strings_size);
++	for (s = end - argslen; s < end; s += len + 1) {
++		len = strnlen(s, end - s);
++		if (len > prefix_len && s + len < end && strncmp(s, REDFIN_CONTAINER_VARIABLE, prefix_len) == 0) {
++			s += prefix_len;
++			len -= prefix_len;
++			if (len < home_size) {
++				memcpy(home, s, len + 1);
++				error = 0;
++			} else {
++				error = ENAMETOOLONG;
++			}
++			break;
++		}
++	}
++	kmem_free(kernel_map, strings, strings_size);
++	return error;
++}
++
++int
++sweet_sandbox_container_path(user_addr_t arg)
++{
++	struct {
++		int64_t     pid;
++		uint64_t    pidversion;
++		user_addr_t buffer;
++		user_size_t size;
++		uint64_t    check_pidversion;
++	} args;
++	char home[MAXPATHLEN];
++	char tname[MAXCOMLEN + 1];
++	char cname[MAXCOMLEN + 1];
++	size_t argslen = 0, len;
++	int error, result;
++
++	if (!redfin_container_enabled()) {
++		return ENOENT;
++	}
++	error = copyin(arg, &args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	if (args.pid < 0 || args.pid != (int64_t)(int)args.pid) {
++		return ESRCH;
++	}
++	home[0] = '\0';
++	tname[0] = '\0';
++	result = redfin_container_lookup((int)args.pid, args.pidversion, args.check_pidversion, home, sizeof(home),
++	    tname, sizeof(tname), &argslen);
++	if (result == 0) {
++		len = strlen(home);
++		if (len == 0 || args.buffer == USER_ADDR_NULL || (user_size_t)len >= args.size) {
++			result = ENAMETOOLONG;
++		} else {
++			result = copyout(home, args.buffer, len + 1);
++		}
++	}
++	if (redfin_container_log_wanted((int)args.pid)) {
++		proc_name(proc_selfpid(), cname, sizeof(cname));
++		if (result == 0) {
++			printf("SWEET SANDBOX: container %s[%d] asks for %s[%d]: \"%.120s\"\n", cname, proc_selfpid(), tname,
++			    (int)args.pid, home);
++		} else if (result == ENOENT) {
++			printf("SWEET SANDBOX: container %s[%d] asks for %s[%d]: none (no %s, argslen %lu)\n", cname,
++			    proc_selfpid(), tname, (int)args.pid, REDFIN_CONTAINER_VARIABLE, (unsigned long)argslen);
++		} else {
++			printf("SWEET SANDBOX: container %s[%d] asks for %s[%d]: error %d (buffer %lu)\n", cname,
++			    proc_selfpid(), tname, (int)args.pid, result, (unsigned long)args.size);
++		}
++	}
++	return result;
++}
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -279,12 +279,16 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  * launchd reports mach lookups as "error = 159: Sandbox restriction"
+  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
+  * "profile not found"). SWEET runs without a sandbox: operations succeed
+- * (checks allow, profile init is accepted); container paths fail with
+- * ENOENT, extensions are issued and consumed (below). The first
+- * use of each operation number is logged.
++ * (checks allow, profile init is accepted); container paths come from
++ * the process's CFFIXED_USER_HOME (ENOENT if it has none), extensions are
++ * issued and consumed (below). The first use of each operation number is
++ * logged.
+  */
+ static uint64_t sweet_sandbox_seen;
+ 
++/* op 4: bsd/kern/redfin_sandbox_container.c (CFFIXED_USER_HOME of the process; ENOENT if none or sweetcontainer=0) */
++int sweet_sandbox_container_path(user_addr_t arg);
++
+ /*
+  * Extension tokens. tccd hands the processes it allows a sandbox extension
+  * for the service (sandbox_extension_issue_generic("com.apple.tcc.kTCCServiceCamera")
+@@ -341,6 +345,7 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ 	case 6:         /* extension consume */
+ 		return sweet_sandbox_consume(arg);
+ 	case 4:         /* container path (audit token / pid) */
++		return sweet_sandbox_container_path(arg);
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:
+-- 
+2.43.0

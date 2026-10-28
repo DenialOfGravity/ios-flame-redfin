@@ -1325,6 +1325,7 @@ static int s_join_asked, s_result = -1;
 static uint8_t s_ssid[32], s_ssid_len, s_bssid[6], s_pmk[32];
 static uint8_t s_body[768];				/* the AP's beacon elements */
 static uint32_t s_body_len, s_freq, s_aid, s_tries, s_desc, s_msg1s;
+static uint32_t s_kicks;				/* deauths/disassocs taken while authenticating/associating (re-auth) */
 static uint64_t s_deadline;
 static int s_rsn, s_start_resp, s_ptk_set;
 static int32_t s_start_status;
@@ -1781,6 +1782,7 @@ static void w_join_begin(void)
 	if (tim && tim[1] >= 2 && tim[3])
 		dtim = tim[3];
 	s_msg1s = 0;
+	s_kicks = 0;
 	s_start_resp = 0;
 	LOG("join: '%.*s' %02x:%02x:%02x:**:**:** %u MHz %d dBm %s", (int)s_ssid_len, s_ssid, s_bssid[0], s_bssid[1],
 	    s_bssid[2], s_freq, bss[best].rssi, s_rsn ? "WPA2" : "open");
@@ -1846,10 +1848,23 @@ static void sta_mgmt_rx(const uint8_t *f, uint32_t len)
 		}
 	} else if (fc == FC_DEAUTH || fc == FC_DISASSOC) {
 		LOG("join: the AP ended the link, reason %u (state %u)", v, s_state);
-		if (s_state == S_UP)
+		if (s_state == S_UP) {
 			w_link_lost("deauth/disassoc");
-		else
+		} else if ((s_state == S_AUTH || s_state == S_ASSOC) && s_kicks < 3) {
+			/*
+			 * redfin 2026-10-28: an AP that still holds this MAC's association from before a reboot ends it
+			 * (deauth/disassoc, e.g. reason 8) when the new authentication arrives, then accepts a fresh one.
+			 * Failing here cost wifid's whole auto-join retry (~28 s). Authenticate again, at most 3 times
+			 * (wpa_supplicant reconnects the same way).
+			 */
+			s_kicks++;
+			LOG("join: an older association ended (reason %u): authenticating again (%u/3)", v, s_kicks);
+			s_state = S_AUTH;
+			s_tries = 0;				/* sta_poll sends the authentication at the deadline */
+			s_deadline = link_ms() + 150;
+		} else {
 			w_join_end(s_state == S_4WAY ? EAUTH : ECONNREFUSED);
+		}
 	}
 }
 
@@ -2277,6 +2292,20 @@ unsigned radio_ssid(uint8_t ssid[32], uint8_t bssid[6])
 	if (bssid)
 		memcpy(bssid, s_bssid, 6);
 	return s_ssid_len;
+}
+
+/* the joined network's signal as the scans/beacons last heard it: 0 and *rssi, *age_ms, or -1 when not joined */
+int radio_link_rssi(int *rssi, uint32_t *age_ms)
+{
+	if (s_state != S_UP)
+		return -1;
+	for (uint32_t i = 0; i < nbss; i++)
+		if (!memcmp(bss[i].bssid, s_bssid, 6)) {
+			*rssi = bss[i].rssi;
+			*age_ms = (uint32_t)MIN(link_ms() - bss[i].last_ms, 0xffffffffull);
+			return 0;
+		}
+	return -1;
 }
 
 /* a scan as soon as the radio can, also while joined (radio_rescan is only for an idle radio) */
