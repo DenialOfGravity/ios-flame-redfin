@@ -1,0 +1,129 @@
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index b6e21a63..a52061a8 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -5888,7 +5888,12 @@ impl RenderCommandEncoder {
+         };
+         match (sweet_keeps, sweet_at) {
+             (true, Some(_)) => crate::sweet_drawstat::count(crate::sweet_drawstat::C_FAST_HITS),
+-            (true, None) => crate::sweet_drawstat::count(crate::sweet_drawstat::C_FAST_MISSES),
++            (true, None) => {
++                crate::sweet_drawstat::count(crate::sweet_drawstat::C_FAST_MISSES);
++                if crate::sweet_drawstat::on() && !self.sweet_current() {
++                    crate::sweet_drawstat::count(crate::sweet_drawstat::C_FAST_MISS_GEN);
++                }
++            }
+             _ => {}
+         }
+         let sweet_settings = (sweet_keeps && sweet_at.is_none()).then(|| settings.clone());
+diff --git a/crates/metal2vulkan-runtime/src/render/sweet_fast.rs b/crates/metal2vulkan-runtime/src/render/sweet_fast.rs
+index e588f64c..8145797a 100644
+--- a/crates/metal2vulkan-runtime/src/render/sweet_fast.rs
++++ b/crates/metal2vulkan-runtime/src/render/sweet_fast.rs
+@@ -25,9 +25,6 @@ use super::{
+ };
+ use std::sync::Arc;
+ 
+-/// The most entries an encoder keeps: a window server's pass draws a few states in turn.
+-const KEPT: usize = 6;
+-
+ /// What one draw settled (the module docs).
+ pub(super) struct SweetFast {
+     gen: u64,
+@@ -97,8 +94,11 @@ impl RenderCommandEncoder {
+         let gen = self.sweet_gen;
+         self.sweet_fast
+             .retain(|kept| kept.gen == gen && !(kept.assembly == assembly && kept.pipeline.same(&pipeline)));
+-        if self.sweet_fast.len() >= KEPT {
++        // The most entries an encoder keeps (a window server's pass draws a few states in turn):
++        // `sweet_drawstat::fast_kept`.
++        if self.sweet_fast.len() >= crate::sweet_drawstat::fast_kept() {
+             self.sweet_fast.remove(0);
++            crate::sweet_drawstat::count(crate::sweet_drawstat::C_FAST_EVICTS);
+         }
+         self.sweet_fast.push(SweetFast {
+             gen,
+@@ -111,6 +111,12 @@ impl RenderCommandEncoder {
+         });
+     }
+ 
++    /// Whether the encoder keeps an entry of its current generation (`#fast-miss-gen` counts the
++    /// misses without one).
++    pub(super) fn sweet_current(&self) -> bool {
++        self.sweet_fast.iter().any(|kept| kept.gen == self.sweet_gen)
++    }
++
+     /// Forget every entry: another instance or layout.
+     pub(super) fn sweet_forget(&mut self) {
+         self.sweet_fast.clear();
+diff --git a/crates/metal2vulkan-runtime/src/sweet_drawstat.rs b/crates/metal2vulkan-runtime/src/sweet_drawstat.rs
+index 027f38a3..d7dc4261 100644
+--- a/crates/metal2vulkan-runtime/src/sweet_drawstat.rs
++++ b/crates/metal2vulkan-runtime/src/sweet_drawstat.rs
+@@ -68,7 +68,11 @@ pub const C_FB_HITS: usize = 43;
+ pub const C_FAST_HITS: usize = 44;
+ pub const C_FAST_MISSES: usize = 45;
+ pub const C_SEED_SKIPS: usize = 46;
+-pub const STEPS: usize = 47;
++// u-cpu counts: fast-draw misses that found no entry of the encoder's current generation at all
++// (a state call since, or a new instance), and entries dropped for room (`fast_kept`).
++pub const C_FAST_MISS_GEN: usize = 47;
++pub const C_FAST_EVICTS: usize = 48;
++pub const STEPS: usize = 49;
+ 
+ /// Each step's short name, in the order of the constants above.
+ pub const NAMES: [&str; STEPS] = [
+@@ -77,7 +81,7 @@ pub const NAMES: [&str; STEPS] = [
+     "keep", "retain", "post", "DRAW", "e.pre", "e.settle", "e.plan", "e.objects", "e.p2.record",
+     "e.steps", "e.tail", "e.core", "END", "OPEN", "#rp", "#fb", "#set", "#set-reused",
+     "#held", "#writes", "e.p2.plan", "e.p2.shadows", "e.p2.uses", "e.p2.endsec", "#rp-hit",
+-    "#fb-hit", "#fast-hit", "#fast-miss", "#seed-skip",
++    "#fb-hit", "#fast-hit", "#fast-miss", "#seed-skip", "#fast-miss-gen", "#fast-evict",
+ ];
+ 
+ static NS: [AtomicU64; STEPS] = [const { AtomicU64::new(0) }; STEPS];
+@@ -139,6 +143,44 @@ pub fn shadow_seed() -> bool {
+     *ON.get_or_init(|| flag("SWEET_SHADOW_SEED", false))
+ }
+ 
++/// ios-on-pixel u-cpu: the runtime's bits of env `SWEET_CPUFAST` (one bitmask with the SweetMetal2
++/// frontend's 0x1 and 0x2; unset or empty = [`CPU_FAST_DEFAULT`]).
++#[inline]
++pub fn cpu_fast() -> u32 {
++    static BITS: OnceLock<u32> = OnceLock::new();
++    *BITS.get_or_init(|| {
++        std::env::var("SWEET_CPUFAST")
++            .ok()
++            .map(|v| v.trim().to_string())
++            .filter(|v| !v.is_empty())
++            .and_then(|v| match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
++                Some(hex) => u32::from_str_radix(hex, 16).ok(),
++                None => v.parse().ok(),
++            })
++            .unwrap_or(CPU_FAST_DEFAULT)
++    })
++}
++
++/// `SWEET_CPUFAST` bit 0x4: an encoder keeps [`FAST_KEPT_MORE`] fast-draw entries, not
++/// [`FAST_KEPT`] (`render/sweet_fast.rs`). Exact either way: an entry is taken only where its
++/// whole key matches; more entries only let fewer draws settle again.
++pub const CPU_FAST_KEPT: u32 = 0x4;
++/// The bits on where `SWEET_CPUFAST` is unset (the frontend's 0x1 and 0x2 among them).
++pub const CPU_FAST_DEFAULT: u32 = 0x1 | 0x2 | CPU_FAST_KEPT;
++/// The fast-draw entries an encoder keeps by default.
++pub(crate) const FAST_KEPT: usize = 6;
++/// The fast-draw entries an encoder keeps with [`CPU_FAST_KEPT`].
++pub(crate) const FAST_KEPT_MORE: usize = 16;
++
++/// The fast-draw entries an encoder keeps now.
++#[inline]
++pub(crate) fn fast_kept() -> usize {
++    match cpu_fast() & CPU_FAST_KEPT {
++        0 => FAST_KEPT,
++        _ => FAST_KEPT_MORE,
++    }
++}
++
+ /// The most framebuffers a device keeps (`attachmentless::KeptPasses`).
+ pub(crate) const KEPT_FRAMEBUFFERS: usize = 48;
+ /// The most render passes a device keeps beyond the attachmentless and compatible ones.

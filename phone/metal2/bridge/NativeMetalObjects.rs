@@ -769,6 +769,62 @@ pub extern "C" fn nmb_texture_new_on_surface(buffer: *mut NmbBuffer, descriptor:
     })
 }
 
+/// SweetMetal2: the generation of a two-plane YCbCr texture's planes (its surface's seed + 1; 0 = unknown): the runtime converts them
+/// again only when it changes (bridge patch 0103). False for any other texture.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_set_converted_generation(texture: *const NmbTexture, generation: u64) -> bool {
+    guard(false, || Ok(get(texture)?.0.set_converted_generation(generation)))
+}
+
+/// SweetMetal2: the surface seed + 1 (0 = the bytes changed some other way) a shadowed texture over a surface's bytes is bound at: its
+/// copy in is skipped while its image holds that seed's bytes (bridge patch 0107, env SWEET_SHADOW_SEED=1). False for any other texture
+/// or with the knob off.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_set_bytes_generation(texture: *const NmbTexture, generation: u64) -> bool {
+    guard(false, || Ok(get(texture)?.0.set_bytes_generation(generation)))
+}
+
+/// SweetMetal2: the runtime's shadow copy counts since the process started (bridge patch 0104), into the caller's five words:
+/// copies recorded, their texel bytes, of them repacked through the kernel, YCbCr copies in skipped, linear layouts refused.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_sweet_shadow_counts(out: *mut u64) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let counts = metal2vulkan_runtime::sweet_counts::snapshot();
+    // SAFETY: the caller passes five writable words.
+    unsafe { std::ptr::copy_nonoverlapping(counts.as_ptr(), out, counts.len()) };
+    true
+}
+
+/// SweetMetal2: whether the runtime times its render encoders' steps (bridge patch 0106, env `SWEET_DRAWSTAT=1`).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_sweet_drawstat_on() -> bool {
+    metal2vulkan_runtime::sweet_drawstat::on()
+}
+
+/// SweetMetal2: the runtime's render encoder step times and counts since the process started (bridge patch 0106), as
+/// (nanoseconds, count) pairs into the caller's `2 * capacity` words: the number of steps written.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_sweet_drawstat(out: *mut u64, capacity: usize) -> usize {
+    if out.is_null() || capacity == 0 {
+        return 0;
+    }
+    // SAFETY: the caller passes `2 * capacity` writable words.
+    let out = unsafe { std::slice::from_raw_parts_mut(out, 2 * capacity) };
+    metal2vulkan_runtime::sweet_drawstat::snapshot(out)
+}
+
+/// SweetMetal2: the name of render encoder step `index` (a static NUL-terminated string), or null past the last.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_sweet_drawstat_name(index: usize) -> *const c_char {
+    static NAMES: std::sync::OnceLock<Vec<std::ffi::CString>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        metal2vulkan_runtime::sweet_drawstat::NAMES.iter().map(|n| std::ffi::CString::new(*n).unwrap_or_default()).collect()
+    });
+    names.get(index).map_or(std::ptr::null(), |n| n.as_ptr())
+}
+
 /// `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:` (Apple SPI).
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_texture_new_linear(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64, bytes_per_row: u64,
@@ -1500,6 +1556,45 @@ pub extern "C" fn nmb_command_buffer_gpu_time(command_buffer: *const NmbCommandB
         let command_buffer = &get(command_buffer)?.0;
         let time = if end { command_buffer.gpu_end_time() } else { command_buffer.gpu_start_time() };
         time.map_err(e("GPU time"))
+    })
+}
+
+/// SweetMetal2 (u-t): the host times at which the scheduler began submitting the command buffer's first batch (`end` false) and
+/// finished submitting its last (Metal's `kernelStartTime`/`kernelEndTime`), in seconds of the runtime's host clock (as the GPU
+/// times). 0 where it was never submitted.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_kernel_time(command_buffer: *const NmbCommandBuffer, end: bool) -> f64 {
+    guard(0.0, || {
+        let command_buffer = &get(command_buffer)?.0;
+        Ok(if end { command_buffer.kernel_end_time() } else { command_buffer.kernel_start_time() })
+    })
+}
+
+/// SweetMetal2 (u-t): the runtime's submission counts the frame timeline reports (`WorkCounts`, totals since the device was made), in
+/// this order: vkQueueSubmit calls, VkCommandBuffers submitted, commits handed to another thread's pass, internal submissions,
+/// staging submissions, queue drains (a full wait for the device's queues), timeline waits, encoders re-encoded, shadow copies:
+/// nine words.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_sched_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        let c = get(device)?.0.work_counts();
+        let words = [
+            c.queue_submissions,
+            c.command_buffers_submitted,
+            c.commits_handed_off,
+            c.internal_submissions,
+            c.staging_submissions,
+            c.queue_drains,
+            c.timeline_waits,
+            c.encoders_reencoded,
+            c.shadow_copies,
+        ];
+        // SAFETY: the header's nine words.
+        unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out, words.len()) };
+        Ok(true)
     })
 }
 

@@ -1,0 +1,375 @@
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 5c0888f..ef66976 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -3893,7 +3893,15 @@ tu_emit_subsampled(struct tu_cmd_buffer *cmd,
+ struct sweet_pt_meta {
+    uint32_t w, h, format, gen;
+    uint8_t gmem, load, store, atts;
++   /* u-w (0106): the pass's draws, its bins (tile grid and size), whether it binned in HW and fetched the
++    * framebuffer (sysmem single-prim mode), its VSC pipes and tiles per pipe, the recording it came from */
++   uint32_t draws, cb;
++   uint16_t tile_w, tile_h;
++   uint8_t bins_x, bins_y, binning, fetch, pipes, pipe_tiles;
+ };
++/* per slot in the BO (u64s): [0] begin, [1] after the binning pass (GMEM), [2] end, [3] unused,
++ * [4..19] VSC_CHANNEL_VISIBILITY(0..31) as the binning pass left them */
++#define SWEET_PT_Q 20u
+ static pthread_mutex_t sweet_pt_lock = PTHREAD_MUTEX_INITIALIZER;
+ static struct tu_device *sweet_pt_dev;
+ static struct tu_bo *sweet_pt_bo;
+@@ -3906,6 +3914,36 @@ extern "C" {
+ uint64_t sweet_tu_submit_cpu_waits, sweet_tu_submit_cpu_wait_ns, sweet_tu_submit_gpu_waits, sweet_tu_submits;
+ }
+ 
++/* u-w (0106): which recording a pass belongs to (command buffers are reused from frame to frame, so their address
++ * alone does not say): tu_BeginCommandBuffer numbers each recording, the last 16 kept by command buffer */
++static struct { const struct tu_cmd_buffer *cmd; uint32_t serial; } sweet_pt_cbs[16];
++static uint32_t sweet_pt_cb_next;
++static void
++sweet_pt_cb_begin(const struct tu_cmd_buffer *cmd)
++{
++   if (sweet_pt_state == 0)
++      return;
++   pthread_mutex_lock(&sweet_pt_lock);
++   uint32_t serial = ++sweet_pt_cb_next;
++   unsigned i = 0;
++   for (; i < ARRAY_SIZE(sweet_pt_cbs) && sweet_pt_cbs[i].cmd != cmd; i++)
++      ;
++   if (i == ARRAY_SIZE(sweet_pt_cbs))
++      i = serial % ARRAY_SIZE(sweet_pt_cbs);
++   sweet_pt_cbs[i].cmd = cmd;
++   sweet_pt_cbs[i].serial = serial;
++   pthread_mutex_unlock(&sweet_pt_lock);
++}
++/* with sweet_pt_lock held */
++static uint32_t
++sweet_pt_cb_serial(const struct tu_cmd_buffer *cmd)
++{
++   for (unsigned i = 0; i < ARRAY_SIZE(sweet_pt_cbs); i++)
++      if (sweet_pt_cbs[i].cmd == cmd)
++         return sweet_pt_cbs[i].serial;
++   return 0;
++}
++
+ static int
+ sweet_pt_open(struct tu_cmd_buffer *cmd, bool gmem)
+ {
+@@ -3920,9 +3958,9 @@ sweet_pt_open(struct tu_cmd_buffer *cmd, bool gmem)
+    if (sweet_pt_state == 1 && !sweet_pt_bo && !sweet_pt_dev) {
+       sweet_pt_dev = cmd->device;
+       struct tu_bo *bo = NULL;
+-      if (tu_bo_init_new(cmd->device, NULL, &bo, SWEET_PT_SLOTS * 16, TU_BO_ALLOC_NO_FLAGS, "sweet pass timeline") == VK_SUCCESS) {
++      if (tu_bo_init_new(cmd->device, NULL, &bo, SWEET_PT_SLOTS * SWEET_PT_Q * 8, TU_BO_ALLOC_NO_FLAGS, "sweet pass timeline") == VK_SUCCESS) {
+          if (tu_bo_map(cmd->device, bo, NULL) == VK_SUCCESS && bo->map) {
+-            memset(bo->map, 0, SWEET_PT_SLOTS * 16);
++            memset(bo->map, 0, SWEET_PT_SLOTS * SWEET_PT_Q * 8);
+             sweet_pt_ts = (volatile uint64_t *) bo->map;
+             sweet_pt_bo = bo;
+          }
+@@ -3934,8 +3972,7 @@ sweet_pt_open(struct tu_cmd_buffer *cmd, bool gmem)
+    }
+    if (sweet_pt_state == 1 && sweet_pt_bo && sweet_pt_dev == cmd->device && cmd->state.pass) {
+       slot = (int) (sweet_pt_next++ % SWEET_PT_SLOTS);
+-      sweet_pt_ts[2 * slot] = 0;
+-      sweet_pt_ts[2 * slot + 1] = 0;
++      memset((void *) &sweet_pt_ts[SWEET_PT_Q * slot], 0, SWEET_PT_Q * 8);
+       struct sweet_pt_meta m = {};
+       m.w = cmd->state.render_areas[0].extent.width;
+       m.h = cmd->state.render_areas[0].extent.height;
+@@ -3956,6 +3993,19 @@ sweet_pt_open(struct tu_cmd_buffer *cmd, bool gmem)
+          m.load = m.store = '-';
+       }
+       m.atts = (uint8_t) MIN2(pass->attachment_count, 255u);
++      m.draws = cmd->state.rp.drawcall_count;
++      m.fetch = cmd->state.rp.sysmem_single_prim_mode;
++      m.cb = sweet_pt_cb_serial(cmd);
++      if (cmd->state.tiling && cmd->state.tiling->possible) {
++         const struct tu_vsc_config *vsc = tu_vsc_config(cmd, cmd->state.tiling);
++         m.tile_w = (uint16_t) cmd->state.tiling->tile0.width;
++         m.tile_h = (uint16_t) cmd->state.tiling->tile0.height;
++         m.bins_x = (uint8_t) MIN2(vsc->tile_count.width, 255u);
++         m.bins_y = (uint8_t) MIN2(vsc->tile_count.height, 255u);
++         m.pipes = (uint8_t) MIN2(vsc->pipe_count.width * vsc->pipe_count.height, 32u);
++         m.pipe_tiles = (uint8_t) MIN2(vsc->pipe0.width * vsc->pipe0.height, 32u);
++         m.binning = gmem && use_hw_binning(cmd);
++      }
+       m.gen = ++sweet_pt_gen ? sweet_pt_gen : ++sweet_pt_gen;
+       sweet_pt_meta[slot] = m;
+    }
+@@ -3963,13 +4013,34 @@ sweet_pt_open(struct tu_cmd_buffer *cmd, bool gmem)
+    return slot;
+ }
+ 
++template <chip CHIP>
++static void
++sweet_pt_stamp(struct tu_cmd_buffer *cmd, int slot, unsigned end);
++
++/* u-w (0106): after the binning pass, its visibility bits (which bins of each VSC pipe have geometry; Turnip skips
++ * the loads, draws and stores of the others) into the slot, then the "binned" timestamp */
++template <chip CHIP>
++static void
++sweet_pt_binned(struct tu_cmd_buffer *cmd, int slot)
++{
++   if (slot < 0)
++      return;
++   if (CHIP == A6XX && sweet_pt_meta[slot].binning) {
++      struct tu_cs *cs = &cmd->cs;
++      tu_cs_emit_pkt7(cs, CP_REG_TO_MEM, 3);
++      tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(REG_A6XX_VSC_CHANNEL_VISIBILITY(0)) | CP_REG_TO_MEM_0_CNT(32));
++      tu_cs_emit_qw(cs, sweet_pt_bo->iova + (uint64_t) (SWEET_PT_Q * slot + 4) * 8);
++   }
++   sweet_pt_stamp<CHIP>(cmd, slot, 1);
++}
++
+ template <chip CHIP>
+ static void
+ sweet_pt_stamp(struct tu_cmd_buffer *cmd, int slot, unsigned end)
+ {
+    if (slot < 0)
+       return;
+-   const uint64_t iova = sweet_pt_bo->iova + (uint64_t) (2 * slot + end) * 8;
++   const uint64_t iova = sweet_pt_bo->iova + (uint64_t) (SWEET_PT_Q * slot + end) * 8;
+    struct tu_cs *cs = &cmd->cs;
+    if (CHIP == A6XX) {
+       tu_cs_emit_pkt7(cs, CP_EVENT_WRITE, 4);
+@@ -3985,37 +4056,78 @@ sweet_pt_stamp(struct tu_cmd_buffer *cmd, int slot, unsigned end)
+ }
+ 
+ /* "passes N M.Mms (gmem a sysmem b) top: WxH FMT L/S gmem|sysmem T.Tms/n ... | tu waits cpu n (x ms) gpu n of s submits" */
++/* "passes N M.Mms (gmem a sysmem b fetch f) top: WxH FMT L/S gmem|sysmem T.Tms xn [d D b V/B TWxTH bin B.BB] ...
++ *  [| seq T.Tms: ...] | tu submits ..."
++ * u-w (0106), unless SWEET_TU_PASS_DETAIL=0: per kind the mean draws (d), the mean bins the binning pass found
++ * geometry in of the pass's bins (b V/B; Turnip loads, draws and stores only those, "b -/B" where the pass did not
++ * bin in HW), the bin size and the binning pass's mean time (bin). SWEET_TU_SEQ=1: the passes of the recording that
++ * took the most GPU time in the window, in order ("ms L/S g|s b V/B d D[f]", passes under 0.2 ms and past the 6th summed), with 1 kind. */
++static int sweet_pt_detail = -1, sweet_pt_seq = -1;
++static struct sweet_pt_done {
++   uint32_t gen, cb, ticks, vis, draws, w, h;
++   uint16_t bins;
++   uint8_t load, store, gmem, fetch;
++} sweet_pt_done[SWEET_PT_SLOTS];   /* only the reporting thread (one, every 5 s) uses it */
++
++static uint32_t
++sweet_pt_visible(const struct sweet_pt_meta *m, uint32_t slot)
++{
++   const volatile uint32_t *vis = (const volatile uint32_t *) &sweet_pt_ts[SWEET_PT_Q * slot + 4];
++   const uint32_t mask = m->pipe_tiles >= 32 ? ~0u : ((1u << m->pipe_tiles) - 1);
++   uint32_t n = 0;
++   for (unsigned p = 0; p < m->pipes; p++)
++      n += util_bitcount(vis[p] & mask);
++   return n;
++}
++
+ extern "C" __attribute__((visibility("default"))) size_t
+ sweet_tu_pass_report(char *out, size_t size, unsigned top)
+ {
+    if (!out || size == 0)
+       return 0;
+    out[0] = 0;
++   if (sweet_pt_detail < 0) {
++      const char *e = getenv("SWEET_TU_PASS_DETAIL");
++      sweet_pt_detail = !(e && !strcmp(e, "0"));
++      e = getenv("SWEET_TU_SEQ");
++      sweet_pt_seq = e && *e && strcmp(e, "0");
++   }
++   if (sweet_pt_seq && top > 1)
++      top = 1;
+    struct key {
+       uint32_t w, h, format;
+       uint8_t gmem, load, store;
+-      uint64_t ticks;
+-      uint32_t n;
++      uint64_t ticks, bin_ticks, draws, vis, bins;
++      uint32_t n, binned;
++      uint16_t tile_w, tile_h;
+    } keys[48];
+-   unsigned nkeys = 0;
++   unsigned nkeys = 0, ndone = 0;
+    uint64_t all_ticks = 0;
+-   uint32_t passes = 0, gmem_passes = 0;
++   uint32_t passes = 0, gmem_passes = 0, fetch_passes = 0;
+    pthread_mutex_lock(&sweet_pt_lock);
+    if (sweet_pt_ts) {
+       for (uint32_t slot = 0; slot < SWEET_PT_SLOTS; slot++) {
+          struct sweet_pt_meta *m = &sweet_pt_meta[slot];
+          if (!m->gen)
+             continue;
+-         const uint64_t b = sweet_pt_ts[2 * slot], e = sweet_pt_ts[2 * slot + 1];
++         const volatile uint64_t *ts = &sweet_pt_ts[SWEET_PT_Q * slot];
++         const uint64_t b = ts[0], mid = ts[1], e = ts[2];
+          if (!b || !e || e < b)
+             continue;   /* not run yet (or a reused slot half written): next time */
++         const uint32_t gen = m->gen;
+          m->gen = 0;
+          const uint64_t t = e - b;
+          if (t > 19200000ull)
+             continue;   /* over a second: not one pass's time */
+          passes++;
+          gmem_passes += m->gmem;
++         fetch_passes += m->fetch;
+          all_ticks += t;
++         const uint32_t bins = (uint32_t) m->bins_x * m->bins_y;
++         const bool binned = m->gmem && m->binning && mid >= b && mid <= e;
++         const uint32_t vis = binned ? sweet_pt_visible(m, slot) : bins;
++         sweet_pt_done[ndone++] = (struct sweet_pt_done) { gen, m->cb, (uint32_t) t, binned ? vis : ~0u, m->draws, m->w, m->h,
++                                                           (uint16_t) bins, m->load, m->store, m->gmem, m->fetch };
+          unsigned k = 0;
+          for (; k < nkeys; k++)
+             if (keys[k].w == m->w && keys[k].h == m->h && keys[k].format == m->format && keys[k].gmem == m->gmem &&
+@@ -4024,18 +4136,30 @@ sweet_tu_pass_report(char *out, size_t size, unsigned top)
+          if (k == nkeys) {
+             if (nkeys == ARRAY_SIZE(keys))
+                continue;
+-            keys[nkeys++] = (struct key) { m->w, m->h, m->format, m->gmem, m->load, m->store, 0, 0 };
++            keys[nkeys++] = (struct key) { m->w, m->h, m->format, m->gmem, m->load, m->store };
+          }
+          keys[k].ticks += t;
+          keys[k].n++;
++         keys[k].draws += m->draws;
++         keys[k].tile_w = m->tile_w;
++         keys[k].tile_h = m->tile_h;
++         keys[k].bins += bins;
++         if (binned) {
++            keys[k].binned++;
++            keys[k].vis += vis;
++            keys[k].bin_ticks += mid - b;
++         }
+       }
+    }
+    pthread_mutex_unlock(&sweet_pt_lock);
+    /* the always-on counter: 19.2 MHz (timestampPeriod) */
+    const double ms_per_tick = 1000.0 / 19200000.0;
+    size_t at = 0;
+-   at += snprintf(out + at, size > at ? size - at : 0, "passes %u %.1fms (gmem %u sysmem %u)", passes, all_ticks * ms_per_tick,
+-                  gmem_passes, passes - gmem_passes);
++#define SWEET_PUT(...) (at += snprintf(out + at, size > at ? size - at : 0, __VA_ARGS__))
++   SWEET_PUT("passes %u %.1fms (gmem %u sysmem %u", passes, all_ticks * ms_per_tick, gmem_passes, passes - gmem_passes);
++   if (sweet_pt_detail)
++      SWEET_PUT(" fetch %u", fetch_passes);
++   SWEET_PUT(")");
+    for (unsigned i = 0; i < top && i < nkeys; i++) {
+       unsigned best = i;
+       for (unsigned k = i + 1; k < nkeys; k++)
+@@ -4044,18 +4168,80 @@ sweet_tu_pass_report(char *out, size_t size, unsigned top)
+       struct key tmp = keys[i];
+       keys[i] = keys[best];
+       keys[best] = tmp;
+-      const char *f = keys[i].format ? util_format_short_name(vk_format_to_pipe_format((VkFormat) keys[i].format)) : "none";
+-      at += snprintf(out + at, size > at ? size - at : 0, "%s %ux%u %s %c/%c %s %.2fms x%u", i ? "," : " top:", keys[i].w,
+-                     keys[i].h, f ? f : "?", keys[i].load, keys[i].store, keys[i].gmem ? "gmem" : "sysmem",
+-                     keys[i].ticks * ms_per_tick / keys[i].n, keys[i].n);
++      const struct key *q = &keys[i];
++      const char *f = q->format ? util_format_short_name(vk_format_to_pipe_format((VkFormat) q->format)) : "none";
++      SWEET_PUT("%s %ux%u %s %c/%c %s %.2fms x%u", i ? "," : " top:", q->w, q->h, f ? f : "?", q->load, q->store,
++                q->gmem ? "gmem" : "sysmem", q->ticks * ms_per_tick / q->n, q->n);
++      if (sweet_pt_detail) {
++         SWEET_PUT(" d%.0f", (double) q->draws / q->n);
++         if (q->gmem) {
++            if (q->binned)
++               SWEET_PUT(" b%.1f/%.0f %ux%u bin%.2f", (double) q->vis / q->binned, (double) q->bins / q->n, q->tile_w,
++                         q->tile_h, q->bin_ticks * ms_per_tick / q->binned);
++            else
++               SWEET_PUT(" b-/%.0f %ux%u", (double) q->bins / q->n, q->tile_w, q->tile_h);
++         }
++      }
++   }
++   if (sweet_pt_seq && ndone) {
++      /* the recording with the most GPU time, its passes in the order they were recorded */
++      static struct { uint32_t cb; uint64_t ticks; } sums[512];
++      unsigned nsums = 0;
++      for (unsigned i = 0; i < ndone; i++) {
++         const uint32_t cb = sweet_pt_done[i].cb;
++         if (!cb)
++            continue;
++         unsigned k = 0;
++         for (; k < nsums && sums[k].cb != cb; k++)
++            ;
++         if (k == nsums) {
++            if (nsums == ARRAY_SIZE(sums))
++               continue;
++            sums[nsums++] = { cb, 0 };
++         }
++         sums[k].ticks += sweet_pt_done[i].ticks;
++      }
++      unsigned best = 0;
++      for (unsigned k = 1; k < nsums; k++)
++         if (sums[k].ticks > sums[best].ticks)
++            best = k;
++      if (nsums) {
++         struct sweet_pt_done seq[64];
++         unsigned nseq = 0;
++         for (unsigned i = 0; i < ndone && nseq < ARRAY_SIZE(seq); i++)
++            if (sweet_pt_done[i].cb == sums[best].cb) {
++               unsigned j = nseq++;
++               for (; j > 0 && seq[j - 1].gen > sweet_pt_done[i].gen; j--)
++                  seq[j] = seq[j - 1];
++               seq[j] = sweet_pt_done[i];
++            }
++         SWEET_PUT(" | seq %.1fms:", sums[best].ticks * ms_per_tick);
++         uint32_t small = 0, shown = 0;
++         uint64_t small_ticks = 0;
++         for (unsigned i = 0; i < nseq; i++) {
++            const struct sweet_pt_done *d = &seq[i];
++            if (d->ticks * ms_per_tick < 0.2 || shown == 6) {
++               small++;
++               small_ticks += d->ticks;
++               continue;
++            }
++            shown++;
++            SWEET_PUT(" %.2f %ux%u %c/%c%c", d->ticks * ms_per_tick, d->w, d->h, d->load, d->store, d->gmem ? 'g' : 's');
++            if (d->vis != ~0u)
++               SWEET_PUT(" b%u/%u", d->vis, (unsigned) d->bins);
++            SWEET_PUT(" d%u%s;", d->draws, d->fetch ? "f" : "");
++         }
++         if (small)
++            SWEET_PUT(" +%u more %.2fms", small, small_ticks * ms_per_tick);
++      }
+    }
+    static uint64_t last[4];
+    const uint64_t now[4] = { p_atomic_read(&sweet_tu_submits), p_atomic_read(&sweet_tu_submit_cpu_waits),
+                              p_atomic_read(&sweet_tu_submit_cpu_wait_ns), p_atomic_read(&sweet_tu_submit_gpu_waits) };
+-   at += snprintf(out + at, size > at ? size - at : 0, " | tu submits %llu, cpu-waited %llu (%.1fms), gpu-waited %llu",
+-                  (unsigned long long) (now[0] - last[0]), (unsigned long long) (now[1] - last[1]),
+-                  (now[2] - last[2]) / 1e6, (unsigned long long) (now[3] - last[3]));
++   SWEET_PUT(" | tu submits %llu, cpu-waited %llu (%.1fms), gpu-waited %llu", (unsigned long long) (now[0] - last[0]),
++             (unsigned long long) (now[1] - last[1]), (now[2] - last[2]) / 1e6, (unsigned long long) (now[3] - last[3]));
+    memcpy(last, now, sizeof(last));
++#undef SWEET_PUT
+    return at < size ? at : size - 1;
+ }
+ 
+@@ -4106,6 +4292,7 @@ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
+ 
+    sweet_pt_stamp<CHIP>(cmd, sweet_slot, 0);
+    tu6_tile_render_begin<CHIP>(cmd, &cmd->cs, rp_ctx, fdm_offsets);
++   sweet_pt_binned<CHIP>(cmd, sweet_slot);
+ 
+    /* Note: we reverse the order of walking the pipes and tiles on every
+     * other row, to improve texture cache locality compared to raster order.
+@@ -4159,7 +4346,7 @@ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
+    }
+ 
+    tu6_tile_render_end<CHIP>(cmd, &cmd->cs, rp_ctx);
+-   sweet_pt_stamp<CHIP>(cmd, sweet_slot, 1);
++   sweet_pt_stamp<CHIP>(cmd, sweet_slot, 2);
+ 
+    /* Outside of renderpasses we assume all draw states are disabled. We do
+     * this outside the draw CS for the normal case where 3d gmem stores aren't
+@@ -4214,7 +4401,7 @@ tu_cmd_render_sysmem(struct tu_cmd_buffer *cmd,
+    trace_end_draw_ib_sysmem(&cmd->trace, &cmd->cs);
+ 
+    tu6_sysmem_render_end<CHIP>(cmd, &cmd->cs, rp_ctx);
+-   sweet_pt_stamp<CHIP>(cmd, sweet_slot, 1);
++   sweet_pt_stamp<CHIP>(cmd, sweet_slot, 2);
+ 
+    /* Outside of renderpasses we assume all draw states are disabled. */
+    tu_disable_draw_states(cmd, &cmd->cs);
+@@ -4566,6 +4753,7 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+    VkResult result = tu_cmd_buffer_begin(cmd_buffer, pBeginInfo);
+    if (result != VK_SUCCESS)
+       return result;
++   sweet_pt_cb_begin(cmd_buffer);
+ 
+    /* setup initial configuration into command buffer */
+    if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
