@@ -1,0 +1,94 @@
+diff --git a/crates/metal2vulkan/src/env_vars.rs b/crates/metal2vulkan/src/env_vars.rs
+index 1610d4c3..1e8f181f 100644
+--- a/crates/metal2vulkan/src/env_vars.rs
++++ b/crates/metal2vulkan/src/env_vars.rs
+@@ -40,7 +40,8 @@ pub const REGISTRY: &[EnvVar] = &[
+         effect: "sweet 0109: `device` (or `1`): a float color output is stored by the device's own \
+                  conversion (unorm, snorm, sRGB, half), not rounded to Metal's code in the \
+                  fragment function first; the two differ only at the exact ties between two \
+-                 codes. Changes the SPIR-V (and every cache key)",
++                 codes. sweet 0110: `fetch`: so only in fragment functions that read the \
++                 framebuffer. Changes the SPIR-V (and every cache key)",
+     },
+     EnvVar {
+         name: "METAL2VULKAN_LOG_PIPELINES",
+@@ -94,6 +95,14 @@ pub fn sweet_color_writes_device() -> bool {
+     })
+ }
+ 
++/// sweet 0110: `SWEET_M2V_COLOR_WRITES=fetch`: only a fragment function that reads the framebuffer
++/// (framebuffer fetch) leaves its float colour outputs to the device's conversion; every other
++/// function keeps Metal's rounding (`pipeline::compile`, `color_writes::writes_hold`).
++pub fn sweet_color_writes_fetch() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("SWEET_M2V_COLOR_WRITES").is_ok_and(|v| v == "fetch"))
++}
++
+ /// sweet: the bytes the sweet knobs that change compiled modules add to every cache key (the
+ /// compile layer's keys, the runtime's shader cache build); empty with every knob off, so the
+ /// keys are then upstream's.
+@@ -104,6 +113,9 @@ pub fn sweet_key_tag() -> &'static [u8] {
+         if sweet_color_writes_device() {
+             t.extend_from_slice(b"sweet-color-writes-device\0");
+         }
++        if sweet_color_writes_fetch() {
++            t.extend_from_slice(b"sweet-color-writes-fetch\0");
++        }
+         t
+     })
+ }
+diff --git a/crates/metal2vulkan/src/pipeline/color_writes.rs b/crates/metal2vulkan/src/pipeline/color_writes.rs
+index 6ad79869..dc5eb6b9 100644
+--- a/crates/metal2vulkan/src/pipeline/color_writes.rs
++++ b/crates/metal2vulkan/src/pipeline/color_writes.rs
+@@ -130,7 +130,7 @@ pub(crate) fn exact_writes(
+ /// sweet 0109: the rule a channel of rule `r` takes under SWEET_M2V_COLOR_WRITES=device: the
+ /// device's conversion for every rounding the function would compute (unorm, snorm, sRGB, the
+ /// small floats' and the packed formats'); a blended channel's rule is kept.
+-fn sweet_device_rule(r: ChannelWrite) -> ChannelWrite {
++pub(crate) fn sweet_device_rule(r: ChannelWrite) -> ChannelWrite {
+     match r {
+         ChannelWrite::BlendedNearestEven { .. } | ChannelWrite::Device => r,
+         _ => ChannelWrite::Device,
+@@ -748,9 +748,15 @@ fn writes_hold(
+     let exact = exact_writes(written(fragment), colors, rounding, p);
+     let compiled = &fragment.interface.io.color_writes;
+     let mut attachments = selected.keys().chain(exact.keys()).chain(compiled.keys());
++    // sweet 0110: under SWEET_M2V_COLOR_WRITES=fetch a fetching function is compiled with every
++    // rounding left to the device (`pipeline::compile`).
++    let device = |w: Option<&[Option<ChannelWrite>; 4]>| w.map(|w| w.map(|r| r.map(sweet_device_rule)));
+     attachments.all(|a| {
+         let got = compiled.get(a);
+-        got == selected.get(a) || got == exact.get(a)
++        got == selected.get(a)
++            || got == exact.get(a)
++            || (crate::env_vars::sweet_color_writes_fetch()
++                && (got.copied() == device(exact.get(a)) || got.copied() == device(selected.get(a))))
+     })
+ }
+ 
+diff --git a/crates/metal2vulkan/src/pipeline/compile.rs b/crates/metal2vulkan/src/pipeline/compile.rs
+index c448dca0..657ab7fd 100644
+--- a/crates/metal2vulkan/src/pipeline/compile.rs
++++ b/crates/metal2vulkan/src/pipeline/compile.rs
+@@ -1733,6 +1733,20 @@ fn lower_inputs(
+             out.unattached_colors =
+                 unattached_colors_written(spec, d.color_attachments, d.alpha_to_coverage);
+             out.framebuffer_fetch = fetch_inputs(spec, d, variant, p);
++            // sweet 0110: SWEET_M2V_COLOR_WRITES=fetch: a function that reads the framebuffer
++            // leaves its float colour outputs to the device's conversion.
++            let fetches = spec
++                .ep
++                .params
++                .iter()
++                .any(|b| matches!(b.role, ParamRole::ColorInput { .. }));
++            if crate::env_vars::sweet_color_writes_fetch() && fetches {
++                for rules in out.color_writes.values_mut() {
++                    *rules = rules.map(|r| {
++                        r.map(crate::pipeline::color_writes::sweet_device_rule)
++                    });
++                }
++            }
+             out.srgb_fetches = srgb_fetches(spec, d.color_attachments);
+             let read = raw_indices_read(spec);
+             out.viewport_index_varying = written.viewport && read.viewport;
