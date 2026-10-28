@@ -1,0 +1,51 @@
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 3cb7362..51da733 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -19,6 +19,9 @@
+ #include "common/freedreno_gpu_event.h"
+ #include "common/freedreno_lrz.h"
+ #include "common/freedreno_vrs.h"
++extern "C" {
++#include "common/disasm.h"
++}
+ #include "tu_autotune.h"
+ #include "tu_buffer.h"
+ #include "tu_clear_blit.h"
+@@ -4174,6 +4177,22 @@ extern "C" {
+ extern uint64_t sweet_tex_writes[3];
+ }
+ 
++
++/* sweet 0114: SWEET_TU_FS_DUMP's disassembly. A compiled variant no longer holds its ir3 (ir3 frees it after assembly
++ * unless shader debugging keeps it), and ir3_shader_disasm() reads it (the r47 crash: SIGSEGV at 0x18): without the ir
++ * only the binary is disassembled. */
++static void
++sweet_variant_disasm(const struct ir3_shader_variant *v, FILE *f)
++{
++   if (v->ir) {
++      ir3_shader_disasm((struct ir3_shader_variant *) v, v->bin, f);
++      return;
++   }
++   fprintf(f, "; %u instrs, %u dwords, %u full regs, %u half regs, constlen %u (binary only: no ir kept)\n",
++           v->info.instrs_count, v->info.sizedwords, v->info.max_reg + 1, v->info.max_half_reg + 1, v->constlen);
++   disasm_a3xx(v->bin, v->info.sizedwords, 0, f, v->compiler->gen * 100);
++}
++
+ static void
+ sweet_draw_census(struct tu_cmd_buffer *cmd)
+ {
+@@ -4255,11 +4274,11 @@ sweet_draw_census(struct tu_cmd_buffer *cmd)
+             if (f) {
+                fprintf(f, "fs #%u: i%u r%u/%u w%u%s c%u t%u fetch %u blake3 %s\n", e.id, e.instrs, e.max_reg, e.max_half,
+                        e.waves, e.dbl ? "x2" : "", e.constlen, e.tex, e.fetch, v->blake3_str);
+-               ir3_shader_disasm((struct ir3_shader_variant *) v, v->bin, f);
++               sweet_variant_disasm(v, f);
+                const struct tu_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+                if (vs && vs->variant && vs->variant->bin) {
+                   fprintf(f, "\n---- vertex shader (blake3 %s)\n", vs->variant->blake3_str);
+-                  ir3_shader_disasm((struct ir3_shader_variant *) vs->variant, vs->variant->bin, f);
++                  sweet_variant_disasm(vs->variant, f);
+                }
+                fclose(f);
+             }
