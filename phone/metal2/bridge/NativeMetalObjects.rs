@@ -803,6 +803,13 @@ pub extern "C" fn nmb_sweet_drawstat_on() -> bool {
     metal2vulkan_runtime::sweet_drawstat::on()
 }
 
+/// SweetMetal2 (u-combo): bridge patch 0111's scratch trim from the next pass on, from the frontend's live knobs
+/// (/var/local/mtl2-live SWEET_M2V_SCRATCH): 0 off, 1 on, negative = the env value (SWEET_M2V_SCRATCH at startup) again.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_sweet_scratch_live(value: i32) {
+    metal2vulkan_runtime::sweet_drawstat::set_scratch_live(value.clamp(-1, 1) as i8);
+}
+
 /// SweetMetal2: the runtime's render encoder step times and counts since the process started (bridge patch 0106), as
 /// (nanoseconds, count) pairs into the caller's `2 * capacity` words: the number of steps written.
 #[unsafe(no_mangle)]

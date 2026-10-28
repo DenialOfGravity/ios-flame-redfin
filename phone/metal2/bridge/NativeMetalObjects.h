@@ -101,6 +101,8 @@ bool nmb_sweet_shadow_counts(uint64_t out[5]);
 /* SweetMetal2: render encoder step times (patch 0106, env SWEET_DRAWSTAT=1): (ns, count) pairs since start into out[2*capacity];
    returns the steps written. nmb_sweet_drawstat_name: step index's name (static), or NULL. */
 bool nmb_sweet_drawstat_on(void);
+/* u-combo: bridge 0111's SWEET_M2V_SCRATCH from the next pass on (0 off, 1 on, -1 the env's): the live knobs */
+void nmb_sweet_scratch_live(int32_t value);
 size_t nmb_sweet_drawstat(uint64_t *out, size_t capacity);
 const char *nmb_sweet_drawstat_name(size_t index);
 NmbTexture *nmb_texture_new_linear(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, uint64_t bytes_per_image);

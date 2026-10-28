@@ -1,5 +1,5 @@
 diff --git a/crates/metal2vulkan-runtime/src/linear_attachment.rs b/crates/metal2vulkan-runtime/src/linear_attachment.rs
-index 56508e92..2d5835c7 100644
+index 56508e92..e1221cc7 100644
 --- a/crates/metal2vulkan-runtime/src/linear_attachment.rs
 +++ b/crates/metal2vulkan-runtime/src/linear_attachment.rs
 @@ -135,6 +135,13 @@ impl Coverage {
@@ -17,7 +17,7 @@ index 56508e92..2d5835c7 100644
  
  /// What a draw writes of each color, by color index: `Some(reads)` where it writes the color,
 diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
-index a52061a8..39536b88 100644
+index a52061a8..8228873e 100644
 --- a/crates/metal2vulkan-runtime/src/render.rs
 +++ b/crates/metal2vulkan-runtime/src/render.rs
 @@ -3649,6 +3649,40 @@ impl RenderCommandEncoder {
@@ -32,15 +32,15 @@ index a52061a8..39536b88 100644
 +            && pending.is_empty()
 +            && dispatches.is_empty()
 +            && imageblock.is_none();
-+        let scratch_free = sweet_scratch_free(
-+            &layout,
-+            &instances,
-+            &coverage,
-+            &inputs_read,
-+            &extended,
-+            simple,
-+        );
-+        if !scratch_free.is_empty() && crate::sweet_drawstat::scratch_trim() {
++        // ios-on-pixel (ws-u-combo): looked at only with SWEET_M2V_SCRATCH or SWEET_DRAWSTAT on
++        // (every pass as before with both off).
++        // The knob is read once per pass (it may change live, `sweet_drawstat::set_scratch_live`).
++        let trim = crate::sweet_drawstat::scratch_trim();
++        let scratch_free = match trim || crate::sweet_drawstat::on() {
++            true => sweet_scratch_free(&layout, &instances, &coverage, &inputs_read, &extended, simple),
++            false => Vec::new(),
++        };
++        if !scratch_free.is_empty() && trim {
 +            for instance in instances.iter_mut() {
 +                let mut storage = instance.shape.storage.clone();
 +                storage.extend(scratch_free.iter().copied());
@@ -78,7 +78,7 @@ index a52061a8..39536b88 100644
 +/// buffers keep the compatible pass that has it: a driver that runs them in the subpass without
 +/// it writes nothing there (Turnip: the color's MRT format `NONE`, `tu6_emit_mrt`), and its
 +/// pipelines write it with an empty mask anyway. Counted (`SWEET_DRAWSTAT`) whether or not
-+/// `SWEET_M2V_SCRATCH` leaves them out.
++/// `SWEET_M2V_SCRATCH` leaves them out; not called with both off.
 +fn sweet_scratch_free(
 +    layout: &PassLayout,
 +    instances: &[Instance],
@@ -155,7 +155,7 @@ index a52061a8..39536b88 100644
  /// pass's hidden depth and stencil, for an instance before they arrived (its shape has no
  /// depth/stencil attachment), else `layout`.
 diff --git a/crates/metal2vulkan-runtime/src/sweet_drawstat.rs b/crates/metal2vulkan-runtime/src/sweet_drawstat.rs
-index d7dc4261..3e5bd7b3 100644
+index d7dc4261..59729d82 100644
 --- a/crates/metal2vulkan-runtime/src/sweet_drawstat.rs
 +++ b/crates/metal2vulkan-runtime/src/sweet_drawstat.rs
 @@ -72,7 +72,20 @@ pub const C_SEED_SKIPS: usize = 46;
@@ -189,7 +189,7 @@ index d7dc4261..3e5bd7b3 100644
  ];
  
  static NS: [AtomicU64; STEPS] = [const { AtomicU64::new(0) }; STEPS];
-@@ -135,6 +150,19 @@ pub fn fast_draw() -> bool {
+@@ -135,6 +150,33 @@ pub fn fast_draw() -> bool {
      *ON.get_or_init(|| flag("SWEET_FASTDRAW", true))
  }
  
@@ -199,11 +199,25 @@ index d7dc4261..3e5bd7b3 100644
 +/// `end_encoding` begins (env `SWEET_M2V_SCRATCH`, off unless set and not `0`). A tiler then keeps
 +/// it out of tile memory (Turnip: half the bytes per pixel of CoreAnimation's two-color passes,
 +/// twice the pixels per bin) and neither clears nor loads it. Metal keeps nothing of a memoryless
-+/// texture past its pass, so a color no draw touches holds nothing anyone reads.
++/// texture past its pass, so a color no draw touches holds nothing anyone reads. The frontend's
++/// live knobs (`/var/local/mtl2-live`) override the env through `set_scratch_live`: the choice is
++/// made per pass (a trimmed pass and its framebuffer are other kept objects than the full ones,
++/// `render_target` keys them by their attachments and subpass), so it may change between passes.
 +#[inline]
 +pub fn scratch_trim() -> bool {
 +    static ON: OnceLock<bool> = OnceLock::new();
-+    *ON.get_or_init(|| flag("SWEET_M2V_SCRATCH", false))
++    match SCRATCH_LIVE.load(Ordering::Relaxed) {
++        live if live >= 0 => live != 0,
++        _ => *ON.get_or_init(|| flag("SWEET_M2V_SCRATCH", false)),
++    }
++}
++
++static SCRATCH_LIVE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
++
++/// ios-on-pixel (bridge 0111): `scratch_trim`'s live value from the next pass on: 0 off, 1 on,
++/// negative = the env's again.
++pub fn set_scratch_live(value: i8) {
++    SCRATCH_LIVE.store(value.max(-1), Ordering::Relaxed);
 +}
 +
  /// Whether a surface texture's shadow skips its copy in while its image holds the bytes of the

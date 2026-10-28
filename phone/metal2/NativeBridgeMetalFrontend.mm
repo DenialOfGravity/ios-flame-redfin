@@ -55,7 +55,11 @@ static const uint32_t kCpuFastDefault=CPUFAST_ANSWERS|CPUFAST_VIEWPORT;
 // file (or no file) = the env value again. Changes are logged "native-metal: live: KEY=VALUE". No restart: an A/B of
 // these switches in a second (tools-claude/exp-run.py `live` lines). All else (TU_DEBUG, SWEET_UBWC, bridge knobs, QoS)
 // is read once at startup and still needs the backboardd restart.
-static std::atomic<int64_t> gLiveCpuFast{-1},gLiveEncStat{-1},gLiveFnStat{-1},gLiveEncSlowMs{-1};
+// u-combo: also SWEET_M2V_SCRATCH (bridge 0111, chosen per pass: passed on with nmb_sweet_scratch_live) and
+// SWEET_ENCTHREAD_REPLACE (a flush before replaceRegion, per call; matters only with SWEET_ENCTHREAD on). Not live, by design:
+// SWEET_ENCTHREAD (a command buffer's mode is fixed at creation; switching would reorder commits against the worker's queue),
+// SWEET_ENCTHREAD_PRI/_SPIN_US (worker start), SWEET_M2V_COLOR_WRITES (compiled SPIR-V, cache keys), SWEET_TU_* (Turnip).
+static std::atomic<int64_t> gLiveCpuFast{-1},gLiveEncStat{-1},gLiveFnStat{-1},gLiveEncSlowMs{-1},gLiveScratch{-1},gLiveEncReplace{-1};
 static uint32_t cpuFast() {
  static const uint32_t bits=[]{const char *e=getenv("SWEET_CPUFAST");return e && *e?(uint32_t)strtoul(e,nullptr,0):kCpuFastDefault;}();
  const int64_t live=gLiveCpuFast.load(std::memory_order_relaxed);
@@ -186,7 +190,7 @@ static void liveKnobsPoll() {
  if(have==had && (!have || (st.st_mtimespec.tv_sec==seen.tv_sec && st.st_mtimespec.tv_nsec==seen.tv_nsec)))return;
  had=have;
  seen=have?st.st_mtimespec:(struct timespec){0,0};
- int64_t cf=-1,es=-1,fs=-1,ms=-1;
+ int64_t cf=-1,es=-1,fs=-1,ms=-1,sc=-1,er=-1;
  if(FILE *f=have?fopen("/var/local/mtl2-live","r"):nullptr) {
   char line[256];
   while(fgets(line,sizeof line,f)) {
@@ -199,15 +203,20 @@ static void liveKnobsPoll() {
    else if(!strcmp(line,"SWEET_ENCSTAT"))es=strcmp(v,"0")?1:0;
    else if(!strcmp(line,"SWEET_FNSTAT"))fs=*v && strcmp(v,"0")?1:0;
    else if(!strcmp(line,"SWEET_ENC_SLOW_MS") && atof(v)>0)ms=(int64_t)atof(v);
+   else if(!strcmp(line,"SWEET_M2V_SCRATCH"))sc=*v && strcmp(v,"0")?1:0;   // u-combo: as the bridge reads the env
+   else if(!strcmp(line,"SWEET_ENCTHREAD_REPLACE"))er=*v=='1'?1:0;
   }
   fclose(f);
  }
  gLiveCpuFast.store(cf,std::memory_order_relaxed);gLiveEncStat.store(es,std::memory_order_relaxed);
  gLiveFnStat.store(fs,std::memory_order_relaxed);gLiveEncSlowMs.store(ms,std::memory_order_relaxed);
- char text[200];
- snprintf(text,sizeof text,"native-metal: live: %s -> SWEET_CPUFAST=0x%x SWEET_ENCSTAT=%d SWEET_FNSTAT=%d SWEET_ENC_SLOW_MS=%llu",
+ gLiveEncReplace.store(er,std::memory_order_relaxed);
+ if(gLiveScratch.exchange(sc)!=sc)nmb_sweet_scratch_live((int32_t)sc);   // u-combo: the bridge, from its next pass
+ char text[300];
+ snprintf(text,sizeof text,"native-metal: live: %s -> SWEET_CPUFAST=0x%x SWEET_ENCSTAT=%d SWEET_FNSTAT=%d SWEET_ENC_SLOW_MS=%llu"
+  " SWEET_M2V_SCRATCH=%s SWEET_ENCTHREAD_REPLACE=%s",
   have?"/var/local/mtl2-live read":"no /var/local/mtl2-live (env values)",cpuFast(),encStatOn(),fnStatOn(),
-  (unsigned long long)llround(encSlowTicks()*encTickNs()/1e6));
+  (unsigned long long)llround(encSlowTicks()*encTickNs()/1e6),sc<0?"env":sc?"1":"0",er<0?"env":er?"1":"0");
  sm2_logs(text);
 }
 struct EncTLS {uint64_t ticks[EC_COUNT];uint32_t n[EC_COUNT];uint32_t depth;uint64_t scopes;};
@@ -735,7 +744,8 @@ NB_RESOURCE_SPI
  if(encThreadOn()) {   // u-encthread: a recorded bind of this texture not replayed yet must not take the old shadow seed
   encReplaceEpoch.fetch_add(1);
   static const bool flushFirst=[]{const char *e=getenv("SWEET_ENCTHREAD_REPLACE");return e && *e=='1';}();
-  if(flushFirst)encFlush(EF_REPLACE);
+  const int64_t live=gLiveEncReplace.load(std::memory_order_relaxed);   // u-combo: live knob
+  if(live>=0?live==1:flushFirst)encFlush(EF_REPLACE);
  }
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
