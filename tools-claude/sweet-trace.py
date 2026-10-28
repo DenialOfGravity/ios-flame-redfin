@@ -14,6 +14,11 @@ display/GPU/touch events) and show who wakes whom in the frame chain.
   --frames N   per-frame lines to print (default 40; the summary uses all)
   --from/--to  window in ms from the trace start
   --dump       print every 0994 event as text (for checking the kernel side)
+  --pace       frame pacing: panel edges from the INTF frame counter, each frame's edge, and for every frame that
+               took 2 vsyncs or more the stage that was running when the edge it missed went by (cause table),
+               plus the app tick / commit / backboardd tick phase against the panel edges over time
+  --pace-frames N  also print the first N late frames with their chain (ms relative to the missed edge)
+  --pace-swipes    only those during swipes (touch .. 700 ms after it)
 
 Prints a per-frame critical path for each frame that went on screen (direct scanout latch, or a present):
 touch -> app main thread wake (and its waker) -> app message to backboardd -> backboardd display thread wake (and
@@ -24,6 +29,7 @@ import argparse
 import bisect
 import collections
 import json
+import math
 import struct
 import sys
 
@@ -104,6 +110,9 @@ def main():
     ap.add_argument('--from', dest='t_from', type=float, default=None)
     ap.add_argument('--to', dest='t_to', type=float, default=None)
     ap.add_argument('--dump', action='store_true')
+    ap.add_argument('--pace', action='store_true')
+    ap.add_argument('--pace-frames', type=int, default=0)
+    ap.add_argument('--pace-swipes', action='store_true')
     a = ap.parse_args()
 
     T = Trace(a.trace)
@@ -522,8 +531,403 @@ def main():
         if sw[nm]:
             print(f'{nm}: {len(sw[nm])} events')
 
+    if a.pace:
+        pace_report(a, T, threads, sw, calls, wakes, slices, msgs, fences, disp, app_main, bb, app, gpu_abs)
+
     if a.json:
         write_json(a, T, threads, slices, calls, sw, fences, bb, app, sb, wakes, tname, gpu_abs)
+
+
+def pace_report(a, T, threads, sw, calls, wakes, slices, msgs, fences, disp, app_main, bb, app, gpu_abs):
+    """--pace: which stage was running when the panel edge a late frame needed went by."""
+    MS = T.abs_of_ns(1e6)            # 1 ms in absolute time units
+    ms = lambda d: d / MS            # a duration in ms
+    at = lambda t: T.ms(t)           # a time in ms from the trace start
+    print()
+    print('pacing (--pace)')
+    if disp is None:
+        print('  no display thread: nothing to do')
+        return
+    # ---- panel edges: VSYNC a4 = INTF1 frame counter when the tick ran (counts at each panel frame start) ----
+    ticks = sorted((e[0], e[6], e[4]) for e in sw['VSYNC'] if e[6])          # (abs, frame counter, sent)
+    if len(ticks) < 20:
+        print('  fewer than 20 vsync ticks with an INTF frame count: no edge model')
+        return
+    n = len(ticks)
+    mf = sum(f for _, f, _ in ticks) / n
+    mt = sum(t for t, _, _ in ticks) / n
+    P = sum((f - mf) * (t - mt) for t, f, _ in ticks) / sum((f - mf) ** 2 for _, f, _ in ticks)
+    res = [t - f * P for t, f, _ in ticks]
+    W = 40      # a calibration tick (polls the counter, so it runs right at an edge) every 32 ticks
+    from collections import deque
+    off = [0.0] * n
+    dq = deque()
+    # sliding-window minimum of the residuals: tick time - f * P >= edge offset, equal at a calibration tick
+    j = 0
+    for i in range(n):
+        while j < n and j <= i + W:
+            while dq and res[dq[-1]] >= res[j]:
+                dq.pop()
+            dq.append(j)
+            j += 1
+        while dq[0] < i - W:
+            dq.popleft()
+        off[i] = res[dq[0]]
+    tick_t = [t for t, _, _ in ticks]
+
+    def edge(f, hint):
+        i = min(n - 1, max(0, bisect.bisect_left(tick_t, hint)))
+        return off[i] + f * P
+
+    def frame_at(t):
+        """the frame counter value at time t (the last edge at or before t)"""
+        i = min(n - 1, max(0, bisect.bisect_left(tick_t, t)))
+        return math.floor((t - off[i]) / P)
+
+    Pms = ms(P)
+    lag = [ms(t - edge(f, t)) for t, f, _ in ticks]
+    s_lag = sorted(lag)
+    tick_iv = sorted(ms(tick_t[i + 1] - tick_t[i]) for i in range(n - 1))
+    print(f'  panel period {Pms:.4f} ms ({1000 / Pms:.3f} Hz) from {n} ticks over frames {ticks[0][1]}-{ticks[-1][1]}; '
+          f'tick after its edge: median {s_lag[n // 2]:.2f} p10 {s_lag[n // 10]:.2f} p90 {s_lag[n * 9 // 10]:.2f} ms; '
+          f'tick to tick p10 {tick_iv[len(tick_iv) // 10]:.2f} median {tick_iv[len(tick_iv) // 2]:.2f} '
+          f'p90 {tick_iv[len(tick_iv) * 9 // 10]:.2f} ms; notification period sent '
+          f'{ms(sw["VSYNC_SEND"][0][6]):.3f} ms' if sw['VSYNC_SEND'] else '')
+    opts = collections.Counter(e[5] >> 8 for e in sw['VSYNC'])
+    lost = sum(1 for i in range(n - 1) if ticks[i + 1][1] - ticks[i][1] >= 2)
+    print(f'  ticks lost (the frame counter moved 2+ between two ticks): {lost} of {ticks[-1][1] - ticks[0][1]} edges; '
+          'kernel sweetvsync (0995) on the ticks: ' + ', '.join(f'{k:#x} x{v}' for k, v in opts.most_common()))
+    vsend = sorted(e[0] for e in sw['VSYNC_SEND'])
+
+    # ---- the display thread's calls ----
+    dc = calls.get(disp, [])
+    sbegin = {}         # swap id -> SwapBegin end abs
+    send_ = {}          # swap id -> (SwapEnd start, end)
+    swapwaits = []      # (start, end, id)
+    subs = []           # (start, end, fence)
+    gates = []          # (start, end)
+    for s, e, c, sa, ea in dc:
+        if c == 0x04 and sa[0] == 4:
+            sbegin.setdefault(ea[2], e)
+        elif c == 0x04 and sa[0] == 5:
+            send_.setdefault(ea[3], (s, e))
+        elif c == 0x04 and sa[0] == 6:
+            swapwaits.append((s, e, sa[1] & 0xffffffff))
+        elif c == 0x10:
+            subs.append((s, e, ea[0]))
+        elif c == 0x14:
+            gates.append((s, e))
+    subs.sort()
+    gates.sort()
+    swapwaits.sort()
+    swap_fence = {}
+    for tid, cl in calls.items():
+        for s, e, c, sa, ea in cl:
+            if c == 0x05:
+                swap_fence.setdefault(sa[0], sa[1])
+    flips = {e[3]: (e[0], e[6]) for e in sw['SCAN_FLIP']}       # swap -> (abs, INTF frame at the flip)
+    latch = {e[3]: e[0] for e in sw['SCAN_LATCH']}
+
+    # ---- app commits: bursts of app -> backboardd messages ----
+    am = sorted((m[0], m[4]) for m in msgs if m[2] in app and m[3] in bb and (app_main is None or m[1] == app_main))
+    bursts = []         # (first, last, count, largest): a commit is >= 3 messages or one >= 500 bytes
+    for t, sz in am:
+        if bursts and t - bursts[-1][1] < 0.5 * MS:
+            bursts[-1][1] = t
+            bursts[-1][2] += 1
+            bursts[-1][3] = max(bursts[-1][3], sz)
+        else:
+            bursts.append([t, t, 1, sz])
+    bursts = [b for b in bursts if b[2] >= 3 or b[3] >= 500]
+    b_first = [b[0] for b in bursts]
+    aw = wakes.get(app_main, []) if app_main else []
+    aw_t = [w[0] for w in aw]
+
+    def wclass(w):
+        nm = threads.get(w[2], [0, '?', ''])[2] or ''
+        if w[3]:
+            return 'irq'
+        if 'thread call' in nm:
+            return 'timer'
+        if 'inProcessAnimation' in nm:
+            return 'anim'
+        if 'eventfetch' in nm:
+            return 'touch'
+        return 'other'
+
+    def app_tick_of(t0):
+        i = bisect.bisect_right(aw_t, t0) - 1
+        if i >= 0 and t0 - aw_t[i] < 30 * MS:
+            return aw[i]
+        return None
+
+    def in_iv(ivs, t):
+        i = bisect.bisect_right(ivs, (t, float('inf'))) - 1
+        return i >= 0 and ivs[i][0] <= t <= ivs[i][1]
+
+    dsl = sorted(slices.get(disp, []))
+
+    def disp_state(t):
+        i = bisect.bisect_right(dsl, (t, float('inf'))) - 1
+        if i >= 0 and dsl[i][0] <= t <= dsl[i][1]:
+            return dsl[i][2]
+        return 'running'
+
+    # ---- frames in the order they reached the panel ----
+    path = 'direct scanout: the INTF frame counter at the flip'
+    if not flips:
+        # present path (0944 swap queue, blit/CPU copy into the panel buffer): on the panel at the first edge after
+        # the swap's present is done (SWAPDONE 1 blit fence / 2 CPU copy after its PRESENT)
+        done = sorted(e[0] for e in sw['SWAPDONE'] if e[3] in (1, 2))
+        for tid, cl in calls.items():
+            for s, e, c, sa, ea in cl:
+                if c == 0x06 and not ea[1]:
+                    k = bisect.bisect_left(done, e)
+                    if k < len(done) and done[k] - e < 50 * MS:
+                        t = done[k]
+                        if sa[0] not in flips or flips[sa[0]][0] > t:
+                            flips[sa[0]] = (t, frame_at(t))
+        path = 'present path: the first edge after the present\'s blit fence / copy (approximate)'
+    frames = []
+    for swap, (ft, ff) in sorted(flips.items(), key=lambda x: x[1][0]):
+        if swap not in send_:
+            continue
+        fr = {'swap': swap, 'F': ft, 'n': ff + 1, 'SE': send_[swap][1], 'B': sbegin.get(swap), 'L': latch.get(swap)}
+        b = fr['B'] or send_[swap][0]
+        fr['B'] = b
+        i = bisect.bisect_right(vsend, b) - 1
+        fr['V'] = vsend[i] if i >= 0 else None
+        k = bisect.bisect_left(subs, (b,))
+        fr['S0'] = fr['S1'] = None
+        if k < len(subs) and subs[k][0] <= fr['SE']:
+            fr['S0'], fr['S1'] = subs[k][0], subs[k][1]
+        fe = fences.get(swap_fence.get(swap))
+        fr['G'] = fe[1] if fe else None
+        fr['gpu'] = ms(fe[1] - fe[0]) if fe else None
+        fr['newsub'] = fr['S0'] is not None
+        j = bisect.bisect_right(b_first, b) - 1
+        fr['C'] = fr['Cb'] = None
+        if j >= 0 and b - bursts[j][1] < 40 * MS:
+            fr['Cb'] = j
+            fr['C0'], fr['C'] = bursts[j][0], bursts[j][1]
+            w = app_tick_of(bursts[j][0])
+            fr['A'] = w[0] if w else None
+            fr['Aw'] = wclass(w) if w else '-'
+        frames.append(fr)
+    if not frames:
+        print('  no flips or presents with a swap id: nothing to do')
+        return
+    # one frame per edge: a later swap flipped for the same edge replaced the earlier one on the panel
+    byn = {}
+    for fr in frames:
+        byn[fr['n']] = fr
+    frames = [byn[k] for k in sorted(byn)]
+
+    CAUSES = collections.OrderedDict([
+        ('content', 'a frame without a new app commit (render-server-only change) after a long gap'),
+        ('app_rate', 'the app sent nothing for that edge: its commits came >= 1.5 periods apart (app cadence)'),
+        ('app_phase', 'app at display rate, its commit just missed bb\'s tick (< P/2 after): app tick ~ bb tick (phase)'),
+        ('app_cpu', 'app at display rate, its commit just missed bb\'s tick: app tick well before it, CPU too long'),
+        ('bb_busy', 'backboardd still on the previous frame at the tick (its SwapEnd after the tick)'),
+        ('bb_skip', 'commit there before the tick, backboardd idle, but no frame from that tick'),
+        ('no_tick', 'no vsync tick in the period before the missed edge (a lost tick)'),
+        ('swapwait', 'no free surface: SwapWait (swap-done) still blocked at the edge'),
+        ('bb_cpu', 'backboardd CPU (render/encode, tick -> GPU submit) across the edge'),
+        ('gate', 'no free surface: GPU submit held at the scanout gate (previous frame not latched) at the edge'),
+        ('gpu_long', 'GPU busy across the edge, GPU time >= 0.8 period (GPU-bound)'),
+        ('gpu_late', 'GPU done after the edge, GPU time < 0.8 period (late start)'),
+        ('bb_post', 'backboardd CPU after the submit (SwapEnd after the edge)'),
+        ('flip', 'fence and SwapEnd before the edge, flip after it (flip poll / queue)'),
+        ('other', 'not classified'),
+    ])
+    # gestures: touch reports less than 100 ms apart; a swipe window runs until 700 ms after the last report
+    tt = sorted(e[0] for e in sw['TOUCH'])
+    swin = []
+    for t in tt:
+        if swin and t - swin[-1][1] < 100 * MS:
+            swin[-1][1] = t
+        else:
+            swin.append([t, t])
+    swin = [(s0, s1 + 700 * MS) for s0, s1 in swin]
+    in_sw = lambda t: any(s0 <= t <= s1 for s0, s1 in swin)
+    cnt_sw = collections.Counter()
+    ivs_sw = collections.Counter()
+    gpu_sw = []
+    cnt = collections.Counter()
+    rate_by = collections.Counter()
+    gate_gap = []       # GPU-bound frames: previous fence done -> this frame's GPU start (the 2-surface gate idle)
+    by_iv = collections.defaultdict(collections.Counter)
+    late = []
+    ivs = collections.Counter()
+    prev = None
+    for fr in frames:
+        if prev is None:
+            prev = fr
+            continue
+        dn = fr['n'] - prev['n']
+        if dn > 30:              # idle: nothing changed for a while
+            prev = fr
+            continue
+        ivs[min(dn, 4)] += 1
+        sw_ = in_sw(fr['F'])
+        if sw_:
+            ivs_sw[min(dn, 4)] += 1
+            if fr['gpu'] is not None and fr['newsub']:
+                gpu_sw.append(fr['gpu'])
+        if dn >= 2:
+            D = edge(prev['n'] + 1, fr['F'])        # the edge this frame missed (the first after the previous one)
+            why = 'other'
+            new_commit = fr['Cb'] is not None and fr['Cb'] != prev.get('Cb')
+            start = max(fr['V'] or fr['B'], prev['SE'])     # when backboardd could start this frame
+            if fr['F'] < D:
+                why = 'flip'
+            elif start >= D or (fr['V'] is not None and fr['V'] >= D):
+                vi = bisect.bisect_left(vsend, D) - 1      # the last tick before the missed edge
+                Vt = vsend[vi] if vi >= 0 else None
+                c_iv = None
+                if fr['Cb'] is not None and fr['Cb'] > 0:
+                    c_iv = fr['C'] - bursts[fr['Cb'] - 1][1]
+                if Vt is None or Vt <= D - P:
+                    why = 'no_tick'         # no tick in the period before the edge (0946's calibration lost it)
+                elif not new_commit:
+                    why = 'content'
+                elif prev['SE'] >= Vt and prev['SE'] >= D - 1 * MS:
+                    why = 'bb_busy'
+                elif fr['C'] is not None and fr['C'] > Vt:
+                    if c_iv is not None and c_iv < 1.5 * P and fr['C'] - Vt < 0.5 * P:
+                        why = 'app_phase' if fr.get('A') and fr['A'] > Vt - 0.3 * MS else 'app_cpu'
+                    else:
+                        why = 'app_rate'
+                        rate_by[fr.get('Aw', '-')] += 1
+                elif prev['SE'] >= Vt:
+                    why = 'bb_busy'
+                else:
+                    why = 'bb_skip'
+            else:
+                S0, S1, G, SE = fr['S0'], fr['S1'], fr['G'], fr['SE']
+                if S0 is not None and S0 >= D:
+                    blocked = [w for w in swapwaits if w[0] <= D <= w[1] and w[0] >= start - MS]
+                    why = 'swapwait' if blocked else 'bb_cpu'
+                elif S1 is not None and S1 >= D:
+                    why = 'gate'
+                elif G is not None and G >= D:
+                    why = 'gpu_long' if fr['gpu'] is not None and fr['gpu'] >= 0.8 * Pms else 'gpu_late'
+                    if prev['G'] is not None and S1 is not None:
+                        gate_gap.append(ms(S1 - prev['G']))
+                elif SE >= D:
+                    why = 'bb_post' if S0 is not None else ('swapwait' if [w for w in swapwaits if w[0] <= D <= w[1]] else 'bb_cpu')
+                else:
+                    why = 'flip'
+            cnt[why] += 1
+            by_iv[min(dn, 4)][why] += 1
+            late.append((fr, prev, D, why, dn))
+            if sw_:
+                cnt_sw[why] += 1
+        prev = fr
+    tot = sum(ivs.values())
+    print(f'  frames by panel edge ({path}), idle gaps > 30 vsyncs left out: '
+          + ', '.join(f'{k}{"+" if k == 4 else ""}v {ivs[k]}' for k in sorted(ivs)) + f' (of {tot})')
+    tsw = sum(ivs_sw.values())
+    print(f'  during the {len(swin)} swipes (touch .. 700 ms after the finger left): '
+          + ', '.join(f'{k}{"+" if k == 4 else ""}v {ivs_sw[k]}' for k in sorted(ivs_sw)) + f' (of {tsw})')
+    if gpu_sw:
+        gpu_sw.sort()
+        print(f'    GPU per swipe frame: median {gpu_sw[len(gpu_sw) // 2]:.2f} p10 {gpu_sw[len(gpu_sw) // 10]:.2f} '
+              f'p90 {gpu_sw[len(gpu_sw) * 9 // 10]:.2f} ms; >= 0.8 period {sum(1 for x in gpu_sw if x >= 0.8 * Pms)} '
+              f'of {len(gpu_sw)}')
+    print('  late frames (2v or more): the stage running when the missed edge went by')
+    print(f'    {"cause":10s} {"all":>5} {"2v":>5} {"3v":>5} {"4+v":>5} {"swipe":>5}  meaning')
+    for k, txt in CAUSES.items():
+        if cnt[k]:
+            print(f'    {k:10s} {cnt[k]:5d} {by_iv[2][k]:5d} {by_iv[3][k]:5d} {by_iv[4][k]:5d} {cnt_sw[k]:5d}  {txt}')
+    if rate_by:
+        print('    app_rate by what woke the app main thread for that commit: ' +
+              ', '.join(f'{k} {v}' for k, v in rate_by.most_common()) +
+              ' (timer: CADisplayLink, anim: UIKit inProcessAnimationManager, touch: eventfetch)')
+    if gate_gap:
+        gate_gap.sort()
+        print(f'    GPU late: previous frame\'s GPU done -> this frame\'s GPU start (held for the previous latch, 2 '
+              f'surfaces): median {gate_gap[len(gate_gap) // 2]:.2f} p90 {gate_gap[len(gate_gap) * 9 // 10]:.2f} ms')
+    # the suspected race: the tick before the previous frame's latch (swap-done), so the tick finds no free surface
+    lt = sorted(latch.values())
+    rel = []
+    for v in vsend:
+        k = bisect.bisect_left(lt, v - 0.5 * P)
+        if k < len(lt) and lt[k] < v + 0.5 * P:
+            rel.append(ms(lt[k] - v))
+    if rel:
+        rel.sort()
+        print(f'  latch (swap-done) - nearest tick: median {rel[len(rel) // 2]:+.2f} p10 {rel[len(rel) // 10]:+.2f} p90 '
+              f'{rel[len(rel) * 9 // 10]:+.2f} ms; latch after the tick {sum(1 for x in rel if x > 0)} of {len(rel)}')
+    ll = sorted(ms(fr['L'] - edge(fr['n'], fr['L'])) for fr in frames if fr.get('L') is not None)
+    if ll:
+        print(f'  latch seen after its edge: median {ll[len(ll) // 2]:.2f} p10 {ll[len(ll) // 10]:.2f} p90 '
+              f'{ll[len(ll) * 9 // 10]:.2f} max {ll[-1]:.2f} ms (the scanout thread polls every 1 ms; the gate opens then)')
+    swb = sorted(ms(e - s) for s, e, _ in swapwaits if e - s > 0.05 * MS)
+    gw = sorted(ms(e - s) for s, e in gates)
+    print(f'  display thread: SwapWait blocked {len(swb)} of {len(swapwaits)} calls'
+          + (f' (median {swb[len(swb) // 2]:.2f} max {swb[-1]:.2f} ms)' if swb else '')
+          + f'; scanout gate held the submit {len(gw)} times' + (f' (median {gw[len(gw) // 2]:.2f} p90 '
+                                                                 f'{gw[len(gw) * 9 // 10]:.2f} ms)' if gw else ''))
+    g = sorted(fr['gpu'] for fr in frames if fr['gpu'] is not None and fr['newsub'])
+    if g:
+        print(f'  GPU per frame (frames with a new submit): median {g[len(g) // 2]:.2f} p90 {g[len(g) * 9 // 10]:.2f} '
+              f'ms; >= 0.8 period: {sum(1 for x in g if x >= 0.8 * Pms)} of {len(g)}')
+    # chain timings relative to the frame's own edge for on-time frames vs late ones
+    if a.pace_frames:
+        print(f'  first {a.pace_frames} late frames: times in ms relative to the missed edge (A app tick, C commit end, '
+              'V bb tick used, B SwapBegin, S0/S1 submit start/end (gate), G GPU done, SE SwapEnd, F flip)')
+        for fr, pv, D, why, dn in [x for x in late if not a.pace_swipes or in_sw(x[0]['F'])][:a.pace_frames]:
+            r = lambda x: f'{ms(x - D):7.2f}' if x is not None else f'{"-":>7}'
+            print(f'    {at(fr["F"]):9.1f} swap {fr["swap"]:#x} {dn}v {why:9s} prevSE {r(pv["SE"])} A {r(fr.get("A"))} '
+                  f'({fr.get("Aw", "-"):5s}) C {r(fr["C"])} V {r(fr["V"])} B {r(fr["B"])} S0 {r(fr["S0"])} '
+                  f'S1 {r(fr["S1"])} G {r(fr["G"])} SE {r(fr["SE"])} F {r(fr["F"])} gpu '
+                  f'{fr["gpu"] if fr["gpu"] is not None else -1:5.2f}')
+
+    # ---- phases against the panel edges over time ----
+    def phase(t):
+        f = frame_at(t)
+        return ms(t - edge(f, t))
+    app_ticks = [w[0] for w in aw if wclass(w) == 'timer']
+    commits = [b[1] for b in bursts]
+    print(f'  phase after the last panel edge (0..{Pms:.2f} ms), per 500 ms: app timer wakes of the main thread '
+          '(CADisplayLink), app commit ends, backboardd ticks')
+    print(f'    {"t ms":>7} {"app n":>5} {"app ph":>7} {"commit n":>8} {"commit ph":>9} {"bb tick ph":>10}')
+    span = T.end_abs - T.start_abs
+    nb = int(ms(span) // 500) + 1
+
+    def circ_med(v):
+        if not v:
+            return None
+        # circular median: rotate so the largest gap is at the wrap
+        v = sorted(v)
+        gaps = [(v[(i + 1) % len(v)] - v[i]) % Pms for i in range(len(v))]
+        k = max(range(len(v)), key=lambda i: gaps[i])
+        rot = v[k + 1:] + [x + Pms for x in v[:k + 1]]
+        return rot[len(rot) // 2] % Pms
+    series = []
+    for b in range(nb):
+        lo_, hi_ = T.start_abs + b * 500 * MS, T.start_abs + (b + 1) * 500 * MS
+        ap_ = [phase(t) for t in app_ticks if lo_ <= t < hi_]
+        cp_ = [phase(t) for t in commits if lo_ <= t < hi_]
+        vp_ = [phase(t) for t in vsend if lo_ <= t < hi_]
+        m1, m2, m3 = circ_med(ap_), circ_med(cp_), circ_med(vp_)
+        if m1 is not None:
+            series.append((b * 500 + 250, m1))
+        f_ = lambda m: f'{m:7.2f}' if m is not None else f'{"-":>7}'
+        print(f'    {b * 500:7d} {len(ap_):5d} {f_(m1)} {len(cp_):8d} {f_(m2):>9} {f_(m3):>10}')
+    # drift of the app timer against the panel: consecutive app timer wakes ~1 period apart
+    d = []
+    for i in range(len(app_ticks) - 1):
+        iv = ms(app_ticks[i + 1] - app_ticks[i])
+        if 0.5 * Pms < iv < 1.5 * Pms:
+            d.append(iv)
+    if d:
+        d.sort()
+        dm = d[len(d) // 2]
+        slope = (dm - Pms) / Pms * 1000
+        print(f'  app timer period median {dm:.4f} ms ({len(d)} intervals) vs panel {Pms:.4f} ms: phase moves '
+              f'{slope:+.2f} ms per second, one full period every {abs(Pms / slope) if slope else float("inf"):.1f} s')
 
 
 def write_json(a, T, threads, slices, calls, sw, fences, bb, app, sb, wakes, tname, gpu_abs):
