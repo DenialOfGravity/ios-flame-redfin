@@ -95,6 +95,7 @@ size_t (*native_bridge_metal_pass_report)(char *,size_t,unsigned);
 size_t (*native_bridge_metal_cpu_report)(char *,size_t);
 size_t (*native_bridge_metal_ubwc_report)(char *,size_t);
 size_t (*native_bridge_metal_draw_report)(char *,size_t);   // u-gpudraw: Turnip 0112 "T tu-draw"
+size_t (*native_bridge_metal_perf_report)(char *,size_t,unsigned);   // u-perfctr: Turnip 0113 "T tu-perf 5s"
 static bool timelineOn() {
  static int on=-1;
  if(on<0){const char *e=getenv("SWEET_TIMELINE");on=!strcmp(getprogname(),"backboardd") && e && *e && strcmp(e,"0")?1:0;}
@@ -3414,6 +3415,15 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
   if(native_bridge_metal_draw_report(draw,sizeof draw)) {
    snprintf(line,sizeof line,"native-metal: T tu-draw: %s",draw);
    sm2_logs(line);
+  }
+ }
+ if(native_bridge_metal_perf_report) {   // u-perfctr: Turnip 0113's hardware counters (SWEET_TU_PERFCTR), after tu-draw
+  static char perf[1300];
+  for(unsigned part=0;part<3;part++) {
+   if(!native_bridge_metal_perf_report(perf,sizeof perf,part))continue;
+   char pline[1400];
+   snprintf(pline,sizeof pline,"native-metal: T tu-perf 5s%s: %s",part?" fs":"",perf);
+   sm2_logs(pline);
   }
  }
  if(native_bridge_metal_ubwc_report) {

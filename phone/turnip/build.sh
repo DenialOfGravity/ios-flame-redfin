@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 ROOT=$(cd ../.. && pwd)
 mkdir -p out
 : > out/shaders.h
-for s in fill.comp:fill_comp tri.vert:tri_vert tri.frag:tri_frag full.vert:full_vert; do
+for s in fill.comp:fill_comp tri.vert:tri_vert tri.frag:tri_frag full.vert:full_vert alu.frag:alu_frag alu16.frag:alu16_frag; do
 	glslangValidator -V --target-env vulkan1.2 --vn "${s#*:}" -o out/"${s#*:}".h shaders/"${s%%:*}" >/dev/null
 	cat out/"${s#*:}".h >> out/shaders.h
 done

@@ -26,6 +26,8 @@ extern size_t (*native_bridge_metal_cpu_report)(char *out, size_t size);
 // "native-metal: T tu-ubwc:" line when images were made since the last; null where Turnip does not export it.
 extern size_t (*native_bridge_metal_ubwc_report)(char *out, size_t size);
 extern size_t (*native_bridge_metal_draw_report)(char *out, size_t size);   /* u-gpudraw: Turnip 0112 */
+/* u-perfctr: Turnip 0113's perf counter report (sweet_tu_perf_report, SWEET_TU_PERFCTR), part 0 passes, 1-2 shaders */
+extern size_t (*native_bridge_metal_perf_report)(char *out, size_t size, unsigned part);
 // Structured cumulative artifact/driver-cache counters for offline qualification.
 struct NmbShaderCacheStats;
 bool native_bridge_metal_shader_cache_stats(struct NmbShaderCacheStats *out);
