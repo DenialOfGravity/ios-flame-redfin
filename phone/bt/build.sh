@@ -20,6 +20,9 @@ grep -v '^\[' out/tlv_test.log | tail -8
 codesign -f -s - out/btd 2>/dev/null
 ls -la out/btd
 # BlueTool stand-in (bluetool.c): /var/local/bin/bluetool, the com.apple.BlueTool job pointed at it
-../../work/userland/bin/ios-cc -O2 -Wall -Wextra -Wno-unused-parameter -o out/bluetool bluetool.c
-codesign -f -s - out/bluetool 2>/dev/null
-ls -la out/bluetool
+if ../../work/userland/bin/ios-cc -O2 -Wall -Wextra -Wno-unused-parameter -o out/bluetool bluetool.c; then
+	codesign -f -s - out/bluetool 2>/dev/null
+	ls -la out/bluetool
+else
+	echo "WARN bluetool failed (btd is built)"
+fi

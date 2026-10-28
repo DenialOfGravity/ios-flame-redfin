@@ -176,7 +176,9 @@ int main(int argc, char **argv)
 			say_object("listener event:", peer);
 			return;
 		}
-		pid_t pid = xpc_connection_get_pid((xpc_connection_t)peer);
+		/* (xpc_connection_get_pid is hidden by the iOS SDK too; libxpc exports it) */
+		pid_t (*get_pid)(xpc_connection_t) = (pid_t (*)(xpc_connection_t))dlsym(RTLD_DEFAULT, "xpc_connection_get_pid");
+		pid_t pid = get_pid ? get_pid((xpc_connection_t)peer) : -1;
 		say("connection from pid %d", (int)pid);
 		xpc_connection_set_event_handler((xpc_connection_t)peer, ^(xpc_object_t msg) {
 			if (xpc_get_type(msg) == XPC_TYPE_DICTIONARY)
