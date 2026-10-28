@@ -11,3 +11,10 @@ mkdir -p out
 	-o out/SweetFPS.dylib SweetFPS.m
 codesign -f -s - out/SweetFPS.dylib
 ls -la out/SweetFPS.dylib
+# The PC's local userland builder has a fixed component list (it runs phone/haptics/build.sh, which calls this):
+# the dylib goes into the build log as base64 between these markers (tools-claude: sed -n '/^SWEETFPS-B64-BEGIN/,/^SWEETFPS-B64-END/p').
+if [ -n "${SWEETFPS_B64:-}" ]; then
+	echo SWEETFPS-B64-BEGIN
+	base64 < out/SweetFPS.dylib
+	echo SWEETFPS-B64-END
+fi
