@@ -1,5 +1,5 @@
 diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
-index e76f169..2db839e 100644
+index e76f169..e11a827 100644
 --- a/src/freedreno/vulkan/tu_cmd_buffer.cc
 +++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
 @@ -592,6 +592,50 @@ tu_emit_cache_flush_renderpass(struct tu_cmd_buffer *cmd_buffer)
@@ -85,7 +85,7 @@ index e76f169..2db839e 100644
        if (cmd->state.tiling && cmd->state.tiling->possible) {
           const struct tu_vsc_config *vsc = tu_vsc_config(cmd, cmd->state.tiling);
           m.tile_w = (uint16_t) cmd->state.tiling->tile0.width;
-@@ -4077,6 +4139,254 @@ sweet_pt_stamp(struct tu_cmd_buffer *cmd, int slot, unsigned end)
+@@ -4077,6 +4139,313 @@ sweet_pt_stamp(struct tu_cmd_buffer *cmd, int slot, unsigned end)
     }
  }
  
@@ -99,7 +99,7 @@ index e76f169..2db839e 100644
 +struct sweet_fs_ent {
 +   const struct tu_shader *fs;
 +   uint32_t id, draws, timed;
-+   uint64_t ticks;
++   uint64_t ticks, px_all, px_timed;   /* px: each draw's scissor/viewport/render area, summed */
 +   uint16_t instrs, sizedw, max_reg, max_half, constlen, tex, ss, sy, sstall, pvt;
 +   uint8_t waves, dbl, fetch, gorder, sorder, noearlyz, kill;
 +};
@@ -107,8 +107,11 @@ index e76f169..2db839e 100644
 +static uint32_t sweet_fs_n, sweet_fs_ids, sweet_fs_last;
 +static uint32_t sweet_cb_serials;
 +struct sweet_ds_meta {
-+   uint32_t gen, serial, idx, fs;
++   uint32_t gen, serial, idx, fs, px;
 +};
++/* sweet 0112: the passes the last pass report counted (begin, end), for the draw report's time split */
++static struct sweet_pt_win { uint64_t b, e; } sweet_pt_win[SWEET_PT_SLOTS];
++static uint32_t sweet_pt_nwin;
 +static struct sweet_ds_meta sweet_ds_meta[SWEET_DS_SLOTS];
 +static struct tu_bo *sweet_ds_bo;
 +static volatile uint64_t *sweet_ds_ts;
@@ -133,6 +136,22 @@ index e76f169..2db839e 100644
 +   if (cmd->state.pipeline_sysmem_single_prim_mode)
 +      rp->sweet_sorder_draws++;
 +   cmd->sweet_fs_id = 0;
++   {
++      /* the draw's bound: scissor 0 within viewport 0 within the render area */
++      const struct vk_viewport_state *vp = &cmd->vk.dynamic_graphics_state.vp;
++      const VkRect2D *sc = &vp->scissors[0];
++      const VkViewport *v = &vp->viewports[0];
++      const VkRect2D *ra = &cmd->state.render_areas[0];
++      int64_t x0 = MAX2((int64_t) sc->offset.x, (int64_t) MIN2(v->x, v->x + v->width));
++      int64_t y0 = MAX2((int64_t) sc->offset.y, (int64_t) MIN2(v->y, v->y + v->height));
++      int64_t x1 = MIN2((int64_t) sc->offset.x + sc->extent.width, (int64_t) MAX2(v->x, v->x + v->width));
++      int64_t y1 = MIN2((int64_t) sc->offset.y + sc->extent.height, (int64_t) MAX2(v->y, v->y + v->height));
++      x0 = MAX2(x0, (int64_t) ra->offset.x);
++      y0 = MAX2(y0, (int64_t) ra->offset.y);
++      x1 = MIN2(x1, (int64_t) ra->offset.x + ra->extent.width);
++      y1 = MIN2(y1, (int64_t) ra->offset.y + ra->extent.height);
++      cmd->sweet_px = (x1 > x0 && y1 > y0) ? (uint32_t) ((x1 - x0) * (y1 - y0)) : 0;
++   }
 +   if (!fs || cmd->device != sweet_pt_dev)
 +      return;
 +   pthread_mutex_lock(&sweet_pt_lock);
@@ -176,6 +195,7 @@ index e76f169..2db839e 100644
 +   }
 +   struct sweet_fs_ent *e = &sweet_fs_tab[i];
 +   e->draws++;
++   e->px_all += cmd->sweet_px;
 +   e->gorder |= cmd->state.sweet_gmem_flush;
 +   e->sorder |= cmd->state.pipeline_sysmem_single_prim_mode;
 +   cmd->sweet_fs_id = e->id;
@@ -214,7 +234,7 @@ index e76f169..2db839e 100644
 +   sweet_ds_ts[slot] = 0;
 +   sweet_ds_gen = sweet_ds_gen + 1 ? sweet_ds_gen + 1 : 1;
 +   sweet_ds_meta[slot] = (struct sweet_ds_meta) { sweet_ds_gen, cmd->sweet_serial, cmd->state.rp.drawcall_count,
-+                                                  cmd->sweet_fs_id };
++                                                  cmd->sweet_fs_id, cmd->sweet_px };
 +   pthread_mutex_unlock(&sweet_pt_lock);
 +   const uint64_t iova = sweet_ds_bo->iova + (uint64_t) slot * 8;
 +   if (CHIP == A6XX) {
@@ -230,41 +250,72 @@ index e76f169..2db839e 100644
 +   }
 +}
 +
-+/* with sweet_pt_lock held: charge each stamped draw's time since the draw before it in its recording to its shader */
++/* with sweet_pt_lock held: the GPU time of the passes the last pass report counted, split by the draw stamps in
++ * GPU order: from the pass's begin to its first stamped draw ("first"), from each stamped draw to the next (charged to
++ * the later draw's fragment shader), from the last to the pass's end ("tail"); passes without stamps ("bare") */
++struct sweet_ds_ev { uint64_t t; uint32_t fs, px; };
++static struct sweet_ds_ev sweet_ds_evs[SWEET_DS_SLOTS];
++static uint64_t sweet_split[5];   /* first, draws, tail, bare, all (ticks) */
++static uint32_t sweet_split_passes;
++static int
++sweet_ds_ev_cmp(const void *a, const void *b)
++{
++   const uint64_t x = ((const struct sweet_ds_ev *) a)->t, y = ((const struct sweet_ds_ev *) b)->t;
++   return x < y ? -1 : x > y;
++}
++static int
++sweet_pt_win_cmp(const void *a, const void *b)
++{
++   const uint64_t x = ((const struct sweet_pt_win *) a)->b, y = ((const struct sweet_pt_win *) b)->b;
++   return x < y ? -1 : x > y;
++}
++static void
++sweet_fs_charge(uint32_t fs, uint32_t px, uint64_t t)
++{
++   for (unsigned i = 0; i < sweet_fs_n; i++)
++      if (sweet_fs_tab[i].id == fs) {
++         sweet_fs_tab[i].ticks += t;
++         sweet_fs_tab[i].timed++;
++         sweet_fs_tab[i].px_timed += px;
++         return;
++      }
++}
 +static void
 +sweet_ds_collect(void)
 +{
++   memset(sweet_split, 0, sizeof(sweet_split));
++   sweet_split_passes = 0;
 +   if (sweet_ds_state != 1 || !sweet_ds_ts)
 +      return;
-+   const uint32_t end = sweet_ds_next;
-+   const uint32_t n = MIN2(end, SWEET_DS_SLOTS);
-+   for (uint32_t k = 0; k < n; k++) {
-+      const uint32_t s = (end - n + k) % SWEET_DS_SLOTS;
-+      struct sweet_ds_meta *m = &sweet_ds_meta[s];
-+      if (!m->gen || m->idx < 2 || !m->fs)
++   uint32_t n = 0;
++   for (uint32_t s = 0; s < SWEET_DS_SLOTS; s++) {
++      if (!sweet_ds_meta[s].gen || !sweet_ds_ts[s])
 +         continue;
-+      const uint64_t t = sweet_ds_ts[s];
-+      if (!t)
-+         continue;
-+      /* the draw before it in its recording: within the 96 slots before */
-+      for (uint32_t b = 1; b <= 96 && b <= k; b++) {
-+         const uint32_t q = (s + SWEET_DS_SLOTS - b) % SWEET_DS_SLOTS;
-+         const struct sweet_ds_meta *p = &sweet_ds_meta[q];
-+         if (p->serial != m->serial || p->idx != m->idx - 1)
-+            continue;
-+         const uint64_t pt = sweet_ds_ts[q];
-+         if (pt && t >= pt && t - pt < 1920000ull) {
-+            for (unsigned i = 0; i < sweet_fs_n; i++)
-+               if (sweet_fs_tab[i].id == m->fs) {
-+                  sweet_fs_tab[i].ticks += t - pt;
-+                  sweet_fs_tab[i].timed++;
-+                  break;
-+               }
-+            m->gen = 0;   /* counted once */
-+         }
-+         break;
-+      }
++      sweet_ds_evs[n++] = (struct sweet_ds_ev) { sweet_ds_ts[s], sweet_ds_meta[s].fs, sweet_ds_meta[s].px };
 +   }
++   qsort(sweet_ds_evs, n, sizeof(sweet_ds_evs[0]), sweet_ds_ev_cmp);
++   qsort(sweet_pt_win, sweet_pt_nwin, sizeof(sweet_pt_win[0]), sweet_pt_win_cmp);
++   uint32_t k = 0;
++   for (uint32_t w = 0; w < sweet_pt_nwin; w++) {
++      const uint64_t b = sweet_pt_win[w].b, e = sweet_pt_win[w].e;
++      while (k < n && sweet_ds_evs[k].t < b)
++         k++;
++      sweet_split[4] += e - b;
++      sweet_split_passes++;
++      uint64_t prev = b;
++      bool any = false;
++      for (; k < n && sweet_ds_evs[k].t <= e; k++) {
++         const uint64_t d = sweet_ds_evs[k].t - prev;
++         sweet_split[any ? 1 : 0] += d;
++         sweet_fs_charge(sweet_ds_evs[k].fs, sweet_ds_evs[k].px, d);
++         prev = sweet_ds_evs[k].t;
++         any = true;
++      }
++      sweet_split[any ? 2 : 3] += e - prev;
++   }
++   /* every stamp read now; stamps of passes reported later are lost (the ring holds about 3 s) */
++   for (uint32_t s = 0; s < SWEET_DS_SLOTS; s++)
++      sweet_ds_meta[s].gen = 0;
 +}
 +
 +/* with sweet_pt_lock held: the window's 10 fragment shaders of most GPU time (SWEET_TU_DRAWTS) or most draws, with
@@ -281,6 +332,10 @@ index e76f169..2db839e 100644
 +      used += sweet_fs_tab[i].draws > 0;
 +   }
 +   at += snprintf(out + at, size > at ? size - at : 0, "fs %u shaders %u draws:", used, draws);
++   if (sweet_ds_state == 1)
++      at += snprintf(out + at, size > at ? size - at : 0, " split %u passes %.1fms = first %.1f + draws %.1f + tail %.1f + bare %.1f;",
++                     sweet_split_passes, sweet_split[4] / 19200.0, sweet_split[0] / 19200.0, sweet_split[1] / 19200.0,
++                     sweet_split[2] / 19200.0, sweet_split[3] / 19200.0);
 +   bool shown[SWEET_FS_N] = {};
 +   for (unsigned r = 0; r < 10; r++) {
 +      int best = -1;
@@ -299,6 +354,9 @@ index e76f169..2db839e 100644
 +      if (sweet_ds_state == 1)
 +         at += snprintf(out + at, size > at ? size - at : 0, " %.2fms/%u %.1fus", e->ticks / 19200.0, e->timed,
 +                        e->timed ? e->ticks / 19.2 / e->timed : 0.0);
++      at += snprintf(out + at, size > at ? size - at : 0, " a%.0fk", e->draws ? e->px_all / 1000.0 / e->draws : 0.0);
++      if (sweet_ds_state == 1 && e->px_timed)
++         at += snprintf(out + at, size > at ? size - at : 0, " %.1fns/px", e->ticks / 19.2e-3 / (double) e->px_timed);
 +      at += snprintf(out + at, size > at ? size - at : 0, " d%u i%u r%u/%u w%u%s c%u t%u ss%u sy%u st%u%s%s%s%s%s%s;",
 +                     e->draws, e->instrs, e->max_reg, e->max_half, e->waves, e->dbl ? "x2" : "", e->constlen, e->tex,
 +                     e->ss, e->sy, e->sstall, e->fetch ? " F" : "", e->gorder ? " O" : "", e->sorder ? " s" : "",
@@ -308,6 +366,7 @@ index e76f169..2db839e 100644
 +      sweet_fs_tab[i].draws = 0;
 +      sweet_fs_tab[i].timed = 0;
 +      sweet_fs_tab[i].ticks = 0;
++      sweet_fs_tab[i].px_all = sweet_fs_tab[i].px_timed = 0;
 +      sweet_fs_tab[i].gorder = sweet_fs_tab[i].sorder = 0;
 +   }
 +   static uint64_t last_tex[3];
@@ -340,7 +399,7 @@ index e76f169..2db839e 100644
  /* "passes N M.Mms (gmem a sysmem b) top: WxH FMT L/S gmem|sysmem T.Tms/n ... | tu waits cpu n (x ms) gpu n of s submits" */
  /* "passes N M.Mms (gmem a sysmem b fetch f) top: WxH FMT L/S gmem|sysmem T.Tms xn [d D b V/B TWxTH bin B.BB] ...
   *  [| seq T.Tms: ...] | tu submits ..."
-@@ -4089,7 +4399,9 @@ static struct sweet_pt_done {
+@@ -4089,7 +4458,9 @@ static struct sweet_pt_done {
     uint32_t gen, cb, ticks, vis, draws, w, h;
     uint16_t bins;
     uint8_t load, store, gmem, fetch;
@@ -351,7 +410,24 @@ index e76f169..2db839e 100644
  
  static uint32_t
  sweet_pt_visible(const struct sweet_pt_meta *m, uint32_t slot)
-@@ -4148,8 +4460,11 @@ sweet_tu_pass_report(char *out, size_t size, unsigned top)
+@@ -4127,6 +4498,7 @@ sweet_tu_pass_report(char *out, size_t size, unsigned top)
+    uint64_t all_ticks = 0;
+    uint32_t passes = 0, gmem_passes = 0, fetch_passes = 0;
+    pthread_mutex_lock(&sweet_pt_lock);
++   sweet_pt_nwin = 0;   /* sweet 0112 */
+    if (sweet_pt_ts) {
+       for (uint32_t slot = 0; slot < SWEET_PT_SLOTS; slot++) {
+          struct sweet_pt_meta *m = &sweet_pt_meta[slot];
+@@ -4141,6 +4513,8 @@ sweet_tu_pass_report(char *out, size_t size, unsigned top)
+          const uint64_t t = e - b;
+          if (t > 19200000ull)
+             continue;   /* over a second: not one pass's time */
++         if (sweet_pt_nwin < SWEET_PT_SLOTS)
++            sweet_pt_win[sweet_pt_nwin++] = (struct sweet_pt_win) { b, e };
+          passes++;
+          gmem_passes += m->gmem;
+          fetch_passes += m->fetch;
+@@ -4148,8 +4522,11 @@ sweet_tu_pass_report(char *out, size_t size, unsigned top)
           const uint32_t bins = (uint32_t) m->bins_x * m->bins_y;
           const bool binned = m->gmem && m->binning && mid >= b && mid <= e;
           const uint32_t vis = binned ? sweet_pt_visible(m, slot) : bins;
@@ -365,7 +441,7 @@ index e76f169..2db839e 100644
           unsigned k = 0;
           for (; k < nkeys; k++)
              if (keys[k].w == m->w && keys[k].h == m->h && keys[k].format == m->format && keys[k].gmem == m->gmem &&
-@@ -4251,7 +4566,12 @@ sweet_tu_pass_report(char *out, size_t size, unsigned top)
+@@ -4251,7 +4628,12 @@ sweet_tu_pass_report(char *out, size_t size, unsigned top)
              SWEET_PUT(" %.2f %ux%u %c/%c%c", d->ticks * ms_per_tick, d->w, d->h, d->load, d->store, d->gmem ? 'g' : 's');
              if (d->vis != ~0u)
                 SWEET_PUT(" b%u/%u", d->vis, (unsigned) d->bins);
@@ -379,7 +455,7 @@ index e76f169..2db839e 100644
           }
           if (small)
              SWEET_PUT(" +%u more %.2fms", small, small_ticks * ms_per_tick);
-@@ -4808,6 +5128,7 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+@@ -4808,6 +5190,7 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
     if (result != VK_SUCCESS)
        return result;
     sweet_pt_cb_begin(cmd_buffer);
@@ -387,7 +463,7 @@ index e76f169..2db839e 100644
  
     /* setup initial configuration into command buffer */
     if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
-@@ -5150,6 +5471,9 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
+@@ -5150,6 +5533,9 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
     struct tu_descriptor_state *descriptors_state =
        tu_get_descriptors_state(cmd, bind_point);
  
@@ -397,7 +473,7 @@ index e76f169..2db839e 100644
     descriptors_state->max_sets_bound =
        MAX2(descriptors_state->max_sets_bound,
             info->firstSet + info->descriptorSetCount);
-@@ -5933,6 +6257,9 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
+@@ -5933,6 +6319,9 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
     cmd->state.load_state = pipeline->load_state;
     cmd->state.prim_order_gmem = pipeline->prim_order.state_gmem;
     cmd->state.pipeline_sysmem_single_prim_mode = pipeline->prim_order.sysmem_single_prim_mode;
@@ -407,7 +483,7 @@ index e76f169..2db839e 100644
     cmd->state.pipeline_has_tess = pipeline->active_stages & VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
     cmd->state.pipeline_disable_gmem = gfx_pipeline->feedback_loop_may_involve_textures;
  
-@@ -6587,6 +6914,18 @@ tu_render_pass_state_merge(struct tu_render_pass_state *dst,
+@@ -6587,6 +6976,18 @@ tu_render_pass_state_merge(struct tu_render_pass_state *dst,
  
     dst->drawcall_bandwidth_per_sample_sum +=
        src->drawcall_bandwidth_per_sample_sum;
@@ -426,7 +502,7 @@ index e76f169..2db839e 100644
     if (!dst->lrz_disable_reason && src->lrz_disable_reason) {
        dst->lrz_disable_reason = src->lrz_disable_reason;
        dst->lrz_disabled_at_draw =
-@@ -8772,6 +9111,7 @@ tu6_draw_common_body(struct tu_cmd_buffer *cmd,
+@@ -8772,6 +9173,7 @@ tu6_draw_common_body(struct tu_cmd_buffer *cmd,
  
     /* Fill draw stats for autotuner */
     rp->drawcall_count++;
@@ -434,7 +510,7 @@ index e76f169..2db839e 100644
  
     rp->drawcall_bandwidth_per_sample_sum +=
        cmd->state.bandwidth.color_bandwidth_per_sample;
-@@ -9241,6 +9581,7 @@ tu_CmdDraw(VkCommandBuffer commandBuffer,
+@@ -9241,6 +9643,7 @@ tu_CmdDraw(VkCommandBuffer commandBuffer,
     tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX));
     tu_cs_emit(cs, instanceCount);
     tu_cs_emit(cs, vertexCount);
@@ -442,7 +518,7 @@ index e76f169..2db839e 100644
  
     trace_end_draw(&cmd->rp_trace, cs);
  }
-@@ -9319,6 +9660,7 @@ tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+@@ -9319,6 +9722,7 @@ tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
     tu_cs_emit(cs, firstIndex);
     tu_cs_emit_qw(cs, cmd->state.index_va);
     tu_cs_emit(cs, cmd->state.max_index_count);
@@ -450,7 +526,7 @@ index e76f169..2db839e 100644
  
     trace_end_draw(&cmd->rp_trace, cs);
  }
-@@ -10440,6 +10782,8 @@ tu_barrier(struct tu_cmd_buffer *cmd,
+@@ -10440,6 +10844,8 @@ tu_barrier(struct tu_cmd_buffer *cmd,
  
     struct tu_cache_state *cache =
        cmd->state.pass  ? &cmd->state.renderpass_cache : &cmd->state.cache;
@@ -460,7 +536,7 @@ index e76f169..2db839e 100644
     /* a750 has a HW bug where writing a UBWC compressed image with a compute
      * shader followed by reading it as a texture (or readonly image) requires
 diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
-index 17bebeb..6f7c9ad 100644
+index 17bebeb..1a90a7c 100644
 --- a/src/freedreno/vulkan/tu_cmd_buffer.h
 +++ b/src/freedreno/vulkan/tu_cmd_buffer.h
 @@ -359,6 +359,12 @@ struct tu_render_pass_state
@@ -484,12 +560,13 @@ index 17bebeb..6f7c9ad 100644
     bool pipeline_has_tess;
     bool pipeline_disable_gmem;
     bool raster_order_attachment_access;
-@@ -659,6 +666,9 @@ struct tu_cmd_buffer
+@@ -659,6 +666,10 @@ struct tu_cmd_buffer
  {
     struct vk_command_buffer vk;
  
 +   uint32_t sweet_serial;   /* sweet 0112: which recording (tu_BeginCommandBuffer numbers them) */
 +   uint32_t sweet_fs_id;    /* sweet 0112: the census id of the last draw's fragment shader */
++   uint32_t sweet_px;       /* sweet 0112: the last draw's bound (scissor in viewport in render area), pixels */
 +
     struct tu_device *device;
  
