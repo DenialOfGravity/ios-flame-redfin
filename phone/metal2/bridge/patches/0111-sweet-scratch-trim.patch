@@ -7,7 +7,7 @@ index 56508e92..2d5835c7 100644
          }
      }
 +
-+    /// ios-on-pixel (bridge 0110): whether no draw of the pass writes color `index`: every draw's
++    /// ios-on-pixel (bridge 0111): whether no draw of the pass writes color `index`: every draw's
 +    /// pixels bounded (no execution, tile dispatch or rate map), and none of them with a write
 +    /// mask (or a zeroing variant) on that color.
 +    pub(super) fn sweet_unwritten(&self, index: usize) -> bool {
@@ -24,7 +24,7 @@ index a52061a8..39536b88 100644
                  depth_stencil: None,
                  ..layout.clone()
              });
-+        // ios-on-pixel (bridge 0110, `SWEET_M2V_SCRATCH=1`): the memoryless colors no draw of the
++        // ios-on-pixel (bridge 0111, `SWEET_M2V_SCRATCH=1`): the memoryless colors no draw of the
 +        // pass writes or reads leave every instance's subpass, after the clears ahead of the pass
 +        // above (none for them) and before the pass objects below, which begin those instances
 +        // and whose framebuffers a tiler sizes its bins by (`sweet_scratch_free`).
@@ -65,7 +65,7 @@ index a52061a8..39536b88 100644
          .collect()
  }
  
-+/// ios-on-pixel (bridge 0110): the color indices of `layout`'s memoryless attachments that the
++/// ios-on-pixel (bridge 0111): the color indices of `layout`'s memoryless attachments that the
 +/// pass's subpass may leave out (`VK_ATTACHMENT_UNUSED`, as the interlock's storage colors are,
 +/// `render_target::create`): no draw of the pass writes one (`coverage`, every draw's pixels
 +/// bounded) or reads one as an input attachment (`inputs_read`), nor took a view of it (its
@@ -163,7 +163,7 @@ index d7dc4261..3e5bd7b3 100644
  pub const C_FAST_MISS_GEN: usize = 47;
  pub const C_FAST_EVICTS: usize = 48;
 -pub const STEPS: usize = 49;
-+// 0110 counts (`render.rs` `sweet_scratch_free`): passes with a memoryless color attachment, those
++// 0111 counts (`render.rs` `sweet_scratch_free`): passes with a memoryless color attachment, those
 +// whose draws neither write nor read one (the ones `SWEET_M2V_SCRATCH=1` leaves out of the subpass),
 +// the passes it did leave one out of, those of them whose load action was `Clear`, and why the
 +// others kept it (a draw wrote it; a draw fetched it; anything else: an execution, a tile dispatch,
@@ -193,7 +193,7 @@ index d7dc4261..3e5bd7b3 100644
      *ON.get_or_init(|| flag("SWEET_FASTDRAW", true))
  }
  
-+/// ios-on-pixel (bridge 0110): whether a memoryless color attachment that no draw of its pass
++/// ios-on-pixel (bridge 0111): whether a memoryless color attachment that no draw of its pass
 +/// writes or reads is left out of the pass's subpass (`VK_ATTACHMENT_UNUSED`, its description
 +/// kept, so its framebuffer and every pipeline's compatible pass are as before) in the passes
 +/// `end_encoding` begins (env `SWEET_M2V_SCRATCH`, off unless set and not `0`). A tiler then keeps
