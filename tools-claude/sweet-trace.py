@@ -19,6 +19,16 @@ display/GPU/touch events) and show who wakes whom in the frame chain.
                plus the app tick / commit / backboardd tick phase against the panel edges over time
   --pace-frames N  also print the first N late frames with their chain (ms relative to the missed edge)
   --pace-swipes    only those during swipes (touch .. 700 ms after it)
+  --chain      frame chain against the vsync ticks: app commits (bursts of app -> backboardd messages) -> arrival at the
+               render server -> the tick and frame that used them (ticks skipped, phase), and each frame split into
+               tick -> display wake -> CA prepare -> encode -> GPU -> present -> visible edge, with the display thread's
+               on-CPU / blocked time (and its wakers) before the first submit
+  --ipc        mach messages by msgh_id (MACH_IPC_MSG_SEND / RECV kdebug events): sender, receiving thread, rate,
+               bytes, latency, receiver CPU
+  --summary-json OUT  one JSON per test for the dashboard: frames, interval histogram (vsync periods), stage gaps,
+               GPU ms per frame, largest-gap counts, the late-frame root-cause table (--pace), --chain and --ipc numbers
+  --label NAME the test's label in the summary (default: the trace file name)
+  --json also gets per-frame critical-path tracks, the app commits and msgh_id annotations on the receiving threads
 
 Prints a per-frame critical path for each frame that went on screen (direct scanout latch, or a present):
 touch -> app main thread wake (and its waker) -> app message to backboardd -> backboardd display thread wake (and
@@ -113,6 +123,10 @@ def main():
     ap.add_argument('--pace', action='store_true')
     ap.add_argument('--pace-frames', type=int, default=0)
     ap.add_argument('--pace-swipes', action='store_true')
+    ap.add_argument('--chain', action='store_true')
+    ap.add_argument('--ipc', action='store_true')
+    ap.add_argument('--summary-json', metavar='OUT')
+    ap.add_argument('--label')
     a = ap.parse_args()
 
     T = Trace(a.trace)
@@ -153,6 +167,9 @@ def main():
     wakes = collections.defaultdict(list)      # tid -> (wake abs, oncpu abs, waker tid, in irq)
     oncpu_abs = collections.defaultdict(int)
     msgs = []                  # (abs, sender tid, send pid, dst pid, size)
+    imsgs = []                 # [send abs, sender tid, kmsg, msgh_bits, msgh_id, send pid, dst pid, size, recv abs, receiver tid]
+    ipc_pend = {}              # sender tid -> its last MACH_IPC_MSG_SEND waiting for the KMSG_INFO END (pids, size)
+    ipc_inflight = {}          # kmsg -> the message, until a MACH_IPC_MSG_RECV of the same kmsg
     sw = collections.defaultdict(list)         # name -> [(abs, tid, func, a1, a2, a3, a4)]
     call_stack = collections.defaultdict(list) # tid -> [(code, abs, a1..a4)]
     calls = collections.defaultdict(list)      # tid -> (start, end, name, args)
@@ -202,6 +219,21 @@ def main():
                 cpu_intr[cpu] -= 1
         elif cid == IPC_KMSG_INFO and fn == 2:
             msgs.append((ts, tid, a1, a2, a3))
+            m = ipc_pend.pop(tid, None)
+            if m is not None:
+                m[5], m[6], m[7] = a1, a2, a3
+        elif cid == IPC_SEND:
+            # MACH_IPC_MSG_SEND: kmsg, msgh_bits, msgh_id, voucher (then KMSG_INFO END on the same thread: pids, size)
+            m = [ts, tid, a1, a2 & 0xffffffff, a3 & 0xffffffff, None, None, None, None, None]
+            imsgs.append(m)
+            ipc_pend[tid] = m
+            ipc_inflight[a1] = m
+        elif cid == IPC_RECV or cid == IPC_RECV_NV:
+            # MACH_IPC_MSG_RECV: kmsg, msgh_bits, msgh_id: the receiver of that kmsg (a kernel MIG reply reuses the
+            # request's kmsg with id + 100: not matched)
+            m = ipc_inflight.pop(a1, None)
+            if m is not None and m[4] == (a3 & 0xffffffff):
+                m[8], m[9] = ts, tid
         elif cid == TRACE_NEWTHREAD:
             threads.setdefault(a1, [a2, threads.get(tid, [0, '?', ''])[1], ''])
         elif cid == TRACE_STRING_GLOBAL:
@@ -449,10 +481,12 @@ def main():
     print()
     print('typical gaps (ms):')
     dom = collections.Counter()
+    basics = {'frames': len(rows), 'stage_gaps_ms': {}}
     for x, y in PAIRS:
         v = [gap(st, x, y) for _, _, st, _ in rows]
         v = [g for g in v if g is not None]
         print(f'  {x:>12} -> {y:<12} {stats(v)}')
+        basics['stage_gaps_ms'][f'{x} -> {y}'] = _st(v)
     for _, _, st, _ in rows:
         gs = [(gap(st, x, y), f'{x} -> {y}') for x, y in PAIRS]
         gs = [g for g in gs if g[0] is not None and g[0] > 0]
@@ -460,6 +494,7 @@ def main():
             dom[max(gs)[1]] += 1
     if dom:
         print('largest gap per frame:', ', '.join(f'{k} {n}x' for k, n in dom.most_common()))
+    basics['largest_gap_counts'] = dict(dom.most_common())
     if intervals:
         per = collections.Counter(min(4, max(1, round(i / period_ms))) for i in intervals)
         print(f'on-screen intervals: {stats(intervals)}; in vsync periods: ' +
@@ -474,6 +509,14 @@ def main():
         g = [info['gpu ms'] for _, _, _, info in rows if 'gpu ms' in info]
         if g:
             print(f'GPU time per frame (fence stamps): {stats(g)}')
+            basics['gpu_ms'] = _st(g)
+    if intervals:
+        basics['onscreen_interval_ms'] = _st(intervals)
+        basics['onscreen_interval_vsyncs'] = {f'{k}{"+" if k == 4 else ""}': v for k, v in sorted(per.items())}
+    if disp:
+        basics['display_thread_oncpu_ms'] = round(ms(T.start_abs + oncpu_abs[disp]), 1)
+    if app_main:
+        basics['app_main_oncpu_ms'] = round(ms(T.start_abs + oncpu_abs[app_main]), 1)
 
     # vsync accounting
     ticks = sw['VSYNC']
@@ -531,28 +574,42 @@ def main():
         if sw[nm]:
             print(f'{nm}: {len(sw[nm])} events')
 
-    if a.pace:
-        pace_report(a, T, threads, sw, calls, wakes, slices, msgs, fences, disp, app_main, bb, app, gpu_abs)
+    PR = CH = ipc_rows = None
+    if disp and (a.pace or a.chain or a.summary_json or a.json):
+        PR = pace_report(a, T, threads, sw, calls, wakes, slices, msgs, fences, disp, app_main, bb, app, gpu_abs,
+                         quiet=not a.pace)
+    if PR and (a.chain or a.summary_json or a.json):
+        CH = chain_report(a, T, threads, sw, calls, wakes, slices, imsgs, fences, disp, app_main, bb, app, PR,
+                          quiet=not a.chain)
+    if imsgs and (a.ipc or a.summary_json):
+        ipc_rows = ipc_report(T, threads, imsgs, slices, bb | app | sb, quiet=not a.ipc)
+    if a.summary_json:
+        label = a.label or a.trace.rsplit('/', 1)[-1].rsplit('.', 1)[0]
+        with open(a.summary_json, 'w') as f:
+            json.dump(summary(a, T, label, basics, PR, CH, ipc_rows), f, indent=1)
+        print(f'{a.summary_json}: summary written')
 
     if a.json:
-        write_json(a, T, threads, slices, calls, sw, fences, bb, app, sb, wakes, tname, gpu_abs)
+        write_json(a, T, threads, slices, calls, sw, fences, bb, app, sb, wakes, tname, gpu_abs, imsgs, CH)
 
 
-def pace_report(a, T, threads, sw, calls, wakes, slices, msgs, fences, disp, app_main, bb, app, gpu_abs):
-    """--pace: which stage was running when the panel edge a late frame needed went by."""
+def pace_report(a, T, threads, sw, calls, wakes, slices, msgs, fences, disp, app_main, bb, app, gpu_abs, quiet=False):
+    """--pace: which stage was running when the panel edge a late frame needed went by. Returns the frames, the late
+    frames with their cause and the edge model (for --chain, --summary-json and --json); quiet: no printing."""
+    pr = (lambda *x, **k: None) if quiet else print
     MS = T.abs_of_ns(1e6)            # 1 ms in absolute time units
     ms = lambda d: d / MS            # a duration in ms
     at = lambda t: T.ms(t)           # a time in ms from the trace start
-    print()
-    print('pacing (--pace)')
+    pr()
+    pr('pacing (--pace)')
     if disp is None:
-        print('  no display thread: nothing to do')
-        return
+        pr('  no display thread: nothing to do')
+        return None
     # ---- panel edges: VSYNC a4 = INTF1 frame counter when the tick ran (counts at each panel frame start) ----
     ticks = sorted((e[0], e[6], e[4]) for e in sw['VSYNC'] if e[6])          # (abs, frame counter, sent)
     if len(ticks) < 20:
-        print('  fewer than 20 vsync ticks with an INTF frame count: no edge model')
-        return
+        pr('  fewer than 20 vsync ticks with an INTF frame count: no edge model')
+        return None
     n = len(ticks)
     mf = sum(f for _, f, _ in ticks) / n
     mt = sum(t for t, _, _ in ticks) / n
@@ -588,14 +645,14 @@ def pace_report(a, T, threads, sw, calls, wakes, slices, msgs, fences, disp, app
     lag = [ms(t - edge(f, t)) for t, f, _ in ticks]
     s_lag = sorted(lag)
     tick_iv = sorted(ms(tick_t[i + 1] - tick_t[i]) for i in range(n - 1))
-    print(f'  panel period {Pms:.4f} ms ({1000 / Pms:.3f} Hz) from {n} ticks over frames {ticks[0][1]}-{ticks[-1][1]}; '
+    pr(f'  panel period {Pms:.4f} ms ({1000 / Pms:.3f} Hz) from {n} ticks over frames {ticks[0][1]}-{ticks[-1][1]}; '
           f'tick after its edge: median {s_lag[n // 2]:.2f} p10 {s_lag[n // 10]:.2f} p90 {s_lag[n * 9 // 10]:.2f} ms; '
           f'tick to tick p10 {tick_iv[len(tick_iv) // 10]:.2f} median {tick_iv[len(tick_iv) // 2]:.2f} '
           f'p90 {tick_iv[len(tick_iv) * 9 // 10]:.2f} ms; notification period sent '
           f'{ms(sw["VSYNC_SEND"][0][6]):.3f} ms' if sw['VSYNC_SEND'] else '')
     opts = collections.Counter(e[5] >> 8 for e in sw['VSYNC'])
     lost = sum(1 for i in range(n - 1) if ticks[i + 1][1] - ticks[i][1] >= 2)
-    print(f'  ticks lost (the frame counter moved 2+ between two ticks): {lost} of {ticks[-1][1] - ticks[0][1]} edges; '
+    pr(f'  ticks lost (the frame counter moved 2+ between two ticks): {lost} of {ticks[-1][1] - ticks[0][1]} edges; '
           'kernel sweetvsync (0995) on the ticks: ' + ', '.join(f'{k:#x} x{v}' for k, v in opts.most_common()))
     vsend = sorted(e[0] for e in sw['VSYNC_SEND'])
 
@@ -715,8 +772,8 @@ def pace_report(a, T, threads, sw, calls, wakes, slices, msgs, fences, disp, app
             fr['Aw'] = wclass(w) if w else '-'
         frames.append(fr)
     if not frames:
-        print('  no flips or presents with a swap id: nothing to do')
-        return
+        pr('  no flips or presents with a swap id: nothing to do')
+        return None
     # one frame per edge: a later swap flipped for the same edge replaced the earlier one on the panel
     byn = {}
     for fr in frames:
@@ -755,6 +812,7 @@ def pace_report(a, T, threads, sw, calls, wakes, slices, msgs, fences, disp, app
     gpu_sw = []
     cnt = collections.Counter()
     rate_by = collections.Counter()
+    rate_by_sw = collections.Counter()
     gate_gap = []       # GPU-bound frames: previous fence done -> this frame's GPU start (the 2-surface gate idle)
     by_iv = collections.defaultdict(collections.Counter)
     late = []
@@ -799,6 +857,8 @@ def pace_report(a, T, threads, sw, calls, wakes, slices, msgs, fences, disp, app
                     else:
                         why = 'app_rate'
                         rate_by[fr.get('Aw', '-')] += 1
+                        if sw_:
+                            rate_by_sw[fr.get('Aw', '-')] += 1
                 elif prev['SE'] >= Vt:
                     why = 'bb_busy'
                 else:
@@ -825,28 +885,28 @@ def pace_report(a, T, threads, sw, calls, wakes, slices, msgs, fences, disp, app
                 cnt_sw[why] += 1
         prev = fr
     tot = sum(ivs.values())
-    print(f'  frames by panel edge ({path}), idle gaps > 30 vsyncs left out: '
+    pr(f'  frames by panel edge ({path}), idle gaps > 30 vsyncs left out: '
           + ', '.join(f'{k}{"+" if k == 4 else ""}v {ivs[k]}' for k in sorted(ivs)) + f' (of {tot})')
     tsw = sum(ivs_sw.values())
-    print(f'  during the {len(swin)} swipes (touch .. 700 ms after the finger left): '
+    pr(f'  during the {len(swin)} swipes (touch .. 700 ms after the finger left): '
           + ', '.join(f'{k}{"+" if k == 4 else ""}v {ivs_sw[k]}' for k in sorted(ivs_sw)) + f' (of {tsw})')
     if gpu_sw:
         gpu_sw.sort()
-        print(f'    GPU per swipe frame: median {gpu_sw[len(gpu_sw) // 2]:.2f} p10 {gpu_sw[len(gpu_sw) // 10]:.2f} '
+        pr(f'    GPU per swipe frame: median {gpu_sw[len(gpu_sw) // 2]:.2f} p10 {gpu_sw[len(gpu_sw) // 10]:.2f} '
               f'p90 {gpu_sw[len(gpu_sw) * 9 // 10]:.2f} ms; >= 0.8 period {sum(1 for x in gpu_sw if x >= 0.8 * Pms)} '
               f'of {len(gpu_sw)}')
-    print('  late frames (2v or more): the stage running when the missed edge went by')
-    print(f'    {"cause":10s} {"all":>5} {"2v":>5} {"3v":>5} {"4+v":>5} {"swipe":>5}  meaning')
+    pr('  late frames (2v or more): the stage running when the missed edge went by')
+    pr(f'    {"cause":10s} {"all":>5} {"2v":>5} {"3v":>5} {"4+v":>5} {"swipe":>5}  meaning')
     for k, txt in CAUSES.items():
         if cnt[k]:
-            print(f'    {k:10s} {cnt[k]:5d} {by_iv[2][k]:5d} {by_iv[3][k]:5d} {by_iv[4][k]:5d} {cnt_sw[k]:5d}  {txt}')
+            pr(f'    {k:10s} {cnt[k]:5d} {by_iv[2][k]:5d} {by_iv[3][k]:5d} {by_iv[4][k]:5d} {cnt_sw[k]:5d}  {txt}')
     if rate_by:
-        print('    app_rate by what woke the app main thread for that commit: ' +
+        pr('    app_rate by what woke the app main thread for that commit: ' +
               ', '.join(f'{k} {v}' for k, v in rate_by.most_common()) +
               ' (timer: CADisplayLink, anim: UIKit inProcessAnimationManager, touch: eventfetch)')
     if gate_gap:
         gate_gap.sort()
-        print(f'    GPU late: previous frame\'s GPU done -> this frame\'s GPU start (held for the previous latch, 2 '
+        pr(f'    GPU late: previous frame\'s GPU done -> this frame\'s GPU start (held for the previous latch, 2 '
               f'surfaces): median {gate_gap[len(gate_gap) // 2]:.2f} p90 {gate_gap[len(gate_gap) * 9 // 10]:.2f} ms')
     # the suspected race: the tick before the previous frame's latch (swap-done), so the tick finds no free surface
     lt = sorted(latch.values())
@@ -857,29 +917,29 @@ def pace_report(a, T, threads, sw, calls, wakes, slices, msgs, fences, disp, app
             rel.append(ms(lt[k] - v))
     if rel:
         rel.sort()
-        print(f'  latch (swap-done) - nearest tick: median {rel[len(rel) // 2]:+.2f} p10 {rel[len(rel) // 10]:+.2f} p90 '
+        pr(f'  latch (swap-done) - nearest tick: median {rel[len(rel) // 2]:+.2f} p10 {rel[len(rel) // 10]:+.2f} p90 '
               f'{rel[len(rel) * 9 // 10]:+.2f} ms; latch after the tick {sum(1 for x in rel if x > 0)} of {len(rel)}')
     ll = sorted(ms(fr['L'] - edge(fr['n'], fr['L'])) for fr in frames if fr.get('L') is not None)
     if ll:
-        print(f'  latch seen after its edge: median {ll[len(ll) // 2]:.2f} p10 {ll[len(ll) // 10]:.2f} p90 '
+        pr(f'  latch seen after its edge: median {ll[len(ll) // 2]:.2f} p10 {ll[len(ll) // 10]:.2f} p90 '
               f'{ll[len(ll) * 9 // 10]:.2f} max {ll[-1]:.2f} ms (the scanout thread polls every 1 ms; the gate opens then)')
     swb = sorted(ms(e - s) for s, e, _ in swapwaits if e - s > 0.05 * MS)
     gw = sorted(ms(e - s) for s, e in gates)
-    print(f'  display thread: SwapWait blocked {len(swb)} of {len(swapwaits)} calls'
+    pr(f'  display thread: SwapWait blocked {len(swb)} of {len(swapwaits)} calls'
           + (f' (median {swb[len(swb) // 2]:.2f} max {swb[-1]:.2f} ms)' if swb else '')
           + f'; scanout gate held the submit {len(gw)} times' + (f' (median {gw[len(gw) // 2]:.2f} p90 '
                                                                  f'{gw[len(gw) * 9 // 10]:.2f} ms)' if gw else ''))
     g = sorted(fr['gpu'] for fr in frames if fr['gpu'] is not None and fr['newsub'])
     if g:
-        print(f'  GPU per frame (frames with a new submit): median {g[len(g) // 2]:.2f} p90 {g[len(g) * 9 // 10]:.2f} '
+        pr(f'  GPU per frame (frames with a new submit): median {g[len(g) // 2]:.2f} p90 {g[len(g) * 9 // 10]:.2f} '
               f'ms; >= 0.8 period: {sum(1 for x in g if x >= 0.8 * Pms)} of {len(g)}')
     # chain timings relative to the frame's own edge for on-time frames vs late ones
     if a.pace_frames:
-        print(f'  first {a.pace_frames} late frames: times in ms relative to the missed edge (A app tick, C commit end, '
+        pr(f'  first {a.pace_frames} late frames: times in ms relative to the missed edge (A app tick, C commit end, '
               'V bb tick used, B SwapBegin, S0/S1 submit start/end (gate), G GPU done, SE SwapEnd, F flip)')
         for fr, pv, D, why, dn in [x for x in late if not a.pace_swipes or in_sw(x[0]['F'])][:a.pace_frames]:
             r = lambda x: f'{ms(x - D):7.2f}' if x is not None else f'{"-":>7}'
-            print(f'    {at(fr["F"]):9.1f} swap {fr["swap"]:#x} {dn}v {why:9s} prevSE {r(pv["SE"])} A {r(fr.get("A"))} '
+            pr(f'    {at(fr["F"]):9.1f} swap {fr["swap"]:#x} {dn}v {why:9s} prevSE {r(pv["SE"])} A {r(fr.get("A"))} '
                   f'({fr.get("Aw", "-"):5s}) C {r(fr["C"])} V {r(fr["V"])} B {r(fr["B"])} S0 {r(fr["S0"])} '
                   f'S1 {r(fr["S1"])} G {r(fr["G"])} SE {r(fr["SE"])} F {r(fr["F"])} gpu '
                   f'{fr["gpu"] if fr["gpu"] is not None else -1:5.2f}')
@@ -890,9 +950,9 @@ def pace_report(a, T, threads, sw, calls, wakes, slices, msgs, fences, disp, app
         return ms(t - edge(f, t))
     app_ticks = [w[0] for w in aw if wclass(w) == 'timer']
     commits = [b[1] for b in bursts]
-    print(f'  phase after the last panel edge (0..{Pms:.2f} ms), per 500 ms: app timer wakes of the main thread '
+    pr(f'  phase after the last panel edge (0..{Pms:.2f} ms), per 500 ms: app timer wakes of the main thread '
           '(CADisplayLink), app commit ends, backboardd ticks')
-    print(f'    {"t ms":>7} {"app n":>5} {"app ph":>7} {"commit n":>8} {"commit ph":>9} {"bb tick ph":>10}')
+    pr(f'    {"t ms":>7} {"app n":>5} {"app ph":>7} {"commit n":>8} {"commit ph":>9} {"bb tick ph":>10}')
     span = T.end_abs - T.start_abs
     nb = int(ms(span) // 500) + 1
 
@@ -915,9 +975,10 @@ def pace_report(a, T, threads, sw, calls, wakes, slices, msgs, fences, disp, app
         if m1 is not None:
             series.append((b * 500 + 250, m1))
         f_ = lambda m: f'{m:7.2f}' if m is not None else f'{"-":>7}'
-        print(f'    {b * 500:7d} {len(ap_):5d} {f_(m1)} {len(cp_):8d} {f_(m2):>9} {f_(m3):>10}')
+        pr(f'    {b * 500:7d} {len(ap_):5d} {f_(m1)} {len(cp_):8d} {f_(m2):>9} {f_(m3):>10}')
     # drift of the app timer against the panel: consecutive app timer wakes ~1 period apart
     d = []
+    app_period = None
     for i in range(len(app_ticks) - 1):
         iv = ms(app_ticks[i + 1] - app_ticks[i])
         if 0.5 * Pms < iv < 1.5 * Pms:
@@ -925,12 +986,563 @@ def pace_report(a, T, threads, sw, calls, wakes, slices, msgs, fences, disp, app
     if d:
         d.sort()
         dm = d[len(d) // 2]
+        app_period = dm
         slope = (dm - Pms) / Pms * 1000
-        print(f'  app timer period median {dm:.4f} ms ({len(d)} intervals) vs panel {Pms:.4f} ms: phase moves '
+        pr(f'  app timer period median {dm:.4f} ms ({len(d)} intervals) vs panel {Pms:.4f} ms: phase moves '
               f'{slope:+.2f} ms per second, one full period every {abs(Pms / slope) if slope else float("inf"):.1f} s')
+    return {'frames': frames, 'late': late, 'cnt': cnt, 'by_iv': by_iv, 'cnt_sw': cnt_sw, 'ivs': ivs, 'ivs_sw': ivs_sw,
+            'in_sw': in_sw, 'swin': swin, 'P': P, 'Pms': Pms, 'edge': edge, 'frame_at': frame_at, 'bursts': bursts,
+            'vsend': vsend, 'gpu_sw': gpu_sw, 'rate_by': rate_by, 'rate_by_sw': rate_by_sw, 'CAUSES': CAUSES,
+            'app_period': app_period, 'tick_lag': s_lag[n // 2], 'path': path, 'gate_gap': gate_gap,
+            'swapwaits': swapwaits, 'subs': subs, 'sbegin': sbegin, 'send_': send_, 'swap_fence': swap_fence,
+            'flips': flips}
 
 
-def write_json(a, T, threads, slices, calls, sw, fences, bb, app, sb, wakes, tname, gpu_abs):
+MSG_IDS = {0: 'empty message (mk_timer / port wake-up)', 53: 'IOKit notification (kOSNotificationMessageID: IOMFB vsync)',
+           57: 'IOKit async completion', 70: 'MACH_NOTIFY_NO_SENDERS', 71: 'MACH_NOTIFY_SEND_ONCE',
+           72: 'MACH_NOTIFY_DEAD_NAME', 2865: 'IOKit io_connect_method', 2866: 'IOKit io_connect_async_method',
+           40002: 'QuartzCore client -> render server (CAContext commit / update)',
+           0x10000000: 'XPC message', 0x10000004: 'XPC reply', 0x40000000: 'XPC / libdispatch mach channel'}
+
+
+def msg_name(i):
+    """a short name for a msgh_id (MIG subsystem ranges; only the ids seen in the redfin traces are named exactly)"""
+    if i in MSG_IDS:
+        return MSG_IDS[i]
+    for lo, hi, nm in ((200, 300, 'mach_host'), (400, 500, 'host_priv'), (2800, 3000, 'IOKit MIG'),
+                       (3200, 3300, 'mach_port'), (3300, 3400, 'mach_port reply'), (3400, 3600, 'task'),
+                       (3600, 3800, 'thread_act'), (4800, 5000, 'mach_vm'), (40000, 41000, 'QuartzCore MIG'),
+                       (0x10000000, 0x10000100, 'XPC')):
+        if lo <= i < hi:
+            return f'{nm} {i}'
+    return f'id {i}'
+
+
+def _pct(v, q):
+    v = sorted(v)
+    return v[min(len(v) - 1, int(len(v) * q))] if v else None
+
+
+def _st(v):
+    """{n, median, p90, mean} of a list (None entries dropped)"""
+    v = sorted(x for x in v if x is not None)
+    if not v:
+        return {'n': 0}
+    return {'n': len(v), 'median': round(v[len(v) // 2], 3), 'p90': round(_pct(v, 0.9), 3),
+            'mean': round(sum(v) / len(v), 3), 'max': round(v[-1], 3)}
+
+
+def _sts(d):
+    if not d.get('n'):
+        return 'n    0'
+    return f'n {d["n"]:4d} median {d["median"]:7.2f} p90 {d["p90"]:7.2f} mean {d["mean"]:7.2f}'
+
+
+def ipc_report(T, threads, imsgs, slices, focus_pids, quiet=False, top=25):
+    """--ipc: mach messages with their msgh_id (MACH_IPC_MSG_SEND), sender (KMSG_INFO) and receiving thread
+    (MACH_IPC_MSG_RECV of the same kmsg). Receiver cost = on-CPU time of the receiving thread from the receive until it
+    blocks again (all messages handled in that run share it)."""
+    pr = (lambda *x, **k: None) if quiet else print
+    MS = T.abs_of_ns(1e6)
+    span_s = (T.end_abs - T.start_abs) / MS / 1000
+
+    def pn(p):
+        if p is None:
+            return '?'
+        for v in threads.values():
+            if v[0] == p:
+                return v[1]
+        return 'kernel' if p == 0 else f'pid {p}'
+
+    def tn(t):
+        v = threads.get(t)
+        return f'{v[1]}/{v[2] or t}' if v else f'tid {t}'
+    run = {t: sorted((s, e) for s, e, k, _ in sl if k == 'running') for t, sl in slices.items()}
+
+    def run_left(t, ts):
+        r = run.get(t)
+        if not r:
+            return None
+        i = bisect.bisect_right(r, (ts, float('inf'))) - 1
+        if i >= 0 and r[i][0] <= ts <= r[i][1]:
+            return r[i]
+        return None
+    groups = collections.defaultdict(lambda: {'n': 0, 'bytes': 0, 'lat': [], 'runs': set(), 'recv': 0})
+    for m in imsgs:
+        if m[5] is None or not (m[5] in focus_pids or m[6] in focus_pids):
+            continue
+        if m[6] == 0 and m[9] is None:
+            continue        # MIG calls into the kernel: not messages between processes
+        key = (pn(m[5]), m[4], pn(m[6]), tn(m[9]) if m[9] else '-')
+        g = groups[key]
+        g['n'] += 1
+        g['bytes'] += m[7] or 0
+        if m[8] is not None:
+            g['recv'] += 1
+            g['lat'].append((m[8] - m[0]) / MS)
+            r = run_left(m[9], m[8])
+            if r:
+                g['runs'].add((m[9], r[0], r[1]))
+    rows = []
+    for (s, i, d, rt), g in groups.items():
+        cpu = sum(e - st for _, st, e in g['runs']) / MS
+        rows.append({'sender': s, 'id': i, 'name': msg_name(i), 'dst': d, 'receiver': rt, 'count': g['n'],
+                     'per_s': round(g['n'] / span_s, 1), 'bytes': g['bytes'], 'latency_ms': _st(g['lat']),
+                     'receiver_runs': len(g['runs']), 'receiver_cpu_ms': round(cpu, 2)})
+    rows.sort(key=lambda r: -r['count'])
+    pr()
+    pr(f'mach messages by msgh_id (--ipc; {len(imsgs)} sends with an id; involving '
+       f'{", ".join(sorted({pn(p) for p in focus_pids}))}); receiver CPU = on-CPU runs of the receiving thread that '
+       'contain the receive (shared by the messages handled in one run)')
+    pr(f'  {"count":>6} {"/s":>6} {"bytes":>8} {"lat med":>7}  {"rcv cpu ms":>10}  sender -> receiver thread: id (name)')
+    for r in rows[:top]:
+        lm = r['latency_ms'].get('median')
+        pr(f'  {r["count"]:6d} {r["per_s"]:6.0f} {r["bytes"]:8d} {lm if lm is not None else -1:7.3f}  '
+           f'{r["receiver_cpu_ms"]:10.1f}  {r["sender"]} -> {r["receiver"]}: {r["id"]} ({r["name"]})')
+    return rows
+
+
+def chain_report(a, T, threads, sw, calls, wakes, slices, imsgs, fences, disp, app_main, bb, app, PR, quiet=False):
+    """--chain: the frame chain against the vsync ticks. App commits (the app main thread's bursts of messages to
+    backboardd, with their arrival at the receiving render-server thread) -> the tick and the display-thread frame that
+    used them (how many ticks they waited), and each frame split into tick -> wake -> SwapBegin (CA prepare) -> first
+    GPU submit (encode) -> GPU done -> SwapEnd -> on the panel, with the display thread's on-CPU / blocked time (and
+    who woke it) between its wake and the first submit."""
+    pr = (lambda *x, **k: None) if quiet else print
+    MS = T.abs_of_ns(1e6)
+    ms = lambda d: d / MS
+    P, Pms, edge = PR['P'], PR['Pms'], PR['edge']
+    vsend = PR['vsend']
+    # every display-thread frame (SwapEnd), also those replaced on the panel by a later one for the same edge
+    frames = []
+    subs = PR['subs']
+    for swap, (s0, s1) in PR['send_'].items():
+        b = PR['sbegin'].get(swap) or s0
+        i = bisect.bisect_right(vsend, b) - 1
+        fr = {'swap': swap, 'B': b, 'SE': s1, 'V': vsend[i] if i >= 0 else None, 'S0': None, 'S1': None}
+        k = bisect.bisect_left(subs, (b,))
+        if k < len(subs) and subs[k][0] <= s1:
+            fr['S0'], fr['S1'] = subs[k][0], subs[k][1]
+        fr['newsub'] = fr['S0'] is not None
+        fe = fences.get(PR['swap_fence'].get(swap))
+        fr['G'] = fe[1] if fe else None
+        fr['gpu'] = ms(fe[1] - fe[0]) if fe else None
+        # all of the display thread's submits for this frame (offscreen passes + the final one)
+        fs = [fences[x[2]] for x in subs[k:bisect.bisect_right(subs, (s1, float('inf')))] if x[2] in fences]
+        fr['nsub'] = len(fs)
+        fr['gpu_all'] = ms(sum(e - st for st, e, _ in fs)) if fs else None
+        if fs and fe is None:
+            fr['G'] = max(e for _, e, _ in fs)
+        fl = PR['flips'].get(swap)
+        fr['F'], fr['n'] = (fl[0], fl[1] + 1) if fl else (None, None)
+        frames.append(fr)
+    frames.sort(key=lambda f: f['B'])
+    shown = {f['swap'] for f in PR['frames']}
+    for f in frames:
+        f['shown'] = f['swap'] in shown
+
+    def tn(t):
+        v = threads.get(t)
+        return f'{v[1]}/{v[2] or t}' if v else f'tid {t}'
+
+    def short(t, irq=False):
+        v = threads.get(t, [0, '?', ''])
+        nm = v[2] or ''
+        if irq:
+            return 'irq'
+        if 'thread call' in nm:
+            return 'timer/tick'
+        if v[1] == 'kernel_task':
+            return 'kernel'
+        return f'{v[1]}/{nm or t}'
+    # ---- the display thread's frames: its wake after the tick, split of wake -> first submit ----
+    dwk = wakes.get(disp, [])
+    dwt = [w[0] for w in dwk]
+    dsl = sorted(slices.get(disp, []))
+    dst = [x[0] for x in dsl]
+    dcalls = sorted(calls.get(disp, []))
+    for fr in frames:
+        lo = fr['V'] if fr['V'] is not None else fr['B'] - 20 * MS
+        i = bisect.bisect_left(dwt, lo)
+        fr['W'] = dwt[i] if i < len(dwt) and dwt[i] <= fr['B'] else (fr['V'] or fr['B'])
+        fr['Wby'] = short(dwk[i][2], dwk[i][3]) if i < len(dwt) and dwt[i] <= fr['B'] else '-'
+    # the frame's start: the display thread's wake after its last idle block (>= 1 ms) since the previous SwapEnd, or
+    # the previous SwapEnd itself when it did not go idle in between (it went straight on to this frame)
+    prev_se = None
+    for fr in frames:
+        fr['start'], fr['startby'] = fr['W'], 'tick' if fr['Wby'] == 'timer/tick' else fr['Wby']
+        if prev_se is not None and prev_se < fr['B']:
+            j = max(0, bisect.bisect_right(dst, prev_se) - 1)
+            idle = None
+            while j < len(dsl) and dsl[j][0] < fr['B']:
+                s_, e_, kd, w = dsl[j]
+                if kd == 'blocked' and e_ > prev_se and e_ - max(s_, prev_se) >= 1 * MS:
+                    idle = dsl[j]
+                j += 1
+            if idle is None:
+                fr['start'], fr['startby'] = prev_se, 'went on from the previous SwapEnd'
+            else:
+                i = bisect.bisect_left(dwt, idle[1] - 0.01 * MS)
+                if i < len(dwt) and dwt[i] <= fr['B']:
+                    fr['start'] = dwt[i]
+                    fr['startby'] = 'tick' if short(dwk[i][2], dwk[i][3]) == 'timer/tick' else short(dwk[i][2], dwk[i][3])
+                else:
+                    fr['start'] = idle[1]
+        prev_se = fr['SE']
+    for fr in frames:
+        end = fr['S0'] or fr['SE']
+        split = collections.Counter()
+        blk = collections.Counter()
+        j = max(0, bisect.bisect_right(dst, fr['start']) - 1)
+        while j < len(dsl) and dsl[j][0] < end:
+            s, e, kind, w = dsl[j]
+            d = min(e, end) - max(s, fr['start'])
+            if d > 0:
+                split[kind] += d
+                if kind == 'blocked' and w:
+                    blk[short(w[1], w[2])] += d
+            j += 1
+        fr['split'] = {k: ms(v) for k, v in split.items()}
+        fr['blk'] = {k: ms(v) for k, v in blk.items()}
+        k = bisect.bisect_left(dcalls, (fr['start'],))
+        big = []
+        while k < len(dcalls) and dcalls[k][0] < end:
+            c = dcalls[k]
+            if c[1] - c[0] > 0.5 * MS:
+                nm = (IOMFB_SEL_NAMES.get(c[3][0], f'IOMFB {c[3][0]}') if c[2] == 0x04 else
+                      'accel ' + ACCEL_NAMES.get(c[3][0], str(c[3][0])) if c[2] == 0x15 else
+                      {0x10: 'GPU submit', 0x12: 'GPU wait', 0x14: 'gate'}.get(c[2], hex(c[2])))
+                big.append((nm, ms(c[1] - c[0])))
+            k += 1
+        fr['bigcalls'] = big
+    # ---- app commits ----
+    cm = sorted((m for m in imsgs if m[5] in app and m[6] in bb and (app_main is None or m[1] == app_main)),
+                key=lambda m: m[0])
+    commits = []
+    for m in cm:
+        if commits and m[0] - commits[-1]['s1'] < 0.5 * MS:
+            c = commits[-1]
+        else:
+            c = {'s0': m[0], 's1': m[0], 'n': 0, 'bytes': 0, 'big': 0, 'arr': None, 'rtid': None}
+            commits.append(c)
+        c['s1'] = m[0]
+        c['n'] += 1
+        c['bytes'] += m[7] or 0
+        c['big'] = max(c['big'], m[7] or 0)
+        if m[8] is not None and (c['arr'] is None or m[8] > c['arr']):
+            c['arr'], c['rtid'] = m[8], m[9]
+    commits = [c for c in commits if (c['n'] >= 3 or c['big'] >= 500) and c['arr'] is not None]
+    run = {}
+    aw = wakes.get(app_main, []) if app_main else []
+    awt = [w[0] for w in aw]
+    fb = [f['B'] for f in frames]
+    for c in commits:
+        t = c['rtid']
+        if t not in run:
+            run[t] = sorted((s, e) for s, e, kd, _ in slices.get(t, []) if kd == 'running')
+        r = run[t]
+        i = bisect.bisect_right(r, (c['arr'], float('inf'))) - 1
+        c['done'] = r[i][1] if i >= 0 and r[i][0] <= c['arr'] <= r[i][1] else c['arr']
+        i = bisect.bisect_right(vsend, c['arr']) - 1
+        c['ptick'] = vsend[i] if i >= 0 else None
+        c['ntick'] = vsend[i + 1] if i + 1 < len(vsend) else None
+        c['phase'] = ms(c['arr'] - c['ptick']) if c['ptick'] is not None else None
+        j = bisect.bisect_right(awt, c['s0']) - 1
+        c['why'] = '-'
+        if j >= 0 and c['s0'] - awt[j] < 30 * MS:
+            w = aw[j]
+            nm = threads.get(w[2], [0, '?', ''])[2] or ''
+            c['why'] = ('irq' if w[3] else 'timer' if 'thread call' in nm else 'anim' if 'inProcessAnimation' in nm
+                        else 'touch' if 'eventfetch' in nm else 'other')
+        k = bisect.bisect_right(fb, c['done'])
+        c['frame'] = frames[k] if k < len(frames) and frames[k]['B'] - c['done'] < 100 * MS else None
+        if c['frame'] is not None and c['ntick'] is not None:
+            fr = c['frame']
+            c['wait'] = ms(max(fr['W'], fr['start']) - c['arr'])
+            c['tick_wait'] = ms(c['ntick'] - c['arr'])
+            v = fr['V'] or fr['W']
+            c['late_ticks'] = max(0, bisect.bisect_right(vsend, v) - bisect.bisect_left(vsend, c['ntick']) - 1) \
+                if v >= c['ntick'] else -1
+            c['to_screen'] = ms(edge(fr['n'], fr['F']) - c['arr']) if fr.get('n') is not None else None
+            c['frame_gpu'] = fr['gpu'] if fr['newsub'] else None
+            if c['late_ticks'] >= 1:
+                # why the first tick after the arrival did not take it: the display thread at that tick
+                t = c['ntick']
+                k = bisect.bisect_left(fb, t) - 1
+                pf = frames[k] if k >= 0 else None
+                if pf is not None and pf['SE'] >= t:
+                    if t < pf['B']:
+                        c['skip'] = 'busy: previous frame CA prepare'
+                    elif pf['S0'] is None or t < pf['S0']:
+                        c['skip'] = 'busy: previous frame encode'
+                    elif t < pf['S1']:
+                        c['skip'] = 'busy: previous frame GPU submit held (scanout gate)'
+                    else:
+                        c['skip'] = 'busy: previous frame after submit (SwapEnd)'
+                else:
+                    i = bisect.bisect_left(dwt, t)
+                    woke = i < len(dwt) and dwt[i] - t < 1 * MS
+                    st = 'blocked'
+                    j = bisect.bisect_right(dst, t) - 1
+                    if j >= 0 and dsl[j][0] <= t <= dsl[j][1]:
+                        st = dsl[j][2]
+                    c['skip'] = ('idle: woke at the tick, no frame' if woke else
+                                 'idle: not woken by the tick' if st == 'blocked' else
+                                 'busy: display thread running (CA prepare of a frame begun before the commit '
+                                 'arrived, or post-frame work)' if st == 'running' else f'display thread {st} at the tick')
+    # ---- report ----
+    R = {'commits': len(commits)}
+    R['commit_msgs'] = _st([c['n'] for c in commits])
+    R['commit_bytes'] = _st([c['bytes'] for c in commits])
+    R['commit_send'] = _st([ms(c['s1'] - c['s0']) for c in commits])
+    R['commit_ipc'] = _st([ms(c['arr'] - c['s1']) for c in commits])
+    R['commit_decode'] = _st([ms(c['done'] - c['arr']) for c in commits])
+    R['commit_phase'] = _st([c['phase'] for c in commits])
+    R['commit_wait'] = _st([c.get('wait') for c in commits])
+    R['commit_tick_wait'] = _st([c.get('tick_wait') for c in commits])
+    R['commit_to_screen'] = _st([c.get('to_screen') for c in commits])
+    lt = collections.Counter(c.get('late_ticks') for c in commits if c.get('late_ticks') is not None)
+    R['late_ticks'] = {str(k): v for k, v in sorted(lt.items())}
+    ph = collections.Counter(min(int(c['phase']), int(Pms)) for c in commits if c['phase'] is not None)
+    R['phase_hist_ms'] = [ph.get(i, 0) for i in range(int(Pms) + 1)]
+    R['commit_by_waker'] = dict(collections.Counter(c['why'] for c in commits))
+    R['_skip_examples'] = [(T.ms(c['ntick']), c['skip']) for c in commits if 'skip' in c][:12]
+    R['skipped_tick_reason'] = dict(collections.Counter(c['skip'] for c in commits if 'skip' in c).most_common())
+    # frames
+    def g(fr, x, y):
+        return ms(fr[y] - fr[x]) if fr.get(x) is not None and fr.get(y) is not None else None
+    for fr in frames:
+        fr['E'] = edge(fr['n'], fr['F']) if fr['n'] is not None else None
+    st = collections.OrderedDict()
+    st['tick -> display wake'] = [g(f, 'V', 'W') for f in frames]
+    st['frame start -> SwapBegin (CA prepare)'] = [g(f, 'start', 'B') for f in frames]
+    st['SwapBegin -> 1st submit (encode)'] = [g(f, 'B', 'S0') for f in frames]
+    st['wake -> 1st submit'] = [g(f, 'W', 'S0') for f in frames]
+    st['frame start -> 1st submit (CPU)'] = [g(f, 'start', 'S0') for f in frames]
+    st['1st submit call (scanout gate)'] = [g(f, 'S0', 'S1') for f in frames]
+    st['1st submit -> GPU done'] = [g(f, 'S0', 'G') for f in frames]
+    st['wake -> SwapEnd'] = [g(f, 'W', 'SE') for f in frames]
+    st['SwapEnd -> on panel (present/flip)'] = [g(f, 'SE', 'F') for f in frames]
+    st['on panel -> visible edge'] = [g(f, 'F', 'E') for f in frames]
+    st['tick -> visible edge'] = [g(f, 'V', 'E') for f in frames]
+    R['stages'] = {k: _st(v) for k, v in st.items()}
+    sp = collections.defaultdict(list)
+    bk = collections.Counter()
+    for f in frames:
+        for k in ('running', 'blocked', 'runnable', 'preempted'):
+            sp[k].append(f['split'].get(k, 0.0))
+        for k, v in f['blk'].items():
+            bk[k] += v
+    R['start_to_submit_split'] = {k: _st(v) for k, v in sp.items()}
+    # the display thread's CPU: inside frames (wake -> SwapEnd) and outside them
+    tot = sum(e - s for s, e, kd, _ in dsl if kd == 'running')
+    inside = 0
+    for f in frames:
+        j = max(0, bisect.bisect_right(dst, f['W']) - 1)
+        while j < len(dsl) and dsl[j][0] < f['SE']:
+            s, e, kd, _ = dsl[j]
+            if kd == 'running':
+                inside += max(0, min(e, f['SE']) - max(s, f['W']))
+            j += 1
+    post = 0
+    post_calls = collections.Counter()
+    for i, f in enumerate(frames):
+        nxt = frames[i + 1]['W'] if i + 1 < len(frames) else T.end_abs
+        j = max(0, bisect.bisect_right(dst, f['SE']) - 1)
+        while j < len(dsl) and dsl[j][0] < nxt:
+            s, e, kd, _ = dsl[j]
+            if kd == 'running':
+                post += max(0, min(e, nxt) - max(s, f['SE']))
+            j += 1
+        k = bisect.bisect_left(dcalls, (f['SE'],))
+        while k < len(dcalls) and dcalls[k][0] < nxt:
+            c = dcalls[k]
+            nm = (IOMFB_SEL_NAMES.get(c[3][0], f'IOMFB {c[3][0]}') if c[2] == 0x04 else
+                  'accel ' + ACCEL_NAMES.get(c[3][0], str(c[3][0])) if c[2] == 0x15 else
+                  {0x10: 'GPU submit', 0x12: 'GPU wait', 0x14: 'gate'}.get(c[2], hex(c[2])))
+            post_calls[nm] += c[1] - c[0]
+            k += 1
+    R['display_oncpu_ms'] = {'total': round(ms(tot), 1), 'in_frames': round(ms(inside), 1),
+                             'per_frame': round(ms(inside) / max(1, len(frames)), 2),
+                             'after_swapend': round(ms(post), 1),
+                             'after_swapend_per_frame': round(ms(post) / max(1, len(frames)), 2)}
+    R['after_swapend_kernel_calls_ms'] = {k: round(ms(v), 1) for k, v in post_calls.most_common(6)}
+    # when does the display thread first block (or get preempted) after SwapEnd, against its frame's GPU done?
+    # (a busy wait for the GPU shows as running until the fence ends: block - GPU done ~ 0)
+    rel = []
+    for f in frames:
+        if f['G'] is None:
+            continue
+        j = bisect.bisect_right(dst, f['SE'])
+        while j < len(dsl) and dsl[j][2] == 'running':
+            j += 1
+        if j < len(dsl) and dsl[j][0] - f['SE'] < 100 * MS:
+            rel.append((ms(dsl[j][0] - f['SE']), ms(dsl[j][0] - f['G'])))
+    R['after_swapend_run_ms'] = _st([x[0] for x in rel])
+    R['after_swapend_block_minus_gpu_done_ms'] = _st([x[1] for x in rel])
+    R['after_swapend_block_within_1ms_of_gpu_done'] = sum(1 for x in rel if abs(x[1]) < 1)
+    R['after_swapend_frames'] = len(rel)
+    R['blocked_on_ms_total'] = {k: round(v, 1) for k, v in bk.most_common(8)}
+    R['display_woken_by'] = dict(collections.Counter(f['Wby'] for f in frames).most_common(8))
+    R['frame_started_by'] = dict(collections.Counter(f['startby'] for f in frames).most_common(8))
+    R['gpu_ms'] = _st([f['gpu'] for f in frames if f['newsub']])
+    R['gpu_all_submits_ms'] = _st([f['gpu_all'] for f in frames if f['newsub']])
+    R['submits_per_frame'] = _st([f['nsub'] for f in frames if f['newsub']])
+    long_ = [f for f in frames if f['S0'] is not None and ms(f['S0'] - f['start']) > 20]
+    R['long_frames_start_submit_gt20ms'] = len(long_)
+    lc = collections.Counter()
+    for f in long_:
+        for nm, d in f['bigcalls']:
+            lc[nm] += 1
+    R['long_frame_calls'] = dict(lc.most_common(8))
+    R['long_frames'] = [{'t_ms': round(T.ms(f['start']), 1), 'cpu_ms': round(ms(f['S0'] - f['start']), 2),
+                         'split': {k: round(v, 2) for k, v in f['split'].items()}, 'started_by': f['startby'],
+                         'gpu_ms': round(f['gpu_all'], 2) if f['gpu_all'] else None,
+                         'interval_before_ms': round(ms(f['start'] - frames[i - 1]['SE']), 1) if i else None}
+                        for i, f in enumerate(frames) if f in long_][:20]
+    # scaling: encode / prepare against the GPU time (work proxy) and the commit size
+    sc = []
+    for f in frames:
+        if f['S0'] is not None and f['gpu'] is not None and f['newsub']:
+            sc.append((f['gpu_all'] or f['gpu'], ms(f['S0'] - f['B']), ms(f['B'] - f['start'])))
+    bins = [(0, 1), (1, 5), (5, 12), (12, 100)]
+    R['encode_by_gpu_ms'] = {f'{lo}-{hi}': {'n': len(v), 'encode_median': _st([x[1] for x in v]).get('median'),
+                                           'prepare_median': _st([x[2] for x in v]).get('median')}
+                             for lo, hi in bins for v in [[x for x in sc if lo <= x[0] < hi]]}
+    sw_frames = [f for f in frames if PR['in_sw'](f['B'])]
+    R['frames'] = len(frames)
+    R['frames_replaced_or_not_shown'] = sum(1 for f in frames if not f['shown'])
+    R['gpu_by_commit_waker'] = {k: _st([c.get('frame_gpu') for c in commits if c['why'] == k])
+                                for k in sorted({c['why'] for c in commits})}
+    pg = []
+    for f, (s, e, pid) in fences.items():
+        if pid == 0:
+            pg.append(ms(e - s))
+    R['present_blit_gpu_ms'] = _st(pg)
+    R['swipe_frames'] = len(sw_frames)
+    R['swipe_gpu_ms'] = _st([f['gpu'] for f in sw_frames if f['newsub']])
+    R['swipe_gpu_all_submits_ms'] = _st([f['gpu_all'] for f in sw_frames if f['newsub']])
+    # GPU busy share during swipes: the union of all fences (any process) inside the swipe windows
+    iv = sorted((st, e) for st, e, _ in fences.values())
+    busy = tot_sw = 0
+    for w0, w1 in PR['swin']:
+        w1 = min(w1, T.end_abs)
+        tot_sw += max(0, w1 - w0)
+        cur = None
+        for st, e in iv:
+            st, e = max(st, w0), min(e, w1)
+            if e <= st:
+                continue
+            if cur and st <= cur[1]:
+                cur[1] = max(cur[1], e)
+            else:
+                if cur:
+                    busy += cur[1] - cur[0]
+                cur = [st, e]
+        if cur:
+            busy += cur[1] - cur[0]
+    R['swipe_gpu_busy_pct'] = round(100 * busy / tot_sw, 1) if tot_sw else None
+    R['swipe_stages'] = {k: _st([g(f, *xy) for f in sw_frames]) for k, xy in
+                         (('wake -> 1st submit', ('W', 'S0')), ('frame start -> 1st submit (CPU)', ('start', 'S0')),
+                          ('1st submit call (scanout gate)', ('S0', 'S1')), ('1st submit -> GPU done', ('S0', 'G')),
+                          ('tick -> visible edge', ('V', 'E')))}
+    swc = [c for c in commits if PR['in_sw'](c['arr'])]
+    R['swipe_commit_wait'] = _st([c.get('wait') for c in swc])
+    R['swipe_commit_to_screen'] = _st([c.get('to_screen') for c in swc])
+    R['swipe_commit_rate_hz'] = None
+    if PR['swin']:
+        dur = sum(min(s1, T.end_abs) - s0 for s0, s1 in PR['swin']) / MS / 1000
+        R['swipe_commit_rate_hz'] = round(len(swc) / dur, 1) if dur > 0 else None
+    pr()
+    pr('frame chain (--chain): app commits -> backboardd tick -> frame -> panel; all times in ms')
+    pr(f'  {len(commits)} app commits (bursts of app main thread -> backboardd messages): messages per commit '
+       f'{_sts(R["commit_msgs"])}; bytes {_sts(R["commit_bytes"])}')
+    pr(f'  commit send burst {_sts(R["commit_send"])}; last send -> received {_sts(R["commit_ipc"])}; '
+       f'receiver decode (run until it blocks) {_sts(R["commit_decode"])}')
+    pr(f'  commit arrival after the previous bb tick (phase): {_sts(R["commit_phase"])}; histogram per ms: '
+       f'{R["phase_hist_ms"]}')
+    pr(f'  arrival -> next tick {_sts(R["commit_tick_wait"])}; arrival -> display wake of the frame that used it '
+       f'{_sts(R["commit_wait"])}; ticks skipped after the first: {R["late_ticks"]}')
+    pr(f'  arrival -> visible on the panel {_sts(R["commit_to_screen"])}; commits by app waker: {R["commit_by_waker"]}')
+    pr(f'  commits not taken by the first tick after them, the display thread at that tick: {R["skipped_tick_reason"]}')
+    if R['swipe_commit_rate_hz'] is not None:
+        pr(f'  during swipes: {len(swc)} commits, {R["swipe_commit_rate_hz"]} per s; arrival -> display wake '
+           f'{_sts(R["swipe_commit_wait"])}; arrival -> visible {_sts(R["swipe_commit_to_screen"])}')
+    pr(f'  {len(frames)} display frames ({R["frames_replaced_or_not_shown"]} replaced before the panel showed them / not '
+       f'shown); display thread woken by {R["display_woken_by"]}')
+    pr(f'  GPU per frame by what woke the app for the commit it carried: ' +
+       '; '.join(f'{k} {_sts(v)}' for k, v in R['gpu_by_commit_waker'].items()))
+    pr(f'  present-path blits (kernel GPU work, pid 0): {_sts(R["present_blit_gpu_ms"])}')
+    for k, v in R['stages'].items():
+        pr(f'    {k:36s} {_sts(v)}')
+    pr(f'  frames started by: {R["frame_started_by"]}')
+    pr('  display thread frame start -> 1st submit split: ' + '; '.join(f'{k} {_sts(v)}' for k, v in
+                                                            R['start_to_submit_split'].items()))
+    pr(f'  blocked time (start -> submit) by waker, total ms: {R["blocked_on_ms_total"]}; display thread on CPU '
+       f'{R["display_oncpu_ms"]} ms; kernel calls after SwapEnd (ms): {R["after_swapend_kernel_calls_ms"]}')
+    pr(f'  after SwapEnd the display thread runs {_sts(R["after_swapend_run_ms"])} before it first blocks; that block '
+       f'- its frame\'s GPU done {_sts(R["after_swapend_block_minus_gpu_done_ms"])} (within 1 ms: '
+       f'{R["after_swapend_block_within_1ms_of_gpu_done"]} of {R["after_swapend_frames"]})')
+    pr(f'  frames with start -> submit > 20 ms: {len(long_)}; their kernel calls > 0.5 ms: {R["long_frame_calls"]}')
+    for x in R['long_frames'][:10]:
+        pr(f'    long: {x}')
+    pr(f'  CA prepare / encode against the frame\'s GPU time (work proxy): {R["encode_by_gpu_ms"]}')
+    pr(f'  GPU per frame (swap fence) {_sts(R["gpu_ms"])}; during swipes {_sts(R["swipe_gpu_ms"])}')
+    pr(f'  GPU per frame (all display-thread submits, {_sts(R["submits_per_frame"])} per frame) '
+       f'{_sts(R["gpu_all_submits_ms"])}; during swipes {_sts(R["swipe_gpu_all_submits_ms"])}; GPU busy during swipes '
+       f'{R["swipe_gpu_busy_pct"]} %')
+    R['_commits'] = commits
+    R['_frames'] = frames
+    return R
+
+
+CAUSE_GROUPS = collections.OrderedDict([
+    ('late commit phase', ('app_phase', 'app_cpu')),
+    ('no new commit (app cadence)', ('app_rate', 'content')),
+    ('encode too long (bb CPU)', ('bb_cpu', 'bb_busy', 'bb_post')),
+    ('GPU', ('gpu_long', 'gpu_late')),
+    ('swap/flip back-pressure', ('swapwait', 'gate', 'flip')),
+    ('other', ('bb_skip', 'no_tick', 'other')),
+])
+
+
+def summary(a, T, label, basics, PR, CH, ipc_rows):
+    """--summary-json: one test's numbers for the coordinator's dashboard"""
+    S = {'label': label, 'trace': a.trace, 'app': a.app, 'span_ms': round(T.ms(T.end_abs), 1)}
+    S.update(basics)
+    if not basics.get('frames'):
+        S['warning'] = 'no frames on screen in this trace (no SwapEnd / present / latch): nothing was rendered'
+    if PR:
+        S['period_ms'] = round(PR['Pms'], 4)
+        S['panel_hz'] = round(1000 / PR['Pms'], 3)
+        S['tick_after_edge_ms'] = round(PR['tick_lag'], 3)
+        S['app_timer_period_ms'] = round(PR['app_period'], 4) if PR['app_period'] else None
+        S['present_path'] = PR['path']
+        iv = lambda c: {'1': c.get(1, 0), '2': c.get(2, 0), '3': c.get(3, 0), '4+': c.get(4, 0)}
+        S['interval_vsyncs'] = iv(PR['ivs'])
+        S['interval_vsyncs_swipe'] = iv(PR['ivs_sw'])
+        fr = PR['frames']
+        ivms = [(fr[i]['n'] - fr[i - 1]['n']) * PR['Pms'] for i in range(1, len(fr)) if fr[i]['n'] - fr[i - 1]['n'] <= 30]
+        S['interval_ms'] = _st(ivms)
+        S['gpu_ms_swipe'] = _st(PR['gpu_sw'])
+        rc = {}
+        for k in PR['CAUSES']:
+            if PR['cnt'][k]:
+                rc[k] = {'all': PR['cnt'][k], '2v': PR['by_iv'][2][k], '3v': PR['by_iv'][3][k],
+                         '4+v': PR['by_iv'][4][k], 'swipe': PR['cnt_sw'][k]}
+        S['root_causes'] = rc
+        S['root_cause_groups'] = {g: {'all': sum(PR['cnt'][k] for k in ks), 'swipe': sum(PR['cnt_sw'][k] for k in ks)}
+                                  for g, ks in CAUSE_GROUPS.items()}
+        S['app_cadence_by_waker'] = dict(PR['rate_by'])
+        S['app_cadence_by_waker_swipe'] = dict(PR['rate_by_sw'])
+    if CH:
+        S['chain'] = {k: v for k, v in CH.items() if not k.startswith('_')}
+    if ipc_rows:
+        S['ipc_top'] = ipc_rows[:15]
+    return S
+
+
+def write_json(a, T, threads, slices, calls, sw, fences, bb, app, sb, wakes, tname, gpu_abs, imsgs=(), CH=None):
     us = lambda t: (t - T.start_abs) * T.numer / T.denom / 1e3
     focus = {t for t, v in threads.items() if v[0] in (bb | app | sb)}
     keep = set(slices) if a.all else set(focus)
@@ -1035,9 +1647,59 @@ def write_json(a, T, threads, slices, calls, sw, fences, bb, app, sb, wakes, tna
         inst(f'touch {e[3]} {"down" if e[4] else "up"} {e[5]},{e[6]}', 'touch', e[0])
     for e in sw['SHOWN']:
         inst('shown (present)', 'present', e[0])
+    # mach messages with their msgh_id on the receiving thread (instant: id, name, sender, size, latency)
+    nmsg = 0
+    for m in imsgs:
+        if m[8] is None or m[9] not in keep:
+            continue
+        if not (m[5] in (bb | app | sb) or m[6] in (bb | app | sb)):
+            continue
+        v = threads.get(m[9], [-1, '?', ''])
+        pid = v[0] if v[0] >= 0 else 99999
+        ev.append({'ph': 'i', 's': 't', 'name': f'msg {m[4]}', 'pid': pid, 'tid': m[9], 'ts': us(m[8]),
+                   'args': {'id': m[4], 'what': msg_name(m[4]), 'from': tname(m[1]), 'bytes': m[7],
+                            'latency_us': round(us(m[8]) - us(m[0]), 1)}})
+        nmsg += 1
+    if CH:
+        # per-frame critical path: tick -> display wake -> CA prepare -> encode -> GPU -> present -> visible edge, on
+        # two alternating tracks (frames overlap); the app commits and how long each waited for a frame
+        for nm, i in (('frame chain A', 8), ('frame chain B', 9), ('app commits A', 10), ('app commits B', 11)):
+            ev.append({'ph': 'M', 'name': 'thread_name', 'pid': VP, 'tid': i, 'args': {'name': nm}})
+        for i, fr in enumerate(CH['_frames']):
+            tid = 8 + (i & 1)
+            t_end = max(x for x in (fr.get('E'), fr.get('F'), fr.get('G'), fr.get('SE')) if x is not None)
+            t0 = min(x for x in (fr.get('V'), fr['W'], fr['start']) if x is not None)
+            ev.append({'ph': 'X', 'name': f'frame swap {fr["swap"]} ({fr["gpu"] or 0:.1f} ms GPU)', 'pid': VP,
+                       'tid': tid, 'ts': us(t0), 'dur': max(0.001, us(t_end) - us(t0)),
+                       'args': {'gpu_ms': fr['gpu'], 'gpu_all_submits_ms': fr['gpu_all'], 'started_by': fr['startby'],
+                                'woken_by': fr['Wby'], 'split_ms': fr['split'],
+                                'blocked_on_ms': fr['blk'], 'big_calls': fr['bigcalls']}})
+            gpu_end = max(x for x in (fr.get('G'), fr.get('SE'), fr.get('S0')) if x is not None)
+            segs = [('tick -> wake', fr.get('V'), fr['W']) if fr['start'] >= fr['W'] else ('after previous frame', t0, fr['start']),
+                    ('CA prepare', fr['start'], fr['B']),
+                    ('encode', fr['B'], fr.get('S0')), ('GPU / SwapEnd', fr.get('S0'), gpu_end),
+                    ('present', gpu_end, fr.get('F')), ('wait for edge', fr.get('F'), fr.get('E'))]
+            prev = t0
+            for nm, s0, s1 in segs:
+                if s0 is None or s1 is None:
+                    continue
+                s0 = max(s0, prev)
+                s1 = min(s1, t_end)
+                if s1 > s0:
+                    ev.append({'ph': 'X', 'name': nm, 'pid': VP, 'tid': tid, 'ts': us(s0), 'dur': us(s1) - us(s0)})
+                    prev = s1
+        for i, c in enumerate(CH['_commits']):
+            tid = 10 + (i & 1)
+            ev.append({'ph': 'X', 'name': f'commit {c["n"]} msgs {c["bytes"]} B ({c["why"]})', 'pid': VP, 'tid': tid,
+                       'ts': us(c['s0']), 'dur': max(0.001, us(c['done']) - us(c['s0'])),
+                       'args': {'phase_after_tick_ms': c['phase'], 'receiver': tname(c['rtid'])}})
+            fr = c.get('frame')
+            if fr is not None and fr['W'] > c['done']:
+                ev.append({'ph': 'X', 'name': f'wait for frame (+{c.get("late_ticks", 0)} ticks)', 'pid': VP,
+                           'tid': tid, 'ts': us(c['done']), 'dur': us(fr['W']) - us(c['done'])})
     with open(a.json, 'w') as f:
         json.dump({'traceEvents': ev, 'displayTimeUnit': 'ms'}, f)
-    print(f'{a.json}: {len(ev)} trace events (open in ui.perfetto.dev)')
+    print(f'{a.json}: {len(ev)} trace events, {nmsg} message annotations (open in ui.perfetto.dev)')
 
 
 if __name__ == '__main__':

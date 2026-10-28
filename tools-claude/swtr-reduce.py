@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """swtr-reduce.py IN.swtr OUT.swtr [PROC ...]: keep only what sweet-trace.py needs for the frame chain of the given
-processes (default backboardd SpringBoard Preferences): all 0994 events, IPC kmsg info, thread names, interrupts,
-wakes of their threads and context switches in/out of their threads. Same file format, events in time order."""
+processes (default backboardd SpringBoard Preferences): all 0994 events, IPC kmsg info, the MACH_IPC_MSG_SEND / RECV
+events (msgh_id, kmsg) of their threads (for sweet-trace.py --ipc / --chain), thread names, interrupts, wakes of their
+threads and context switches in/out of their threads. Same file format, events in time order."""
 import struct
 import sys
 import numpy as np
@@ -22,6 +23,7 @@ HANDOFF = code(1, 0x40, 0x02)
 MKRUN = code(1, 0x40, 0x06)
 INTR = code(1, 0x05, 0)
 KMSG = code(1, 0x20, 0x0a)
+IPC_MSG = [code(1, 0x20, 0x03), code(1, 0x20, 0x04), code(1, 0x20, 0x05)]   # MSG_SEND, MSG_RECV, MSG_RECV_NV
 SW_BASE = (6 << 24) | (0xF5 << 16)
 
 src, dst = sys.argv[1], sys.argv[2]
@@ -43,6 +45,7 @@ keep = ((ev['dbg'] & np.uint32(0xffff0000)) == SW_BASE) | (cid == KMSG) | ((ev['
        (cid == INTR)
 fa = np.array(sorted(focus), dtype=np.uint64)
 keep |= (cid == MKRUN) & np.isin(ev['a1'], fa)
+keep |= np.isin(cid, np.array(IPC_MSG, dtype=np.uint32)) & np.isin(ev['tid'], fa)
 si = np.nonzero((cid == SCHED) | (cid == HANDOFF))[0]
 cpu_cur = {}
 s_cpu = ev['cpu'][si].tolist()
