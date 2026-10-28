@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
+#include <chrono>
 #include <pthread.h>
 #include <pthread/qos.h>
 #include <sched.h>
@@ -121,6 +123,11 @@ static void noteProblem(NSString *what) {
 }
 extern "C" void sm2_logs(const char *);
 #define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];sm2_logs(nbText.UTF8String);noteProblem(nbText);}while(0)
+// u-encthread (SWEET_ENCTHREAD, see "the encode thread" below): the frontend records render/blit encoder calls and commits and a
+// worker thread replays them into the bridge. The calls that need the replayed state now wait for it (a sync flush, by reason).
+enum EncFlushWhy : uint8_t {EF_SCHEDULED,EF_COMPLETED,EF_RESOURCE,EF_GETBYTES,EF_COMPUTE,EF_PURGEABLE,EF_REPLACE,EF_BACKPRESSURE,EF_WHY_COUNT};
+static bool encThreadOn();
+static void encFlush(EncFlushWhy why);
 // u-e (r33): encode-time accounting (backboardd, with the timeline; /var/local/mtl2-env SWEET_ENCSTAT=0 turns it off). Every
 // Metal call CA makes into this frontend that can cost (creation, encoder begin/end, binds, draws, blits, uploads, waits) runs in
 // an EncScope: two mach_absolute_time reads around the call, counted on the calling thread by category (outermost scope only, so a
@@ -503,7 +510,10 @@ static void waitForResource(id resource);
 @property(nonatomic,strong) id<MTLHeap> parentHeap;   // the heap that made the buffer, nil otherwise
 @property(nonatomic) NSUInteger heapOffset;
 @end
-@interface NBTexture : NBObject
+@interface NBTexture : NBObject {
+@public
+ std::atomic<uint32_t> encReplaceEpoch;   // u-encthread: replaceRegion calls (a recorded setTexture's shadow seed is stale past one)
+}
 @property(nonatomic) NmbTexture *handle;
 @property(nonatomic) NmbTextureDescriptor descriptor;
 @property(nonatomic,strong) NBBuffer *buffer;
@@ -548,6 +558,7 @@ static void surfaceDrop(IOSurfaceRef surface);
 - (MTLHazardTrackingMode)hazardTrackingMode {return (MTLHazardTrackingMode)((_options&MTLResourceHazardTrackingModeMask)>>MTLResourceHazardTrackingModeShift);}
 - (void)didModifyRange:(NSRange)range {(void)range;}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
+ if(state!=MTLPurgeableStateKeepCurrent && encThreadOn())encFlush(EF_PURGEABLE);   // u-encthread: recorded uses replayed first
  const uint64_t answer=nmb_buffer_set_purgeable_state(_handle,state);
  if(!answer)NBLOG(@"native-metal: buffer setPurgeableState refused: %@",lastError());
  return (MTLPurgeableState)answer;
@@ -634,6 +645,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (id<MTLTexture>)parentTexture {return _parent;}
 - (NSUInteger)rotation {return 0;}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
+ if(state!=MTLPurgeableStateKeepCurrent && encThreadOn())encFlush(EF_PURGEABLE);   // u-encthread: recorded uses replayed first
  const uint64_t answer=nmb_texture_set_purgeable_state(_handle,state);
  if(!answer)NBLOG(@"native-metal: texture setPurgeableState refused: %@",lastError());
  return (MTLPurgeableState)answer;
@@ -669,6 +681,11 @@ NB_RESOURCE_SPI
  return [self view:nmb_texture_new_view(_handle,sweetFormat(format),type,l,s,false)];
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {ENC_SCOPE(EC_UPLOAD,"replaceRegion");if(encStatOn())snprintf(tEncDetail,sizeof tEncDetail,"%lux%lu of %lux%lu fmt %lu",(unsigned long)r.size.width,(unsigned long)r.size.height,(unsigned long)self.width,(unsigned long)self.height,(unsigned long)self.pixelFormat);
+ if(encThreadOn()) {   // u-encthread: a recorded bind of this texture not replayed yet must not take the old shadow seed
+  encReplaceEpoch.fetch_add(1);
+  static const bool flushFirst=[]{const char *e=getenv("SWEET_ENCTHREAD_REPLACE");return e && *e=='1';}();
+  if(flushFirst)encFlush(EF_REPLACE);
+ }
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
  if(!nmb_texture_replace(_handle,region,level,slice,bytes,row,image,length))NBLOG(@"native-metal: replaceRegion refused: %@",lastError());
@@ -678,6 +695,7 @@ NB_RESOURCE_SPI
  [self replaceRegion:r mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:row bytesPerImage:row*r.size.height];
 }
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice {ENC_SCOPE(EC_UPLOAD,"getBytes");
+ if(encThreadOn())encFlush(EF_GETBYTES);   // u-encthread: what was committed is in the bridge before the CPU reads
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
  if(!nmb_texture_get_bytes(_handle,bytes,row,image,length,region,level,slice))NBLOG(@"native-metal: getBytes refused: %@",lastError());
@@ -1036,6 +1054,10 @@ static void notified(void *context,uint64_t value) {
  // u-e: the encoding thread's counts at the first encoder (EncScope), its CPU time, CPU, and the runtime's VkPipeline makings then
  EncTLS encStart;uint64_t encCpuStart,encThread,encVkStart[2];int8_t encCpu0;EncFrame encFrame;
  bool tlFrame,tlWaitedCompleted,tlWaitedScheduled;
+ // u-encthread: recorded for the worker (SWEET_ENCTHREAD, fixed at creation); the commit was replayed (the bridge has it);
+ // and returned (waits may use the bridge's); the recorded encoder not ended yet (kept alive by its recorded creation until its
+ // end or discard is replayed)
+ bool encDeferred;std::atomic<bool> encCommitStarted,encCommitDone;__unsafe_unretained id encOpen;
 }
 @property(nonatomic) NmbCommandBuffer *handle;
 @property(nonatomic,strong) NBQueue *queue;
@@ -1053,7 +1075,175 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic,strong) dispatch_group_t schedulingHandlers;
 @property(nonatomic) BOOL schedulingDelivered;
 - (void)refuse:(NSString *)what;
+- (void)commitSubmit;
 @end
+
+// ---- u-encthread: the encode thread (SWEET_ENCTHREAD) ----
+// prof (Settings flings): the bridge's draw path (frontend -> metal2vulkan -> Turnip record) is ~46% of CA's display thread, ~70-80 us
+// a draw, and it runs inline between CA's own work, so a frame's first GPU submit waits for both. With SWEET_ENCTHREAD=1 (backboardd;
+// 2: every process) the render and blit encoders' calls, encoder creation/end, encoded events and commit are recorded by the frontend
+// (validation, resource ownership, counters and CA-visible state at the call, as before) into a compact command list, with small
+// inline data (setBytes, the pass descriptor, blit regions) copied, and replayed into the bridge in call order by one worker thread
+// ("sweet.encthread", user-interactive QoS), which starts while CA still records. Every bridge call on a recorded command buffer or
+// its encoders happens on the worker. Ownership: buffers and textures a command names are the command buffer's resourceOwners (as
+// today, released at completion); pipeline, sampler, depth/stencil, fence and event objects are retained by their command; an encoder
+// is retained by its recorded creation until its end (or discard) is replayed; an event or commit command retains its command buffer.
+// Waits (must-flush, the worker catches up with everything recorded so far first): waitUntilScheduled / waitUntilCompleted /
+// commitAndWaitUntilSubmitted of a command buffer whose commit is not replayed yet, a resource's waitUntilComplete, getBytes,
+// setPurgeableState (not KeepCurrent), a compute encoder on a recorded command buffer (compute stays inline, after the flush),
+// SWEET_ENCTHREAD_REPLACE=1 replaceRegion, and over 32768 commands queued (backpressure). Synchronous as before (no flush): every
+// creation, query and CPU-visible answer (contents, pixel formats, sizes), replaceRegion (its bytes are written now, as Metal does;
+// a bind recorded before it re-copies its surface's shadow), shared event CPU calls. status/error/GPU times answer Committed/none
+// until the commit is replayed. A refusal at replay fails the command buffer as before (logged, completed with an error).
+// "native-metal: T enc-thread 5s:" (with the timeline) counts it. SWEET_ENCTHREAD_SPIN_US (50): the worker's spin before it sleeps;
+// SWEET_ENCTHREAD_PRI (54, CA's display thread's; 0 = user-interactive QoS only): its fixed RR priority.
+enum EncOp : uint8_t {EO_RENDER_NEW,EO_BLIT_NEW,EO_END,EO_DISCARD,EO_BUFFER,EO_OFFSET,EO_BYTES,EO_TEXTURE,EO_SAMPLER,EO_FENCE,EO_PIPELINE,
+ EO_DSS,EO_VIEWPORT,EO_SCISSOR,EO_RASTER,EO_DEPTH_BIAS,EO_LINE_WIDTH,EO_VISIBILITY,EO_STENCIL_REF,EO_BLEND_COLOR,EO_DRAW,EO_DRAW_INDEXED,
+ EO_COPY_BUFFER,EO_FILL_BUFFER,EO_COPY_TEXTURE,EO_BUFFER_TO_TEXTURE,EO_TEXTURE_TO_BUFFER,EO_MIPMAPS,EO_EVENT,EO_COMMIT,EO_COUNT};
+enum : uint8_t {ECF_RETAIN_A=1,ECF_NULL_BYTES=2};
+// target: the encoder (or, for EO_EVENT/EO_COMMIT, the command buffer, retained); a/b: the objects named; off/len: inline data
+struct EncCmd {uint8_t op,stage,flags,mask;uint32_t index;void *target,*a,*b;uint64_t u[6];uint32_t off,len;};
+struct EncChunk {std::vector<EncCmd> cmds;std::vector<uint8_t> bytes;};
+static void encReplay(const EncCmd &c,const uint8_t *bytes);
+static int encThreadMode() {
+ static int mode=-1;
+ if(mode<0){const char *e=getenv("SWEET_ENCTHREAD");const int v=e && *e?atoi(e):0;mode=v==2 || (v==1 && !strcmp(getprogname(),"backboardd"))?1:0;}
+ return mode;
+}
+static bool encThreadOn() {return encThreadMode()==1;}
+static os_unfair_lock gEqLock=OS_UNFAIR_LOCK_INIT;
+static EncChunk *gEqOpen;                        // what the worker takes next (gEqLock)
+static std::vector<EncChunk *> gEqFree;          // replayed chunks for reuse (gEqLock)
+static std::atomic<uint64_t> gEqAppended{0},gEqReplayed{0};   // commands recorded / replayed since start
+static std::atomic<bool> gEqIdle{false},gEqStarted{false};
+static bool gEqBroken;   // the worker could not be started: commands replay at once on the caller
+static std::atomic<unsigned> gEqWaiters{0};
+static std::mutex gEqSleepLock;static std::condition_variable gEqWake,gEqDone;
+static pthread_t gEqThread;
+// telemetry (cumulative; the 5 s line takes deltas)
+static std::atomic<uint64_t> gEtOps[EO_COUNT],gEtRecordTicks,gEtReplayTicks,gEtBatches,gEtBatchMax,gEtDepthMax,gEtWakes,gEtCommits;
+static std::atomic<uint64_t> gEtFlushCalls[EF_WHY_COUNT],gEtFlushWaits[EF_WHY_COUNT],gEtFlushTicks[EF_WHY_COUNT],gEtFlushOnWorker,gEtStalls;
+static const char *const kEncFlushName[EF_WHY_COUNT]={"sched","done","resource","getbytes","compute","purgeable","replace","backpressure"};
+static __thread uint32_t tEtDepth;
+// The caller's time inside a recording call (outermost only): what the display thread still pays.
+struct EtRec {
+ uint64_t t0;bool outer;
+ EtRec():t0(0),outer(tEtDepth++==0){if(outer)t0=mach_absolute_time();}
+ ~EtRec(){tEtDepth--;if(outer)gEtRecordTicks.fetch_add(mach_absolute_time()-t0,std::memory_order_relaxed);}
+};
+#define ET_REC EtRec etRec_
+static void encWake() {
+ std::lock_guard<std::mutex> l(gEqSleepLock);
+ if(gEqIdle.exchange(false)){gEtWakes.fetch_add(1,std::memory_order_relaxed);gEqWake.notify_one();}
+}
+static EncChunk *encChunk() {   // gEqLock held
+ if(gEqFree.empty())return new EncChunk();
+ EncChunk *k=gEqFree.back();gEqFree.pop_back();return k;
+}
+static void *encWorkerMain(void *) {
+ pthread_setname_np("sweet.encthread");
+ // CA's display thread runs at a fixed priority 54 (RR): the work it hands over keeps that (SWEET_ENCTHREAD_PRI=N, 0: QoS only)
+ const char *pri=getenv("SWEET_ENCTHREAD_PRI");const int priority=pri && *pri?atoi(pri):54;
+ if(priority>0){struct sched_param sp={};sp.sched_priority=priority;pthread_setschedparam(pthread_self(),SCHED_RR,&sp);}
+ encThreadNote();
+ static const uint64_t spinTicks=[]{const char *e=getenv("SWEET_ENCTHREAD_SPIN_US");const double us=e && *e?atof(e):50;
+  return (uint64_t)(std::max(0.0,us)*1e3/encTickNs());}();
+ for(;;) {
+  EncChunk *k=nullptr;
+  os_unfair_lock_lock(&gEqLock);
+  if(!gEqOpen->cmds.empty()){k=gEqOpen;gEqOpen=encChunk();}
+  os_unfair_lock_unlock(&gEqLock);
+  if(!k) {
+   // nothing recorded: spin a little (the next call is usually microseconds away), then sleep until a recording wakes it
+   const uint64_t until=mach_absolute_time()+spinTicks;
+   while(gEqAppended.load()==gEqReplayed.load() && mach_absolute_time()<until)__asm__ volatile("yield");
+   if(gEqAppended.load()!=gEqReplayed.load())continue;
+   gEqIdle.store(true);
+   os_unfair_lock_lock(&gEqLock);const bool empty=gEqOpen->cmds.empty();os_unfair_lock_unlock(&gEqLock);
+   if(!empty){gEqIdle.store(false);continue;}
+   std::unique_lock<std::mutex> l(gEqSleepLock);
+   gEqWake.wait(l,[]{return !gEqIdle.load();});
+   continue;
+  }
+  const uint64_t t0=mach_absolute_time();
+  @autoreleasepool {for(const EncCmd &c:k->cmds)encReplay(c,k->bytes.data());}
+  gEtReplayTicks.fetch_add(mach_absolute_time()-t0,std::memory_order_relaxed);
+  const uint64_t n=k->cmds.size();
+  gEtBatches.fetch_add(1,std::memory_order_relaxed);
+  uint64_t seen=gEtBatchMax.load();while(n>seen && !gEtBatchMax.compare_exchange_weak(seen,n)){}
+  gEqReplayed.fetch_add(n);
+  if(gEqWaiters.load()){std::lock_guard<std::mutex> l(gEqSleepLock);gEqDone.notify_all();}
+  k->cmds.clear();
+  if(k->bytes.capacity()>(1u<<20))std::vector<uint8_t>().swap(k->bytes);else k->bytes.clear();
+  os_unfair_lock_lock(&gEqLock);
+  if(gEqFree.size()<4){gEqFree.push_back(k);k=nullptr;}
+  os_unfair_lock_unlock(&gEqLock);
+  delete k;
+ }
+ return nullptr;
+}
+static void encStart() {
+ static dispatch_once_t once;
+ dispatch_once(&once,^{
+  gEqOpen=new EncChunk();
+  pthread_attr_t attr;pthread_attr_init(&attr);
+  pthread_attr_set_qos_class_np(&attr,QOS_CLASS_USER_INTERACTIVE,0);
+  pthread_attr_setdetachstate(&attr,PTHREAD_CREATE_DETACHED);
+  const int r=pthread_create(&gEqThread,&attr,encWorkerMain,nullptr);
+  pthread_attr_destroy(&attr);
+  if(r){NBLOG(@"native-metal: enc-thread: worker not started (%d): commands are replayed at once by the caller",r);gEqBroken=true;return;}
+  gEqStarted=true;
+  sm2_logs([NSString stringWithFormat:@"native-metal: enc-thread on (SWEET_ENCTHREAD): render/blit encoders and commits replayed on 'sweet.encthread'%s",
+            r?" (NOT STARTED)":""].UTF8String);
+ });
+}
+static bool encOnWorker() {return gEqStarted.load() && pthread_equal(pthread_self(),gEqThread);}
+// Records a command (and `length` bytes of inline data) for the worker, in call order.
+static void encPush(EncCmd &c,const void *extra=nullptr,size_t length=0) {
+ encStart();
+ gEtOps[c.op].fetch_add(1,std::memory_order_relaxed);
+ if(gEqBroken){c.off=0;c.len=(uint32_t)length;@autoreleasepool{encReplay(c,(const uint8_t *)extra);}return;}
+ os_unfair_lock_lock(&gEqLock);
+ EncChunk *k=gEqOpen;
+ if(extra && length) {
+  const size_t at=(k->bytes.size()+7)&~(size_t)7;
+  k->bytes.resize(at+length);memcpy(k->bytes.data()+at,extra,length);
+  c.off=(uint32_t)at;c.len=(uint32_t)length;
+ }
+ k->cmds.push_back(c);
+ const uint64_t depth=gEqAppended.fetch_add(1)+1-gEqReplayed.load();
+ os_unfair_lock_unlock(&gEqLock);
+ uint64_t seen=gEtDepthMax.load(std::memory_order_relaxed);
+ while(depth>seen && !gEtDepthMax.compare_exchange_weak(seen,depth)){}
+ if(gEqIdle.load())encWake();
+ if(depth>32768)encFlush(EF_BACKPRESSURE);
+}
+// Waits until the worker replayed every command recorded so far (not on the worker itself: it replays in order anyway).
+static void encFlush(EncFlushWhy why) {
+ if(!gEqStarted.load())return;
+ gEtFlushCalls[why].fetch_add(1,std::memory_order_relaxed);
+ if(encOnWorker()){gEtFlushOnWorker.fetch_add(1,std::memory_order_relaxed);return;}
+ const uint64_t target=gEqAppended.load();
+ if(gEqReplayed.load()>=target)return;
+ gEtFlushWaits[why].fetch_add(1,std::memory_order_relaxed);
+ const uint64_t t0=mach_absolute_time();
+ gEqWaiters.fetch_add(1);
+ if(gEqIdle.load())encWake();
+ {
+  std::unique_lock<std::mutex> l(gEqSleepLock);
+  bool logged=false;
+  while(gEqReplayed.load()<target) {
+   if(!gEqDone.wait_for(l,std::chrono::seconds(2),[&]{return gEqReplayed.load()>=target;}) && !logged) {
+    logged=true;gEtStalls.fetch_add(1);
+    char line[200];snprintf(line,sizeof line,"native-metal: enc-thread: %s flush waits > 2 s (%llu commands behind)",kEncFlushName[why],
+     (unsigned long long)(target-gEqReplayed.load()));
+    sm2_logs(line);
+   }
+  }
+ }
+ gEqWaiters.fetch_sub(1);
+ gEtFlushTicks[why].fetch_add(mach_absolute_time()-t0,std::memory_order_relaxed);
+}
 // u-gpudraw: SWEET_FNSTAT=1 (backboardd, with the timeline): draws per render pipeline (its vertex + fragment function
 // names) every 5 s as "T fn" lines, with one draw's inputs per pipeline: the vertex count, the last setVertexBytes /
 // setFragmentBytes (index and the first 64 bytes as floats) and 64 bytes of vertex buffer 0 at the draw's offset.
@@ -1097,12 +1287,19 @@ static void fnReport() {
  }
  if(other){char line[80];snprintf(line,sizeof line,"native-metal: T fn: %llu draws of more pipelines",(unsigned long long)other);sm2_logs(line);}
 }
-@interface NBEncoder : NBObject
+@interface NBEncoder : NBObject {
+@public
+ bool encDeferred,encEnded;   // u-encthread: recorded for the worker (then `handle` is the worker's alone); endEncoding recorded
+}
 @property(nonatomic) NmbEncoder *handle;
 @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
+- (bool)check:(bool)ok what:(const char *)what;
 @end
+// u-encthread: a recording call on an encoder already ended fails its command buffer (never recorded: the encoder may be gone).
+#define ENC_LIVE() do{if(encEnded){[self.commandBuffer refuse:@"encoder call after endEncoding"];return;}}while(0)
 static void waitForResource(id resource) {
  ENC_SCOPE(EC_WAIT,"waitForResource");
+ if(encThreadOn())encFlush(EF_RESOURCE);   // u-encthread: committed command buffers are in gInFlight once replayed
  const uint64_t began=nowUs();
  NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
  for(NBCommandBuffer *commandBuffer in pending) {
@@ -1126,6 +1323,14 @@ static void waitForResource(id resource) {
  static EncSite renderEnd{"endEncoding(render)",EC_ENC},blitEnd{"endEncoding(blit)",EC_ENC},computeEnd{"endEncoding(compute)",EC_ENC};
  EncScope encScope_([self respondsToSelector:@selector(setRenderPipelineState:)]?&renderEnd:
                     [self respondsToSelector:@selector(setComputePipelineState:)]?&computeEnd:&blitEnd);
+ if(encDeferred) {
+  ET_REC;
+  if(encEnded){[_commandBuffer refuse:@"endEncoding twice"];return;}
+  encEnded=true;
+  if(_commandBuffer->encOpen==self)_commandBuffer->encOpen=nil;
+  EncCmd c={};c.op=EO_END;c.target=(__bridge void *)self;encPush(c);
+  return;
+ }
  NmbEncoder *handle=_handle;_handle=nullptr;
  if(!handle){[_commandBuffer refuse:@"endEncoding twice"];return;}
  [self check:nmb_encoder_end(handle) what:"endEncoding"];
@@ -1143,15 +1348,27 @@ static void waitForResource(id resource) {
 - (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setBuffer");
  if(stage==1 && index==0 && fnStatOn()){tFnVb0=buffer;tFnVb0Off=offset;tFnVb0Enc=(__bridge const void *)self;}
  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
+ if(encDeferred) {
+  ET_REC;ENC_LIVE();
+  if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
+  EncCmd c={};c.op=EO_BUFFER;c.stage=(uint8_t)stage;c.index=(uint32_t)index;c.target=(__bridge void *)self;c.a=(__bridge void *)buffer;c.u[0]=offset;
+  encPush(c);return;
+ }
  if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
  [self check:nmb_encoder_set_buffer(_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"];
 }
 - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setTexture");
  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
- if(texture)[_commandBuffer.resourceOwners addObject:texture];
- if(texture && [(NBTexture *)texture surface]) {
-  [_commandBuffer.surfaces addObject:texture];
-  if(shaderWritable((NBTexture *)texture))[_commandBuffer.writtenSurfaces addObject:texture];
+ if(encDeferred) {   // u-encthread: the YCbCr refresh, the shadow seed and the handle (a YCbCr copy's turn) are the replay's
+  ET_REC;ENC_LIVE();
+  if(texture)[_commandBuffer.resourceOwners addObject:texture];
+  if(texture && [(NBTexture *)texture surface]) {
+   [_commandBuffer.surfaces addObject:texture];
+   if(shaderWritable((NBTexture *)texture))[_commandBuffer.writtenSurfaces addObject:texture];
+  }
+  EncCmd c={};c.op=EO_TEXTURE;c.stage=(uint8_t)stage;c.index=(uint32_t)index;c.target=(__bridge void *)self;c.a=(__bridge void *)texture;
+  if(texture)c.u[0]=((NBTexture *)texture)->encReplaceEpoch.load();
+  encPush(c);return;
  }
  if(texture)ycbcrRefresh((NBTexture *)texture,_commandBuffer);
  if(texture && shadowSeedOn() && [(NBTexture *)texture surface] && !((NBTexture *)texture).ycbcrGPU)
@@ -1160,20 +1377,43 @@ static void waitForResource(id resource) {
 }
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setSamplerState");
  if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
+ if(encDeferred) {
+  ET_REC;ENC_LIVE();
+  EncCmd c={};c.op=EO_SAMPLER;c.stage=(uint8_t)stage;c.index=(uint32_t)index;c.target=(__bridge void *)self;
+  if(sampler){c.a=(__bridge_retained void *)sampler;c.flags=ECF_RETAIN_A;}
+  encPush(c);return;
+ }
  [self check:nmb_encoder_set_sampler(_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"];
 }
 - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setBytes");
  if(stage<3 && fnStatOn()){FnSnap &f=tFnBytes[stage];f.n=(uint16_t)std::min<NSUInteger>(64,length);f.index=(uint16_t)index;if(bytes)memcpy(f.b,bytes,f.n);}
+ if(encDeferred) {   // the bytes are the caller's only during the call: copied
+  ET_REC;ENC_LIVE();
+  EncCmd c={};c.op=EO_BYTES;c.stage=(uint8_t)stage;c.index=(uint32_t)index;c.target=(__bridge void *)self;
+  if(!bytes || !length){c.flags=ECF_NULL_BYTES;c.u[0]=(uint64_t)(uintptr_t)bytes;c.u[1]=length;encPush(c);}
+  else encPush(c,bytes,length);
+  return;
+ }
  [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];
 }
 - (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {ENC_SCOPE(EC_BIND,"fence");
  if(![(id)fence isKindOfClass:[NBFence class]]){[_commandBuffer refuse:@"foreign fence"];return;}
+ if(encDeferred) {
+  ET_REC;ENC_LIVE();
+  EncCmd c={};c.op=EO_FENCE;c.target=(__bridge void *)self;c.a=(__bridge_retained void *)fence;c.flags=ECF_RETAIN_A;c.u[0]=stages;c.u[1]=update;
+  encPush(c);return;
+ }
  NmbFence *handle=[(NBFence *)fence handle];
  [self check:update?nmb_encoder_update_fence(_handle,handle,stages):nmb_encoder_wait_fence(_handle,handle,stages) what:update?"updateFence":"waitForFence"];
 }
 - (void)updateFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:true];}
 - (void)waitForFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:false];}
 - (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setBufferOffset");
+ if(encDeferred) {
+  ET_REC;ENC_LIVE();
+  EncCmd c={};c.op=EO_OFFSET;c.stage=(uint8_t)stage;c.index=(uint32_t)index;c.target=(__bridge void *)self;c.u[0]=offset;
+  encPush(c);return;
+ }
  [self check:nmb_encoder_set_buffer_offset(_handle,stage,offset,(uint32_t)index) what:"setBufferOffset"];
 }
 @end
@@ -1231,6 +1471,10 @@ static void waitForResource(id resource) {
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {ENC_SCOPE(EC_BIND,"setRenderPipelineState");
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
  if(encStatOn() || fnStatOn())memcpy(encPipeline,((NBRenderPipeline *)state)->encNames,sizeof encPipeline);
+ if(encDeferred) {
+  ET_REC;ENC_LIVE();
+  EncCmd c={};c.op=EO_PIPELINE;c.target=(__bridge void *)self;c.a=(__bridge_retained void *)state;c.flags=ECF_RETAIN_A;encPush(c);return;
+ }
  [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"];
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
@@ -1254,6 +1498,10 @@ static void waitForResource(id resource) {
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:2];}
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)state {ENC_SCOPE(EC_BIND,"setDepthStencilState");
  if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
+ if(encDeferred) {
+  ET_REC;ENC_LIVE();
+  EncCmd c={};c.op=EO_DSS;c.target=(__bridge void *)self;if(state){c.a=(__bridge_retained void *)state;c.flags=ECF_RETAIN_A;}encPush(c);return;
+ }
  [self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"];
 }
 - (void)setViewport:(MTLViewport)v {ENC_SCOPE(EC_BIND,"setViewport");
@@ -1262,6 +1510,13 @@ static void waitForResource(id resource) {
  const bool fast=cpuFast()&CPUFAST_VIEWPORT;
  if(fast && haveViewport && !memcmp(values,lastViewport,sizeof values)){gCfViewportSkips.fetch_add(1,std::memory_order_relaxed);return;}
  haveViewport=false;
+ if(encDeferred) {   // u-encthread: taken as accepted (a refusal at replay fails the command buffer anyway)
+  ET_REC;ENC_LIVE();
+  EncCmd c={};c.op=EO_VIEWPORT;c.target=(__bridge void *)self;memcpy(c.u,values,sizeof values);encPush(c);
+  if(fast){memcpy(lastViewport,values,sizeof values);haveViewport=true;}
+  gCfViewportSent.fetch_add(1,std::memory_order_relaxed);
+  return;
+ }
  if([self check:nmb_render_set_viewport(self.handle,values) what:"setViewport"] && fast){memcpy(lastViewport,values,sizeof values);haveViewport=true;}
  gCfViewportSent.fetch_add(1,std::memory_order_relaxed);
 }
@@ -1270,21 +1525,41 @@ static void waitForResource(id resource) {
  const bool fast=cpuFast()&CPUFAST_VIEWPORT;
  if(fast && haveScissor && !memcmp(values,lastScissor,sizeof values)){gCfScissorSkips.fetch_add(1,std::memory_order_relaxed);return;}
  haveScissor=false;
+ if(encDeferred) {
+  ET_REC;ENC_LIVE();
+  EncCmd c={};c.op=EO_SCISSOR;c.target=(__bridge void *)self;memcpy(c.u,values,sizeof values);encPush(c);
+  if(fast){memcpy(lastScissor,values,sizeof values);haveScissor=true;}
+  gCfScissorSent.fetch_add(1,std::memory_order_relaxed);
+  return;
+ }
  if([self check:nmb_render_set_scissor(self.handle,values) what:"setScissorRect"] && fast){memcpy(lastScissor,values,sizeof values);haveScissor=true;}
  gCfScissorSent.fetch_add(1,std::memory_order_relaxed);
 }
 // The runtime takes cull mode, winding and fill mode together; this encoder keeps Metal's defaults until each is set.
 - (void)raster {ENC_SCOPE(EC_BIND,"raster state");
+ if(encDeferred) {
+  ET_REC;ENC_LIVE();
+  EncCmd c={};c.op=EO_RASTER;c.target=(__bridge void *)self;c.u[0]=rasterCull;c.u[1]=rasterWinding;c.u[2]=rasterFill;encPush(c);return;
+ }
  [self check:nmb_render_set_raster(self.handle,rasterCull,rasterWinding,rasterFill) what:"raster state"];
 }
 - (void)setCullMode:(MTLCullMode)m {rasterCull=(uint64_t)m;[self raster];}
 - (void)setFrontFacingWinding:(MTLWinding)w {rasterWinding=(uint64_t)w;[self raster];}
 - (void)setTriangleFillMode:(MTLTriangleFillMode)f {rasterFill=(uint64_t)f;[self raster];}
 - (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp {
+ if(encDeferred) {
+  ET_REC;ENC_LIVE();
+  EncCmd c={};c.op=EO_DEPTH_BIAS;c.target=(__bridge void *)self;memcpy(&c.u[0],&bias,4);memcpy(&c.u[1],&slope,4);memcpy(&c.u[2],&clamp,4);
+  encPush(c);return;
+ }
  [self check:nmb_render_set_depth_bias(self.handle,bias,slope,clamp) what:"setDepthBias"];
 }
-- (void)setLineWidth:(float)width {[self check:nmb_render_set_line_width(self.handle,width) what:"setLineWidth"];}
+- (void)setLineWidth:(float)width {
+ if(encDeferred){ET_REC;ENC_LIVE();EncCmd c={};c.op=EO_LINE_WIDTH;c.target=(__bridge void *)self;memcpy(&c.u[0],&width,4);encPush(c);return;}
+ [self check:nmb_render_set_line_width(self.handle,width) what:"setLineWidth"];
+}
 - (void)setVisibilityResultMode:(MTLVisibilityResultMode)mode offset:(NSUInteger)offset {
+ if(encDeferred){ET_REC;ENC_LIVE();EncCmd c={};c.op=EO_VISIBILITY;c.target=(__bridge void *)self;c.u[0]=(uint64_t)mode;c.u[1]=offset;encPush(c);return;}
  [self check:nmb_render_set_visibility_mode(self.handle,mode,offset) what:"setVisibilityResultMode"];
 }
 - (void)setFragmentTexture:(id<MTLTexture>)t atTextureIndex:(NSUInteger)ti samplerState:(id<MTLSamplerState>)s atSamplerIndex:(NSUInteger)si {
@@ -1298,16 +1573,29 @@ static void waitForResource(id resource) {
 - (void)setTileBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {(void)p;(void)n;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];}
 - (void)dispatchThreadsPerTile:(MTLSize)size {(void)size;[self.commandBuffer refuse:@"tile shaders are not supported"];}
 - (void)dispatchThreadsPerTile:(MTLSize)size inRegion:(MTLRegion)region {(void)size;(void)region;[self.commandBuffer refuse:@"tile shaders are not supported"];}
-- (void)setStencilReferenceValue:(uint32_t)v {[self check:nmb_render_set_stencil_reference(self.handle,v,v) what:"setStencilReferenceValue"];}
+- (void)setStencilReferenceValue:(uint32_t)v {
+ if(encDeferred){[self setStencilFrontReferenceValue:v backReferenceValue:v];return;}
+ [self check:nmb_render_set_stencil_reference(self.handle,v,v) what:"setStencilReferenceValue"];
+}
 - (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b {
+ if(encDeferred){ET_REC;ENC_LIVE();EncCmd c={};c.op=EO_STENCIL_REF;c.target=(__bridge void *)self;c.u[0]=f;c.u[1]=b;encPush(c);return;}
  [self check:nmb_render_set_stencil_reference(self.handle,f,b) what:"setStencilReferenceValues"];
 }
 - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a {
+ if(encDeferred) {
+  ET_REC;ENC_LIVE();
+  EncCmd c={};c.op=EO_BLEND_COLOR;c.target=(__bridge void *)self;const float v[4]={r,g,b,a};memcpy(c.u,v,sizeof v);encPush(c);return;
+ }
  const float c[4]={r,g,b,a};[self check:nmb_render_set_blend_color(self.handle,c) what:"setBlendColor"];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {ENC_SCOPE(EC_DRAW,"drawPrimitives");
  gDraws++;self.commandBuffer->encodedWork.draws++;
  if(fnStatOn())fnNote((__bridge const void *)self,encPipeline,(uint32_t)n,(uint32_t)i,s);
+ if(encDeferred) {
+  ET_REC;ENC_LIVE();
+  EncCmd c={};c.op=EO_DRAW;c.target=(__bridge void *)self;c.u[0]=(uint64_t)t;c.u[1]=(uint32_t)s;c.u[2]=(uint32_t)n;c.u[3]=(uint32_t)i;c.u[4]=(uint32_t)b;
+  encPush(c);return;
+ }
  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
  if(encScope_.slow())[self encDescribeSlowDraw];
 }
@@ -1320,9 +1608,16 @@ static void waitForResource(id resource) {
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
                 instanceCount:(NSUInteger)i baseVertex:(NSInteger)v baseInstance:(NSUInteger)bi {ENC_SCOPE(EC_DRAW,"drawIndexedPrimitives");
  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
+ if(encDeferred)ENC_LIVE();
  [self.commandBuffer.resourceOwners addObject:b];
  gDraws++;self.commandBuffer->encodedWork.draws++;
  if(fnStatOn())fnNote((__bridge const void *)self,encPipeline,(uint32_t)n,(uint32_t)i,0);
+ if(encDeferred) {
+  ET_REC;
+  EncCmd c={};c.op=EO_DRAW_INDEXED;c.target=(__bridge void *)self;c.a=(__bridge void *)b;c.u[0]=(uint64_t)t;c.u[1]=(uint64_t)(uint32_t)n<<32|(uint32_t)i;
+  c.u[2]=(uint64_t)k;c.u[3]=o;c.u[4]=(uint64_t)(uint32_t)(int32_t)v<<32|(uint32_t)bi;
+  encPush(c);return;
+ }
  [self check:nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi) what:"drawIndexedPrimitives"];
  if(encScope_.slow())[self encDescribeSlowDraw];
 }
@@ -1360,22 +1655,38 @@ static void waitForResource(id resource) {
    [self.commandBuffer.surfaces addObject:o];
    if(written&(1u<<i))[self.commandBuffer.writtenSurfaces addObject:o];
   }
-  if(!(written&(1u<<i)))ycbcrRefresh((NBTexture *)o,self.commandBuffer);
+  if(!(written&(1u<<i)) && !encDeferred)ycbcrRefresh((NBTexture *)o,self.commandBuffer);   // u-encthread: the replay's
  }
  return true;
 }
 - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)dO size:(NSUInteger)n {ENC_SCOPE(EC_BLIT,"blit copyBuffer");
+ if(encDeferred)ENC_LIVE();
  if(![self buffers:NB_OBJECTS(s,d) count:2])return;
+ if(encDeferred) {
+  ET_REC;EncCmd c={};c.op=EO_COPY_BUFFER;c.target=(__bridge void *)self;c.a=(__bridge void *)s;c.b=(__bridge void *)d;c.u[0]=so;c.u[1]=dO;c.u[2]=n;
+  encPush(c);return;
+ }
  [self check:nmb_blit_copy_buffer(self.handle,[(NBBuffer *)s handle],so,[(NBBuffer *)d handle],dO,n) what:"copyFromBuffer:toBuffer:"];
 }
 - (void)fillBuffer:(id<MTLBuffer>)b range:(NSRange)r value:(uint8_t)v {ENC_SCOPE(EC_BLIT,"blit fillBuffer");
+ if(encDeferred)ENC_LIVE();
  if(![self buffers:NB_OBJECTS(b) count:1])return;
+ if(encDeferred) {
+  ET_REC;EncCmd c={};c.op=EO_FILL_BUFFER;c.target=(__bridge void *)self;c.a=(__bridge void *)b;c.u[0]=r.location;c.u[1]=r.location+r.length;c.u[2]=v;
+  encPush(c);return;
+ }
  [self check:nmb_blit_fill_buffer(self.handle,[(NBBuffer *)b handle],r.location,r.location+r.length,v) what:"fillBuffer"];
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
               toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {ENC_SCOPE(EC_BLIT,"blit copyTexture");
+ if(encDeferred)ENC_LIVE();
  if(![self textures:NB_OBJECTS(s,d) count:2 written:2])return;
  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
+ if(encDeferred) {
+  ET_REC;EncCmd c={};c.op=EO_COPY_TEXTURE;c.target=(__bridge void *)self;c.a=(__bridge void *)s;c.b=(__bridge void *)d;c.mask=1;
+  const uint64_t args[13]={ss,sl,a[0],a[1],a[2],size[0],size[1],size[2],ds,dl,b[0],b[1],b[2]};
+  encPush(c,args,sizeof args);return;
+ }
  [self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a,size,[(NBTexture *)d handle],ds,dl,b) what:"copyFromTexture:toTexture:"];
 }
 - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {ENC_SCOPE(EC_BLIT,"blit copyTexture(whole)");
@@ -1390,22 +1701,144 @@ static void waitForResource(id resource) {
 - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
             sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
      destinationOrigin:(MTLOrigin)dO {ENC_SCOPE(EC_BLIT,"blit bufferToTexture");
+ if(encDeferred)ENC_LIVE();
  if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1 written:1])return;
  const uint64_t size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
+ if(encDeferred) {
+  ET_REC;EncCmd c={};c.op=EO_BUFFER_TO_TEXTURE;c.target=(__bridge void *)self;c.a=(__bridge void *)s;c.b=(__bridge void *)d;
+  const uint64_t args[11]={o,row,image,size[0],size[1],size[2],slice,level,b[0],b[1],b[2]};
+  encPush(c,args,sizeof args);return;
+ }
  [self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size,[(NBTexture *)d handle],slice,level,b) what:"copyFromBuffer:toTexture:"];
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
                toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image {ENC_SCOPE(EC_BLIT,"blit textureToBuffer");
+ if(encDeferred)ENC_LIVE();
  if(![self textures:NB_OBJECTS(s) count:1 written:0] || ![self buffers:NB_OBJECTS(d) count:1])return;
  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth};
+ if(encDeferred) {
+  ET_REC;EncCmd c={};c.op=EO_TEXTURE_TO_BUFFER;c.target=(__bridge void *)self;c.a=(__bridge void *)s;c.b=(__bridge void *)d;c.mask=1;
+  const uint64_t args[11]={slice,level,a[0],a[1],a[2],size[0],size[1],size[2],o,row,image};
+  encPush(c,args,sizeof args);return;
+ }
  [self check:nmb_blit_texture_to_buffer(self.handle,[(NBTexture *)s handle],slice,level,a,size,[(NBBuffer *)d handle],o,row,image) what:"copyFromTexture:toBuffer:"];
 }
 - (void)generateMipmapsForTexture:(id<MTLTexture>)t {ENC_SCOPE(EC_BLIT,"blit generateMipmaps");
+ if(encDeferred)ENC_LIVE();
  if(![self textures:NB_OBJECTS(t) count:1 written:1])return;
+ if(encDeferred){ET_REC;EncCmd c={};c.op=EO_MIPMAPS;c.target=(__bridge void *)self;c.a=(__bridge void *)t;encPush(c);return;}
  [self check:nmb_blit_generate_mipmaps(self.handle,[(NBTexture *)t handle]) what:"generateMipmapsForTexture"];
 }
 - (void)synchronizeResource:(id<MTLResource>)r {(void)r;}
 @end
+
+// u-encthread: one recorded command, on the worker (in call order): the bridge calls the inline paths make, with the same refusals.
+static void encReplay(const EncCmd &c,const uint8_t *bytes) {
+ if(c.op==EO_COMMIT) {
+  NBCommandBuffer *cb=(__bridge_transfer NBCommandBuffer *)c.target;
+  cb->encCommitStarted=true;
+  [cb commitSubmit];
+  cb->encCommitDone=true;
+  gEtCommits.fetch_add(1,std::memory_order_relaxed);
+  return;
+ }
+ if(c.op==EO_EVENT) {
+  NBCommandBuffer *cb=(__bridge_transfer NBCommandBuffer *)c.target;NBEvent *event=(__bridge_transfer NBEvent *)c.a;
+  const bool signal=c.u[1];
+  if(!(signal?nmb_command_buffer_signal_event(cb.handle,event.handle,c.u[0]):nmb_command_buffer_wait_event(cb.handle,event.handle,c.u[0])))
+   [cb refuse:[NSString stringWithFormat:@"%s: %@",signal?"encodeSignalEvent":"encodeWaitForEvent",lastError()]];
+  return;
+ }
+ if(c.op==EO_RENDER_NEW || c.op==EO_BLIT_NEW) {   // the recorded creation keeps the encoder until its end
+  NBEncoder *e=(__bridge NBEncoder *)c.target;NBCommandBuffer *cb=e.commandBuffer;
+  NmbEncoder *h=c.op==EO_RENDER_NEW?nmb_render_encoder_new(cb.handle,(const NmbRenderPassDescriptor *)(bytes+c.off)):nmb_blit_encoder_new(cb.handle);
+  if(!h)[cb refuse:[NSString stringWithFormat:@"%@: %@",c.op==EO_RENDER_NEW?@"renderCommandEncoder":@"blitCommandEncoder",lastError()]];
+  e.handle=h;
+  return;
+ }
+ if(c.op==EO_END || c.op==EO_DISCARD) {
+  NBEncoder *e=(__bridge_transfer NBEncoder *)c.target;
+  NmbEncoder *h=e.handle;e.handle=nullptr;
+  if(h){if(c.op==EO_END)[e check:nmb_encoder_end(h) what:"endEncoding"];else nmb_encoder_discard(h);}
+  return;
+ }
+ NBEncoder *e=(__bridge NBEncoder *)c.target;
+ id a;   // released at the end of the replay when the command retained it
+ if(c.flags&ECF_RETAIN_A)a=(__bridge_transfer id)c.a;else a=(__bridge id)c.a;
+ NmbEncoder *h=e.handle;
+ if(!h)return;   // its creation was refused: the command buffer failed then
+ const uint32_t stage=c.stage,index=c.index;
+ switch(c.op) {
+ case EO_BUFFER:[e check:nmb_encoder_set_buffer(h,stage,a?[(NBBuffer *)a handle]:nullptr,c.u[0],index) what:"setBuffer"];break;
+ case EO_OFFSET:[e check:nmb_encoder_set_buffer_offset(h,stage,c.u[0],index) what:"setBufferOffset"];break;
+ case EO_BYTES:
+  [e check:c.flags&ECF_NULL_BYTES?nmb_encoder_set_bytes(h,stage,(const void *)(uintptr_t)c.u[0],(size_t)c.u[1],index):
+                                  nmb_encoder_set_bytes(h,stage,bytes+c.off,c.len,index) what:"setBytes"];
+  break;
+ case EO_TEXTURE: {
+  NBTexture *t=(NBTexture *)a;
+  if(t) {
+   ycbcrRefresh(t,e.commandBuffer);
+   // a replaceRegion since the bind was recorded: its bytes are not the seed's (0 = copied again)
+   if(shadowSeedOn() && t.surface && !t.ycbcrGPU)
+    nmb_texture_set_bytes_generation(t.handle,t->encReplaceEpoch.load()==(uint32_t)c.u[0]?(uint64_t)IOSurfaceGetSeed(t.surface)+1:0);
+  }
+  [e check:nmb_encoder_set_texture(h,stage,t?t.handle:nullptr,index) what:"setTexture"];
+  break;
+ }
+ case EO_SAMPLER:[e check:nmb_encoder_set_sampler(h,stage,a?[(NBSampler *)a handle]:nullptr,index) what:"setSamplerState"];break;
+ case EO_FENCE: {
+  NmbFence *f=[(NBFence *)a handle];const bool update=c.u[1];
+  [e check:update?nmb_encoder_update_fence(h,f,c.u[0]):nmb_encoder_wait_fence(h,f,c.u[0]) what:update?"updateFence":"waitForFence"];
+  break;
+ }
+ case EO_PIPELINE:[e check:nmb_render_set_pipeline(h,[(NBRenderPipeline *)a handle]) what:"setRenderPipelineState"];break;
+ case EO_DSS:[e check:nmb_render_set_depth_stencil(h,a?[(NBDepthStencil *)a handle]:nullptr) what:"setDepthStencilState"];break;
+ case EO_VIEWPORT: {double v[6];memcpy(v,c.u,sizeof v);[e check:nmb_render_set_viewport(h,v) what:"setViewport"];break;}
+ case EO_SCISSOR:[e check:nmb_render_set_scissor(h,c.u) what:"setScissorRect"];break;
+ case EO_RASTER:[e check:nmb_render_set_raster(h,c.u[0],c.u[1],c.u[2]) what:"raster state"];break;
+ case EO_DEPTH_BIAS: {
+  float v[3];memcpy(&v[0],&c.u[0],4);memcpy(&v[1],&c.u[1],4);memcpy(&v[2],&c.u[2],4);
+  [e check:nmb_render_set_depth_bias(h,v[0],v[1],v[2]) what:"setDepthBias"];break;
+ }
+ case EO_LINE_WIDTH: {float w;memcpy(&w,&c.u[0],4);[e check:nmb_render_set_line_width(h,w) what:"setLineWidth"];break;}
+ case EO_VISIBILITY:[e check:nmb_render_set_visibility_mode(h,c.u[0],c.u[1]) what:"setVisibilityResultMode"];break;
+ case EO_STENCIL_REF:[e check:nmb_render_set_stencil_reference(h,(uint32_t)c.u[0],(uint32_t)c.u[1]) what:"setStencilReferenceValues"];break;
+ case EO_BLEND_COLOR: {float v[4];memcpy(v,c.u,sizeof v);[e check:nmb_render_set_blend_color(h,v) what:"setBlendColor"];break;}
+ case EO_DRAW:
+  [e check:nmb_render_draw(h,c.u[0],(uint32_t)c.u[1],(uint32_t)c.u[2],(uint32_t)c.u[3],(uint32_t)c.u[4]) what:"drawPrimitives"];break;
+ case EO_DRAW_INDEXED:
+  [e check:nmb_render_draw_indexed(h,c.u[0],(uint32_t)(c.u[1]>>32),c.u[2],[(NBBuffer *)a handle],c.u[3],(uint32_t)c.u[1],
+                                   (int32_t)(uint32_t)(c.u[4]>>32),(uint32_t)c.u[4]) what:"drawIndexedPrimitives"];
+  break;
+ case EO_COPY_BUFFER:
+  [e check:nmb_blit_copy_buffer(h,[(NBBuffer *)a handle],c.u[0],[(NBBuffer *)(__bridge id)c.b handle],c.u[1],c.u[2]) what:"copyFromBuffer:toBuffer:"];
+  break;
+ case EO_FILL_BUFFER:[e check:nmb_blit_fill_buffer(h,[(NBBuffer *)a handle],c.u[0],c.u[1],(uint8_t)c.u[2]) what:"fillBuffer"];break;
+ case EO_COPY_TEXTURE: {
+  NBTexture *s=(NBTexture *)a,*d=(__bridge NBTexture *)c.b;
+  if(c.mask&1)ycbcrRefresh(s,e.commandBuffer);
+  const uint64_t *v=(const uint64_t *)(bytes+c.off);
+  [e check:nmb_blit_copy_texture(h,s.handle,v[0],v[1],v+2,v+5,d.handle,v[8],v[9],v+10) what:"copyFromTexture:toTexture:"];
+  break;
+ }
+ case EO_BUFFER_TO_TEXTURE: {
+  const uint64_t *v=(const uint64_t *)(bytes+c.off);
+  [e check:nmb_blit_buffer_to_texture(h,[(NBBuffer *)a handle],v[0],v[1],v[2],v+3,[(__bridge NBTexture *)c.b handle],v[6],v[7],v+8)
+       what:"copyFromBuffer:toTexture:"];
+  break;
+ }
+ case EO_TEXTURE_TO_BUFFER: {
+  NBTexture *s=(NBTexture *)a;
+  if(c.mask&1)ycbcrRefresh(s,e.commandBuffer);
+  const uint64_t *v=(const uint64_t *)(bytes+c.off);
+  [e check:nmb_blit_texture_to_buffer(h,s.handle,v[0],v[1],v+2,v+5,[(__bridge NBBuffer *)c.b handle],v[8],v[9],v[10]) what:"copyFromTexture:toBuffer:"];
+  break;
+ }
+ case EO_MIPMAPS:[e check:nmb_blit_generate_mipmaps(h,[(NBTexture *)a handle]) what:"generateMipmapsForTexture"];break;
+ default:break;
+ }
+}
 
 static void completed(void *context);
 static void scheduled(void *context);
@@ -1433,7 +1866,7 @@ static void noteDeviceLost(const char *why) {
 @implementation NBCommandBuffer
 - (instancetype)init {
  if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_writtenSurfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
- if(self){createdUs=nowUs();if(timelineOn())tlCreated=tlNow();}
+ if(self){createdUs=nowUs();if(timelineOn())tlCreated=tlNow();encDeferred=encThreadOn();}
  return self;
 }
 - (void)dealloc {nmb_command_buffer_release(_handle);}
@@ -1448,10 +1881,16 @@ static void noteDeviceLost(const char *why) {
 }
 - (MTLCommandBufferStatus)status {
  if(self.failedLocally)return MTLCommandBufferStatusError;
+ if(encDeferred) {   // u-encthread: the bridge has the command buffer to itself until its commit is replayed
+  if(!encCommitStarted.load())return self.committed?MTLCommandBufferStatusCommitted:MTLCommandBufferStatusNotEnqueued;
+  const uint64_t raw=nmb_command_buffer_status(_handle);
+  return (MTLCommandBufferStatus)(raw<MTLCommandBufferStatusCommitted?MTLCommandBufferStatusCommitted:raw);
+ }
  return (MTLCommandBufferStatus)nmb_command_buffer_status(_handle);
 }
 - (NSError *)error {
  if(self.failedLocally)return nbError(self.encodeFailure);
+ if(encDeferred && !encCommitStarted.load())return nil;
  if(self.status!=MTLCommandBufferStatusError)return nil;
  char text[512]={};nmb_command_buffer_error(_handle,text,sizeof text);
  return nbError([NSString stringWithUTF8String:text]);
@@ -1465,8 +1904,19 @@ static void noteDeviceLost(const char *why) {
 - (CFTimeInterval)kernelStartTime {return 0;}
 - (CFTimeInterval)kernelEndTime {return 0;}
 - (BOOL)commitAndWaitUntilSubmitted {tlWaitedScheduled=true;[(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];return !self.failedLocally;}
-- (CFTimeInterval)GPUStartTime {return nmb_command_buffer_gpu_time(_handle,false);}
-- (CFTimeInterval)GPUEndTime {return nmb_command_buffer_gpu_time(_handle,true);}
+- (CFTimeInterval)GPUStartTime {return encDeferred && !encCommitStarted.load()?0:nmb_command_buffer_gpu_time(_handle,false);}
+- (CFTimeInterval)GPUEndTime {return encDeferred && !encCommitStarted.load()?0:nmb_command_buffer_gpu_time(_handle,true);}
+// u-encthread: a recorded encoder; its bridge encoder is made by the worker (EO_RENDER_NEW/EO_BLIT_NEW: the pass copied).
+- (id)deferredEncoder:(NBEncoder *)encoder op:(uint8_t)op pass:(const NmbRenderPassDescriptor *)pass what:(NSString *)what {
+ ET_REC;
+ if(!tlFirstEncoder && tlCreated)tlFirstEncoder=tlNow();
+ if(self.committed){[self refuse:[what stringByAppendingString:@" after commit"]];return nil;}
+ encoder.commandBuffer=self;encoder->encDeferred=true;
+ encOpen=encoder;
+ EncCmd c={};c.op=op;c.target=(__bridge_retained void *)encoder;   // released as its end (or discard) is replayed
+ encPush(c,pass,pass?sizeof *pass:0);
+ return encoder;
+}
 - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)what {
  if(!tlFirstEncoder && tlCreated)tlFirstEncoder=tlNow();
  if(self.committed){[self refuse:[what stringByAppendingString:@" after commit"]];return nil;}
@@ -1475,6 +1925,8 @@ static void noteDeviceLost(const char *why) {
 }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
  [self encBegin];ENC_SCOPE(EC_ENC,"computeCommandEncoder");
+ // u-encthread: compute stays inline: the worker first replays what this command buffer (and every other) recorded
+ if(encDeferred)encFlush(EF_COMPUTE);
  return [self encoder:[NBComputeEncoder new] handle:self.committed?nullptr:nmb_compute_encoder_new(_handle) what:@"computeCommandEncoder"];
 }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)type {
@@ -1484,6 +1936,7 @@ static void noteDeviceLost(const char *why) {
 - (id<MTLBlitCommandEncoder>)blitCommandEncoder {
  [self encBegin];ENC_SCOPE(EC_ENC,"blitCommandEncoder");
  gBlits++;encodedWork.blits++;
+ if(encDeferred)return [self deferredEncoder:[NBBlitEncoder new] op:EO_BLIT_NEW pass:nullptr what:@"blitCommandEncoder"];
  return [self encoder:[NBBlitEncoder new] handle:self.committed?nullptr:nmb_blit_encoder_new(_handle) what:@"blitCommandEncoder"];
 }
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
@@ -1520,6 +1973,7 @@ static void noteDeviceLost(const char *why) {
   [_resourceOwners addObject:d.visibilityResultBuffer];
   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
  }
+ if(encDeferred)return [self deferredEncoder:[NBRenderEncoder new] op:EO_RENDER_NEW pass:&pass what:@"renderCommandEncoder"];
  return [self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
 }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {ENC_SCOPE(EC_CB,"addScheduledHandler");if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
@@ -1528,6 +1982,11 @@ static void noteDeviceLost(const char *why) {
 - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
  if(![(id)event isKindOfClass:[NBEvent class]]){[self refuse:@"foreign event"];return;}
  if(self.committed){[self refuse:@"event encoded after commit"];return;}
+ if(encDeferred) {
+  ET_REC;
+  EncCmd c={};c.op=EO_EVENT;c.target=(__bridge_retained void *)self;c.a=(__bridge_retained void *)event;c.flags=ECF_RETAIN_A;c.u[0]=value;c.u[1]=signal;
+  encPush(c);return;
+ }
  NmbEvent *handle=[(NBEvent *)event handle];
  if(!(signal?nmb_command_buffer_signal_event(_handle,handle,value):nmb_command_buffer_wait_event(_handle,handle,value)))
   [self refuse:[NSString stringWithFormat:@"%s: %@",signal?"encodeSignalEvent":"encodeWaitForEvent",lastError()]];
@@ -1634,6 +2093,18 @@ static void noteDeviceLost(const char *why) {
  }
  dispatch_group_enter(_handlers);
  dispatch_group_enter(_schedulingHandlers);
+ if(encDeferred) {   // u-encthread: the rest (in flight, surface cleans, handlers, the bridge's commit) is the worker's, in order
+  ET_REC;
+  if(NBEncoder *open=encOpen)if(!open->encEnded){open->encEnded=true;EncCmd d={};d.op=EO_DISCARD;d.target=(__bridge void *)open;encPush(d);}
+  encOpen=nil;
+  EncCmd c={};c.op=EO_COMMIT;c.target=(__bridge_retained void *)self;encPush(c);
+  return;
+ }
+ [self commitSubmit];
+}
+// The commit's submission: in flight, CPU-written surfaces cleaned, the runtime's handlers registered and its commit; a refusal
+// fails it locally (completed handlers run with the error). Inline from commit, or the worker's replay of it (u-encthread).
+- (void)commitSubmit {
  @synchronized(gInFlight){[gInFlight addObject:self];}
  if(!self.encodeFailure) {
   flushSurfaces(_surfaces,false);
@@ -1648,6 +2119,15 @@ static void noteDeviceLost(const char *why) {
  self.failedLocally=YES;gCommitFailures++;
  dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{[self finish];});
 }
+// u-encthread: a wait on a recorded command buffer: its commit replayed first (another thread's wait may come before the commit
+// is recorded: it flushes again).
+- (void)encAwaitCommit:(EncFlushWhy)why {
+ for(unsigned tries=0;!encCommitDone.load();tries++) {
+  if(encOnWorker() || !gEqStarted.load())return;
+  encFlush(why);
+  if(!encCommitDone.load())usleep(tries<100?20:1000);
+ }
+}
 // u-t: this command buffer's timeline record, as its completed handlers start.
 - (void)timelineRecord {
  TLRecord r={};
@@ -1661,6 +2141,7 @@ static void noteDeviceLost(const char *why) {
 }
 - (void)waitUntilCompleted {ENC_SCOPE(EC_WAIT,"waitUntilCompleted");
  if(!self.committed)return;
+ if(encDeferred)[self encAwaitCommit:EF_COMPLETED];
  tlWaitedCompleted=true;
  const uint64_t began=nowUs();
  if(!self.failedLocally)nmb_command_buffer_wait(_handle,0);
@@ -1669,6 +2150,7 @@ static void noteDeviceLost(const char *why) {
 }
 - (void)waitUntilScheduled {ENC_SCOPE(EC_WAIT,"waitUntilScheduled");
  if(!self.committed)return;
+ if(encDeferred)[self encAwaitCommit:EF_SCHEDULED];
  tlWaitedScheduled=true;
  const uint64_t began=nowUs();
  if(!self.failedLocally && !nmb_command_buffer_wait_scheduled(_handle)){
@@ -2950,6 +3432,42 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
   snprintf(line,sizeof line,"native-metal: T cpufast 5s: bits 0x%x | answers memo %llu asked %llu | viewport skipped %llu sent %llu | scissor skipped %llu sent %llu",
    cpuFast(),(unsigned long long)d[0],(unsigned long long)d[1],(unsigned long long)d[2],(unsigned long long)d[3],(unsigned long long)d[4],
    (unsigned long long)d[5]);
+  sm2_logs(line);
+ }
+ if(encThreadOn()) {   // u-encthread: what was recorded, replayed, and what the callers still waited for, in the window
+  enum {K_DRAW,K_BIND,K_ENC,K_BLIT,K_CB,K_N};
+  static uint64_t lastOps[EO_COUNT],lastRec,lastRep,lastBatches,lastWakes,lastCommits,lastCalls[EF_WHY_COUNT],lastWaits[EF_WHY_COUNT],
+   lastTicks[EF_WHY_COUNT],lastOnWorker;
+  uint64_t kind[K_N]={},all=0;
+  for(int o=0;o<EO_COUNT;o++) {
+   const uint64_t now=gEtOps[o].load(),d=now-lastOps[o];lastOps[o]=now;all+=d;
+   const int k=o==EO_DRAW || o==EO_DRAW_INDEXED?K_DRAW:o<=EO_DISCARD?K_ENC:o>=EO_COPY_BUFFER && o<=EO_MIPMAPS?K_BLIT:o>=EO_EVENT?K_CB:K_BIND;
+   kind[k]+=d;
+  }
+  const double tick=encTickNs()/1e6;
+  const uint64_t rec=gEtRecordTicks.load(),rep=gEtReplayTicks.load(),batches=gEtBatches.load(),wakes=gEtWakes.load(),commits=gEtCommits.load();
+  const double recMs=(rec-lastRec)*tick,repMs=(rep-lastRep)*tick;
+  const uint64_t dCommits=commits-lastCommits;
+  double flushMs=0;
+  char flushes[600]="";size_t at=0;
+  for(int w=0;w<EF_WHY_COUNT;w++) {
+   const uint64_t calls=gEtFlushCalls[w].load(),waits=gEtFlushWaits[w].load(),ticks=gEtFlushTicks[w].load();
+   const uint64_t dc=calls-lastCalls[w],dw=waits-lastWaits[w];const double ms=(ticks-lastTicks[w])*tick;
+   lastCalls[w]=calls;lastWaits[w]=waits;lastTicks[w]=ticks;flushMs+=ms;
+   if(dc && at<sizeof flushes)at+=(size_t)snprintf(flushes+at,sizeof flushes-at," %s %llu/%llu %.1fms",kEncFlushName[w],(unsigned long long)dw,
+    (unsigned long long)dc,ms);
+  }
+  const uint64_t onWorker=gEtFlushOnWorker.load();
+  snprintf(line,sizeof line,"native-metal: T enc-thread 5s: cmds %llu (draw %llu bind %llu enc %llu blit %llu cb %llu) commits %llu | caller record %.1f ms"
+   " (%.2f us/cmd) | worker replay %.1f ms (%.1f us/cmd, %llu batches, max %llu) | caller saved ~%.1f ms (%.2f ms/commit), flush waits %.1f ms"
+   " (net %.2f ms/commit) | depth max %llu, now %llu | wakes %llu | flushes waited/calls:%s%s | on-worker %llu stalls %llu",
+   (unsigned long long)all,(unsigned long long)kind[K_DRAW],(unsigned long long)kind[K_BIND],(unsigned long long)kind[K_ENC],(unsigned long long)kind[K_BLIT],
+   (unsigned long long)kind[K_CB],(unsigned long long)dCommits,recMs,all?recMs*1e3/all:0,repMs,all?repMs*1e3/all:0,
+   (unsigned long long)(batches-lastBatches),(unsigned long long)gEtBatchMax.exchange(0),repMs-recMs,dCommits?(repMs-recMs)/dCommits:0,flushMs,
+   dCommits?(repMs-recMs-flushMs)/dCommits:0,(unsigned long long)gEtDepthMax.exchange(0),(unsigned long long)(gEqAppended.load()-gEqReplayed.load()),
+   (unsigned long long)(wakes-lastWakes),at?flushes:" none",gEqBroken?" | WORKER NOT STARTED (inline)":"",(unsigned long long)(onWorker-lastOnWorker),
+   (unsigned long long)gEtStalls.load());
+  lastRec=rec;lastRep=rep;lastBatches=batches;lastWakes=wakes;lastCommits=commits;lastOnWorker=onWorker;
   sm2_logs(line);
  }
  std::sort(hitches.begin(),hitches.end(),[](const Hitch &a,const Hitch &b){return a.every>b.every;});
