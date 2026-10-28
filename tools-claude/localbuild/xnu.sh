@@ -67,10 +67,21 @@ say "patching: $(ls "$PREP/patches" | wc -l) files"
 		# their xcrun --sdk macosx must give the real macOS SDK (TargetConditionals.h), not the fakeroot
 		LB_MODE= PATH="$LBIN:$PATH" bash "$s" || exit 1
 	done
+	# A patch that does not apply fails the build, unless its name is in patch-skip-allow.txt (patches that are
+	# known not to apply on 13.5's xnu and have always been skipped). No more silent "skip" of a kernel patch.
+	napplied=0 nskipped=0 bad=
 	for p in ../patches/*.patch; do
-		if c=$(git apply --check "$p" 2>&1); then git apply "$p" || exit 1
-		else echo "skip $(basename "$p"): $(echo "$c" | head -1)"; fi
+		b=$(basename "$p")
+		if c=$(git apply --check "$p" 2>&1); then git apply "$p" || { echo "PATCH FAILED: $b (git apply after a clean --check)"; exit 1; }
+			napplied=$((napplied + 1))
+		elif grep -qxF "$b" "$HERE/patch-skip-allow.txt" 2>/dev/null; then
+			echo "skip (allow-listed) $b: $(echo "$c" | head -1)"; nskipped=$((nskipped + 1))
+		else
+			echo "PATCH FAILED: $b does not apply: $(echo "$c" | head -1)"; bad="$bad $b"
+		fi
 	done
+	[ -z "$bad" ] || { echo "PATCH FAILED: not in patch-skip-allow.txt:$bad"; exit 1; }
+	echo "patches applied: $napplied (allow-listed skips: $nskipped)"
 	# UniXNU scripts/linux/prepare-xnu.py "source": sources that assume Apple's clang or BSD tools
 	python3 - <<'PY'
 from pathlib import Path

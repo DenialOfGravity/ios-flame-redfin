@@ -50,7 +50,8 @@ to the repo afterwards.
   in `env.sh`; built by `setup.sh`/`tc.py` without root): clang 24 with `__builtin_xnu_type_*`
   (`toolchain/llvm/bin/clang`), cctools-port ld64-956.6, mig (bootstrap_cmds-138), iig-port, their clang/plutil/
   install shims; our `bin/xcrun`. blacktop's patch steps, then `xnu/patches` (`*.sh` then `*.patch`, C locale order)
-  on a pristine xnu-8796.141.3; changed files are rsynced into the build tree, so make is incremental. Linux-only
+  on a pristine xnu-8796.141.3 (a patch that does not apply fails the build with `PATCH FAILED: NAME`, unless NAME is in
+  `patch-skip-allow.txt`; the log says `patches applied: N`); changed files are rsynced into the build tree, so make is incremental. Linux-only
   source rewrites (not kernel patches; logged as `linux:` in the build log): mawk syscall table, arm64 ISA asm syntax,
   kextsymboltool lseek on /dev/null, and `KALLOC_TYPE_IS_COMPATIBLE_PTR` in C++ (`__remove_pointer` instead of
   `*(void *)` in `__typeof__`, which Apple clang only warns about). Also `-Wno-error=incompatible-pointer-types` (an
