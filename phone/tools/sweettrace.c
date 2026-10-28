@@ -2,7 +2,7 @@
  * sweettrace: record a kdebug trace for the frame-pacing analysis (tools-claude/sweet-trace.py).
  *
  *   sweettrace [-t SECS] [-o FILE] [-b KBUFS] [-m MAXEVENTS] [-r MS] [-d DELAY] [-p PID,...] [-c CLASS[/SUB],...]
- *              [-S] [-I] [-n]
+ *              [-S] [-I] [-n] [-f | -F PROC,...] [-z | -Z LEVEL]
  *
  *   -t SECS     how long to record (default 10)
  *   -o FILE     output (default /var/tmp/sweettrace.swtr)
@@ -16,6 +16,14 @@
  *   -S          also syscalls (BSD and Mach traps: many events)
  *   -I          no interrupts (DBG_MACH_EXCP_INTR)
  *   -n          no thread names (skip the proc_pidinfo walk)
+ *   -F PROCS    u-lab: keep only what tools-claude/swtr-reduce.py keeps for these processes' frame chain (comma list of
+ *               process names): all 0xF5 events, DBG_TRACE, interrupts, IPC kmsg info, MACH_IPC_MSG_SEND/RECV of their
+ *               threads, wakes of their threads, context switches in/out of their threads; events in time order. The
+ *               same events (byte for byte) as `swtr-reduce.py FULL OUT PROCS` on a full trace, 3-4x smaller. Events of
+ *               -c / -S classes are kept whole. Events no rule can keep are dropped while reading (less memory).
+ *   -f          -F backboardd,SpringBoard,Preferences (swtr-reduce.py's default)
+ *   -z          gzip the output (zlib level 6; -Z LEVEL 1-9). The file is a plain gzip of the same format: `gzip -dc`
+ *               on the PC gives the .swtr the PC tools read. A reduced Settings trace: ~180 MB full -> ~52 MB -f -> ~4.5 MB -f -z.
  *
  * Default classes: DBG_MACH/DBG_MACH_SCHED (context switches, MAKE_RUNNABLE with the waker as the current thread,
  * blocks, waits), DBG_MACH/DBG_MACH_IPC (mach_msg send/receive, KMSG_INFO sender -> receiver pid), DBG_MACH/
@@ -27,6 +35,7 @@
  * Needs root (kdebug's ktrace_configure: superuser). Another owner of ktrace (EBUSY): `sweettrace -R` resets it.
  */
 #include <errno.h>
+#include <stddef.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -34,9 +43,12 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#ifndef SWT_HOST_TEST
 #include <mach/mach_time.h>
 #include <sys/sysctl.h>
 #include <sys/proc.h>
+#include <zlib.h>
+#endif
 
 /* bsd/sys/sysctl.h, bsd/sys/kdebug_private.h (not in the iOS SDK) */
 #ifndef KERN_KDEBUG
@@ -130,6 +142,205 @@ struct swt_thread {
 	char     comm[32];
 	char     name[64];
 };
+
+
+/*
+ * u-lab: -F, swtr-reduce.py on the phone. swt_prekeep() runs on every event read (drain): it drops what no rule below can
+ * keep. swt_reduce() runs once at the end, on the time-sorted events and the final thread map, and applies the rules that
+ * need the focus threads. Kept in step with tools-claude/swtr-reduce.py (the host test below checks byte equality).
+ */
+#define SWT_CODE(c, s, n)       ((uint32_t)(c) << 24 | (uint32_t)(s) << 16 | (uint32_t)(n) << 2)
+#define SWT_SCHED               SWT_CODE(1, 0x40, 0x00)
+#define SWT_HANDOFF             SWT_CODE(1, 0x40, 0x02)
+#define SWT_MKRUN               SWT_CODE(1, 0x40, 0x06)
+#define SWT_INTR                SWT_CODE(1, 0x05, 0)
+#define SWT_KMSG                SWT_CODE(1, 0x20, 0x0a)
+#define SWT_MSG_SEND            SWT_CODE(1, 0x20, 0x03)
+#define SWT_MSG_RECV            SWT_CODE(1, 0x20, 0x04)
+#define SWT_MSG_RECV_NV         SWT_CODE(1, 0x20, 0x05)
+#define SWT_SW_BASE             ((6u << 24) | (0xF5u << 16))
+
+static uint8_t swt_whole[TYPEFILTER_SIZE];      /* -c / -S class-subclasses: kept whole under -F */
+
+static int swt_always(uint32_t dbg)             /* kept whatever the focus */
+{
+	uint32_t cid = dbg & 0xfffffffcu;
+	return (dbg & 0xffff0000u) == SWT_SW_BASE || cid == SWT_KMSG || (dbg >> 24) == 7 || cid == SWT_INTR;
+}
+
+static int swt_whole_csc(uint32_t dbg)
+{
+	uint32_t csc = dbg >> 16;
+	return (swt_whole[csc / 8] >> (csc % 8)) & 1;
+}
+
+static int swt_prekeep(uint32_t dbg)
+{
+	uint32_t cid = dbg & 0xfffffffcu;
+	return swt_always(dbg) || cid == SWT_MKRUN || cid == SWT_MSG_SEND || cid == SWT_MSG_RECV || cid == SWT_MSG_RECV_NV ||
+	    cid == SWT_SCHED || cid == SWT_HANDOFF || swt_whole_csc(dbg);
+}
+
+/* keep the swt_prekeep() events of buf[0..n) in place; returns how many */
+static size_t swt_prefilter(kd_buf *buf, size_t n)
+{
+	size_t w = 0;
+	for (size_t i = 0; i < n; i++)
+		if (swt_prekeep(buf[i].debugid)) {
+			if (w != i)
+				buf[w] = buf[i];
+			w++;
+		}
+	return w;
+}
+
+static int u64cmp(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+	return x < y ? -1 : x > y;
+}
+
+static const kd_buf *swt_sort_base;
+static int swt_idx_cmp(const void *a, const void *b)   /* stable: ties by index */
+{
+	uint32_t i = *(const uint32_t *)a, j = *(const uint32_t *)b;
+	uint64_t x = swt_sort_base[i].timestamp, y = swt_sort_base[j].timestamp;
+	if (x != y)
+		return x < y ? -1 : 1;
+	return i < j ? -1 : i > j;
+}
+
+/* stable sort by timestamp (np.argsort kind='stable'), only when the events are not in order already */
+static int swt_sort(kd_buf *e, uint64_t n)
+{
+	uint64_t i;
+	for (i = 1; i < n && e[i - 1].timestamp <= e[i].timestamp; i++) {
+	}
+	if (i >= n)
+		return 0;
+	uint32_t *idx = malloc(n * sizeof(uint32_t));
+	kd_buf *tmp = malloc(n * sizeof(kd_buf));
+	if (idx == NULL || tmp == NULL) {
+		free(idx);
+		free(tmp);
+		return -1;
+	}
+	for (i = 0; i < n; i++)
+		idx[i] = (uint32_t)i;
+	swt_sort_base = e;
+	qsort(idx, n, sizeof(uint32_t), swt_idx_cmp);
+	for (i = 0; i < n; i++)
+		tmp[i] = e[idx[i]];
+	memcpy(e, tmp, n * sizeof(kd_buf));
+	free(idx);
+	free(tmp);
+	return 1;
+}
+
+static int in_set(const uint64_t *set, size_t n, uint64_t v)
+{
+	return n && bsearch(&v, set, n, sizeof(uint64_t), u64cmp) != NULL;
+}
+
+/* procs: comma list. Returns the number of events kept (compacted in e[]), *nfocus the focus threads. */
+static uint64_t swt_reduce(kd_buf *e, uint64_t n, const struct swt_thread *t, uint32_t nt, const char *procs, uint32_t *nfocus)
+{
+	uint64_t *focus = malloc((nt + 1) * sizeof(uint64_t));
+	size_t nf = 0;
+	char *list = strdup(procs);
+	for (uint32_t k = 0; focus != NULL && list != NULL && k < nt; k++) {
+		char comm[sizeof(t[k].comm) + 1];
+		memcpy(comm, t[k].comm, sizeof(t[k].comm));
+		comm[sizeof(t[k].comm)] = 0;
+		size_t cl = strlen(comm);
+		for (const char *p = list; *p;) {
+			const char *q = strchr(p, ',');
+			size_t l = q ? (size_t)(q - p) : strlen(p);
+			if (l == cl && strncmp(p, comm, l) == 0) {
+				focus[nf++] = t[k].tid;
+				break;
+			}
+			p += l + (q != NULL);
+		}
+	}
+	free(list);
+	if (focus != NULL)
+		qsort(focus, nf, sizeof(uint64_t), u64cmp);
+	/* the same tid can be listed twice in the table: unique */
+	size_t u = 0;
+	for (size_t k = 0; k < nf; k++)
+		if (u == 0 || focus[u - 1] != focus[k])
+			focus[u++] = focus[k];
+	nf = u;
+	*nfocus = (uint32_t)nf;
+	swt_sort(e, n);
+	enum { NCPU_MAX = 4096 };
+	static uint64_t cpu_cur[NCPU_MAX];
+	static uint8_t cpu_has[NCPU_MAX];
+	memset(cpu_has, 0, sizeof(cpu_has));
+	uint64_t w = 0;
+	for (uint64_t i = 0; i < n; i++) {
+		uint32_t dbg = e[i].debugid, cid = dbg & 0xfffffffcu;
+		int keep = swt_always(dbg) || swt_whole_csc(dbg);
+		if (cid == SWT_MKRUN)
+			keep |= in_set(focus, nf, e[i].arg1);
+		else if (cid == SWT_MSG_SEND || cid == SWT_MSG_RECV || cid == SWT_MSG_RECV_NV)
+			keep |= in_set(focus, nf, e[i].arg5);
+		else if (cid == SWT_SCHED || cid == SWT_HANDOFF) {
+			uint32_t c = e[i].cpuid < NCPU_MAX ? e[i].cpuid : NCPU_MAX - 1;
+			uint64_t old = cpu_has[c] ? cpu_cur[c] : e[i].arg5, nw = e[i].arg2;
+			if (old != nw && (in_set(focus, nf, old) || in_set(focus, nf, nw)))
+				keep = 1;
+			cpu_cur[c] = nw;
+			cpu_has[c] = 1;
+		}
+		if (keep)
+			e[w++] = e[i];
+	}
+	free(focus);
+	return w;
+}
+
+#ifdef SWT_HOST_TEST
+/* host test (Linux/macOS): cc -O2 -DSWT_HOST_TEST -o swt-reduce-test sweettrace.c
+ *   ./swt-reduce-test FULL.swtr OUT.swtr [PROCS]   == swtr-reduce.py FULL.swtr OUT.swtr PROCS... (compare with cmp) */
+int main(int argc, char **argv)
+{
+	if (argc < 3)
+		return fprintf(stderr, "usage: %s IN OUT [PROCS]\n", argv[0]), 2;
+	FILE *f = fopen(argv[1], "rb");
+	if (f == NULL)
+		return perror(argv[1]), 1;
+	uint8_t hb[512];
+	_Static_assert(sizeof(struct swt_header) == 216, "header");
+	if (fread(hb, 1, 216, f) != 216)
+		return fprintf(stderr, "short header\n"), 1;
+	uint32_t hsize;
+	uint64_t n;
+	uint32_t nt;
+	memcpy(&hsize, hb + offsetof(struct swt_header, header_size), 4);
+	memcpy(&n, hb + offsetof(struct swt_header, n_events), 8);
+	memcpy(&nt, hb + offsetof(struct swt_header, n_threads), 4);
+	if (hsize > sizeof(hb) || (hsize > 216 && fread(hb + 216, 1, hsize - 216, f) != hsize - 216))
+		return fprintf(stderr, "bad header\n"), 1;
+	kd_buf *e = malloc(n * sizeof(kd_buf));
+	struct swt_thread *t = malloc((nt + 1) * sizeof(*t));
+	if (fread(e, sizeof(kd_buf), n, f) != n || fread(t, sizeof(*t), nt, f) != nt)
+		return fprintf(stderr, "short file\n"), 1;
+	fclose(f);
+	uint64_t m = swt_prefilter(e, n);       /* as drain() does with -F */
+	uint32_t nf = 0;
+	uint64_t r = swt_reduce(e, m, t, nt, argc > 3 ? argv[3] : "backboardd,SpringBoard,Preferences", &nf);
+	memcpy(hb + offsetof(struct swt_header, n_events), &r, 8);
+	FILE *o = fopen(argv[2], "wb");
+	if (o == NULL || fwrite(hb, 1, hsize, o) != hsize || fwrite(e, sizeof(kd_buf), r, o) != r ||
+	    fwrite(t, sizeof(*t), nt, o) != nt || fclose(o) != 0)
+		return perror(argv[2]), 1;
+	printf("%s: %llu -> %llu (prefilter) -> %llu events, %u focus threads\n", argv[1], (unsigned long long)n,
+	    (unsigned long long)m, (unsigned long long)r, nf);
+	return 0;
+}
+#else
 
 static volatile sig_atomic_t stop;
 static void on_sig(int s) { (void)s; stop = 1; }
@@ -267,6 +478,8 @@ static kd_buf *ev;
 static uint64_t nev, capev, maxev, dropped;
 static kd_buf *chunk;
 static size_t chunk_n;
+static const char *focus_procs;         /* -F */
+static uint64_t prefiltered;            /* events read, before -F's prefilter */
 
 /* one KERN_KDREADTR: everything the kernel has, into ev[] */
 static int drain(void)
@@ -280,6 +493,10 @@ static int drain(void)
 		size_t got = len;       /* the kernel returns the number of events */
 		if (got == 0)
 			return 0;
+		size_t read_n = got;
+		prefiltered += got;
+		if (focus_procs != NULL)
+			got = swt_prefilter(chunk, got);
 		uint64_t keep = got;
 		if (nev + keep > maxev) {
 			keep = maxev > nev ? maxev - nev : 0;
@@ -302,7 +519,7 @@ static int drain(void)
 		}
 		memcpy(ev + nev, chunk, keep * sizeof(kd_buf));
 		nev += keep;
-		if (got < chunk_n)
+		if (read_n < chunk_n)
 			return 0;
 	}
 	return 0;
@@ -320,9 +537,9 @@ int main(int argc, char **argv)
 	unsigned secs = 10, read_ms = 100, delay = 0;
 	unsigned kbufs = 1u << 20;
 	const char *out = "/var/tmp/sweettrace.swtr", *pids = NULL, *extra = NULL;
-	int sysc = 0, nointr = 0, nonames = 0, reset = 0, o;
+	int sysc = 0, nointr = 0, nonames = 0, reset = 0, zlevel = 0, o;
 	maxev = 1u << 22;
-	while ((o = getopt(argc, argv, "t:o:b:m:r:d:p:c:SInR")) != -1) {
+	while ((o = getopt(argc, argv, "t:o:b:m:r:d:p:c:SInRfF:zZ:")) != -1) {
 		switch (o) {
 		case 't': secs = (unsigned)strtoul(optarg, NULL, 0); break;
 		case 'o': out = optarg; break;
@@ -336,9 +553,13 @@ int main(int argc, char **argv)
 		case 'I': nointr = 1; break;
 		case 'n': nonames = 1; break;
 		case 'R': reset = 1; break;
+		case 'f': focus_procs = "backboardd,SpringBoard,Preferences"; break;
+		case 'F': focus_procs = optarg; break;
+		case 'z': zlevel = 6; break;
+		case 'Z': zlevel = atoi(optarg); zlevel = zlevel < 1 ? 1 : zlevel > 9 ? 9 : zlevel; break;
 		default:
 			fprintf(stderr, "usage: sweettrace [-t SECS] [-o FILE] [-b KBUFS] [-m MAX] [-r MS] [-d DELAY] [-p PIDS] "
-			    "[-c CSC] [-S] [-I] [-n] [-R]\n");
+			    "[-c CSC] [-S] [-I] [-n] [-R] [-f | -F PROCS] [-z | -Z LEVEL]\n");
 			return 2;
 		}
 	}
@@ -388,6 +609,8 @@ int main(int argc, char **argv)
 	if (sysc) {
 		tf_allow(tf, DBG_MACH, DBG_MACH_EXCP_SC);
 		tf_allow(tf, DBG_BSD, DBG_BSD_EXCP_SC);
+		tf_allow(swt_whole, DBG_MACH, DBG_MACH_EXCP_SC);
+		tf_allow(swt_whole, DBG_BSD, DBG_BSD_EXCP_SC);
 	}
 	if (extra != NULL) {
 		char *s = strdup(extra), *save = NULL;
@@ -395,8 +618,10 @@ int main(int argc, char **argv)
 			char *sl = strchr(t, '/');
 			unsigned c = (unsigned)strtoul(t, NULL, 0);
 			int sub = sl ? (int)strtoul(sl + 1, NULL, 0) : -1;
-			if (c < 256 && sub < 256)
+			if (c < 256 && sub < 256) {
 				tf_allow(tf, c, sub);
+				tf_allow(swt_whole, c, sub);   /* asked for: kept whole under -F */
+			}
 		}
 		free(s);
 	}
@@ -480,6 +705,12 @@ int main(int argc, char **argv)
 	kd(KERN_KDREMOVE, 0, NULL, NULL);
 	if (!nonames)
 		map_names();
+	uint64_t nev_read = nev;
+	uint32_t nfocus = 0;
+	uint64_t r0 = mach_absolute_time();
+	if (focus_procs != NULL)
+		nev = swt_reduce(ev, nev, thr, nthr, focus_procs, &nfocus);
+	uint64_t r1 = mach_absolute_time();
 
 	struct swt_header h;
 	memset(&h, 0, sizeof(h));
@@ -510,10 +741,44 @@ int main(int argc, char **argv)
 		for (int i = 1; i < argc && w < sizeof(h.args) - 1; i++)
 			w += (size_t)snprintf(h.args + w, sizeof(h.args) - w, "%s%s", i > 1 ? " " : "", argv[i]);
 	}
-	if (fwrite(&h, sizeof(h), 1, f) != 1 || (nev && fwrite(ev, sizeof(kd_buf), nev, f) != nev) ||
+	if (zlevel > 0) {
+		/* gzip (deflate in 4 MB pieces: gzwrite takes an unsigned length) */
+		char mode[8];
+		snprintf(mode, sizeof(mode), "wb%d", zlevel);
+		fflush(f);
+		gzFile g = gzdopen(dup(fileno(f)), mode);
+		int bad = g == NULL || gzbuffer(g, 1 << 20) != 0 || gzwrite(g, &h, sizeof(h)) != (int)sizeof(h);
+		const uint8_t *parts[2] = { (const uint8_t *)ev, (const uint8_t *)thr };
+		uint64_t lens[2] = { nev * sizeof(kd_buf), (uint64_t)nthr * sizeof(*thr) };
+		for (int k = 0; !bad && k < 2; k++)
+			for (uint64_t off = 0; !bad && off < lens[k]; off += 4u << 20) {
+				unsigned piece = (unsigned)(lens[k] - off < (4u << 20) ? lens[k] - off : (4u << 20));
+				bad = gzwrite(g, parts[k] + off, piece) != (int)piece;
+			}
+		if (g != NULL && gzclose(g) != Z_OK)
+			bad = 1;
+		if (bad || fclose(f) != 0) {
+			fprintf(stderr, "%s: gzip write failed\n", out);
+			return 1;
+		}
+	} else if (fwrite(&h, sizeof(h), 1, f) != 1 || (nev && fwrite(ev, sizeof(kd_buf), nev, f) != nev) ||
 	    (nthr && fwrite(thr, sizeof(*thr), nthr, f) != nthr) || fclose(f) != 0) {
 		perror(out);
 		return 1;
+	}
+	uint64_t w1 = mach_absolute_time();
+	if (focus_procs != NULL || zlevel > 0) {
+		FILE *sf = fopen(out, "rb");
+		long fsz = -1;
+		if (sf != NULL && fseek(sf, 0, SEEK_END) == 0)
+			fsz = ftell(sf);
+		if (sf != NULL)
+			fclose(sf);
+		printf("sweettrace: reduce %s: %llu read, %llu after prefilter, %llu kept (%u focus threads) in %.0f ms; "
+		    "write%s %ld bytes in %.0f ms\n", focus_procs ? focus_procs : "off", (unsigned long long)prefiltered,
+		    (unsigned long long)nev_read, (unsigned long long)nev, nfocus,
+		    (double)(r1 - r0) * tb.numer / tb.denom / 1e6, zlevel ? " (gzip)" : "", fsz,
+		    (double)(w1 - r1) * tb.numer / tb.denom / 1e6);
 	}
 	double s = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
 	printf("sweettrace: %llu events in %.2f s (%.0f/s), %u threads, %u reads%s%s -> %s\n", (unsigned long long)nev, s,
@@ -521,3 +786,4 @@ int main(int argc, char **argv)
 	    dropped ? ", -m reached (events dropped)" : "", out);
 	return 0;
 }
+#endif /* SWT_HOST_TEST */
