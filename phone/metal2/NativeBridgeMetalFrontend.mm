@@ -132,6 +132,11 @@ extern "C" void sm2_logs(const char *);
 // "E slow" at once (at most 12 per 5 s) with its category, site and object.
 static const char *const kEncCatName[EC_COUNT]={"pipe","tex","buf","enc","draw","bind","blit","upload","wait","cb"};
 static bool timelineOn();
+static bool fnStatOn() {   // u-gpudraw
+ static int on=-1;
+ if(on<0){const char *e=getenv("SWEET_FNSTAT");on=timelineOn() && e && *e && strcmp(e,"0")?1:0;}
+ return on==1;
+}
 static bool encStatOn() {
  static int on=-1;
  if(on<0){const char *e=getenv("SWEET_ENCSTAT");on=timelineOn() && !(e && !strcmp(e,"0"))?1:0;}
@@ -1049,6 +1054,49 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic) BOOL schedulingDelivered;
 - (void)refuse:(NSString *)what;
 @end
+// u-gpudraw: SWEET_FNSTAT=1 (backboardd, with the timeline): draws per render pipeline (its vertex + fragment function
+// names) every 5 s as "T fn" lines, with one draw's inputs per pipeline: the vertex count, the last setVertexBytes /
+// setFragmentBytes (index and the first 64 bytes as floats) and 64 bytes of vertex buffer 0 at the draw's offset.
+// Matches Turnip 0112's fragment shader census (T tu-draw) by draw counts.
+static bool fnStatOn();
+struct FnSnap {uint8_t b[64];uint16_t n,index;};
+static thread_local FnSnap tFnBytes[3];   // by stage: 1 vertex, 2 fragment
+static thread_local __unsafe_unretained id tFnVb0;static thread_local NSUInteger tFnVb0Off;static thread_local const void *tFnVb0Enc;
+struct FnEnt {char name[80];uint32_t draws,verts,inst;FnSnap vb,fb,v0;bool have;};
+static std::mutex gFnLock;static FnEnt gFn[48];static unsigned gFnN;static uint64_t gFnOther;
+static void fnNote(const void *enc,const char *name,uint32_t verts,uint32_t inst,NSUInteger vertexStart) {
+ std::lock_guard<std::mutex> l(gFnLock);
+ unsigned i=0;for(;i<gFnN && strncmp(gFn[i].name,name,sizeof gFn[i].name);i++);
+ if(i==gFnN){if(gFnN==48){gFnOther++;return;}gFnN++;memset(&gFn[i],0,sizeof gFn[i]);snprintf(gFn[i].name,sizeof gFn[i].name,"%s",name);}
+ FnEnt &e=gFn[i];e.draws++;e.verts+=verts;e.inst+=inst;
+ if(!e.have || (e.draws%64)==0) {   // a sample now and then
+  e.have=true;e.vb=tFnBytes[1];e.fb=tFnBytes[2];memset(&e.v0,0,sizeof e.v0);
+  if(tFnVb0 && tFnVb0Enc==enc && [tFnVb0 respondsToSelector:@selector(contents)] && [tFnVb0 respondsToSelector:@selector(length)]) {
+   const uint8_t *c=(const uint8_t *)[(id<MTLBuffer>)tFnVb0 contents];NSUInteger len=[(id<MTLBuffer>)tFnVb0 length];
+   if(c && tFnVb0Off<len){e.v0.n=(uint16_t)std::min<NSUInteger>(64,len-tFnVb0Off);memcpy(e.v0.b,c+tFnVb0Off,e.v0.n);}
+  }
+  (void)vertexStart;
+ }
+}
+static void fnPut(char *out,size_t size,const char *what,const FnSnap &s) {
+ size_t at=strlen(out);if(!s.n)return;
+ at+=snprintf(out+at,size>at?size-at:0," %s[%u] %u:",what,s.index,s.n);
+ for(unsigned k=0;k+4<=s.n && k<64;k+=4){float f;memcpy(&f,s.b+k,4);at+=snprintf(out+at,size>at?size-at:0," %.4g",f);}
+}
+static void fnReport() {
+ if(!fnStatOn())return;
+ std::vector<FnEnt> v;uint64_t other;
+ {std::lock_guard<std::mutex> l(gFnLock);v.assign(gFn,gFn+gFnN);gFnN=0;other=gFnOther;gFnOther=0;}
+ std::sort(v.begin(),v.end(),[](const FnEnt &a,const FnEnt &b){return a.draws>b.draws;});
+ for(size_t i=0;i<v.size() && i<12;i++) {
+  char line[1300];
+  snprintf(line,sizeof line,"native-metal: T fn %s: d%u v%.1f i%.1f",v[i].name,v[i].draws,v[i].draws?(double)v[i].verts/v[i].draws:0,
+   v[i].draws?(double)v[i].inst/v[i].draws:0);
+  fnPut(line,sizeof line,"vbytes",v[i].vb);fnPut(line,sizeof line,"fbytes",v[i].fb);fnPut(line,sizeof line,"vb0",v[i].v0);
+  sm2_logs(line);
+ }
+ if(other){char line[80];snprintf(line,sizeof line,"native-metal: T fn: %llu draws of more pipelines",(unsigned long long)other);sm2_logs(line);}
+}
 @interface NBEncoder : NBObject
 @property(nonatomic) NmbEncoder *handle;
 @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
@@ -1093,6 +1141,7 @@ static void waitForResource(id resource) {
 - (void)popDebugGroup {}
 // Stage 0 compute, 1 vertex, 2 fragment (the bridge's numbering).
 - (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setBuffer");
+ if(stage==1 && index==0 && fnStatOn()){tFnVb0=buffer;tFnVb0Off=offset;tFnVb0Enc=(__bridge const void *)self;}
  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
  if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
  [self check:nmb_encoder_set_buffer(_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"];
@@ -1114,6 +1163,7 @@ static void waitForResource(id resource) {
  [self check:nmb_encoder_set_sampler(_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"];
 }
 - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setBytes");
+ if(stage<3 && fnStatOn()){FnSnap &f=tFnBytes[stage];f.n=(uint16_t)std::min<NSUInteger>(64,length);f.index=(uint16_t)index;if(bytes)memcpy(f.b,bytes,f.n);}
  [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];
 }
 - (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {ENC_SCOPE(EC_BIND,"fence");
@@ -1180,7 +1230,7 @@ static void waitForResource(id resource) {
 }
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {ENC_SCOPE(EC_BIND,"setRenderPipelineState");
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
- if(encStatOn())memcpy(encPipeline,((NBRenderPipeline *)state)->encNames,sizeof encPipeline);
+ if(encStatOn() || fnStatOn())memcpy(encPipeline,((NBRenderPipeline *)state)->encNames,sizeof encPipeline);
  [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"];
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
@@ -1257,6 +1307,7 @@ static void waitForResource(id resource) {
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {ENC_SCOPE(EC_DRAW,"drawPrimitives");
  gDraws++;self.commandBuffer->encodedWork.draws++;
+ if(fnStatOn())fnNote((__bridge const void *)self,encPipeline,(uint32_t)n,(uint32_t)i,s);
  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
  if(encScope_.slow())[self encDescribeSlowDraw];
 }
@@ -1271,6 +1322,7 @@ static void waitForResource(id resource) {
  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
  [self.commandBuffer.resourceOwners addObject:b];
  gDraws++;self.commandBuffer->encodedWork.draws++;
+ if(fnStatOn())fnNote((__bridge const void *)self,encPipeline,(uint32_t)n,(uint32_t)i,0);
  [self check:nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi) what:"drawIndexedPrimitives"];
  if(encScope_.slow())[self encDescribeSlowDraw];
 }
@@ -2874,6 +2926,7 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
    sm2_logs(line);
   }
  }
+ fnReport();
  if(native_bridge_metal_draw_report) {   // u-gpudraw: Turnip 0112's draw census (fragment shaders, draw times)
   char draw[1300];
   if(native_bridge_metal_draw_report(draw,sizeof draw)) {
