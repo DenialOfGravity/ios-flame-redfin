@@ -762,6 +762,66 @@ static int up(unsigned secs)
 int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *buffer, size_t size);
 struct memlimit_properties { int32_t active; uint32_t active_attr; int32_t inactive; uint32_t inactive_attr; };
 
+/*
+ * redfin 2026-10-28: every line of wland.log starts with the uptime ("[  73.342] ", seconds, as the kernel log), so the
+ * bring-up's steps can be timed against launchd/wifid in the live log. stdout/stderr go through a pipe to a thread
+ * that stamps each line; the pipe's write end is non-blocking, so a stuck logger can only lose lines, never stall
+ * wland. WLAND_NOSTAMP=1 (or /var/local/wland.nostamp) writes the log as before.
+ */
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <time.h>
+#ifndef CLOCK_UPTIME_RAW
+#define CLOCK_UPTIME_RAW CLOCK_MONOTONIC	/* (Darwin: mach_absolute_time, the kernel log's clock) */
+#endif
+
+static int stamp_out = -1;
+
+static void *stamp_thread(void *arg)
+{
+	FILE *in = fdopen((int)(intptr_t)arg, "r");
+	char line[1024];
+	int at_start = 1;
+	if (!in)
+		return NULL;
+	while (fgets(line, sizeof(line), in)) {
+		char out[1100];
+		int n = 0;
+		if (at_start) {
+			struct timespec ts;
+			clock_gettime(CLOCK_UPTIME_RAW, &ts);
+			n = snprintf(out, sizeof(out), "[%4ld.%03ld] ", (long)ts.tv_sec, ts.tv_nsec / 1000000);
+		}
+		size_t l = strlen(line);
+		at_start = l && line[l - 1] == '\n';
+		memcpy(out + n, line, l);
+		if (write(stamp_out, out, (size_t)n + l) < 0)
+			break;
+	}
+	return NULL;
+}
+
+static void stamp_log(void)
+{
+	int fds[2];
+	pthread_t t;
+	if (getenv("WLAND_NOSTAMP") || !access("/var/local/wland.nostamp", F_OK))
+		return;
+	if ((stamp_out = dup(1)) < 0 || pipe(fds))
+		return;
+	fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL) | O_NONBLOCK);
+	if (pthread_create(&t, NULL, stamp_thread, (void *)(intptr_t)fds[0])) {
+		close(fds[0]);
+		close(fds[1]);
+		return;
+	}
+	pthread_detach(t);
+	dup2(fds[1], 1);
+	dup2(fds[1], 2);
+	close(fds[1]);
+}
+
 static int auto_up(void)
 {
 	/* launchd's per-process limit for a job killed us while the modem firmware loaded (jetsam reason 7) */
@@ -797,6 +857,7 @@ static int auto_up(void)
 	if (freopen(WLAND_LOG, "a", stdout))
 		dup2(fileno(stdout), 2);
 	setvbuf(stdout, NULL, _IONBF, 0);
+	stamp_log();
 	printf("wland auto: boot %ld, memory limit 2048 MB -> %d\n", (long)bt.tv_sec, mrc);
 	return up(0);
 }

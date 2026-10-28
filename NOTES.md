@@ -311,7 +311,7 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   properties (transport-encoding 3, 3 Mbaud, vendor/product/profiles/coex, compatible "bluetooth,n88"); AppleOLYHAL
   is an empty IOService for BlueTool's IOProviderClass match. Property reads logged found/MISSING, user-client
   requests refused + logged, setProperties keys logged (`SWEET BTNUB:`).
-- 0983 Bluetooth bridge (`btbridge=1`, no nodes by default): /dev/cu.bluetooth + /dev/uart.bluetooth (one H4 pipe
+- 1010 (was ws-q-bt's 0983) Bluetooth bridge (`btbridge=1`, no nodes by default): /dev/cu.bluetooth + /dev/uart.bluetooth (one H4 pipe
   bluetoothd opens) <-> /dev/btbridge (btd --bridge) + dummy /dev/btwake. Two 16 KiB rings, blocking/O_NONBLOCK/
   select; btd forwards standard HCI to the WCN3998 and fakes/logs vendor 0xFC__ commands (`SWEET BTBR:`, btd `BTD BRIDGE:`).
 - 0973 AppleARMBacklight publishes the panel's nits for CoreBrightness (MinNits/MaxNits/MaxNitsPanel,
@@ -326,7 +326,7 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   HardwareAccessibleMin/MaxNits, user-accessible-max-nits, digital-dimming-min-nits, brightness-nits(-cap),
   DisplayPanel/ProductLuminanceMin/Mid/Max: 2..500, integer nits; 500 nits <-> level 1023): `sweetnits=0` off.
   `tools/mkadt.py --backlight` (opt-in) also copies D22AP's /backlight node with max-nit-value/LmaxProduct = 500.
-- 0990 Sandbox op 4 (container path of a pid) answered: `bsd/kern/redfin_sandbox_container.c` returns the target's
+- 1011 (was ws-q-bt's 0990) Sandbox op 4 (container path of a pid) answered: `bsd/kern/redfin_sandbox_container.c` returns the target's
   `CFFIXED_USER_HOME=` from the strings exec left at the top of its user stack (as sysctl_procargsx reads them), so
   PlugInKit's `-[PKService checkEnvironment:]` stops killing every .appex ("plugin has invalid sandbox or container:
   error 2 path ?"; 0050/0924 answered ENOENT). No variable = ENOENT as before; `sweetcontainer=0` = always ENOENT.
@@ -334,3 +334,11 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   argslen N)` / `error N`, once per pid, 300 lines at most. Code: HackiOS `kern_minimac.c`
   `minisandbox_container_path` (APSL 2.0) via ios-topaz 0936 (same code, topaz's 0149 weak hook not needed: 0050 calls it
   directly), plus bounds checks and the log. If a pid logs `none`, pkd/RunningBoard did not set CFFIXED_USER_HOME.
+- 1012 = Yofuness/ios-flame sunfish 0188 (apple80211 auto-join diagnostics: log caps, 60 s summary, scan elements, set 383 dump).
+- 1013 = sunfish 0193: COUNTRY_CODE (51) get/set kept in the kernel, set 383 taken (`sweetwifiacc=0` refuses both, as before).
+- 1014 Wi-Fi signal for wifid: wland's FW_RSSI (joined network's signal every 2-10 s) feeds RSSI/CURRENT_NETWORK; NOISE 17
+  (-95), RATE 8, PHY_MODE 14, MCS 57 answered; while joined a timer posts the signal (`sweetwifilqm=` / sysctl
+  `kern.sweet_wifi_lqm`: 1 LINK_QUALITY 17, 2 RSSI_CHANGED 39, 4 LINK_CHANGED again, 8 snr/noise in LINK_CHANGED;
+  default 9; `kern.sweet_wifi_rssi` last told); a link wland made by itself posts SSID/BSSID/LINK (`sweetwifilink=0` off).
+  `SWEET WIFI: signal` lines. wland (same branch): re-auth when the AP kicks a stale association (reason 8, the
+  first auto-join after a reboot), 2 retries of a failed wifid join, uptime-stamped wland.log.

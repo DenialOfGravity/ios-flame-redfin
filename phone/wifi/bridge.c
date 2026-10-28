@@ -22,19 +22,45 @@ static int hello_sent;
 static int scan_pending, join_pending;
 static unsigned scans_at;
 static uint64_t scan_deadline, join_deadline, last_bg_scan;
+/*
+ * redfin 2026-10-28: a failed join of wifid's (the network not in the list yet, the AP refusing or not answering)
+ * is tried again here, up to JOIN_RETRIES times while wifid's join is still open, before wifid hears of it:
+ * wifid's own retry of an auto-join comes ~28 s later. The key stays only for the retries.
+ */
+#define JOIN_RETRIES	2
+static char join_ssid[33], join_pass[65];
+static int join_retries;
+static unsigned join_scans_at;
+static uint64_t join_retry_at;
+static int rssi_off;			/* the kernel refused FW_RSSI (a kernel without 1014): not sent again */
+static uint64_t rssi_next, rssi_sent_ms;
+static int rssi_sent = 1000;
+
+static void join_forget(void)
+{
+	memset(join_pass, 0, sizeof(join_pass));
+	join_retries = 0;
+	join_retry_at = 0;
+}
 int bridge_joins;	/* wifid has asked for a network (or to leave): wland's own wlan.conf join stands down */
 
-static void bridge_send(uint16_t type, const void *data, size_t len)
+/* 0 or the errno of the write */
+static int bridge_send(uint16_t type, const void *data, size_t len)
 {
 	uint8_t m[FW_MSG_MAX];
 	struct fw_hdr h = { type, (uint16_t)len };
 	if (bfd < 0 || len > sizeof(m) - sizeof(h))
-		return;
+		return EINVAL;
 	memcpy(m, &h, sizeof(h));
 	if (len)
 		memcpy(m + sizeof(h), data, len);
-	if (write(bfd, m, sizeof(h) + len) < 0 && type != FW_RX)
-		printf("[%6llu] bridge: write type %u: %s\n", (unsigned long long)link_ms(), type, strerror(errno));
+	if (write(bfd, m, sizeof(h) + len) < 0) {
+		int e = errno;
+		if (type != FW_RX && type != FW_RSSI)
+			printf("[%6llu] bridge: write type %u: %s\n", (unsigned long long)link_ms(), type, strerror(e));
+		return e;
+	}
+	return 0;
 }
 
 static void bridge_status(uint16_t type, int32_t status)
@@ -123,10 +149,15 @@ static void on_join(const struct fw_join *j)
 	}
 	if (radio_joined())
 		radio_disconnect();
+	join_forget();
+	snprintf(join_ssid, sizeof(join_ssid), "%s", ssid);
+	snprintf(join_pass, sizeof(join_pass), "%s", pass);
 	int r = radio_join(ssid, pass);
+	memset(pass, 0, sizeof(pass));
 	printf("[%6llu] bridge: join '%s' (%s) -> %d\n", (unsigned long long)link_ms(), ssid,
 	       j->key_kind == FW_KEY_PMK ? "PMK" : j->key_kind == FW_KEY_PASSPHRASE ? "passphrase" : "open", r);
 	if (r) {
+		join_forget();
 		bridge_status(FW_JOIN_DONE, r);
 		return;
 	}
@@ -232,6 +263,8 @@ void bridge_poll(void)
 			}
 			break;
 		case FW_JOIN:
+			join_pending = 0;
+			join_forget();
 			if (h.len >= sizeof(struct fw_join))
 				on_join((const struct fw_join *)p);
 			else
@@ -239,6 +272,8 @@ void bridge_poll(void)
 			break;
 		case FW_LEAVE:
 			bridge_joins = 1;
+			join_pending = 0;
+			join_forget();
 			printf("[%6llu] bridge: leave\n", (unsigned long long)link_ms());
 			radio_disconnect();
 			bridge_status(FW_LEFT, 0);
@@ -255,11 +290,60 @@ void bridge_poll(void)
 		scan_pending = 0;
 		bridge_list(0);			/* (after the deadline: what is known so far) */
 	}
-	if (join_pending) {
+	if (join_pending && join_retry_at) {
+		/* a retry waits for its moment (and, for a network not heard, a scan that has finished) */
+		if (now >= join_retry_at && (join_scans_at == 0 || radio_scans() > join_scans_at || now > join_retry_at + 8000)) {
+			join_retry_at = 0;
+			int r = radio_join(join_ssid, join_pass);
+			printf("[%6llu] bridge: join '%s' again (retry %d) -> %d\n", (unsigned long long)now, join_ssid,
+			       join_retries, r);
+			if (r) {
+				join_pending = 0;
+				join_forget();
+				bridge_status(FW_JOIN_DONE, r);
+			}
+		}
+	} else if (join_pending) {
 		int r = radio_join_result();
-		if (r != -1 || now > join_deadline) {
+		int again = (r == ENOENT || r == ECONNREFUSED || r == ETIMEDOUT || r == EIO) && join_retries < JOIN_RETRIES &&
+			    now + 12000 < join_deadline;
+		if (r != -1 && again) {
+			join_retries++;
+			join_scans_at = 0;
+			join_retry_at = now + 500;
+			if (r == ENOENT) {			/* not in the list: a fresh scan first */
+				join_scans_at = radio_scans();
+				radio_rescan(0);
+			}
+			printf("[%6llu] bridge: join '%s' failed (%s): trying again (%d/%d)\n", (unsigned long long)now,
+			       join_ssid, strerror(r), join_retries, JOIN_RETRIES);
+		} else if (r != -1 || now > join_deadline) {
 			join_pending = 0;
+			join_forget();
 			bridge_status(FW_JOIN_DONE, r == -1 ? ETIMEDOUT : r);
+		}
+	}
+	/* the joined network's signal for the status bar (kernel 1014): every 2 s when it moved 2 dB, else every 10 s */
+	if (!rssi_off && now >= rssi_next) {
+		int rssi;
+		uint32_t age;
+		rssi_next = now + 2000;
+		if (radio_link_rssi(&rssi, &age) == 0 && (abs(rssi - rssi_sent) >= 2 || now - rssi_sent_ms >= 10000)) {
+			struct fw_rssi q;
+			memset(&q, 0, sizeof(q));
+			q.rssi = (int16_t)rssi;
+			radio_ssid((uint8_t[32]){ 0 }, q.bssid);
+			q.age_s = (uint16_t)(age / 1000 > 0xffffu ? 0xffffu : age / 1000);
+			int e = bridge_send(FW_RSSI, &q, sizeof(q));
+			if (e == EINVAL) {
+				rssi_off = 1;
+				printf("[%6llu] bridge: the kernel takes no signal reports (no 1014)\n", (unsigned long long)now);
+			} else if (!e) {
+				rssi_sent = rssi;
+				rssi_sent_ms = now;
+			}
+		} else if (!radio_joined()) {
+			rssi_sent = 1000;
 		}
 	}
 }

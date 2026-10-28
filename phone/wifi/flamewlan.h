@@ -31,6 +31,7 @@ enum {
 	FW_LEFT = 21,			/* int32_t */
 	FW_LINK = 22,			/* struct fw_link: frames can pass now (up), or no longer (left or lost) */
 	FW_RX = 23,			/* an Ethernet frame */
+	FW_RSSI = 24,			/* struct fw_rssi: the joined network's signal, every few seconds (redfin 1014) */
 };
 
 #define FW_FRAME_MAX	1514
@@ -53,6 +54,13 @@ struct fw_link {
 	uint8_t up;
 	uint8_t ssid[32], ssid_len;	/* the network joined (also when wland joined it by itself: wlan.conf) */
 	uint8_t bssid[6];
+};
+
+struct fw_rssi {
+	int16_t rssi;			/* dBm, as the radio last heard the joined access point */
+	uint16_t tx_rate;		/* Mbit/s, 0: not known */
+	uint8_t bssid[6];
+	uint16_t age_s;			/* how old the reading is */
 };
 
 struct fw_bss {
