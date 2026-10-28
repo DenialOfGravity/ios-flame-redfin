@@ -11,9 +11,11 @@
  * /var/local/sweetfps ("MODE [TARGET]", read when readable, i.e. not inside app sandboxes), else the environment:
  *   SWEET_FPS=MODE    bit 0 log (NSLog "SweetFPS: ..."; bit 2 also appends to /var/tmp/sweetfps.log)
  *                     bit 1 rewrite: preferredFramesPerSecond / preferredFrameRateRange whose rate (max) is
- *                           in [SWEET_FPS_MIN, TARGET) becomes TARGET (range: {min, TARGET, TARGET})
+ *                           in [MIN, TARGET) becomes TARGET (range: {min, TARGET, TARGET})
  *                     bit 3 rewrite to 0 / CAFrameRateRangeDefault instead of TARGET
- *   SWEET_FPS_TARGET=N (default 90), SWEET_FPS_MIN=N (default 46: requests for <= 45 fps are left alone)
+ *   SWEET_FPS_TARGET=N (default 90), SWEET_FPS_MIN=N (default 25: requests below 25 fps are left alone); the mode
+ *   file takes both: "MODE TARGET MIN". The rate tested is a range's maximum (its preferred when the maximum is 0):
+ *   UIKit's inProcessAnimationManager asks for {20 30 0} (frame interval 3 on the 90 Hz heartbeat).
  * Hooks: -[CADisplayLink setPreferredFramesPerSecond:], setPreferredFrameRateRange:, setFrameInterval:,
  * addToRunLoop:forMode: (logs the link's rate state and the thread when it starts, and again 2 s later); each log
  * line carries the link's own view: heartbeatRate, maximumRefreshRate, minimumFrameDuration, frameInterval,
@@ -29,7 +31,7 @@
 #include <string.h>
 
 static unsigned sf_mode;
-static float sf_target = 90, sf_min = 46;
+static float sf_target = 90, sf_min = 25;
 static FILE *sf_file;
 
 static void
@@ -202,7 +204,10 @@ sf_init(void)
 	char *end = NULL;
 	sf_mode = (unsigned)strtoul(e, &end, 0);
 	if (end != NULL && *end == ' ') {
-		sf_target = (float)strtod(end + 1, NULL);
+		sf_target = (float)strtod(end + 1, &end);
+		if (end != NULL && *end == ' ') {
+			sf_min = (float)strtod(end + 1, NULL);  /* "MODE TARGET MIN" */
+		}
 	}
 	if ((e = getenv("SWEET_FPS_TARGET")) != NULL) {
 		sf_target = (float)atof(e);
