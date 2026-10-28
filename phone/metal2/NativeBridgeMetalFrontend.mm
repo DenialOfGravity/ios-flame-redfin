@@ -22,6 +22,8 @@
 #include <vector>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
+#include <sys/stat.h>
+#include <math.h>
 #include <unistd.h>
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -45,9 +47,17 @@
 // "native-metal: T cpufast 5s:" counts them.
 enum : uint32_t {CPUFAST_ANSWERS=0x1,CPUFAST_VIEWPORT=0x2};
 static const uint32_t kCpuFastDefault=CPUFAST_ANSWERS|CPUFAST_VIEWPORT;
+// u-lab: live knobs. /var/local/mtl2-live (KEY=VALUE lines, like mtl2-env) is looked at once a second from -commit (its
+// mtime; one stat per second) and its values override the env for the knobs that need no pipeline, device or thread
+// setup: SWEET_CPUFAST (bits), SWEET_ENCSTAT, SWEET_FNSTAT (0/1, with the timeline on), SWEET_ENC_SLOW_MS. A key not in the
+// file (or no file) = the env value again. Changes are logged "native-metal: live: KEY=VALUE". No restart: an A/B of
+// these switches in a second (tools-claude/exp-run.py `live` lines). All else (TU_DEBUG, SWEET_UBWC, bridge knobs, QoS)
+// is read once at startup and still needs the backboardd restart.
+static std::atomic<int64_t> gLiveCpuFast{-1},gLiveEncStat{-1},gLiveFnStat{-1},gLiveEncSlowMs{-1};
 static uint32_t cpuFast() {
  static const uint32_t bits=[]{const char *e=getenv("SWEET_CPUFAST");return e && *e?(uint32_t)strtoul(e,nullptr,0):kCpuFastDefault;}();
- return bits;
+ const int64_t live=gLiveCpuFast.load(std::memory_order_relaxed);
+ return live>=0?(uint32_t)live:bits;
 }
 static std::atomic<uint64_t> gCfAnswerHits{0},gCfAnswerAsks{0},gCfViewportSkips{0},gCfScissorSkips{0},gCfViewportSent{0},gCfScissorSent{0};
 
@@ -135,12 +145,14 @@ static bool timelineOn();
 static bool fnStatOn() {   // u-gpudraw
  static int on=-1;
  if(on<0){const char *e=getenv("SWEET_FNSTAT");on=timelineOn() && e && *e && strcmp(e,"0")?1:0;}
- return on==1;
+ const int64_t live=gLiveFnStat.load(std::memory_order_relaxed);
+ return live>=0?live && timelineOn():on==1;
 }
 static bool encStatOn() {
  static int on=-1;
  if(on<0){const char *e=getenv("SWEET_ENCSTAT");on=timelineOn() && !(e && !strcmp(e,"0"))?1:0;}
- return on==1;
+ const int64_t live=gLiveEncStat.load(std::memory_order_relaxed);
+ return live>=0?live && timelineOn():on==1;
 }
 static double encTickNs() {
  static double ns=0;
@@ -150,7 +162,45 @@ static double encTickNs() {
 static uint64_t encSlowTicks() {
  static uint64_t ticks=0;
  if(!ticks){const char *e=getenv("SWEET_ENC_SLOW_MS");double ms=e && atof(e)>0?atof(e):20;ticks=(uint64_t)(ms*1e6/encTickNs());}
- return ticks;
+ const int64_t live=gLiveEncSlowMs.load(std::memory_order_relaxed);
+ return live>0?(uint64_t)(live*1e6/encTickNs()):ticks;
+}
+// once a second at most (one thread wins the slot): the file's mtime; on a change, parse it and publish the values
+static void liveKnobsPoll() {
+ static std::atomic<uint64_t> next{0};
+ static struct timespec seen;
+ static bool had;
+ const uint64_t now=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+ uint64_t due=next.load(std::memory_order_relaxed);
+ if(now<due || !next.compare_exchange_strong(due,now+1000000000ull))return;
+ struct stat st;
+ const bool have=stat("/var/local/mtl2-live",&st)==0;
+ if(have==had && (!have || (st.st_mtimespec.tv_sec==seen.tv_sec && st.st_mtimespec.tv_nsec==seen.tv_nsec)))return;
+ had=have;
+ seen=have?st.st_mtimespec:(struct timespec){0,0};
+ int64_t cf=-1,es=-1,fs=-1,ms=-1;
+ if(FILE *f=have?fopen("/var/local/mtl2-live","r"):nullptr) {
+  char line[256];
+  while(fgets(line,sizeof line,f)) {
+   line[strcspn(line,"\r\n")]=0;
+   char *eq=strchr(line,'=');
+   if(line[0]=='#' || !eq)continue;
+   *eq=0;
+   const char *v=eq+1;
+   if(!strcmp(line,"SWEET_CPUFAST") && *v)cf=(int64_t)strtoul(v,nullptr,0);
+   else if(!strcmp(line,"SWEET_ENCSTAT"))es=strcmp(v,"0")?1:0;
+   else if(!strcmp(line,"SWEET_FNSTAT"))fs=*v && strcmp(v,"0")?1:0;
+   else if(!strcmp(line,"SWEET_ENC_SLOW_MS") && atof(v)>0)ms=(int64_t)atof(v);
+  }
+  fclose(f);
+ }
+ gLiveCpuFast.store(cf,std::memory_order_relaxed);gLiveEncStat.store(es,std::memory_order_relaxed);
+ gLiveFnStat.store(fs,std::memory_order_relaxed);gLiveEncSlowMs.store(ms,std::memory_order_relaxed);
+ char text[200];
+ snprintf(text,sizeof text,"native-metal: live: %s -> SWEET_CPUFAST=0x%x SWEET_ENCSTAT=%d SWEET_FNSTAT=%d SWEET_ENC_SLOW_MS=%llu",
+  have?"/var/local/mtl2-live read":"no /var/local/mtl2-live (env values)",cpuFast(),encStatOn(),fnStatOn(),
+  (unsigned long long)llround(encSlowTicks()*encTickNs()/1e6));
+ sm2_logs(text);
 }
 struct EncTLS {uint64_t ticks[EC_COUNT];uint32_t n[EC_COUNT];uint32_t depth;uint64_t scopes;};
 static __thread EncTLS tEnc;
@@ -1608,6 +1658,7 @@ static void noteDeviceLost(const char *why) {
  f.valid=true;
 }
 - (void)commit {
+ liveKnobsPoll();   // u-lab
  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
  self.committed=YES;
  self.committedUs=nowUs();
