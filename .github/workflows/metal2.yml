@@ -1,7 +1,7 @@
 name: metal2
 
 # SweetMetal2.bundle for iOS 16 arm64: Turnip (Mesa 85fda3b3 + UniXNU's mesa patches at the commit flame used +
-# phone/turnip/patches) and the metal2vulkan bridge (steelbrain/metal2vulkan 720ef1ce + phone/metal2/bridge/patches),
+# phone/turnip/patches) and the metal2vulkan bridge (steelbrain/metal2vulkan f6a96b7d + phone/metal2/bridge/patches; the 720ef1ce series is in patches/pin-720ef1ce),
 # linked by phone/metal2/build.sh. Install with tools/flame-metal2-install.sh; boot with sweetmtl=2.
 
 on:
@@ -16,7 +16,7 @@ permissions:
 env:
   MESA_COMMIT: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
   UNIXNU_COMMIT: e95b37d97875bd8b30c976fcdef44d35d9c27bf3
-  M2V_COMMIT: 720ef1ce
+  M2V_COMMIT: f6a96b7d
 
 jobs:
   build:

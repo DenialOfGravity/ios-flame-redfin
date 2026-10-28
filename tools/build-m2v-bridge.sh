@@ -2,7 +2,8 @@
 # Build the native Metal bridge (phone/metal2/bridge/NativeMetalBridge.rs: UniXNU's bridge over the metal2vulkan
 # runtime, MIT) as a static library for iOS 16 arm64.
 #   tools/build-m2v-bridge.sh [host]
-# Source: work/metal2vulkan = github.com/steelbrain/metal2vulkan 720ef1ce (UniXNU's pin) + phone/metal2/bridge/patches.
+# Source: work/metal2vulkan = github.com/steelbrain/metal2vulkan at M2V_COMMIT of .github/workflows/metal2.yml (f6a96b7d on
+# ws-u-m2vup; 720ef1ce, UniXNU's pin, before) + phone/metal2/bridge/patches/*.patch (the 720ef1ce series: patches/pin-720ef1ce).
 # Output: work/m2v-bridge/<target>/libnative_metal_bridge.a
 set -e
 cd "$(dirname "$0")/.."

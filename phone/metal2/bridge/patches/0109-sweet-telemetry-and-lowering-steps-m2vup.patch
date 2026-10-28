@@ -1,0 +1,425 @@
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index b2e42d93..3473d425 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -192,6 +192,10 @@ mod sampler;
+ mod scheduler;
+ mod shader_cache;
+ mod shadow;
++/// ios-on-pixel: shadow copy counts the SweetMetal2 bridge reads (`J copies`).
++pub mod sweet_counts;
++/// ios-on-pixel: render encoder step times and knobs the SweetMetal2 bridge reads (`T5`).
++pub mod sweet_drawstat;
+ mod shadow_copy_back;
+ mod shadow_copy_in;
+ mod shadow_merge;
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 28aedc2b..3155d2ec 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -1726,6 +1726,7 @@ impl CommandBuffer {
+         &self,
+         descriptor: &RenderPassDescriptor,
+     ) -> Result<RenderCommandEncoder, Error> {
++        let _span = crate::sweet_drawstat::Span::new(crate::sweet_drawstat::O_TOTAL);
+         // The last render encoder's end, where its call left it to the device's lowering thread.
+         self.settle_end();
+         // Metal's process ends here under some protection options (`command_buffer/protection.rs`).
+@@ -10633,6 +10634,7 @@ impl RenderCommandEncoder {
+         instance_count: u32,
+         base_instance: u32,
+     ) -> Result<(), Error> {
++        let _span = crate::sweet_drawstat::Span::new(crate::sweet_drawstat::D_TOTAL);
+         let primitive_type = primitive_type.into();
+         match self.lowers_at_call() {
+             true => self.at_call(|lowering| {
+@@ -10676,6 +10678,7 @@ impl RenderCommandEncoder {
+         base_vertex: i32,
+         base_instance: u32,
+     ) -> Result<(), Error> {
++        let _span = crate::sweet_drawstat::Span::new(crate::sweet_drawstat::D_TOTAL);
+         let primitive_type = primitive_type.into();
+         match self.lowers_at_call() {
+             true => self.at_call(|lowering| {
+@@ -10991,6 +10994,7 @@ impl RenderCommandEncoder {
+     /// is consumed either way, so a refusal leaves its command buffer abandoned, as Metal stops
+     /// there.
+     pub fn end_encoding(self) -> Result<(), Error> {
++        let _span = crate::sweet_drawstat::Span::new(crate::sweet_drawstat::E_TOTAL);
+         self.end()
+     }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/render/deferral.rs b/crates/metal2vulkan-runtime/src/render/deferral.rs
+index 90023fbc..efda78e9 100644
+--- a/crates/metal2vulkan-runtime/src/render/deferral.rs
++++ b/crates/metal2vulkan-runtime/src/render/deferral.rs
+@@ -141,6 +141,11 @@ impl Batch {
+         }
+         let counts = &lowering.core.device().shared().counts;
+         counts.render_log_batch_lowered(by_thread);
++        let _span = crate::sweet_drawstat::Span::new(crate::sweet_drawstat::L_BATCH);
++        crate::sweet_drawstat::count(match by_thread {
++            true => crate::sweet_drawstat::C_LOWER_THREAD,
++            false => crate::sweet_drawstat::C_LOWER_PROGRAM,
++        });
+         lowering.core.judges_unattached(true);
+         for (at, call) in (self.first..).zip(&self.calls.calls) {
+             let identity = EncoderCall::new(call.selector(), at);
+diff --git a/crates/metal2vulkan-runtime/src/sweet_counts.rs b/crates/metal2vulkan-runtime/src/sweet_counts.rs
+new file mode 100644
+index 00000000..9e816de4
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/sweet_counts.rs
+@@ -0,0 +1,57 @@
++//! ios-on-pixel: process-wide counts of shadowed textures' copies (`shadow.rs`), which the
++//! SweetMetal2 bridge reads for its telemetry (`J copies` lines in the kernel's log).
++//!
++//! - **copies**, **bytes**: copies between a buffer's bytes and a 2D texture's shadow image
++//!   recorded, either way, and the texel bytes they moved;
++//! - **repacked**: of those, the ones made through the rotation kernel at rotation 0 into rows
++//!   64 bytes apart (`ShadowTarget::Image::repack`), which Turnip copies in one blit;
++//! - **skipped**: converted (two-plane YCbCr) copies in not made, the planes' generation held;
++//! - **refusals**: `DRM_FORMAT_MOD_LINEAR` layouts the driver refused, or that were refused
++//!   again unasked (`texture/pitch_refusals.rs`), each a texture made a shadow instead.
++
++#![allow(dead_code)]
++
++use std::sync::atomic::{AtomicU64, Ordering};
++
++static COPIES: AtomicU64 = AtomicU64::new(0);
++static BYTES: AtomicU64 = AtomicU64::new(0);
++static REPACKED: AtomicU64 = AtomicU64::new(0);
++static SKIPPED: AtomicU64 = AtomicU64::new(0);
++static REFUSALS: AtomicU64 = AtomicU64::new(0);
++
++/// A copy of `bytes` texel bytes recorded, `repacked` through the kernel or not.
++pub(crate) fn copied(bytes: u64, repacked: bool) {
++    COPIES.fetch_add(1, Ordering::Relaxed);
++    BYTES.fetch_add(bytes, Ordering::Relaxed);
++    if repacked {
++        REPACKED.fetch_add(1, Ordering::Relaxed);
++    }
++}
++
++/// A converted copy in not made.
++pub(crate) fn skipped() {
++    SKIPPED.fetch_add(1, Ordering::Relaxed);
++}
++
++/// A linear layout refused.
++pub(crate) fn refused() {
++    REFUSALS.fetch_add(1, Ordering::Relaxed);
++}
++
++/// The counts since the process started: copies, bytes, repacked, skipped, refusals.
++pub fn snapshot() -> [u64; 5] {
++    [
++        COPIES.load(Ordering::Relaxed),
++        BYTES.load(Ordering::Relaxed),
++        REPACKED.load(Ordering::Relaxed),
++        SKIPPED.load(Ordering::Relaxed),
++        REFUSALS.load(Ordering::Relaxed),
++    ]
++}
++
++/// Whether textures whose rows Turnip copies a blit per row repack (env `SWEET_SHADOW_REPACK`,
++/// on unless `0`).
++pub(crate) fn repack_enabled() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("SWEET_SHADOW_REPACK").map_or(true, |v| v.trim() != "0"))
++}
+diff --git a/crates/metal2vulkan-runtime/src/sweet_drawstat.rs b/crates/metal2vulkan-runtime/src/sweet_drawstat.rs
+new file mode 100644
+index 00000000..8fbc2594
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/sweet_drawstat.rs
+@@ -0,0 +1,265 @@
++//! ios-on-pixel: where a render encoder's CPU time goes, per step of its draws and of its end
++//! (env `SWEET_DRAWSTAT=1`, off by default), and the draw-overhead knobs (`SWEET_DESC_REUSE`).
++//!
++//! The steps are laps: [`start`] marks the thread's clock, each [`lap`] adds the time since the
++//! last mark to its step and marks again, so the steps of one draw add up to the draw less what
++//! lies between laps. [`Span`] times a whole call. The counts ([`count`]) are events with no time.
++//! The SweetMetal2 bridge reads [`snapshot`] for its telemetry (`T5` lines in the kernel's log).
++
++#![allow(dead_code, missing_docs)]
++
++use std::cell::Cell;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::OnceLock;
++use std::time::Instant;
++
++// Laps of `RenderCommandEncoder::draw` and `draw_resident`, in order.
++pub const D_PRE: usize = 0;
++pub const D_CHECKS: usize = 1;
++pub const D_SETTINGS: usize = 2;
++pub const D_PASS_START: usize = 3;
++pub const D_SETTLE: usize = 4;
++pub const D_CHECKS2: usize = 5;
++pub const D_INSTANTIATE: usize = 6;
++pub const D_PASSES: usize = 7;
++pub const D_TABLES: usize = 8;
++pub const D_USES: usize = 9;
++pub const D_STATE: usize = 10;
++pub const D_DEGRADE: usize = 11;
++pub const D_PIPELINE: usize = 12;
++pub const D_BIND: usize = 13;
++pub const D_SETS: usize = 14;
++pub const D_TRACK: usize = 15;
++pub const D_PREP: usize = 16;
++pub const D_RECORD: usize = 17;
++pub const D_KEEP: usize = 18;
++pub const D_RETAIN: usize = 19;
++pub const D_POST: usize = 20;
++/// Whole `draw` calls (a span).
++pub const D_TOTAL: usize = 21;
++// Laps of a render encoder's end (`end_pass`, `end_encoding`).
++pub const E_PRE: usize = 22;
++pub const E_SETTLE: usize = 23;
++pub const E_PLAN: usize = 24;
++pub const E_OBJECTS: usize = 25;
++pub const E_PLAN2: usize = 26;
++pub const E_STEPS: usize = 27;
++pub const E_TAIL: usize = 28;
++pub const E_CORE: usize = 29;
++/// Whole render `end_encoding` calls (a span).
++pub const E_TOTAL: usize = 30;
++/// Whole `render_command_encoder` opens (a span).
++pub const O_TOTAL: usize = 31;
++// Counts.
++pub const C_RENDER_PASSES: usize = 32;
++pub const C_FRAMEBUFFERS: usize = 33;
++pub const C_SETS_ALLOCATED: usize = 34;
++pub const C_SETS_REUSED: usize = 35;
++pub const C_HELD_CLONES: usize = 36;
++pub const C_DESCRIPTOR_WRITES: usize = 37;
++// r36: `e.plan2` split (its tail, the copies and clears recorded before the pass, keeps E_PLAN2).
++pub const E_P2_PLAN: usize = 38;
++pub const E_P2_SHADOWS: usize = 39;
++pub const E_P2_USES: usize = 40;
++pub const E_P2_ENDSEC: usize = 41;
++// r36 counts: render passes and framebuffers found in the caches (`SWEET_RPCACHE`), draws that took
++// the fast path or were eligible and missed (`SWEET_FASTDRAW`), shadow copies in skipped as their
++// surface's seed held (`SWEET_SHADOW_SEED`).
++pub const C_RP_HITS: usize = 42;
++pub const C_FB_HITS: usize = 43;
++pub const C_FAST_HITS: usize = 44;
++pub const C_FAST_MISSES: usize = 45;
++pub const C_SEED_SKIPS: usize = 46;
++// u-cpu counts: fast-draw misses that found no entry of the encoder's current generation at all
++// (a state call since, or a new instance), and entries dropped for room (`fast_kept`).
++pub const C_FAST_MISS_GEN: usize = 47;
++pub const C_FAST_EVICTS: usize = 48;
++// m2vup (metal2vulkan f6a96b7d, `SWEET_M2V_LOWERING=worker`): a logged batch's lowering
++// (`render/deferral.rs`), wherever it ran, and the batches lowered on the device's lowering thread
++// and on the program's.
++pub const L_BATCH: usize = 49;
++pub const C_LOWER_THREAD: usize = 50;
++pub const C_LOWER_PROGRAM: usize = 51;
++pub const STEPS: usize = 52;
++
++/// Each step's short name, in the order of the constants above.
++pub const NAMES: [&str; STEPS] = [
++    "pre", "checks", "settings", "passstart", "settle", "checks2", "instantiate", "passes",
++    "tables", "uses", "state", "degrade", "pipeline", "bind", "sets", "track", "prep", "record",
++    "keep", "retain", "post", "DRAW", "e.pre", "e.settle", "e.plan", "e.objects", "e.p2.record",
++    "e.steps", "e.tail", "e.core", "END", "OPEN", "#rp", "#fb", "#set", "#set-reused",
++    "#held", "#writes", "e.p2.plan", "e.p2.shadows", "e.p2.uses", "e.p2.endsec", "#rp-hit",
++    "#fb-hit", "#fast-hit", "#fast-miss", "#seed-skip", "#fast-miss-gen", "#fast-evict", "LOWER",
++    "#lower-thread", "#lower-program",
++];
++
++static NS: [AtomicU64; STEPS] = [const { AtomicU64::new(0) }; STEPS];
++static N: [AtomicU64; STEPS] = [const { AtomicU64::new(0) }; STEPS];
++
++thread_local! {
++    static MARK: Cell<Option<Instant>> = const { Cell::new(None) };
++}
++
++fn flag(name: &str, default: bool) -> bool {
++    std::env::var(name).map_or(default, |v| {
++        let v = v.trim();
++        match default {
++            true => v != "0",
++            false => !v.is_empty() && v != "0",
++        }
++    })
++}
++
++/// Whether the steps are timed (env `SWEET_DRAWSTAT`, off unless set and not `0`).
++#[inline]
++pub fn on() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| flag("SWEET_DRAWSTAT", false))
++}
++
++/// Whether a draw takes the set 0 of an earlier draw of its command buffer that wrote the same
++/// descriptors through the same pipeline layout, in place of a new set written again (env
++/// `SWEET_DESC_REUSE`, on unless `0`).
++#[inline]
++pub fn desc_reuse() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| flag("SWEET_DESC_REUSE", true))
++}
++
++/// Whether render passes and framebuffers are kept for reuse (env `SWEET_RPCACHE`, on unless `0`):
++/// a pass of the same attachments, operations and subpass is the kept one, never destroyed until
++/// its device is; a framebuffer of the same pass, views and size is the kept one while every
++/// texture it renders lives and no view went since it was made.
++#[inline]
++pub fn rp_cache() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| flag("SWEET_RPCACHE", true))
++}
++
++/// Whether a draw that repeats the last one's bind state takes the steps the last one settled
++/// (env `SWEET_FASTDRAW`, on unless `0`; `render.rs` `SweetFast`).
++#[inline]
++pub fn fast_draw() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| flag("SWEET_FASTDRAW", true))
++}
++
++/// Whether a surface texture's shadow skips its copy in while its image holds the bytes of the
++/// surface's seed the frontend gave (env `SWEET_SHADOW_SEED`, off unless set and not `0`).
++#[inline]
++pub fn shadow_seed() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| flag("SWEET_SHADOW_SEED", false))
++}
++
++/// ios-on-pixel u-cpu: the runtime's bits of env `SWEET_CPUFAST` (one bitmask with the SweetMetal2
++/// frontend's 0x1 and 0x2; unset or empty = [`CPU_FAST_DEFAULT`]).
++#[inline]
++pub fn cpu_fast() -> u32 {
++    static BITS: OnceLock<u32> = OnceLock::new();
++    *BITS.get_or_init(|| {
++        std::env::var("SWEET_CPUFAST")
++            .ok()
++            .map(|v| v.trim().to_string())
++            .filter(|v| !v.is_empty())
++            .and_then(|v| match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
++                Some(hex) => u32::from_str_radix(hex, 16).ok(),
++                None => v.parse().ok(),
++            })
++            .unwrap_or(CPU_FAST_DEFAULT)
++    })
++}
++
++/// `SWEET_CPUFAST` bit 0x4: an encoder keeps [`FAST_KEPT_MORE`] fast-draw entries, not
++/// [`FAST_KEPT`] (`render/sweet_fast.rs`). Exact either way: an entry is taken only where its
++/// whole key matches; more entries only let fewer draws settle again.
++pub const CPU_FAST_KEPT: u32 = 0x4;
++/// The bits on where `SWEET_CPUFAST` is unset (the frontend's 0x1 and 0x2 among them).
++pub const CPU_FAST_DEFAULT: u32 = 0x1 | 0x2 | CPU_FAST_KEPT;
++/// The fast-draw entries an encoder keeps by default.
++pub(crate) const FAST_KEPT: usize = 6;
++/// The fast-draw entries an encoder keeps with [`CPU_FAST_KEPT`].
++pub(crate) const FAST_KEPT_MORE: usize = 16;
++
++/// The fast-draw entries an encoder keeps now.
++#[inline]
++pub(crate) fn fast_kept() -> usize {
++    match cpu_fast() & CPU_FAST_KEPT {
++        0 => FAST_KEPT,
++        _ => FAST_KEPT_MORE,
++    }
++}
++
++/// The most framebuffers a device keeps (`attachmentless::KeptPasses`).
++pub(crate) const KEPT_FRAMEBUFFERS: usize = 48;
++/// The most render passes a device keeps beyond the attachmentless and compatible ones.
++pub(crate) const KEPT_PASSES: usize = 512;
++
++/// Mark the thread's clock: the next [`lap`] times from here.
++#[inline]
++pub fn start() {
++    if on() {
++        MARK.with(|m| m.set(Some(Instant::now())));
++    }
++}
++
++/// Add the time since the thread's last mark to `step`, and mark again.
++#[inline]
++pub fn lap(step: usize) {
++    if !on() {
++        return;
++    }
++    let now = Instant::now();
++    if let Some(then) = MARK.with(|m| m.replace(Some(now))) {
++        NS[step].fetch_add(now.duration_since(then).as_nanos() as u64, Ordering::Relaxed);
++        N[step].fetch_add(1, Ordering::Relaxed);
++    }
++}
++
++/// One event of `step`.
++#[inline]
++pub fn count(step: usize) {
++    count_n(step, 1);
++}
++
++/// `n` events of `step`.
++#[inline]
++pub fn count_n(step: usize, n: u64) {
++    if on() {
++        N[step].fetch_add(n, Ordering::Relaxed);
++    }
++}
++
++/// A whole call's time, into `step` when it drops.
++pub struct Span(usize, Option<Instant>);
++
++impl Span {
++    #[inline]
++    pub fn new(step: usize) -> Span {
++        Span(step, on().then(Instant::now))
++    }
++}
++
++impl Drop for Span {
++    #[inline]
++    fn drop(&mut self) {
++        if let Some(then) = self.1 {
++            NS[self.0].fetch_add(then.elapsed().as_nanos() as u64, Ordering::Relaxed);
++            N[self.0].fetch_add(1, Ordering::Relaxed);
++        }
++    }
++}
++
++/// Each step's nanoseconds and count since the process started, as pairs, into `out` (at most
++/// `out.len() / 2` steps): the number of steps written.
++pub fn snapshot(out: &mut [u64]) -> usize {
++    let steps = (out.len() / 2).min(STEPS);
++    for i in 0..steps {
++        out[2 * i] = NS[i].load(Ordering::Relaxed);
++        out[2 * i + 1] = N[i].load(Ordering::Relaxed);
++    }
++    steps
++}
++
++/// The most sets a command buffer's arena remembers for reuse (`DescriptorArena::sweet_memo`).
++pub(crate) const MEMO_SETS: usize = 16;
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 37893883..bd2d1922 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -4062,6 +4062,19 @@ pub(super) enum IdUse {
+ }
+ 
+ impl Texture {
++    /// ios-on-pixel (bridge patch 0103 at the pin): the generation of a two-plane YCbCr texture's
++    /// planes. At this upstream the conversion refreshes only where the planes' words changed
++    /// (`ycbcr.rs`, a GPU compare), so the hint is not taken: false, as for any other texture.
++    pub fn set_converted_generation(&self, _generation: u64) -> bool {
++        false
++    }
++
++    /// ios-on-pixel (bridge patch 0107 at the pin, `SWEET_SHADOW_SEED`): the surface seed a
++    /// shadowed texture's bytes are bound at. Not ported to this upstream yet: false.
++    pub fn set_bytes_generation(&self, _generation: u64) -> bool {
++        false
++    }
++
+     /// A new texture object of `device` over `storage`, presenting `record`, a view of `parent`
+     /// if any, with its resource ID as `id_use` says. A program's texture takes its ID's slot,
+     /// and the device's texture table and heap sets hold it there (`heap_sets::place`).

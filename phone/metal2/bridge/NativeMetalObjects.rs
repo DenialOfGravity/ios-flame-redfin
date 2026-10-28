@@ -165,7 +165,23 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         options.metal_level = Some(MetalLevel::NEWEST);
         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
         options.messages = Some(MessageSink::new(observe_message));
+        // m2vup: SWEET_M2V_LOWERING=worker logs render encoder calls and lowers them in batches of 32 on the device's lowering thread
+        // (metal2vulkan RenderLoweringPolicy::Worker); inline (the default) lowers each call inside it, as before.
+        if sweet_m2v_lowering() == 1 {
+            options.policy.render_lowering = metal2vulkan::device::RenderLoweringPolicy::Worker;
+        }
         Ok(boxed(NmbDevice(Device::system_default_with(&options).map_err(e("device"))?, std::sync::OnceLock::new(), std::sync::Mutex::new(()))))
+    })
+}
+
+/// SweetMetal2 (m2vup): how render encoder calls are lowered, from env `SWEET_M2V_LOWERING`: 0 `inline` (the default, each call
+/// inside it), 1 `worker` (logged, lowered in batches on the device's lowering thread).
+#[unsafe(no_mangle)]
+pub extern "C" fn sweet_m2v_lowering() -> u32 {
+    static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("SWEET_M2V_LOWERING").as_deref().map(str::trim) {
+        Ok("worker") | Ok("1") => 1,
+        _ => 0,
     })
 }
 
@@ -1626,7 +1642,7 @@ fn shared<'a>(event: *const NmbEvent) -> Result<&'a SharedEvent, String> {
 /// forwards to it).
 fn listener() -> Result<&'static SharedEventListener, String> {
     static LISTENER: std::sync::OnceLock<Result<SharedEventListener, String>> = std::sync::OnceLock::new();
-    LISTENER.get_or_init(|| SharedEventListener::new().map_err(e("listener"))).as_ref().map_err(|why| why.clone())
+    LISTENER.get_or_init(|| Ok(SharedEventListener::new())).as_ref().map_err(|why: &String| why.clone())
 }
 
 #[unsafe(no_mangle)]

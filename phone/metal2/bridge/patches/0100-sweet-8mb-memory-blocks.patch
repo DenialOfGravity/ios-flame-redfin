@@ -1,10 +1,10 @@
 diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
-index de3df1e..38dfa34 100644
+index 25c32549..b805ac82 100644
 --- a/crates/metal2vulkan-runtime/src/memory.rs
 +++ b/crates/metal2vulkan-runtime/src/memory.rs
-@@ -48,8 +48,9 @@ use std::ptr::NonNull;
- use std::sync::Arc;
- use std::sync::Mutex;
+@@ -63,8 +63,9 @@ use std::ptr::NonNull;
+ use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant};
  
 -/// The size of a pooled block, at most the device's `maxMemoryAllocationSize`.
 -pub(super) const BLOCK_BYTES: u64 = 64 << 20;
@@ -12,5 +12,5 @@ index de3df1e..38dfa34 100644
 +/// kernel backs every block with RAM at once, and each process paid 64 MB per memory class it touched.
 +pub(super) const BLOCK_BYTES: u64 = 8 << 20;
  
- /// What memory a resource needs.
- #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ /// The most empty pooled blocks a pool keeps for its next placements ([`Pool::release`]), at
+ /// most 128 MiB of empty memory a pool. In a pool the encodings place in, one of them is mostly

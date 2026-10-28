@@ -2664,6 +2664,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  gMissing=missing;gInFlight=[NSMutableSet set];
  gDevice=nmb_device_open(loader,cache);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
+ sm2_logs(sweet_m2v_lowering()?"native-metal: render lowering worker (SWEET_M2V_LOWERING)":"native-metal: render lowering inline (SWEET_M2V_LOWERING)");
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
  prewarmStart(cache);
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
