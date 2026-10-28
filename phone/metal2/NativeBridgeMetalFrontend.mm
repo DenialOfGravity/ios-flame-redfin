@@ -1095,7 +1095,8 @@ static void notified(void *context,uint64_t value) {
 // creation, query and CPU-visible answer (contents, pixel formats, sizes), replaceRegion (its bytes are written now, as Metal does;
 // a bind recorded before it re-copies its surface's shadow), shared event CPU calls. status/error/GPU times answer Committed/none
 // until the commit is replayed. A refusal at replay fails the command buffer as before (logged, completed with an error).
-// "native-metal: T enc-thread 5s:" (with the timeline) counts it. SWEET_ENCTHREAD_SPIN_US (50): the worker's spin before it sleeps.
+// "native-metal: T enc-thread 5s:" (with the timeline) counts it. SWEET_ENCTHREAD_SPIN_US (50): the worker's spin before it sleeps;
+// SWEET_ENCTHREAD_PRI (54, CA's display thread's; 0 = user-interactive QoS only): its fixed RR priority.
 enum EncOp : uint8_t {EO_RENDER_NEW,EO_BLIT_NEW,EO_END,EO_DISCARD,EO_BUFFER,EO_OFFSET,EO_BYTES,EO_TEXTURE,EO_SAMPLER,EO_FENCE,EO_PIPELINE,
  EO_DSS,EO_VIEWPORT,EO_SCISSOR,EO_RASTER,EO_DEPTH_BIAS,EO_LINE_WIDTH,EO_VISIBILITY,EO_STENCIL_REF,EO_BLEND_COLOR,EO_DRAW,EO_DRAW_INDEXED,
  EO_COPY_BUFFER,EO_FILL_BUFFER,EO_COPY_TEXTURE,EO_BUFFER_TO_TEXTURE,EO_TEXTURE_TO_BUFFER,EO_MIPMAPS,EO_EVENT,EO_COMMIT,EO_COUNT};
@@ -1141,7 +1142,9 @@ static EncChunk *encChunk() {   // gEqLock held
 }
 static void *encWorkerMain(void *) {
  pthread_setname_np("sweet.encthread");
- if(const char *p=getenv("SWEET_ENCTHREAD_PRI"))if(atoi(p)>0){struct sched_param sp={};sp.sched_priority=atoi(p);pthread_setschedparam(pthread_self(),SCHED_RR,&sp);}
+ // CA's display thread runs at a fixed priority 54 (RR): the work it hands over keeps that (SWEET_ENCTHREAD_PRI=N, 0: QoS only)
+ const char *pri=getenv("SWEET_ENCTHREAD_PRI");const int priority=pri && *pri?atoi(pri):54;
+ if(priority>0){struct sched_param sp={};sp.sched_priority=priority;pthread_setschedparam(pthread_self(),SCHED_RR,&sp);}
  encThreadNote();
  static const uint64_t spinTicks=[]{const char *e=getenv("SWEET_ENCTHREAD_SPIN_US");const double us=e && *e?atof(e):50;
   return (uint64_t)(std::max(0.0,us)*1e3/encTickNs());}();
