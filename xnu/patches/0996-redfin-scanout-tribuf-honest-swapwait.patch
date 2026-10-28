@@ -1,0 +1,219 @@
+From 14d650b7f55a2ce42a328d6d6d39caf65474fd75 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Wed, 28 Oct 2026 12:10:49 +0100
+Subject: [PATCH] 0996 redfin: direct scanout tribuf (p scanout tribuf 1,
+ sweetfbx 0x40): SwapWait polls answer Busy until latched, gate by chain depth
+
+CA's IOMFBDisplay::can_update_ (iOS 18.2 decompile) frees a swap ring entry,
+and the framebuffer surface it holds, only when SwapWait(id, 0x80000000|x)
+answers 0 for the swap after it; kIOReturnBusy = still pending. 0983 answered
+0 for the newest swap at once, so K-1's entry and surface were free right
+after SwapEnd K: CA drew K+1 into K-1's surface (chain 2) and the 0985/0989
+gate held the GPU until K was on screen (GPU idle ~6-7 ms a frame). With
+tribuf on, polls answer Busy while the swap is queued or flipping (0 once it
+or a later one is latched, dropped, late, or after 100 ms), and at chain
+depth 3 the swapper's submits wait for K-1 on screen instead of K. Off by
+default; non-poll SwapWaits are unchanged. 5 s line: SCANOUT 5s tribuf.
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 108 +++++++++++++++++++++++++-
+ 1 file changed, 107 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f60e148..7d9111d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -118,6 +118,7 @@ enum {
+ #define SWEET_FBX_CPUPRESENT    0x8
+ #define SWEET_FBX_VSYNC         0x10    /* 0995: = sweetvsync 3 (ticks without timer slop, calibration keeps its tick) */
+ #define SWEET_FBX_REFRESH       0x20    /* 0995: = sweetfb_refresh=1 (IOMFBDisplayRefresh from the measured period) */
++#define SWEET_FBX_TRIBUF        0x40    /* 0996: = p scanout tribuf 1 at boot (SwapWait polls answer Busy, gate by depth) */
+ static uint32_t sweet_fbx;
+ 
+ /*
+@@ -402,6 +403,7 @@ static uint32_t get32(const uint8_t *p, uint32_t off);      /* 0994: the trace r
+ static bool sweet_scan_live(void);
+ static bool sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence);
+ static void sweet_scan_wait(AppleCLCD *fb, uint32_t id);
++static IOReturn sweet_scan_poll(AppleCLCD *fb, uint32_t id);    /* 0996 */
+ static void sweet_scan_set(AppleCLCD *fb, bool on, const char *why);
+ 
+ static AppleCLCD *sweet_fb_instance;    /* 0943: for the poke commands (p fc, p hz) */
+@@ -2393,6 +2395,9 @@ static struct {
+ 	uint64_t      armedAbs;         /* ... when that was armed */
+ 	uint32_t      stGpuWait, stGpuRelease;
+ 	bool          corners;          /* 0986: p scanout corners 1: the corner mattes drawn into each frame */
++	bool          tribuf;           /* 0996: p scanout tribuf 1 / sweetfbx 0x40: honest SwapWait polls, gate by depth */
++	uint32_t      gateDepth;        /* 0996: the chain depth the pending gate was set for (2 = K on screen) */
++	uint32_t      stTbBusy, stTbDone, stTbStale, stTbShort, stTbGate3;
+ 	uint64_t      stCornerAbs;
+ 	uint32_t      stCorners;
+ 	int           gatePid;          /* 0985: who swapped (backboardd): its GPU submits wait for gateSeq on screen */
+@@ -2626,6 +2631,9 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+ 		}
+ 	}
+ 	sweet_scan.depth = d >= 2 ? d : 2;
++	if (sweet_scan.tribuf && sweet_scan.gateDepth > sweet_scan.depth) {
++		sweet_scan.stTbShort++;         /* 0996: drawn into a surface the relaxed gate did not wait for */
++	}
+ 	sweet_scan.chain[sweet_scan.chainNext] = s->id;
+ 	sweet_scan.chainSeq[sweet_scan.chainNext] = sweet_scan.seq + 1;
+ 	sweet_scan.chainNext = (sweet_scan.chainNext + 1) % 8;
+@@ -2656,6 +2664,12 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+ 		sweet_scan.lastSwap = sweet_scan.later[i].swap;
+ 		sweet_scan.gatePid = proc_selfpid();
+ 		sweet_scan.gateSeq = sweet_scan.later[i].seq;
++		sweet_scan.gateDepth = 2;
++		if (sweet_scan.tribuf && sweet_scan.depth >= 3) {
++			sweet_scan.gateSeq = sweet_scan.later[i].seq - 1;      /* 0996: as below */
++			sweet_scan.gateDepth = 3;
++			sweet_scan.stTbGate3++;
++		}
+ 		sweet_scan.stQueued++;
+ 		sweet_scan.stFrames++;
+ 		SWEET_TRACE(SWT_SCAN_SWAP, sweet_scan.later[i].swap, sweet_scan.later[i].seq, 1, sweet_scan.depth);    /* 0994 */
+@@ -2709,6 +2723,18 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+ 		 */
+ 		sweet_scan.gatePid = proc_selfpid();
+ 		sweet_scan.gateSeq = seq;
++		sweet_scan.gateDepth = 2;
++		if (sweet_scan.tribuf && depth >= 3) {
++			/*
++			 * 0996: CA rotates 3 surfaces: K+1 writes the one of K-2 (if it keeps the rotation), which is free once
++			 * K-1 is on screen. CA itself only reuses a surface after SwapWait said the swap after it is on screen
++			 * (honest polls, sweet_scan_poll), so this gate is a second line; a frame that comes back with a shorter
++			 * depth than this is counted (short).
++			 */
++			sweet_scan.gateSeq = seq - 1;
++			sweet_scan.gateDepth = 3;
++			sweet_scan.stTbGate3++;
++		}
+ 		IOLockUnlock(fb->fLock);
+ 		return true;
+ 	}
+@@ -2814,6 +2840,59 @@ sweet_scan_wait(AppleCLCD *fb, uint32_t id)
+ 	IOLockUnlock(fb->fLock);
+ }
+ 
++/*
++ * 0996: SwapWait as a poll (p scanout tribuf 1). QuartzCore's IOMFBDisplay::can_update_ (iOS 18.2 decompile, the same
++ * call r37a logged on 16.7: scalars id, 0x80000000 | (a later swap exists)) frees a swap ring entry, and the
++ * framebuffer surface it holds, only when SwapWait answers 0 for the swap after it; kIOReturnBusy (0xe00002d5) means
++ * "still pending" and it tries again on its next update. 0983 answered 0 for the newest swap at once, so the entry of
++ * K-1 and its surface were free as soon as K was ended: CA drew K+1 into K-1's surface (a 2-surface chain) and the
++ * GPU had to wait for K on screen (the 0985/0989 gate). Here a poll answers 0 only once that swap (or a later one) is
++ * latched, or it is no longer pending (dropped, late, a normal-path frame); pending past 100 ms: 0 (never stuck).
++ * With CA's ring of 3 that keeps K-1's surface in use until K is on screen and CA takes a third one for K+1.
++ */
++static IOReturn
++sweet_scan_poll(AppleCLCD *fb, uint32_t id)
++{
++	if (!sweet_scan.on) {
++		return kIOReturnSuccess;
++	}
++	IOLockLock(fb->fLock);
++	sweet_scan.stWait++;
++	uint64_t since = 0;
++	bool pending = false;
++	if (sweet_scan.geom && (int32_t)(sweet_scan.shownSwap - id) < 0) {
++		if (sweet_scan.flipping != NULL && sweet_scan.flipSwap == id) {
++			pending = true;
++			since = sweet_scan.flipSwapAbs;
++		} else if (sweet_scan.next != NULL && sweet_scan.nextSwap == id) {
++			pending = true;
++			since = sweet_scan.nextAbs;
++		} else {
++			for (uint32_t i = 0; i < sweet_scan.laterN; i++) {
++				if (sweet_scan.later[i].s != NULL && sweet_scan.later[i].swap == id) {
++					pending = true;
++					since = sweet_scan.later[i].abs;
++				}
++			}
++		}
++	}
++	if (pending) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - since, &ns);
++		if (ns > 100 * NSEC_PER_MSEC) {
++			sweet_scan.stTbStale++;
++			pending = false;
++		}
++	}
++	if (pending) {
++		sweet_scan.stTbBusy++;
++	} else {
++		sweet_scan.stTbDone++;
++	}
++	IOLockUnlock(fb->fLock);
++	return pending ? kIOReturnBusy : kIOReturnSuccess;
++}
++
+ /*
+  * 0986: corner mattes in direct mode (p scanout corners 1). The CPU present darkens the panel's rounded corners with
+  * fCornerCov (copyRow); the display engine has no matte, so the drawn frame gets one itself: after its fence (the GPU
+@@ -3015,6 +3094,13 @@ sweet_scan_stats_locked(uint64_t now)
+ 		sweet_scan.stCorners = 0;
+ 		sweet_scan.stGateAbs = 0;
+ 		sweet_scan.stGate = sweet_scan.stGateWait = sweet_scan.stGateTimeout = 0;
++	}
++	if (sweet_scan.tribuf) {
++		/* 0996 */
++		IOLog("SWEET SCANOUT: 5s tribuf: polls busy %u done %u stale %u | gate at K-1 %u | short %u | chain %u-%u\n",
++		    sweet_scan.stTbBusy, sweet_scan.stTbDone, sweet_scan.stTbStale, sweet_scan.stTbGate3, sweet_scan.stTbShort,
++		    sweet_scan.stDepthMin, sweet_scan.stDepthMax);
++		sweet_scan.stTbBusy = sweet_scan.stTbDone = sweet_scan.stTbStale = sweet_scan.stTbGate3 = sweet_scan.stTbShort = 0;
+ 	}	sweet_scan.stFenceAbs = sweet_scan.stLatchAbs = sweet_scan.stLatchMax = 0;
+ 	sweet_scan.stFrames = sweet_scan.stFlips = sweet_scan.stLatched = sweet_scan.stDropped = sweet_scan.stNonslot = 0;
+ 	sweet_scan.stLate = sweet_scan.stBp = sweet_scan.stBpTimeout = sweet_scan.stWait = sweet_scan.stWaitTimeout = 0;
+@@ -3069,6 +3155,7 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+ 		uint32_t g = 1;         /* 0989: boot-arg sweetscangate=0|1|2 (default 1, the CPU gate) */
+ 		PE_parse_boot_argn("sweetscangate", &g, sizeof(g));
+ 		sweet_scan.gate = g <= 2 ? g : 1;
++		sweet_scan.tribuf = (sweet_fbx & SWEET_FBX_TRIBUF) != 0;     /* 0996 */
+ 		sweet_scan.thread = IOCreateThread(sweet_scan_thread, fb) != NULL;
+ 		if (!sweet_scan.thread) {
+ 			IOLog("SWEET SCANOUT: no thread: stays off\n");
+@@ -3107,6 +3194,7 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+  *   p scanout gate 0|1|2   0985: SwapEnd back pressure (0), the swapper's GPU submits wait (1, default), 0989: the
+  *                          CP waits for the latch (2; boot-arg sweetscangate)
+  *   p scanout corners 0|1  0986: corner mattes drawn into each direct frame (default off)
++ *   p scanout tribuf 0|1   0996: SwapWait polls (0x80000000) answer Busy until latched; gate by chain depth (off)
+  *   p vsync [MASK [LEAD_US]] | p vsync refresh [NS]   0995: tick timer options, IOMFBDisplayRefresh (above)
+  */
+ extern "C" void sweet_gpu_stats_flush(void);     /* 0991 */
+@@ -3323,6 +3411,20 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+ 			IOLockUnlock(fLock);
+ 			IOLog("SWEET SCANOUT: gate %u (%s)\n", sweet_scan.gate, sweet_scan.gate == 0 ? "SwapEnd back pressure" :
+ 			    sweet_scan.gate == 1 ? "GPU submits wait on the CPU" : "the CP waits for the latch");
++		} else if (end - q >= 6 && !strncmp(q, "tribuf", 6)) {
++			/* 0996: p scanout tribuf 0|1 */
++			const char *v = q + 6;
++			while (v < end && *v == ' ') {
++				v++;
++			}
++			IOLockLock(fLock);
++			sweet_scan.tribuf = v < end && *v == '1';
++			sweet_scan.gateDepth = 2;
++			IOLockWakeup(fLock, &sweet_scan.shownSeq, false);
++			IOLockUnlock(fLock);
++			IOLog("SWEET SCANOUT: tribuf %s (SwapWait polls %s, gate %s)\n", sweet_scan.tribuf ? "on" : "off",
++			    sweet_scan.tribuf ? "busy until latched" : "done at once for the newest",
++			    sweet_scan.tribuf ? "K-1 on screen at chain 3" : "K on screen");
+ 		} else if (q < end && (*q == '0' || *q == '1')) {
+ 			sweet_scan_set(this, *q == '1', "p scanout");
+ 		} else {
+@@ -4197,7 +4299,11 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				    args->scalarInput[0], args->scalarInputCount > 1 ? args->scalarInput[1] : 0, last);
+ 			}
+ 			if ((uint32_t)(last - id) < 16) {
+-				sweet_scan_wait(fFB, id);
++				if (sweet_scan.tribuf && args->scalarInputCount >= 2 && (args->scalarInput[1] & 0x80000000ULL)) {
++					ret = sweet_scan_poll(fFB, id);         /* 0996 */
++				} else {
++					sweet_scan_wait(fFB, id);
++				}
+ 			}
+ 		}
+ 		sweet_swaptrace('w', args->scalarInputCount >= 1 ? (uint32_t)args->scalarInput[0] : 0);  /* 0987 */
+-- 
+2.43.0
+
