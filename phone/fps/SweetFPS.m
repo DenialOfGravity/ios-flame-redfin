@@ -6,8 +6,9 @@
  * links run at 90 Hz. Presumably a 60 fps request (iPhone X: UIScreen.maximumFramesPerSecond 60) that CA quantises
  * onto 90/n. This library logs every rate request with its thread, and can rewrite the requests.
  *
- * Inserted with DYLD_INSERT_LIBRARIES=/var/local/lib/SweetFPS.dylib (SpringBoard's launchd EnvironmentVariables,
- * or xnu 0912 sweetenv/sweetui). Environment (or the file /var/local/sweetfps: "MODE [TARGET]" when the env is unset):
+ * Inserted with DYLD_INSERT_LIBRARIES=/var/local/lib/SweetFPS.dylib: xnu 0999 (boot sweetfbx |= 0x100) does it for
+ * SpringBoard and apps with SWEET_FPS=2, or SpringBoard's launchd EnvironmentVariables. Mode: the file
+ * /var/local/sweetfps ("MODE [TARGET]", read when readable, i.e. not inside app sandboxes), else the environment:
  *   SWEET_FPS=MODE    bit 0 log (NSLog "SweetFPS: ..."; bit 2 also appends to /var/tmp/sweetfps.log)
  *                     bit 1 rewrite: preferredFramesPerSecond / preferredFrameRateRange whose rate (max) is
  *                           in [SWEET_FPS_MIN, TARGET) becomes TARGET (range: {min, TARGET, TARGET})
@@ -181,16 +182,18 @@ sf_hook(void)
 __attribute__((constructor)) static void
 sf_init(void)
 {
-	const char *e = getenv("SWEET_FPS");
+	/* the file (readable outside app sandboxes) overrides the environment (SWEET_FPS=2 from xnu 0999) */
+	const char *e = NULL;
 	char buf[64] = "";
-	if (e == NULL) {
-		FILE *f = fopen("/var/local/sweetfps", "r");
-		if (f != NULL) {
-			if (fgets(buf, sizeof(buf), f) != NULL) {
-				e = buf;
-			}
-			fclose(f);
+	FILE *f = fopen("/var/local/sweetfps", "r");
+	if (f != NULL) {
+		if (fgets(buf, sizeof(buf), f) != NULL) {
+			e = buf;
 		}
+		fclose(f);
+	}
+	if (e == NULL) {
+		e = getenv("SWEET_FPS");
 	}
 	unsetenv("DYLD_INSERT_LIBRARIES");      /* children must not inherit the insertion */
 	if (e == NULL) {
