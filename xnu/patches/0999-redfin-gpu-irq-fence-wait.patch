@@ -16,7 +16,7 @@ carries the CP_EVENT_WRITE IRQ bit, RBBM_INT_0_MASK lets only
 CP_CACHE_FLUSH_TS through, and kgsl_3d0_irq (redfin DT: GIC SPI 300,
 level, INTID 332; sweetgpuirqid) acks RBBM_INT_0_STATUS, wakes the fence
 waiters and kicks the scanout thread. Waiters still look every
-sweetgpuirqslice us (default 2000) for the hang check and a lost
+sweetgpuirqslice us (default 5000) for the hang check and a lost
 interrupt; 64 fences landing with no interrupt at all switch it back to
 polling. "p gpuirq" prints the counters. kdebug 0x16 GPU_IRQ. Adapted
 from UniXNU cd1b9757 (their kernel already sleeps until the GPU
@@ -113,7 +113,7 @@ index 710ee3a..1d7e86f 100644
  bool a6_fence_done(const struct a6_gpu *g, uint32_t fence);
  uint32_t a6_fence_read(const struct a6_gpu *g);
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index a9790c0..068d406 100644
+index a9790c0..0521e5c 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
 @@ -68,6 +68,7 @@ static vm_offset_t pool_kva;
@@ -138,14 +138,14 @@ index a9790c0..068d406 100644
 + * With it each submit's CACHE_FLUSH_TS also raises CP_CACHE_FLUSH_TS (CP_EVENT_WRITE IRQ bit, as Linux's
 + * a6xx_submit), RBBM_INT_0_MASK lets only that through, and kgsl_3d0_irq (redfin DT: GIC SPI 300, level =
 + * INTID 332, boot-arg sweetgpuirqid) wakes the fence waiters and the scanout thread. The waiters still look
-+ * every sweetgpuirqslice us (default 2000) for the hang check and a lost interrupt; if fences keep landing
++ * every sweetgpuirqslice us (default 5000, the hang check's period) for the hang check and a lost interrupt; if fences keep landing
 + * with no interrupt at all it goes back to polling by itself. After UniXNU cd1b9757 (whose kernel already
 + * idles until the GPU interrupt inside a wait).
 + */
 +extern bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
 +extern void sweet_spi_mask(uint32_t intid, bool masked);
 +extern void sweet_scan_gpu_kick(void);          /* SweetFramebuffer.cpp: the scanout thread looks now */
-+static uint32_t gpu_irq_want, gpu_irq_intid = 332, gpu_irq_slice_us = 2000;
++static uint32_t gpu_irq_want, gpu_irq_intid = 332, gpu_irq_slice_us = 5000;
 +static volatile bool gpu_irq_on;                /* the waiters sleep until the interrupt (else delay(20)) */
 +static bool gpu_irq_attached;
 +static uint64_t gpu_irq_slice_abs;
@@ -159,7 +159,7 @@ index a9790c0..068d406 100644
 +	PE_parse_boot_argn("sweetgpuirqid", &gpu_irq_intid, sizeof(gpu_irq_intid));
 +	PE_parse_boot_argn("sweetgpuirqslice", &gpu_irq_slice_us, sizeof(gpu_irq_slice_us));
 +	if (gpu_irq_slice_us < 100 || gpu_irq_slice_us > 100000) {
-+		gpu_irq_slice_us = 2000;
++		gpu_irq_slice_us = 5000;
 +	}
 +	nanoseconds_to_absolutetime((uint64_t)gpu_irq_slice_us * NSEC_PER_USEC, &gpu_irq_slice_abs);
 +}
