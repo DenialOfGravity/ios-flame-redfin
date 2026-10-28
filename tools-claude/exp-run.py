@@ -39,6 +39,9 @@ Plan file (one directive per line, # comments):
     SWEET_UBWC=1
   variant B
     SWEET_UBWC=0
+    live SWEET_CPUFAST=0x1    (in a variant) a knob the ws-u-lab frontend switches without a restart (SWEET_CPUFAST,
+                              SWEET_ENCSTAT, SWEET_FNSTAT, SWEET_ENC_SLOW_MS) -> /var/local/mtl2-live; with `restart switch`
+                              and the same env lines, such variants switch in ~1 s (checked: backboardd's "live:" line)
   nav swipe 540 1900 540 600 120   (scroll scene) pokes sent before the trace, one per line (sleep N: wait)
   app Preferences             (scroll scene) the process sweet-trace.py follows (default Preferences)
   settings_xy 914 290         the Settings icon on home page 2;  settings_wait 3 (s after the tap)
@@ -64,6 +67,7 @@ SSH = ['ssh', '-i', KEY, '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHosts
        '-o', 'LogLevel=ERROR', '-o', 'BatchMode=yes', '-o', 'ControlMaster=auto', '-o', 'ControlPersist=300',
        '-o', 'ControlPath=/tmp/exp-run-ssh-%r@%h', 'root@' + PHONE]
 ENV_PATH = '/var/local/mtl2-env'
+LIVE_PATH = '/var/local/mtl2-live'      # ws-u-lab frontend: knobs switched without a restart
 
 
 class Stop(Exception):
@@ -86,12 +90,18 @@ def parse_plan(path):
         if re.match(r'^-?[A-Za-z_][A-Za-z0-9_]*(=|$)', line) and ('=' in line or line.startswith('-')) and cur is not None:
             cur.append(line)
             continue
+        if word == 'live' and plan['variants'] and cur is plan['variants'][-1]['env']:
+            if not re.match(r'^(SWEET_CPUFAST|SWEET_ENCSTAT|SWEET_FNSTAT|SWEET_ENC_SLOW_MS)=\S*$', rest):
+                raise SystemExit(f'{path}:{n}: live KEY=VALUE, KEY one of SWEET_CPUFAST SWEET_ENCSTAT SWEET_FNSTAT '
+                                 'SWEET_ENC_SLOW_MS (ws-u-lab frontend)')
+            plan['variants'][-1]['live'].append(rest)
+            continue
         if word == 'base':
             cur = plan['base']
         elif word == 'variant':
             if not re.match(r'^[A-Za-z0-9_.-]+$', rest):
                 raise SystemExit(f'{path}:{n}: variant name: letters, digits, _ . -')
-            v = dict(name=rest, env=[])
+            v = dict(name=rest, env=[], live=[])
             plan['variants'].append(v)
             cur = v['env']
         elif word == 'scenes':
@@ -127,6 +137,8 @@ def parse_plan(path):
         raise SystemExit(f'{path}: no variant')
     for v in plan['variants']:
         v['text'] = env_text(plan['base'], v['env'])
+        v['live_text'] = ''.join(l + '\n' for l in v['live'])
+    plan['uses_live'] = any(v['live'] for v in plan['variants'])
     return plan
 
 
@@ -475,7 +487,8 @@ class Runner:
         self.log(f'plan {p["name"]}: variants {[v["name"] for v in p["variants"]]}, scenes {p["scenes"]}, '
                  f'{len(runs)} variant runs, order {p["order"]} -> {self.out}')
         for i, (v, r) in enumerate(runs):
-            self.log(f'  {i + 1:2d}. {v["name"]} round {r}: ' + v['text'].replace('\n', ' '))
+            self.log(f'  {i + 1:2d}. {v["name"]} round {r}: ' + v['text'].replace('\n', ' ')
+                     + (' | live ' + ' '.join(v['live']) if v['live'] else ''))
         if self.dry:
             return
         self.live = Live()
@@ -493,6 +506,10 @@ class Runner:
                 self.check_stop()
                 temp, batt = self.guard()
                 info = {}
+                live_mark = None
+                if p['uses_live']:       # before a restart too: the new backboardd reads it at its first commit
+                    ssh(f'cat > {LIVE_PATH}', inp=v['live_text'].encode())
+                    live_mark = self.live.mark()
                 if p['restart'] == 'always' or self.cur_env != v['text']:
                     info = self.apply_env(v)
                 for s in p['scenes']:
@@ -504,6 +521,13 @@ class Runner:
                     self.unlock_home()
                     nav, mode, app = self.scene(s)
                     local, tinfo = self.trace(tid, mode)
+                    if live_mark is not None:
+                        ok = re.search(r'MTL2\[\d+ backboardd\]: native-metal: live: [^\n]*', self.live.since(live_mark))
+                        tinfo['live_ok'] = int(bool(ok))
+                        if not ok:
+                            self.log('live: WARNING no "native-metal: live:" line from backboardd (frontend without '
+                                     'ws-u-lab live knobs?)')
+                        live_mark = None
                     row = dict(seq=seq, id=tid, variant=v['name'], scene=s, round=r, time=time.strftime('%H:%M:%S'),
                                temp_c=temp, battery=batt, display=d, nav=nav, **info, **tinfo)
                     info = {k: info[k] for k in info if k == 'bb_pid'}      # restart numbers only on its first row
@@ -514,6 +538,8 @@ class Runner:
             self.reap(block=True)
             if p['restore'] and self.live is not None and self.cur_env is not None:
                 try:
+                    if p['uses_live']:
+                        ssh(f'cat > {LIVE_PATH}', inp=b'')    # empty: every knob back to its env value
                     self.log('restore: original mtl2-env, backboardd restart')
                     self.apply_env(dict(name='orig', text=orig))
                 except Exception as e:      # noqa: BLE001
@@ -526,7 +552,7 @@ class Runner:
 
 # ---------------------------------------------------------------- summary
 COLS = ['seq', 'id', 'variant', 'scene', 'round', 'time', 'temp_c', 'battery', 'display', 'nav', 'bb_pid',
-        'prewarm_pipes', 'prewarm_ms', 'restart_s', 'env_ok', 'trace_mb', 'trace_s', 'pull_s', 'pull',
+        'prewarm_pipes', 'prewarm_ms', 'restart_s', 'env_ok', 'live_ok', 'trace_mb', 'trace_s', 'pull_s', 'pull',
         'frames', 'fps', 'int_p50', 'int_p90', 'int_mean', 'v1', 'v2', 'v3p', 'v1_swipe', 'v2_swipe', 'v3p_swipe',
         'pct1v_swipe', 'gpu_p50', 'gpu_p90', 'gpu_swipe_p50', 'msg_to_bbwake_p50', 'bbwake_to_submit_p50',
         'bbwake_to_submit_p90', 'submit_to_done_p50', 'touch_to_appwake_p50', 'disp_oncpu_ms', 'app_oncpu_ms',
