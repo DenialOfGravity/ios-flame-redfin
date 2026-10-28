@@ -31,6 +31,8 @@ what you need to fetch yourself.
   - `phone/wifi/radio.c` is a userland port of its TopazModem radio (its patches 0123-0130).
   - Our patch 0123 contains its 0900 (en0 + Apple80211 for wifid) and 0128 (IOKit quiesce).
   - ios-topaz's CREDITS.md puts the HackiOS-derived kernel parts under the APSL 2.0.
+  - Patch 0990 (`bsd/kern/redfin_sandbox_container.c`, Sandbox container path from CFFIXED_USER_HOME) is its 0936 /
+    HackiOS's `minisandbox_container_path` in `kern_minimac.c` (APSL 2.0), with bounds checks, a kill switch and a log.
 - **HackiOS** (OOSEX GANG, <https://github.com/oosexgang/hackios-xnu-kernel>, APSL 2.0): the origin of the
   Apple80211/wifid code above (`redwood_net`, `redwood_apple80211`, `redwood_sta`, `RedwoodWLAN`,
   `MiniIONetworkStack`), the keystore wrap/unwrap and the 10-bit surface formats in 0123/0124.

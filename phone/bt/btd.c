@@ -10,6 +10,10 @@
  *                        (manufacturer 29), BD address from the ADT (/chosen mac-address-bluetooth0)
  *   btd --scan [SECS]    --up, then a passive LE scan (default 5 s), one line per advertisement
  *   btd --raw [PORT]     --up, then H4 passthrough on TCP 127.0.0.1:PORT (default 2225) for a host stack
+ *   btd --bridge [DEV]   --up, then bridge iOS's Bluetooth stack: HCI from DEV (default /dev/btbridge,
+ *                        kernel 0983) to the WCN3998 and back, every packet logged, vendor 0xFC__ commands
+ *                        answered with Command Complete status 0 (not sent to the QCA chip) unless
+ *                        --bridge-forward-vendor. Run with sweetbtnub=7 btbridge=1 so bluetoothd attaches.
  * Options: --baud N (operating speed, default 3000000; 115200 = no change), --os 16|32 (UART oversampling,
  *   default from the QUP version), --pmem (ignore /dev/btuart), --fwdir DIR (default /private/var/local/fw),
  *   --fw FILE, --nvm FILE, --ibs (keep the NVM's in-band sleep / deep sleep as Linux sets them),
@@ -23,6 +27,7 @@
  */
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -48,7 +53,8 @@ int btd_main(int argc, char **argv);
 struct opts {
 	int mode;		/* 'p' probe, 'u' up, 's' scan, 'r' raw */
 	unsigned secs, port, baud;
-	int os, pmem, ibs, noinit, verbose, have_addr, setaddr, nvm_keep, nvm_pos;
+	int os, pmem, ibs, noinit, verbose, have_addr, setaddr, nvm_keep, nvm_pos, fwd_vendor;
+	const char *bridge_dev_path;
 	const char *fwdir, *fw, *nvm;
 	uint8_t addr[6];
 };
@@ -57,7 +63,7 @@ static void usage(void)
 {
 	fprintf(stderr, "usage: btd --probe | --up | --scan [SECS] | --raw [PORT]  [--baud N] [--os 16|32] [--pmem]\n"
 		"           [--fwdir DIR] [--fw FILE] [--nvm FILE] [--ibs] [--nvm-keep] [--nvm-baud-pos N] [--setaddr]\n"
-		"           [--bdaddr XX:..] [--noinit] [-v|-q]\n");
+		"           [--bdaddr XX:..] [--noinit] [--bridge [DEV]] [--bridge-forward-vendor] [-v|-q]\n");
 	exit(2);
 }
 
@@ -264,6 +270,97 @@ static int raw_bridge(struct hci *h, unsigned port)
 	}
 }
 
+/* ---- /dev/btbridge: drive bluetoothd/BlueTool over the WCN3998 (0983) ---- */
+
+static int bridge_fd = -1;
+static unsigned bridge_fake, bridge_fwd;
+
+/* events/ACL from the controller to the iOS side (hci.c tap; IBS bytes have data == NULL and stay here) */
+static void bridge_tap(struct hci *h, uint8_t type, const uint8_t *data, size_t len)
+{
+	(void)h;
+	if (bridge_fd < 0 || !data)
+		return;
+	uint8_t b[1 + H4_MAX];
+	b[0] = type;
+	memcpy(b + 1, data, len);
+	(void)!write(bridge_fd, b, len + 1);
+}
+
+/* a Command Complete (ncmd 1, status 0) for a vendor command we answer instead of forwarding */
+static void bridge_fake_cc(struct hci *h, uint16_t op)
+{
+	uint8_t e[7] = { H4_EVT, EV_CMD_COMPLETE, 4, 1, (uint8_t)op, (uint8_t)(op >> 8), 0x00 };
+	if (write(bridge_fd, e, sizeof(e)) < 0)
+		return;
+	if (h->verbose >= 1)
+		hci_log(h, "BTD BRIDGE: faked Command Complete status 0 for vendor op 0x%04x (%u so far)\n", op, ++bridge_fake);
+	else
+		bridge_fake++;
+}
+
+static void bridge_host_pkt(struct hci *h, const struct h4 *cp)
+{
+	if (h->verbose >= 1)
+		hci_log_pkt(h, 1, cp->type, cp->data, cp->got);
+	if (cp->type == H4_CMD) {
+		uint16_t op = (uint16_t)(cp->data[0] | cp->data[1] << 8);
+		int vendor = (op >> 10) == 0x3f;	/* OGF 0x3f = 0xFC00..0xFFFF */
+		if (vendor && !bridge_fwd) {
+			/* Broadcom/Apple vendor command the QCA chip would reject: answer it, log it, learn it */
+			hci_log(h, "BTD BRIDGE: host vendor command 0x%04x plen %u (not forwarded)\n", op, cp->data[2]);
+			bridge_fake_cc(h, op);
+			return;
+		}
+	}
+	/* standard HCI (and, with --bridge-forward-vendor, vendor too): to the controller */
+	if (hci_send(h, cp->type, cp->data, cp->got, 0))
+		hci_log(h, "BTD BRIDGE: forward to controller failed\n");
+}
+
+static int bridge_dev(struct hci *h, const char *path, int fwd)
+{
+	bridge_fwd = fwd;
+	bridge_fd = open(path, O_RDWR | O_NONBLOCK);
+	if (bridge_fd < 0) {
+		fail(h, "bridge-open", strerror(errno));
+		return -1;
+	}
+	h->tap = bridge_tap;
+	h->on_async = NULL;
+	hci_log(h, "BTD BRIDGE: %s <-> WCN3998; standard HCI forwarded, vendor 0xFC__ %s\n", path,
+		fwd ? "also forwarded" : "faked (Command Complete status 0) and logged");
+	struct h4 cp;
+	memset(&cp, 0, sizeof(cp));
+	uint8_t b[1024];
+	for (;;) {
+		struct pollfd pf[1] = { { bridge_fd, POLLIN, 0 } };
+		poll(pf, 1, 2);
+		if (pf[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+			ssize_t n = read(bridge_fd, b, sizeof(b));
+			if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) {
+				hci_log(h, "BTD BRIDGE: host closed the port (%zd)\n", n);
+				break;
+			}
+			for (ssize_t i = 0; i < n; i++) {
+				uint8_t c = b[i];
+				int r = h4_feed(&cp, &c);
+				if (r == 1)
+					bridge_host_pkt(h, &cp);
+				else if (r >= 2)
+					hci_log(h, "BTD BRIDGE: host stray byte 0x%02x\n", c);
+			}
+		}
+		struct hci_pkt p;		/* controller -> host goes through bridge_tap inside hci_recv */
+		while (hci_recv(h, &p, 0) > 0)
+			;
+	}
+	close(bridge_fd);
+	bridge_fd = -1;
+	hci_log(h, "BTD BRIDGE: %u vendor commands faked\n", bridge_fake);
+	return 0;
+}
+
 /* ---- bring-up ---- */
 
 static int bring_up(struct hci *h, struct opts *o)
@@ -393,6 +490,12 @@ int main(int argc, char **argv)
 			o.mode = 'r';
 			if (more)
 				o.port = (unsigned)atoi(argv[++i]);
+		} else if (!strcmp(a, "--bridge")) {
+			o.mode = 'b';
+			if (more)
+				o.bridge_dev_path = argv[++i];
+		} else if (!strcmp(a, "--bridge-forward-vendor")) {
+			o.fwd_vendor = 1;
 		} else if (!strcmp(a, "--baud") && more)
 			o.baud = (unsigned)atoi(argv[++i]);
 		else if (!strcmp(a, "--os") && more)
@@ -452,6 +555,8 @@ int main(int argc, char **argv)
 	}
 	else if (!rc && o.mode == 'r')
 		rc = raw_bridge(&h, o.port);
+	else if (!rc && o.mode == 'b')
+		rc = bridge_dev(&h, o.bridge_dev_path ? o.bridge_dev_path : "/dev/btbridge", o.fwd_vendor);
 	hci_log(&h, "BTD: %lu packets out, %lu in, %lu junk bytes, %lu IBS bytes, %lu hardware errors\n", h.n_tx,
 		h.n_rx, h.n_junk, h.n_ibs, h.n_hwerr);
 	u->close(u);
