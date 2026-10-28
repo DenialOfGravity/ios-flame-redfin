@@ -50,7 +50,7 @@ index 28aedc2b..3155d2ec 100644
      }
  }
 diff --git a/crates/metal2vulkan-runtime/src/render/deferral.rs b/crates/metal2vulkan-runtime/src/render/deferral.rs
-index 90023fbc..efda78e9 100644
+index 90023fbc..a224aae3 100644
 --- a/crates/metal2vulkan-runtime/src/render/deferral.rs
 +++ b/crates/metal2vulkan-runtime/src/render/deferral.rs
 @@ -141,6 +141,11 @@ impl Batch {
@@ -65,6 +65,17 @@ index 90023fbc..efda78e9 100644
          lowering.core.judges_unattached(true);
          for (at, call) in (self.first..).zip(&self.calls.calls) {
              let identity = EncoderCall::new(call.selector(), at);
+@@ -800,6 +805,10 @@ impl RenderCommandEncoder {
+                 Ok(())
+             }
+             Checked::Now { sticky } => {
++                crate::sweet_drawstat::count(match sticky {
++                    true => crate::sweet_drawstat::C_AT_CALL_STICKY,
++                    false => crate::sweet_drawstat::C_AT_CALL_NOW,
++                });
+                 if sticky {
+                     logged.at_call = true;
+                     state.stop_checking();
 diff --git a/crates/metal2vulkan-runtime/src/sweet_counts.rs b/crates/metal2vulkan-runtime/src/sweet_counts.rs
 new file mode 100644
 index 00000000..9e816de4
@@ -130,10 +141,10 @@ index 00000000..9e816de4
 +}
 diff --git a/crates/metal2vulkan-runtime/src/sweet_drawstat.rs b/crates/metal2vulkan-runtime/src/sweet_drawstat.rs
 new file mode 100644
-index 00000000..8fbc2594
+index 00000000..cabf1c6c
 --- /dev/null
 +++ b/crates/metal2vulkan-runtime/src/sweet_drawstat.rs
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,270 @@
 +//! ios-on-pixel: where a render encoder's CPU time goes, per step of its draws and of its end
 +//! (env `SWEET_DRAWSTAT=1`, off by default), and the draw-overhead knobs (`SWEET_DESC_REUSE`).
 +//!
@@ -216,7 +227,12 @@ index 00000000..8fbc2594
 +pub const L_BATCH: usize = 49;
 +pub const C_LOWER_THREAD: usize = 50;
 +pub const C_LOWER_PROGRAM: usize = 51;
-+pub const STEPS: usize = 52;
++// Logged encoders' calls lowered at the call: one alone (the batch drained first), and one from
++// which the encoder lowers every later call there (a framebuffer-fetch or tile-reading pipeline,
++// barriers, executions, ...: `render/call_checks.rs`).
++pub const C_AT_CALL_NOW: usize = 52;
++pub const C_AT_CALL_STICKY: usize = 53;
++pub const STEPS: usize = 54;
 +
 +/// Each step's short name, in the order of the constants above.
 +pub const NAMES: [&str; STEPS] = [
@@ -226,7 +242,7 @@ index 00000000..8fbc2594
 +    "e.steps", "e.tail", "e.core", "END", "OPEN", "#rp", "#fb", "#set", "#set-reused",
 +    "#held", "#writes", "e.p2.plan", "e.p2.shadows", "e.p2.uses", "e.p2.endsec", "#rp-hit",
 +    "#fb-hit", "#fast-hit", "#fast-miss", "#seed-skip", "#fast-miss-gen", "#fast-evict", "LOWER",
-+    "#lower-thread", "#lower-program",
++    "#lower-thread", "#lower-program", "#at-call-now", "#at-call-sticky",
 +];
 +
 +static NS: [AtomicU64; STEPS] = [const { AtomicU64::new(0) }; STEPS];
