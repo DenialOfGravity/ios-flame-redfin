@@ -1,4 +1,4 @@
-From 2e4d0215a69400a31e4f0be3b7f932bb95cfd3f2 Mon Sep 17 00:00:00 2001
+From c43605e0e70335117959986f5527c652f3b41ef1 Mon Sep 17 00:00:00 2001
 From: Rory Axton <roryaxton@gmail.com>
 Date: Wed, 28 Oct 2026 11:38:11 +0100
 Subject: [PATCH] 0995 redfin: vsync tick precision (no timer slop, calibration
@@ -8,9 +8,9 @@ Subject: [PATCH] 0995 redfin: vsync tick precision (no timer slop, calibration
 ---
  iokit/IOKit/IOTimerEventSource.h      |   1 +
  iokit/Kernel/IOTimerEventSource.cpp   |   4 +
- iokit/Kernel/arm/SweetFramebuffer.cpp | 172 +++++++++++++++++++++++++-
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 182 +++++++++++++++++++++++++-
  iokit/Kernel/arm/SweetTrace.h         |   3 +-
- 4 files changed, 174 insertions(+), 6 deletions(-)
+ 4 files changed, 184 insertions(+), 6 deletions(-)
 
 diff --git a/iokit/IOKit/IOTimerEventSource.h b/iokit/IOKit/IOTimerEventSource.h
 index 4b907bb..6eb13e0 100644
@@ -40,10 +40,27 @@ index 0ee1fe9..71c48a5 100644
  		if (reserved) {
  			if (kPassive & flags) {
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index d1e9304..2a773ca 100644
+index d1e9304..f60e148 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -154,6 +154,32 @@ static uint32_t sweet_pace_min = 8000;
+@@ -108,12 +108,16 @@ enum {
+  *   0x4  (0944) present at SwapEnd (2 frames queued, SwapEnd held when full), vsync ticks phased to the TE
+  *        (0946: or, the TE counter reading 0 on redfin, to INTF1's frame counter)
+  *   0x8  (0946) the CPU scales the frame onto the panel (no GPU ring), into the back buffer with sweetfbflip=1
++ *   0x10 (0995) sweetvsync |= 3, 0x20 (0995) sweetfb_refresh=1 unless given (boot only; the r45 cmdline is 583 of
++ *        591 characters, so no room for new boot-arg names)
+  * sweetfb_hz=90: the panel at 90 Hz (DCS 0x53 0x38) and 11.1 ms ticks; anything else is 60 Hz.
+  */
+ #define SWEET_FBX_MODES         0x1
+ #define SWEET_FBX_NOCLEAN       0x2
+ #define SWEET_FBX_SWAPQ         0x4
+ #define SWEET_FBX_CPUPRESENT    0x8
++#define SWEET_FBX_VSYNC         0x10    /* 0995: = sweetvsync 3 (ticks without timer slop, calibration keeps its tick) */
++#define SWEET_FBX_REFRESH       0x20    /* 0995: = sweetfb_refresh=1 (IOMFBDisplayRefresh from the measured period) */
+ static uint32_t sweet_fbx;
+ 
+ /*
+@@ -154,6 +158,32 @@ static uint32_t sweet_pace_min = 8000;
   *        ids and times, printed as SWEET SWAPTRACE lines once full; p swapdone trace arms it again
   */
  static uint32_t sweet_swapdone;
@@ -76,7 +93,7 @@ index d1e9304..2a773ca 100644
  #define SWEET_SWAPDONE_TICK     0x1
  #define SWEET_SWAPDONE_TRACE    0x2
  #define SWEET_ST_N              256
-@@ -304,6 +330,10 @@ public:
+@@ -304,6 +334,10 @@ public:
  	uint64_t      fFcEdge, fFcPeriod;     /* INTF1 frame counter: last edge seen, measured period */
  	uint32_t      fFcFrame, fFcTicks, fFcMiss;
  	bool          fFcCal, fFcDead;
@@ -87,13 +104,19 @@ index d1e9304..2a773ca 100644
  	bool          presentCPU(const uint8_t *rec);
  	uintptr_t     cpuBuffer(uint64_t pa);
  	uintptr_t     cpuSource(SweetSurface *s);       /* 0978 */
-@@ -766,6 +796,17 @@ AppleCLCD::start(IOService *provider)
+@@ -766,6 +800,23 @@ AppleCLCD::start(IOService *provider)
  	PE_parse_boot_argn("sweetpace", &sweet_pace, sizeof(sweet_pace));      /* 0977 */
  	PE_parse_boot_argn("sweetpace_min", &sweet_pace_min, sizeof(sweet_pace_min));      /* 0983 */
  	PE_parse_boot_argn("sweetswapdone", &sweet_swapdone, sizeof(sweet_swapdone));      /* 0987 */
 +	PE_parse_boot_argn("sweetvsync", &sweet_vsync, sizeof(sweet_vsync));      /* 0995 */
 +	PE_parse_boot_argn("sweetvsync_lead", &sweet_vsync_lead, sizeof(sweet_vsync_lead));
 +	PE_parse_boot_argn("sweetfb_refresh", &sweet_fb_refresh, sizeof(sweet_fb_refresh));
++	if (sweet_fbx & SWEET_FBX_VSYNC) {
++		sweet_vsync |= SWEET_VSYNC_CRIT | SWEET_VSYNC_CAL;     /* 0995: sweetfbx 0x10 (the cmdline is nearly full) */
++	}
++	if ((sweet_fbx & SWEET_FBX_REFRESH) && sweet_fb_refresh == 0) {
++		sweet_fb_refresh = 1;                                   /* 0995: sweetfbx 0x20 */
++	}
 +	fFcEarlyUs = 300;
 +	if (sweet_vsync_lead > 5000) {
 +		sweet_vsync_lead = 5000;
@@ -105,7 +128,7 @@ index d1e9304..2a773ca 100644
  	if (sweet_swapdone) {
  		IOLog("SWEET FB: swapdone %#x (0987: 1 tick at swap done, 2 trace)\n", sweet_swapdone);
  	}
-@@ -835,6 +876,10 @@ AppleCLCD::start(IOService *provider)
+@@ -835,6 +886,10 @@ AppleCLCD::start(IOService *provider)
  	if (sweet_fbx & SWEET_FBX_MODES) {
  		publishModes();
  	}
@@ -116,7 +139,7 @@ index d1e9304..2a773ca 100644
  	sweet_fb_instance = this;
  	sweet_surface_scan_reserve();   /* 0979: the scanout slots' memory before userland (sweetscanout) */
  	if (sweet_surface_scan_mode() == 1) {
-@@ -871,7 +916,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -871,7 +926,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	if (sweet_fbx & SWEET_FBX_SWAPQ) {
  		fb->phaseTick(now);	/* 0944: the next tick just after a TE */
  	}
@@ -129,7 +152,7 @@ index d1e9304..2a773ca 100644
  	sweet_gpu_flip_poll();	/* 0905: a finished frame in the back buffer goes on screen at this vsync */
  	sweet_gpu_present_poll();	/* 0943: blit->fence latency */
  	fb->statLine(now);		/* 0943: every 5 s, the frame statistics */
-@@ -908,7 +957,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -908,7 +967,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  			send = false;
  		}
  	}
@@ -139,7 +162,7 @@ index d1e9304..2a773ca 100644
  	if (send) {
  		fb->sendVsync(count, now);
  	}
-@@ -970,7 +1020,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -970,7 +1030,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  void
  AppleCLCD::sendVsync(uint64_t count, uint64_t now)
  {
@@ -148,7 +171,7 @@ index d1e9304..2a773ca 100644
  	uint64_t values[6] = {
  		(uint32_t)count, (uint32_t)(count >> 32),
  		(uint32_t)now, (uint32_t)(now >> 32),
-@@ -1545,6 +1595,88 @@ AppleCLCD::publishModes(void)
+@@ -1545,6 +1605,88 @@ AppleCLCD::publishModes(void)
  	OSSafeReleaseNULL(color);
  }
  
@@ -237,7 +260,7 @@ index d1e9304..2a773ca 100644
  /*
   * The S6E3HC2's refresh rate: DCS short write 0x53 0x28 = 60 Hz, 0x53 0x38 = 90 Hz, same DSI clock and porches
   * (dsi-panel-s6e3hc2-dvt-dsc-1080p-cmd.dtsi, android-msm-redbull-4.19). Autorefresh starts one frame per TE, so
-@@ -2965,6 +3097,7 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+@@ -2965,6 +3107,7 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
   *   p scanout gate 0|1|2   0985: SwapEnd back pressure (0), the swapper's GPU submits wait (1, default), 0989: the
   *                          CP waits for the latch (2; boot-arg sweetscangate)
   *   p scanout corners 0|1  0986: corner mattes drawn into each direct frame (default off)
@@ -245,7 +268,7 @@ index d1e9304..2a773ca 100644
   */
  extern "C" void sweet_gpu_stats_flush(void);     /* 0991 */
  extern "C" void sweet_prof_cmd(const char *s, const char *end);   /* 0991 */
-@@ -3113,6 +3246,10 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+@@ -3113,6 +3256,10 @@ AppleCLCD::fbCmd(const char *s, const char *end)
  		mdpCmd(s + 3, end);     /* 0948 */
  		return;
  	}
@@ -256,7 +279,7 @@ index d1e9304..2a773ca 100644
  	if (end - s >= 4 && !strncmp(s, "pace", 4)) {
  		/* 0977: p pace N (0 = as before, 1 = ticks held for the SwapEnd of a frame in flight); 0983: p pace N [MIN_US] */
  		const char *q = s + 4;
-@@ -3513,8 +3650,19 @@ AppleCLCD::phaseFrameCount(uint64_t now)
+@@ -3513,8 +3660,19 @@ AppleCLCD::phaseFrameCount(uint64_t now)
  		return;
  	}
  	uint64_t lead, early, period = fFcPeriod ? fFcPeriod : fVsyncAbs;
@@ -278,7 +301,7 @@ index d1e9304..2a773ca 100644
  	if (fFcEdge == 0 || fFcCal) {
  		uint32_t f0 = sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT), f = f0;
  		uint64_t t = now, limit = now + period * 3 / 2;
-@@ -3533,12 +3681,26 @@ AppleCLCD::phaseFrameCount(uint64_t now)
+@@ -3533,12 +3691,26 @@ AppleCLCD::phaseFrameCount(uint64_t now)
  			return;
  		}
  		fFcMiss = 0;
