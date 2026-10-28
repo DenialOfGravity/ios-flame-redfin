@@ -1,5 +1,5 @@
 diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
-index e76f169..2d5880e 100644
+index e76f169..2db839e 100644
 --- a/src/freedreno/vulkan/tu_cmd_buffer.cc
 +++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
 @@ -592,6 +592,50 @@ tu_emit_cache_flush_renderpass(struct tu_cmd_buffer *cmd_buffer)
@@ -85,7 +85,7 @@ index e76f169..2d5880e 100644
        if (cmd->state.tiling && cmd->state.tiling->possible) {
           const struct tu_vsc_config *vsc = tu_vsc_config(cmd, cmd->state.tiling);
           m.tile_w = (uint16_t) cmd->state.tiling->tile0.width;
-@@ -4077,6 +4139,253 @@ sweet_pt_stamp(struct tu_cmd_buffer *cmd, int slot, unsigned end)
+@@ -4077,6 +4139,254 @@ sweet_pt_stamp(struct tu_cmd_buffer *cmd, int slot, unsigned end)
     }
  }
  
@@ -322,6 +322,7 @@ index e76f169..2d5880e 100644
 +}
 +
 +/* sweet 0112: the "T tu-draw" line (SweetMetal2 dlsyms it), with SWEET_TIMELINE on; empty otherwise */
++extern "C" __attribute__((visibility("default"))) size_t sweet_tu_draw_report(char *out, size_t size);
 +extern "C" __attribute__((visibility("default"))) size_t
 +sweet_tu_draw_report(char *out, size_t size)
 +{
@@ -339,7 +340,7 @@ index e76f169..2d5880e 100644
  /* "passes N M.Mms (gmem a sysmem b) top: WxH FMT L/S gmem|sysmem T.Tms/n ... | tu waits cpu n (x ms) gpu n of s submits" */
  /* "passes N M.Mms (gmem a sysmem b fetch f) top: WxH FMT L/S gmem|sysmem T.Tms xn [d D b V/B TWxTH bin B.BB] ...
   *  [| seq T.Tms: ...] | tu submits ..."
-@@ -4089,7 +4398,9 @@ static struct sweet_pt_done {
+@@ -4089,7 +4399,9 @@ static struct sweet_pt_done {
     uint32_t gen, cb, ticks, vis, draws, w, h;
     uint16_t bins;
     uint8_t load, store, gmem, fetch;
@@ -350,7 +351,7 @@ index e76f169..2d5880e 100644
  
  static uint32_t
  sweet_pt_visible(const struct sweet_pt_meta *m, uint32_t slot)
-@@ -4148,8 +4459,11 @@ sweet_tu_pass_report(char *out, size_t size, unsigned top)
+@@ -4148,8 +4460,11 @@ sweet_tu_pass_report(char *out, size_t size, unsigned top)
           const uint32_t bins = (uint32_t) m->bins_x * m->bins_y;
           const bool binned = m->gmem && m->binning && mid >= b && mid <= e;
           const uint32_t vis = binned ? sweet_pt_visible(m, slot) : bins;
@@ -364,7 +365,7 @@ index e76f169..2d5880e 100644
           unsigned k = 0;
           for (; k < nkeys; k++)
              if (keys[k].w == m->w && keys[k].h == m->h && keys[k].format == m->format && keys[k].gmem == m->gmem &&
-@@ -4251,7 +4565,12 @@ sweet_tu_pass_report(char *out, size_t size, unsigned top)
+@@ -4251,7 +4566,12 @@ sweet_tu_pass_report(char *out, size_t size, unsigned top)
              SWEET_PUT(" %.2f %ux%u %c/%c%c", d->ticks * ms_per_tick, d->w, d->h, d->load, d->store, d->gmem ? 'g' : 's');
              if (d->vis != ~0u)
                 SWEET_PUT(" b%u/%u", d->vis, (unsigned) d->bins);
@@ -378,7 +379,7 @@ index e76f169..2d5880e 100644
           }
           if (small)
              SWEET_PUT(" +%u more %.2fms", small, small_ticks * ms_per_tick);
-@@ -4808,6 +5127,7 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+@@ -4808,6 +5128,7 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
     if (result != VK_SUCCESS)
        return result;
     sweet_pt_cb_begin(cmd_buffer);
@@ -386,7 +387,7 @@ index e76f169..2d5880e 100644
  
     /* setup initial configuration into command buffer */
     if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
-@@ -5150,6 +5470,9 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
+@@ -5150,6 +5471,9 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
     struct tu_descriptor_state *descriptors_state =
        tu_get_descriptors_state(cmd, bind_point);
  
@@ -396,7 +397,7 @@ index e76f169..2d5880e 100644
     descriptors_state->max_sets_bound =
        MAX2(descriptors_state->max_sets_bound,
             info->firstSet + info->descriptorSetCount);
-@@ -5933,6 +6256,9 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
+@@ -5933,6 +6257,9 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
     cmd->state.load_state = pipeline->load_state;
     cmd->state.prim_order_gmem = pipeline->prim_order.state_gmem;
     cmd->state.pipeline_sysmem_single_prim_mode = pipeline->prim_order.sysmem_single_prim_mode;
@@ -406,7 +407,7 @@ index e76f169..2d5880e 100644
     cmd->state.pipeline_has_tess = pipeline->active_stages & VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
     cmd->state.pipeline_disable_gmem = gfx_pipeline->feedback_loop_may_involve_textures;
  
-@@ -6587,6 +6913,18 @@ tu_render_pass_state_merge(struct tu_render_pass_state *dst,
+@@ -6587,6 +6914,18 @@ tu_render_pass_state_merge(struct tu_render_pass_state *dst,
  
     dst->drawcall_bandwidth_per_sample_sum +=
        src->drawcall_bandwidth_per_sample_sum;
@@ -425,7 +426,7 @@ index e76f169..2d5880e 100644
     if (!dst->lrz_disable_reason && src->lrz_disable_reason) {
        dst->lrz_disable_reason = src->lrz_disable_reason;
        dst->lrz_disabled_at_draw =
-@@ -8772,6 +9110,7 @@ tu6_draw_common_body(struct tu_cmd_buffer *cmd,
+@@ -8772,6 +9111,7 @@ tu6_draw_common_body(struct tu_cmd_buffer *cmd,
  
     /* Fill draw stats for autotuner */
     rp->drawcall_count++;
@@ -433,7 +434,7 @@ index e76f169..2d5880e 100644
  
     rp->drawcall_bandwidth_per_sample_sum +=
        cmd->state.bandwidth.color_bandwidth_per_sample;
-@@ -9241,6 +9580,7 @@ tu_CmdDraw(VkCommandBuffer commandBuffer,
+@@ -9241,6 +9581,7 @@ tu_CmdDraw(VkCommandBuffer commandBuffer,
     tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX));
     tu_cs_emit(cs, instanceCount);
     tu_cs_emit(cs, vertexCount);
@@ -441,7 +442,7 @@ index e76f169..2d5880e 100644
  
     trace_end_draw(&cmd->rp_trace, cs);
  }
-@@ -9319,6 +9659,7 @@ tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+@@ -9319,6 +9660,7 @@ tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
     tu_cs_emit(cs, firstIndex);
     tu_cs_emit_qw(cs, cmd->state.index_va);
     tu_cs_emit(cs, cmd->state.max_index_count);
@@ -449,7 +450,7 @@ index e76f169..2d5880e 100644
  
     trace_end_draw(&cmd->rp_trace, cs);
  }
-@@ -10440,6 +10781,8 @@ tu_barrier(struct tu_cmd_buffer *cmd,
+@@ -10440,6 +10782,8 @@ tu_barrier(struct tu_cmd_buffer *cmd,
  
     struct tu_cache_state *cache =
        cmd->state.pass  ? &cmd->state.renderpass_cache : &cmd->state.cache;
