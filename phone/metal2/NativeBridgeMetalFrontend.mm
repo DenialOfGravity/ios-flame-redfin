@@ -3391,7 +3391,7 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
  const uint64_t waits[4]={gTimeWaitCompleted.count.load(),gTimeWaitCompleted.total.load(),gTimeWaitScheduled.count.load(),gTimeWaitScheduled.total.load()};
  char passes[680]="n/a (Turnip has no sweet_tu_pass_report)";   // u-gpudraw: 420 before (the SEQ census)
  if(native_bridge_metal_pass_report)native_bridge_metal_pass_report(passes,sizeof passes,3);
- char line[1400];
+ char line[1700];
  snprintf(line,sizeof line,"native-metal: T 5s: frames %u (every %.1f/%.1f) | encode %.1f/%.1f ms | commit->submit %.2f | submit->gpu-start %.2f"
   " | gpu %.1f/%.1f ms | gpu-done->cpu-notice %.2f/%.2f ms (+h %.2f) | gpu idle %.1f, busy %.0f%% | notice->next %.1f"
   " | cb per frame %.2f (aux %u: rp %u bl %u cs %u e %u, gpu %.1f) | waits cpl %llu/%llums sch %llu/%llums | %s",
@@ -3411,7 +3411,7 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
  }
  fnReport();
  if(native_bridge_metal_draw_report) {   // u-gpudraw: Turnip 0112's draw census (fragment shaders, draw times)
-  char draw[1300];
+  char draw[1600];
   if(native_bridge_metal_draw_report(draw,sizeof draw)) {
    snprintf(line,sizeof line,"native-metal: T tu-draw: %s",draw);
    sm2_logs(line);
