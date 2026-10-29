@@ -1801,9 +1801,14 @@ def snap_text(s):
         return 1
     L, P = s['link'], s['phone']
     up = int(P.get('uptime_s') or 0)
-    print('%s  link %s %s rtt %s ms  up %d:%02d:%02d  daemon cpu %s%% rss %s MB' % (
-        s['time'], L['via'], L['host'], L['rtt_ms'], up // 3600, up // 60 % 60, up % 60, s['self']['cpu_pct'],
-        s['self']['rss_mb']))
+    print('%s  link %s %s rtt %s ms  up %d:%02d:%02d  sweetmon cost %s ms/s (%s%% of a core) rss %s MB%s' % (
+        s['time'], L['via'], L['host'], L['rtt_ms'], up // 3600, up // 60 % 60, up % 60, s['self'].get('cpu_ms_s'),
+        s['self']['cpu_pct'], s['self']['rss_mb'], '  [STALE: link down, %s s old]' % s.get('age_s') if s.get('stale')
+        else ''))
+    sp = L.get('speed') or {}
+    if sp:
+        print('link speed: ' + ', '.join('%s %s MB/s' % (k, v.get('mbps')) for k, v in sp.items()) +
+              '; auto prefers %s' % L.get('preferred'))
     for h in s.get('hot') or []:
         print('  * ' + h)
     t = s['temp']
