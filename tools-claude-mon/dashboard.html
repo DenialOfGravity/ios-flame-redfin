@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sweetmon</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --surface-2: #f3f2ee; --border: rgba(11,11,11,0.10);
+  --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781; --grid: #e1e0d9; --axis: #c3c2b7;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948;
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  --accent: #2a78d6; --accent-ink: #ffffff;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232321; --border: rgba(255,255,255,0.10);
+    --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781; --grid: #2c2c2a; --axis: #383835;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+    --accent: #3987e5;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232321; --border: rgba(255,255,255,0.10);
+  --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781; --grid: #2c2c2a; --axis: #383835;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  --accent: #3987e5;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--page); color: var(--ink); }
+body { font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; padding: 12px 16px 24px; }
+button, input, select { font: inherit; color: var(--ink); }
+.num, td.n, .tile .v { font-variant-numeric: tabular-nums; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; margin-bottom: 10px; }
+header h1 { font-size: 16px; margin: 0 6px 0 0; font-weight: 650; letter-spacing: .2px; }
+.tiles { display: flex; flex-wrap: wrap; gap: 8px; flex: 1; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 5px 10px; min-width: 92px; }
+.tile .k { color: var(--muted); font-size: 11px; }
+.tile .v { font-size: 17px; font-weight: 600; white-space: nowrap; }
+.tile .v small { font-size: 12px; font-weight: 500; color: var(--ink-2); }
+.ctl { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; background: var(--surface); }
+.seg button { border: 0; background: transparent; padding: 4px 9px; cursor: pointer; color: var(--ink-2); }
+.seg button.on { background: var(--accent); color: var(--accent-ink); }
+.btn { border: 1px solid var(--border); background: var(--surface); border-radius: 7px; padding: 4px 10px; cursor: pointer; }
+.btn:hover, .seg button:hover:not(.on) { background: var(--surface-2); }
+.btn:disabled { opacity: .5; cursor: default; }
+input[type=text], input[type=number], select { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; }
+.dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: 0; background: var(--muted); }
+.st-good { background: var(--good); } .st-warning { background: var(--warning); } .st-serious { background: var(--serious); } .st-critical { background: var(--critical); }
+.hot { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; margin-bottom: 10px; display: flex; flex-wrap: wrap; gap: 4px 16px; color: var(--ink-2); min-height: 32px; }
+.hot b { color: var(--ink); font-weight: 600; }
+.grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 10px; }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+.panel h2 { font-size: 13px; margin: 0 0 6px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.panel h2 .sub { color: var(--muted); font-weight: 400; font-size: 12px; }
+.panel h2 .right { margin-left: auto; font-weight: 400; }
+.c3 { grid-column: span 3; } .c4 { grid-column: span 4; } .c5 { grid-column: span 5; } .c6 { grid-column: span 6; }
+.c7 { grid-column: span 7; } .c8 { grid-column: span 8; } .c12 { grid-column: span 12; }
+@media (max-width: 1200px) { .c3, .c4 { grid-column: span 6; } .c5, .c7, .c8 { grid-column: span 12; } .c4.wide-sm { grid-column: span 12; } }
+@media (max-width: 800px) { .grid > .panel { grid-column: span 12; } .cores { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+canvas.chart { width: 100%; display: block; }
+.h120 { height: 120px; } .h150 { height: 150px; } .h170 { height: 170px; } .h60 { height: 58px; }
+.cores { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px 10px; }
+.core .lab { display: flex; justify-content: space-between; font-size: 11px; color: var(--ink-2); }
+.legend { display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: 12px; color: var(--ink-2); margin: 2px 0 4px; }
+.legend i { display: inline-block; width: 12px; height: 3px; border-radius: 2px; vertical-align: 3px; margin-right: 5px; }
+.legend .val { color: var(--ink); font-variant-numeric: tabular-nums; margin-left: 3px; }
+table { border-collapse: collapse; width: 100%; }
+th, td { padding: 3px 6px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--grid); }
+th { color: var(--muted); font-weight: 500; font-size: 12px; cursor: pointer; user-select: none; }
+th.n, td.n { text-align: right; }
+tbody tr:hover { background: var(--surface-2); cursor: pointer; }
+tbody tr.sel { outline: 2px solid var(--accent); outline-offset: -2px; }
+.tscroll { max-height: 360px; overflow: auto; max-width: 100%; }
+.panel { overflow: hidden; }
+.bar { position: relative; height: 16px; background: var(--surface-2); border-radius: 3px; overflow: hidden; }
+.bar > span { position: absolute; left: 0; top: 0; bottom: 0; background: var(--s1); border-radius: 0 3px 3px 0; }
+.bar > em { position: absolute; left: 6px; top: 0; font-style: normal; font-size: 11px; line-height: 16px; color: var(--ink); }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 1px 10px; font-size: 12px; }
+.kv .k { color: var(--muted); }
+pre.klog { margin: 0; height: 360px; overflow: auto; background: var(--surface-2); border-radius: 6px; padding: 6px 8px;
+  font: 11.5px/1.35 ui-monospace, "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; word-break: break-all; }
+pre.klog .m { background: color-mix(in srgb, var(--s4) 35%, transparent); color: var(--ink); }
+.trace-form { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 6px 10px; align-items: end; }
+.trace-form label { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--muted); }
+.trace-form label.cb { flex-direction: row; align-items: center; gap: 6px; color: var(--ink-2); font-size: 12px; }
+.big { font-size: 15px; font-weight: 650; padding: 9px 18px; border-radius: 9px; border: 0; cursor: pointer; color: #fff; background: var(--good); min-width: 150px; }
+.big.stop { background: var(--critical); }
+.big:disabled { opacity: .5; cursor: default; }
+.tstatus { margin: 8px 0; padding: 6px 8px; border-radius: 6px; background: var(--surface-2); min-height: 30px; }
+a { color: var(--accent); }
+.muted { color: var(--muted); }
+.err { color: var(--critical); }
+#tip { position: fixed; pointer-events: none; z-index: 10; background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+  padding: 5px 8px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.18); display: none; min-width: 120px; }
+#tip .t { color: var(--muted); margin-bottom: 2px; }
+#tip .r { display: flex; gap: 8px; justify-content: space-between; } #tip .r i { display: inline-block; width: 9px; height: 3px; margin-right: 5px; vertical-align: 3px; border-radius: 2px; }
+#tip .r b { font-weight: 600; font-variant-numeric: tabular-nums; }
+.banner { display: none; padding: 6px 10px; border-radius: 8px; margin-bottom: 8px; background: color-mix(in srgb, var(--warning) 25%, var(--surface)); border: 1px solid var(--border); }
+</style>
+</head>
+<body>
+<div class="banner" id="banner"></div>
+<header>
+  <h1>sweetmon</h1>
+  <div class="tiles">
+    <div class="tile"><div class="k">link</div><div class="v" id="t-link"><span class="dot"></span>-</div></div>
+    <div class="tile"><div class="k">uptime</div><div class="v" id="t-up">-</div></div>
+    <div class="tile"><div class="k">battery</div><div class="v" id="t-bat">-</div></div>
+    <div class="tile"><div class="k">max temp</div><div class="v" id="t-temp">-</div></div>
+    <div class="tile"><div class="k">thermal</div><div class="v" id="t-lvl">-</div></div>
+    <div class="tile"><div class="k">CPU avg</div><div class="v" id="t-cpu">-</div></div>
+    <div class="tile"><div class="k">GPU</div><div class="v" id="t-gpu">-</div></div>
+    <div class="tile"><div class="k">sweetmon cost</div><div class="v" id="t-self">-</div></div>
+  </div>
+  <div class="ctl">
+    <span class="muted">window</span>
+    <div class="seg" id="win"><button data-v="60">1 m</button><button data-v="300" class="on">5 m</button><button data-v="900">15 m</button></div>
+    <span class="muted">link</span>
+    <div class="seg" id="linksel"><button data-v="auto">auto</button><button data-v="usb">USB</button><button data-v="wifi">Wi-Fi</button></div>
+    <button class="btn" id="speedbtn" title="send N MiB of filler from the phone and time it">speed test</button>
+    <input type="number" id="speedmb" value="16" min="1" max="256" style="width:56px" title="MiB"> <span id="speedres" class="muted"></span>
+    <button class="btn" id="themebtn" title="light / dark">theme</button>
+  </div>
+</header>
+<div class="hot" id="hot"><span class="muted">waiting for the first sample</span></div>
+
+<div class="grid">
+  <section class="panel c5">
+    <h2>CPU busy per core <span class="sub">% of each sample interval; silver cpu0-5, gold cpu6, prime cpu7</span></h2>
+    <div class="cores" id="cores"></div>
+  </section>
+  <section class="panel c4">
+    <h2>Cluster clocks <span class="sub">MHz (kernel 5 s line)</span></h2>
+    <div class="legend" id="lg-mhz"></div>
+    <canvas class="chart h150" id="ch-mhz"></canvas>
+  </section>
+  <section class="panel c3">
+    <h2>Temperatures <span class="sub">&deg;C</span><span class="right muted" id="tempsrc"></span></h2>
+    <div class="legend" id="lg-temp"></div>
+    <canvas class="chart h150" id="ch-temp"></canvas>
+  </section>
+
+  <section class="panel c4">
+    <h2>GPU <span class="sub">busy % per 5 s</span><span class="right muted" id="gpu-sub"></span></h2>
+    <canvas class="chart h120" id="ch-gpu"></canvas>
+    <div id="gpu-own" style="margin-top:6px"></div>
+  </section>
+  <section class="panel c4">
+    <h2>Memory <span class="sub">MB</span></h2>
+    <div class="legend" id="lg-mem"></div>
+    <canvas class="chart h120" id="ch-mem"></canvas>
+    <div class="kv" id="mem-kv" style="margin-top:6px"></div>
+  </section>
+  <section class="panel c4 wide-sm">
+    <h2>Frames <span class="sub" id="fps-sub">fps</span>
+      <span class="right"><label class="muted"><input type="checkbox" id="frames-on"> light frame mode (kdebug)</label></span></h2>
+    <div class="legend" id="lg-fps"></div>
+    <canvas class="chart h120" id="ch-fps"></canvas>
+    <div class="kv" id="fps-kv" style="margin-top:6px"></div>
+  </section>
+
+  <section class="panel c7">
+    <h2>Processes <span class="sub" id="proc-sub">click a row to pick it as the profiler target</span></h2>
+    <div class="tscroll"><table id="proc"><thead><tr>
+      <th data-k="name">process</th><th data-k="pid" class="n">pid</th><th data-k="cpu_pct" class="n">CPU %</th>
+      <th data-k="wakeups_s" class="n">wakeups/s</th><th data-k="mem_mb" class="n">mem MB</th><th data-k="threads" class="n">threads</th>
+      <th data-k="disk_kbs" class="n">disk KB/s</th></tr></thead><tbody></tbody></table></div>
+  </section>
+  <section class="panel c5">
+    <h2>Kernel log rate <span class="sub">bytes/s written by the kernel</span><span class="right muted" id="klog-sub"></span></h2>
+    <canvas class="chart h120" id="ch-klog"></canvas>
+    <table id="tags" style="margin-top:6px"><thead><tr><th>tag (last 60 s)</th><th class="n">B/s</th><th class="n">lines/s</th><th style="width:40%"></th></tr></thead><tbody></tbody></table>
+  </section>
+
+  <section class="panel c7">
+    <h2>Kernel log <span class="sub" id="klog-file"></span>
+      <span class="right ctl"><input type="text" id="kfilter" placeholder="filter (regex)" style="width:220px">
+      <button class="btn" id="kpause">pause</button><button class="btn" id="kclear">clear</button></span></h2>
+    <pre class="klog" id="klog"></pre>
+  </section>
+  <section class="panel c5">
+    <h2>Trace</h2>
+    <div class="trace-form">
+      <label>kind<select id="tr-kind"><option value="kdebug">kdebug (sweettrace)</option><option value="prof">kernel profiler</option></select></label>
+      <label>name<input type="text" id="tr-name" value="t1"></label>
+      <label>seconds<input type="number" id="tr-secs" value="10" min="1" max="600"></label>
+      <label class="kd">mode<select id="tr-mode"><option value="buffer">buffer (send after stop)</option><option value="stream">stream</option></select></label>
+      <label class="kd">filter<select id="tr-filter"><option value="f">f (frame chain)</option><option value="none">none (full)</option></select></label>
+      <label class="kd cb"><input type="checkbox" id="tr-quiet"> quiet (pause sampling)</label>
+      <label class="pf">target process<input type="text" id="tr-target" placeholder="backboardd"></label>
+      <label class="pf">Hz<input type="number" id="tr-hz" value="1000" min="1" max="4000"></label>
+    </div>
+    <div style="display:flex; gap:10px; align-items:center; margin-top:10px">
+      <button class="big" id="tr-btn">Start trace</button>
+      <button class="btn" id="tr-abort" title="stop and discard (kdebug)">abort</button>
+    </div>
+    <div class="tstatus" id="tr-status"><span class="muted">idle</span></div>
+    <div class="tscroll" style="max-height:200px"><table id="traces"><thead><tr><th>trace</th><th>kind</th><th>state</th><th class="n">MB</th><th class="n">xfer s</th><th class="n">MB/s</th><th>files</th></tr></thead><tbody></tbody></table></div>
+  </section>
+</div>
+<div id="tip"></div>
+
+<script>
+'use strict';
+const $ = (s) => document.querySelector(s);
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const fmt = (v, d = 0) => (v === null || v === undefined || Number.isNaN(v)) ? '-' : Number(v).toFixed(d);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const S = { win: 300, hist: [], snap: null, link: null, klog: [], kpaused: false, kpending: [], procSort: 'cpu_pct',
+  target: null, trace: null, charts: [] };
+try { S.win = +localStorage.getItem('sm-win') || 300; } catch (e) {}
+try { const th = localStorage.getItem('sm-theme'); if (th) document.documentElement.dataset.theme = th; } catch (e) {}
+
+// ------------------------------------------------------------------ canvas line chart
+class Chart {
+  constructor(canvas, opt) {
+    this.c = canvas; this.o = Object.assign({ min: 0, max: null, unit: '', dec: 0, axis: true, series: [] }, opt);
+    this.hover = null;
+    canvas.addEventListener('mousemove', (e) => { const r = canvas.getBoundingClientRect(); this.hover = { x: e.clientX - r.left, cx: e.clientX, cy: e.clientY }; this.draw(); });
+    canvas.addEventListener('mouseleave', () => { this.hover = null; $('#tip').style.display = 'none'; this.draw(); });
+    S.charts.push(this);
+  }
+  draw() {
+    const c = this.c, o = this.o, dpr = window.devicePixelRatio || 1;
+    const W = c.clientWidth, H = c.clientHeight;
+    if (!W || !H) return;
+    if (c.width !== Math.round(W * dpr) || c.height !== Math.round(H * dpr)) { c.width = Math.round(W * dpr); c.height = Math.round(H * dpr); }
+    const g = c.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+    const L = o.axis ? 38 : 2, R = 6, T = 6, B = o.axis ? 16 : 2, pw = W - L - R, ph = H - T - B;
+    const now = S.lastT || Date.now() / 1000, t0 = now - S.win;
+    const rows = S.hist.filter((h) => h.t >= t0);
+    let lo = o.min, hi = o.max;
+    if (hi === null || lo === null) {
+      let mn = Infinity, mx = -Infinity;
+      for (const h of rows) for (const s of o.series) { const v = s.get(h); if (v !== null && v !== undefined && !Number.isNaN(v)) { mn = Math.min(mn, v); mx = Math.max(mx, v); } }
+      if (mx === -Infinity) { mn = 0; mx = 1; }
+      if (lo === null) lo = Math.floor(mn - (mx - mn) * 0.1 - 0.5);
+      if (hi === null) hi = mx + (mx - lo) * 0.1 + (o.pad || 0);
+      if (o.floor !== undefined) hi = Math.max(hi, o.floor);
+    }
+    if (hi <= lo) hi = lo + 1;
+    const X = (t) => L + (t - t0) / S.win * pw, Y = (v) => T + ph - (v - lo) / (hi - lo) * ph;
+    g.font = '11px system-ui, sans-serif'; g.textBaseline = 'middle';
+    if (o.axis) {
+      const step = niceStep((hi - lo) / 3);
+      g.strokeStyle = css('--grid'); g.fillStyle = css('--muted'); g.lineWidth = 1; g.textAlign = 'right';
+      for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) {
+        const y = Math.round(Y(v)) + 0.5; g.beginPath(); g.moveTo(L, y); g.lineTo(W - R, y); g.stroke();
+        g.fillText(fmtAxis(v, step), L - 4, y);
+      }
+      g.textAlign = 'center'; g.textBaseline = 'alphabetic';
+      const xs = S.win <= 60 ? 15 : S.win <= 300 ? 60 : 300;
+      for (let k = 0; k <= S.win; k += xs) { const x = X(now - k); g.fillText(k ? '-' + (k >= 60 ? (k / 60) + 'm' : k + 's') : 'now', Math.min(Math.max(x, L + 10), W - R - 12), H - 3); }
+    } else {
+      g.strokeStyle = css('--grid'); g.beginPath(); g.moveTo(L, T + ph + 0.5); g.lineTo(W - R, T + ph + 0.5); g.stroke();
+    }
+    g.lineJoin = 'round'; g.lineCap = 'round';
+    for (const s of o.series) {
+      g.strokeStyle = css(s.color); g.lineWidth = o.thin ? 1.5 : 2; g.beginPath();
+      let pen = false, prevT = null;
+      for (const h of rows) {
+        const v = s.get(h);
+        if (v === null || v === undefined || Number.isNaN(v) || (prevT !== null && h.t - prevT > Math.max(12, S.rate * 4))) { pen = false; if (v === null || v === undefined) { prevT = h.t; continue; } }
+        const x = X(h.t), y = Y(Math.min(Math.max(v, lo), hi));
+        if (pen) g.lineTo(x, y); else { g.moveTo(x, y); pen = true; }
+        prevT = h.t;
+      }
+      g.stroke();
+      if (o.fill && o.series.length === 1) {
+        g.lineTo(X(rows.length ? rows[rows.length - 1].t : now), Y(lo)); g.lineTo(X(rows.length ? rows[0].t : t0), Y(lo)); g.closePath();
+        g.globalAlpha = 0.12; g.fillStyle = css(s.color); g.fill(); g.globalAlpha = 1;
+      }
+    }
+    if (this.hover && rows.length && this.hover.x >= L) {
+      const tt = t0 + (this.hover.x - L) / pw * S.win;
+      let best = rows[0]; for (const h of rows) if (Math.abs(h.t - tt) < Math.abs(best.t - tt)) best = h;
+      const x = Math.round(X(best.t)) + 0.5;
+      g.strokeStyle = css('--axis'); g.lineWidth = 1; g.beginPath(); g.moveTo(x, T); g.lineTo(x, T + ph); g.stroke();
+      for (const s of o.series) { const v = s.get(best); if (v === null || v === undefined) continue;
+        g.fillStyle = css(s.color); g.strokeStyle = css('--surface'); g.lineWidth = 2; g.beginPath(); g.arc(x, Y(Math.min(Math.max(v, lo), hi)), 4, 0, 7); g.fill(); g.stroke(); }
+      const tip = $('#tip');
+      tip.innerHTML = '<div class="t">' + new Date(best.t * 1000).toLocaleTimeString() + ' (' + fmt(now - best.t) + ' s ago)</div>' +
+        o.series.map((s) => '<div class="r"><span><i style="background:' + css(s.color) + '"></i>' + esc(s.name) + '</span><b>' + fmt(s.get(best), o.dec) + (o.unit ? ' ' + o.unit : '') + '</b></div>').join('');
+      tip.style.display = 'block';
+      const tw = tip.offsetWidth, th2 = tip.offsetHeight;
+      tip.style.left = Math.min(this.hover.cx + 14, window.innerWidth - tw - 8) + 'px';
+      tip.style.top = Math.max(8, this.hover.cy - th2 - 10) + 'px';
+    }
+  }
+}
+function niceStep(r) { const p = Math.pow(10, Math.floor(Math.log10(Math.max(r, 1e-9)))); const m = r / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; }
+function fmtAxis(v, step) { if (Math.abs(v) >= 10000) return (v / 1000).toFixed(0) + 'k'; if (Math.abs(v) >= 1000 && step >= 1000) return (v / 1000).toFixed(step >= 1000 ? 0 : 1) + 'k'; return step < 1 ? v.toFixed(1) : v.toFixed(0); }
+function legend(el, series, vals, unit, dec) {
+  el.innerHTML = series.map((s, i) => '<span><i style="background:' + css(s.color) + '"></i>' + esc(s.name) + (vals ? '<span class="val">' + fmt(vals[i], dec || 0) + (unit || '') + '</span>' : '') + '</span>').join('');
+}
+
+// ------------------------------------------------------------------ charts
+const cores = [];
+for (let i = 0; i < 8; i++) {
+  const d = document.createElement('div'); d.className = 'core';
+  d.innerHTML = '<div class="lab"><span>cpu' + i + ' <span class="muted">' + (i < 6 ? 'silver' : i === 6 ? 'gold' : 'prime') + '</span></span><span class="num" id="cv' + i + '">-</span></div><canvas class="chart h60"></canvas>';
+  $('#cores').appendChild(d);
+  cores.push(new Chart(d.querySelector('canvas'), { min: 0, max: 100, axis: false, thin: true, fill: true, unit: '%',
+    series: [{ name: 'cpu' + i, color: i < 6 ? '--s1' : i === 6 ? '--s2' : '--s8', get: (h) => h.busy ? h.busy[i] : null }] }));
+}
+const sMhz = [{ name: 'silver', color: '--s1', get: (h) => h.mhz && h.mhz[0] }, { name: 'gold', color: '--s2', get: (h) => h.mhz && h.mhz[1] }, { name: 'prime', color: '--s8', get: (h) => h.mhz && h.mhz[2] }];
+const chMhz = new Chart($('#ch-mhz'), { min: 0, max: null, floor: 2500, unit: 'MHz', series: sMhz });
+const TK = ['silver', 'gold', 'prime', 'gpu', 'ddr', 'aoss'];
+const TC = ['--s1', '--s2', '--s8', '--s3', '--s7', '--s4'];
+const sTemp = TK.map((k, i) => ({ name: k, color: TC[i], get: (h) => h.temp ? h.temp[k] : null }));
+const chTemp = new Chart($('#ch-temp'), { min: null, max: null, unit: '°C', dec: 1, series: sTemp });
+const chGpu = new Chart($('#ch-gpu'), { min: 0, max: 100, unit: '%', fill: true, series: [{ name: 'GPU busy', color: '--s3', get: (h) => h.gpu }] });
+const sMem = [{ name: 'used', color: '--s1', get: (h) => h.mem_used }, { name: 'free', color: '--s3', get: (h) => h.mem_free }, { name: 'compressed', color: '--s2', get: (h) => h.mem_comp }];
+const chMem = new Chart($('#ch-mem'), { min: 0, max: null, unit: 'MB', series: sMem });
+const sFps = [{ name: 'shown (FB 5 s)', color: '--s1', get: (h) => h.fb_fps }, { name: 'frame mode', color: '--s2', get: (h) => h.fps }];
+const chFps = new Chart($('#ch-fps'), { min: 0, max: null, floor: 60, unit: 'fps', dec: 1, series: sFps });
+const chKlog = new Chart($('#ch-klog'), { min: 0, max: null, floor: 1024, unit: 'B/s', fill: true, series: [{ name: 'kernel log', color: '--s7', get: (h) => h.klog_bps }] });
+legend($('#lg-mhz'), sMhz); legend($('#lg-temp'), sTemp); legend($('#lg-mem'), sMem); legend($('#lg-fps'), sFps);
+let drawPending = false;
+function redraw() { if (drawPending) return; drawPending = true; requestAnimationFrame(() => { drawPending = false; for (const c of S.charts) c.draw(); }); }
+new ResizeObserver(redraw).observe(document.body);
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { legendsAll(); redraw(); });
+function legendsAll() { const s = S.snap; legend($('#lg-mhz'), sMhz, s ? ['silver', 'gold', 'prime'].map((k) => s.cpu.clusters[k].mhz) : null, ''); legend($('#lg-temp'), sTemp, s ? TK.map((k) => s.temp[k]) : null, '', 1); legend($('#lg-mem'), sMem, s ? [s.mem.used_mb, s.mem.free_mb, s.mem.compressed_mb] : null, ''); legend($('#lg-fps'), sFps, s && S.hist.length ? [S.hist[S.hist.length - 1].fb_fps, S.hist[S.hist.length - 1].fps] : null, '', 1); }
+
+// ------------------------------------------------------------------ snapshot -> panels
+function lvlClass(l) { return l >= 3 ? 'st-critical' : l === 2 ? 'st-serious' : l === 1 ? 'st-warning' : 'st-good'; }
+function tempClass(t) { return t >= 85 ? 'st-critical' : t >= 75 ? 'st-serious' : t >= 65 ? 'st-warning' : 'st-good'; }
+function hms(s) { s = Math.floor(s || 0); return Math.floor(s / 3600) + ':' + String(Math.floor(s / 60) % 60).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'); }
+function showLink(L) {
+  if (!L) return; S.link = L;
+  const ok = L.authed, via = L.via === 'wifi' ? 'Wi-Fi' : L.via === 'usb' ? 'USB' : '-';
+  $('#t-link').innerHTML = '<span class="dot ' + (ok ? 'st-good' : 'st-critical') + '"></span>' + (ok ? via + ' <small>' + fmt(L.rtt_ms, 1) + ' ms</small>' : 'down');
+  $('#t-link').title = (L.host || '') + ' — ' + (L.msg || '') + (L.rx_bps ? ' — rx ' + fmt(L.rx_bps / 1024, 1) + ' KB/s' : '');
+  for (const b of $('#linksel').children) b.classList.toggle('on', b.dataset.v === L.mode);
+  const ban = $('#banner');
+  if (!ok) { ban.style.display = 'block'; ban.textContent = 'Not connected to the phone: ' + (L.msg || '') + ' (USB ' + L.usb_host + ', Wi-Fi ' + (L.wifi_host || 'unknown') + ')'; } else ban.style.display = 'none';
+}
+function onSnap(s) {
+  S.snap = s; S.rate = (s.phone.rate_ms || 1000) / 1000;
+  showLink(s.link);
+  $('#t-up').textContent = hms(s.phone.uptime_s);
+  const b = s.battery;
+  $('#t-bat').innerHTML = b ? b.pct + '% <small>' + b.ma + ' mA' + (b.chg ? ' chg' : '') + '</small>' : '-';
+  const mx = s.temp.max;
+  $('#t-temp').innerHTML = mx !== undefined ? '<span class="dot ' + tempClass(mx) + '"></span>' + fmt(mx, 1) + ' <small>°C</small>' : '-';
+  const lv = s.thermal.level || 0;
+  $('#t-lvl').innerHTML = '<span class="dot ' + lvlClass(lv) + '"></span>level ' + lv + (lv && s.thermal.cap_mhz ? ' <small>cap ' + Object.entries(s.thermal.cap_mhz).filter((e) => e[1]).map((e) => e[0] + ' ' + e[1]).join(', ') + '</small>' : '');
+  $('#t-cpu').innerHTML = fmt(s.cpu.avg) + '<small>%</small>';
+  $('#t-gpu').innerHTML = s.gpu ? s.gpu.busy_pct + '<small>%</small>' : '-';
+  $('#t-self').innerHTML = fmt(s.self.cpu_pct, 1) + '<small>% CPU, ' + fmt(s.self.rss_mb, 1) + ' MB</small>';
+  $('#hot').innerHTML = (s.hot && s.hot.length) ? s.hot.map((h, i) => i === 0 ? '<b>' + esc(h) + '</b>' : '<span>' + esc(h) + '</span>').join('') : '<span class="muted">nothing stands out</span>';
+  s.cpu.busy.forEach((v, i) => { const e = $('#cv' + i); if (e) e.textContent = fmt(v) + '%'; });
+  $('#tempsrc').textContent = s.temp_source || '';
+  // GPU owners
+  const g = s.gpu;
+  $('#gpu-sub').textContent = g ? g.submits + ' submits, ' + g.missed + ' missed, mean ' + g.mean_us + ' us, longest ' + g.longest_us + ' us' : 'no GPU line yet';
+  const tot = g ? Math.max(1, g.busy_ms) : 1;
+  $('#gpu-own').innerHTML = g && g.owners.length ? '<table><thead><tr><th>GPU owner (5 s)</th><th class="n">submits</th><th class="n">ms</th><th style="width:45%"></th></tr></thead><tbody>' +
+    g.owners.map((o) => '<tr><td>' + esc(o.name) + '</td><td class="n">' + o.submits + '</td><td class="n">' + o.ms + '</td><td><div class="bar"><span style="width:' + Math.min(100, o.ms / tot * 100) + '%;background:var(--s3)"></span></div></td></tr>').join('') + '</tbody></table>' : '';
+  // memory
+  const m = s.mem;
+  $('#mem-kv').innerHTML = [['wired', m.wired_mb, 'MB'], ['active', m.active_mb, 'MB'], ['inactive', m.inactive_mb, 'MB'], ['pageins', m.pageins_s, '/s'], ['faults', m.faults_s, '/s'], ['processes', s.phone.nproc, '']]
+    .map((r) => '<span class="k">' + r[0] + '</span><span class="num">' + fmt(r[1]) + ' ' + r[2] + '</span>').join('');
+  // frames
+  $('#frames-on').checked = !!s.frames_on;
+  const f = s.frames, fb = s.fb;
+  $('#fps-kv').innerHTML = (fb ? '<span class="k">FB 5 s</span><span class="num">shown ' + fb.shown + ', dropped ' + fb.dropped + ', p50 ' + fb.p50_ms + ' / p95 ' + fb.p95_ms + ' ms, ' + fb.hz + ' Hz</span>' : '') +
+    (f ? '<span class="k">frame mode</span><span class="num">' + fmt(f.fps, 1) + ' fps, vsync ' + f.vsync + ', GPU p50 ' + fmt(f.gpu_ms_p50, 1) + ' / p90 ' + fmt(f.gpu_ms_p90, 1) + ' ms, present-to-shown p50 ' + fmt(f.present_to_shown_ms_p50, 1) + ' ms</span>' : '');
+  procTable();
+  // klog
+  const k = s.klog;
+  $('#klog-sub').textContent = 'now ' + fmt((k.bps_kernel || 0) / 1024, 1) + ' KB/s' + (k.lost_bytes ? ', lost ' + k.lost_bytes + ' B' : '');
+  $('#klog-file').textContent = (k.file || '') + (k.status && !String(k.status).startsWith('ok') ? ' — ' + k.status : '');
+  const mt = Math.max(1, ...k.top_tags.map((x) => x.bps));
+  $('#tags tbody').innerHTML = k.top_tags.map((x) => '<tr data-tag="' + esc(x.tag) + '"><td>' + esc(x.tag) + '</td><td class="n">' + x.bps + '</td><td class="n">' + x.lines_s + '</td><td><div class="bar"><span style="width:' + (x.bps / mt * 100) + '%;background:var(--s7)"></span></div></td></tr>').join('');
+  if (s.trace) showTrace(s.trace);
+  legendsAll();
+}
+function procTable() {
+  const s = S.snap; if (!s) return;
+  const rows = (s.procs.by_cpu || []).slice();
+  const k = S.procSort;
+  rows.sort((a, b) => k === 'name' ? String(a.name).localeCompare(b.name) : (b[k] || 0) - (a[k] || 0));
+  $('#proc-sub').textContent = (s.procs.nproc || '?') + ' processes, top ' + rows.length + ' by CPU over ' + fmt(s.procs.interval_s, 1) + ' s; click a row to pick it as the profiler target';
+  const mc = Math.max(10, ...rows.map((r) => r.cpu_pct || 0));
+  $('#proc tbody').innerHTML = rows.map((r) => '<tr data-name="' + esc(r.name) + '"' + (S.target === r.name ? ' class="sel"' : '') + '><td>' + esc(r.name) + '</td><td class="n">' + r.pid + '</td><td class="n"><div class="bar" style="min-width:90px"><span style="width:' + ((r.cpu_pct || 0) / mc * 100) + '%"></span><em>' + fmt(r.cpu_pct, 1) + '</em></div></td><td class="n">' + fmt(r.wakeups_s) + '</td><td class="n">' + fmt(r.mem_mb, 1) + '</td><td class="n">' + r.threads + '</td><td class="n">' + fmt(r.disk_kbs) + '</td></tr>').join('');
+}
+$('#proc thead').addEventListener('click', (e) => { const k = e.target.dataset.k; if (k) { S.procSort = k; procTable(); } });
+$('#proc tbody').addEventListener('click', (e) => { const tr = e.target.closest('tr'); if (!tr) return; S.target = tr.dataset.name; $('#tr-target').value = S.target; $('#tr-kind').value = 'prof'; $('#tr-name').value = S.target.replace(/[^A-Za-z0-9._-]/g, '_'); kindUI(); procTable(); });
+$('#tags tbody').addEventListener('click', (e) => { const tr = e.target.closest('tr'); if (!tr) return; $('#kfilter').value = '^\\[[ 0-9.]*\\] ' + tr.dataset.tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); renderKlog(true); });
+
+// ------------------------------------------------------------------ klog tail
+const KMAX = 4000;
+function addKlog(lines) {
+  if (S.kpaused) { S.kpending.push(...lines); if (S.kpending.length > KMAX) S.kpending.splice(0, S.kpending.length - KMAX); $('#kpause').textContent = 'resume (' + S.kpending.length + ')'; return; }
+  S.klog.push(...lines); if (S.klog.length > KMAX) S.klog.splice(0, S.klog.length - KMAX);
+  renderKlog();
+}
+let kre = null, kreSrc = null;
+function renderKlog(force) {
+  const el = $('#klog'), src = $('#kfilter').value;
+  if (src !== kreSrc) { kreSrc = src; try { kre = src ? new RegExp(src, 'i') : null; $('#kfilter').style.borderColor = ''; } catch (e) { kre = null; $('#kfilter').style.borderColor = 'var(--critical)'; } }
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+  let rows = kre ? S.klog.filter((l) => kre.test(l)) : S.klog;
+  rows = rows.slice(-1200);
+  el.innerHTML = rows.map((l) => { const e = esc(l); if (!kre) return e; return e.replace(new RegExp('(' + esc(src).replace(/^\^/, '') + ')', 'i'), '<span class="m">$1</span>'); }).join('\n');
+  if (atBottom || force) el.scrollTop = el.scrollHeight;
+}
+$('#kfilter').addEventListener('input', () => renderKlog(true));
+$('#kpause').addEventListener('click', () => { S.kpaused = !S.kpaused; $('#kpause').textContent = S.kpaused ? 'resume' : 'pause'; if (!S.kpaused) { const p = S.kpending; S.kpending = []; addKlog(p); } });
+$('#kclear').addEventListener('click', () => { S.klog = []; S.kpending = []; renderKlog(); });
+
+// ------------------------------------------------------------------ API
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  return r.json();
+}
+for (const b of $('#win').children) { b.classList.toggle('on', +b.dataset.v === S.win); b.addEventListener('click', () => { S.win = +b.dataset.v; try { localStorage.setItem('sm-win', S.win); } catch (e) {} for (const x of $('#win').children) x.classList.toggle('on', x === b); redraw(); }); }
+for (const b of $('#linksel').children) b.addEventListener('click', async () => { const r = await api('/api/link', { link: b.dataset.v }); if (r.link) showLink(r.link); });
+$('#speedbtn').addEventListener('click', async () => {
+  $('#speedbtn').disabled = true; $('#speedres').textContent = 'running...';
+  try { const r = await api('/api/speed', { mb: +$('#speedmb').value || 16 }); $('#speedres').textContent = r.ok ? fmt(r.mbps, 1) + ' MB/s via ' + r.via + ' (' + r.mb + ' MiB in ' + r.pc_s + ' s)' : 'failed: ' + (r.msg || (r.phone && r.phone.msg)); }
+  catch (e) { $('#speedres').textContent = 'failed: ' + e; }
+  $('#speedbtn').disabled = false;
+});
+$('#frames-on').addEventListener('change', (e) => api('/api/frames', { on: e.target.checked }));
+$('#themebtn').addEventListener('click', () => {
+  const d = document.documentElement, dark = matchMedia('(prefers-color-scheme: dark)').matches;
+  const cur = d.dataset.theme || (dark ? 'dark' : 'light'); d.dataset.theme = cur === 'dark' ? 'light' : 'dark';
+  try { localStorage.setItem('sm-theme', d.dataset.theme); } catch (e) {}
+  legendsAll(); redraw();
+});
+
+// ------------------------------------------------------------------ traces
+function kindUI() { const p = $('#tr-kind').value === 'prof'; document.querySelectorAll('.kd').forEach((e) => e.style.display = p ? 'none' : ''); document.querySelectorAll('.pf').forEach((e) => e.style.display = p ? '' : 'none'); }
+$('#tr-kind').addEventListener('change', kindUI); kindUI();
+const ACTIVE = ['starting', 'recording', 'stopping', 'transferring', 'analyzing'];
+function showTrace(t) {
+  S.trace = t;
+  const active = t && ACTIVE.includes(t.state);
+  const btn = $('#tr-btn');
+  btn.textContent = active ? (t.state === 'recording' || t.state === 'starting' ? 'Stop trace' : t.state + '...') : 'Start trace';
+  btn.classList.toggle('stop', active); btn.disabled = active && !(t.state === 'recording' || t.state === 'starting');
+  $('#tr-abort').disabled = !(active && t.kind === 'kdebug' && t.state === 'recording');
+  if (!t) { $('#tr-status').innerHTML = '<span class="muted">idle</span>'; return; }
+  let h = '<b>' + esc(t.name) + '</b> (' + t.kind + ') <span class="dot ' + (t.state === 'failed' ? 'st-critical' : t.state === 'done' ? 'st-good' : 'st-warning') + '"></span>' + t.state;
+  if (t.state === 'recording') h += ' ' + fmt(t.recording_s) + ' / ' + t.secs + ' s';
+  if (t.zbytes) h += ' — ' + fmt(t.zbytes / 1e6, 2) + ' MB in ' + fmt(t.transfer_s, 1) + ' s' + (t.transfer_mbps ? ' (' + fmt(t.transfer_mbps, 1) + ' MB/s)' : '');
+  if (t.end) h += ' — ' + fmt(t.end.bytes / 1e6, 1) + ' MB raw' + (t.end.wrapped ? ', <span class="err">wrapped</span>' : '') + (t.end.lost ? ', <span class="err">lost ' + t.end.lost + '</span>' : '') + ', phone cpu ' + t.end.cpu_ms + ' ms';
+  if (t.error) h += '<div class="err">' + esc(t.error) + '</div>';
+  else if (t.state === 'done') h += ' — <a href="/api/traces/' + encodeURIComponent(t.dir) + '/report.txt" target="_blank">report</a>' + (t.kind === 'kdebug' ? ' · <a href="/api/traces/' + encodeURIComponent(t.dir) + '/summary.json" target="_blank">summary</a>' : '');
+  $('#tr-status').innerHTML = h;
+}
+$('#tr-btn').addEventListener('click', async () => {
+  const t = S.trace;
+  if (t && (t.state === 'recording' || t.state === 'starting')) { showTrace(Object.assign({}, t, { state: 'stopping' })); const r = await api('/api/trace/stop', {}); if (!r.ok) alert(r.msg); return; }
+  const kind = $('#tr-kind').value, opts = {};
+  if (kind === 'kdebug') { opts.mode = $('#tr-mode').value; opts.filter = $('#tr-filter').value; if ($('#tr-quiet').checked) opts.quiet = 1; }
+  else { opts.target = $('#tr-target').value.trim() || 'backboardd'; opts.hz = +$('#tr-hz').value || 1000; }
+  const r = await api('/api/trace/start', { kind, name: $('#tr-name').value.trim() || kind, secs: +$('#tr-secs').value || 10, opts });
+  if (!r.ok) { $('#tr-status').innerHTML = '<span class="err">' + esc(r.msg) + '</span>'; return; }
+  showTrace(r.trace); bumpName();
+});
+$('#tr-abort').addEventListener('click', () => api('/api/trace/stop', { abort: true }));
+function bumpName() { const n = $('#tr-name'), m = n.value.match(/^(.*?)(\d+)$/); if (m) n.value = m[1] + (+m[2] + 1); }
+async function loadTraces() {
+  try {
+    const r = await api('/api/traces');
+    $('#traces tbody').innerHTML = r.traces.slice(0, 40).map((t) => {
+      const f = t.files || {}, sz = (f['trace.swtr'] || f['prof.bin'] || 0) / 1e6, d = encodeURIComponent(t.dir);
+      const links = ['summary.json', 'report.txt', 'meta.json'].filter((x) => f[x] || x === 'meta.json').map((x) => '<a href="/api/traces/' + d + '/' + x + '" target="_blank">' + x.split('.')[0] + '</a>').join(' ');
+      return '<tr title="' + esc(t.error || t.msg || '') + '"><td>' + esc(t.dir) + '</td><td>' + t.kind + '</td><td>' + (t.state === 'failed' ? '<span class="err">failed</span>' : t.state) + '</td><td class="n">' + fmt(sz, 1) + '</td><td class="n">' + fmt(t.transfer_s, 1) + '</td><td class="n">' + fmt(t.transfer_mbps, 1) + '</td><td>' + links + '</td></tr>';
+    }).join('');
+    if (r.current) showTrace(r.current); else if (!S.trace && r.traces[0]) showTrace(r.traces[0]);
+  } catch (e) {}
+}
+
+// ------------------------------------------------------------------ live stream
+function pushH(h) { S.hist.push(h); S.lastT = h.t; const lim = h.t - 960; while (S.hist.length && S.hist[0].t < lim) S.hist.shift(); }
+async function init() {
+  try { const h = await api('/api/history?secs=900'); S.hist = h; if (h.length) S.lastT = h[h.length - 1].t; } catch (e) {}
+  try { const k = await api('/api/klog?n=800'); S.klog = k.lines || []; renderKlog(true); } catch (e) {}
+  try { const n = await api('/api/now'); if (n.cpu) onSnap(n); else showLink(n.link); } catch (e) {}
+  loadTraces(); redraw();
+  const es = new EventSource('/api/stream');
+  es.addEventListener('init', (e) => { const d = JSON.parse(e.data); if (d.link) showLink(d.link); if (d.trace) showTrace(d.trace); });
+  es.addEventListener('sample', (e) => { const d = JSON.parse(e.data); pushH(d.h); onSnap(d.snap); redraw(); });
+  es.addEventListener('klog', (e) => addKlog(JSON.parse(e.data).lines));
+  es.addEventListener('link', (e) => showLink(JSON.parse(e.data)));
+  es.addEventListener('hello', (e) => { const d = JSON.parse(e.data); showLink(d.link); });
+  es.addEventListener('trace', (e) => { const t = JSON.parse(e.data); showTrace(t); if (!ACTIVE.includes(t.state) || t.state === 'analyzing') loadTraces(); });
+  es.addEventListener('speed', (e) => { const r = JSON.parse(e.data); $('#speedres').textContent = fmt(r.mbps, 1) + ' MB/s via ' + r.via; });
+  es.onerror = () => { const b = $('#banner'); b.style.display = 'block'; b.textContent = 'Lost the collector (http stream); retrying...'; };
+  es.onopen = () => { if (S.link && S.link.authed) $('#banner').style.display = 'none'; };
+}
+init();
+</script>
+</body>
+</html>
