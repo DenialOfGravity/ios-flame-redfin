@@ -7,7 +7,7 @@ with a hexdump); same behaviour otherwise. Original: ws-w-wifibt xnu/patches/101
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
 diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
-index e2674ee..1a61e48 100644
+index e2674ee..93fa1a5 100644
 --- a/bsd/dev/redwood_apple80211.c
 +++ b/bsd/dev/redwood_apple80211.c
 @@ -34,6 +34,7 @@
@@ -18,7 +18,7 @@ index e2674ee..1a61e48 100644
  #include <sys/errno.h>
  #include <sys/kern_event.h>
  #include <sys/kernel.h>
-@@ -201,6 +202,39 @@ static LCK_GRP_DECLARE(apple80211_lock_group, "redwood-apple80211");
+@@ -201,6 +202,25 @@ static LCK_GRP_DECLARE(apple80211_lock_group, "redwood-apple80211");
  static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
  static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
  static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
@@ -30,35 +30,21 @@ index e2674ee..1a61e48 100644
 +static int wifi_accept = -1;
 +static char country[3] = "XX";
 +
-+/*
-+ * redfin 1014: the joined network's signal for wifid (status-bar bars, Settings). The answers below (NOISE 17, RATE 8,
-+ * PHY_MODE 14, MCS 57) were refused before; the link event carried rssi with snr and noise 0. While joined a timer
-+ * tells wifid the signal again when it moves 2 dB, or every 10 s, as events chosen by sweetwifilqm= /
-+ * sysctl kern.sweet_wifi_lqm (bits; the payloads of 17 and 39 are not known for iOS 16: tried as below):
-+ *   0x1  LINK_QUALITY (17): { int32 rssi; uint32 tx rate Mbit/s } in 32 bytes (CoreWLAN's linkQualityDidChange)
-+ *   0x2  RSSI_CHANGED (39): the RSSI request's answer (apple80211_rssi_data)
-+ *   0x4  LINK_CHANGED (4) up again with the new rssi (the event wifid is known to read)
-+ *   0x8  snr and noise filled in LINK_CHANGED (noise -95 dBm as int16 in the uint16 field)
-+ * Default 0x9. kern.sweet_wifi_rssi: the last signal told (read only).
-+ */
-+#define NOISE_FLOOR     (-95)
-+static int wifi_lqm = 0x9;
-+static int wifi_lqm_rssi;
-+SYSCTL_INT(_kern, OID_AUTO, sweet_wifi_lqm, CTLFLAG_RW | CTLFLAG_LOCKED, &wifi_lqm, 0, "redfin 1014: Wi-Fi signal events (bits)");
-+SYSCTL_INT(_kern, OID_AUTO, sweet_wifi_rssi, CTLFLAG_RD | CTLFLAG_LOCKED, &wifi_lqm_rssi, 0, "redfin 1014: last Wi-Fi signal told, dBm");
-+static thread_call_t lqm_call;
-+static bool lqm_running;
-+static void lqm_tick(thread_call_param_t p0, thread_call_param_t p1);
-+
-+static unsigned
-+link_rate(const struct redwood_sta_bss *bss)
++static bool
++accepting(void)
 +{
-+	return bss->frequency >= 4000 ? 150 : 72;       /* HT20 MCS 7 short GI on 2.4 GHz; 5 GHz as ath10k's wcn3990 HT40 */
++	if (wifi_accept < 0) {
++		int on = 1;
++
++		PE_parse_boot_argn("sweetwifiacc", &on, sizeof(on));
++		wifi_accept = on != 0;
++	}
++	return wifi_accept != 0;
 +}
  
  /* ---- channels ---------------------------------------------------------------------------------------- */
  
-@@ -369,6 +403,20 @@ get(struct apple80211req *request)
+@@ -369,6 +389,20 @@ get(struct apple80211req *request)
  		request->req_val = (int32_t)join_result;
  		lck_mtx_unlock(&apple80211_lock);
  		return 0;
@@ -79,11 +65,11 @@ index e2674ee..1a61e48 100644
  	case 11: {                              /* what the last scan heard, one access point a request; EIO: that was all */
  		struct redwood_sta_bss *bss = kalloc_data(sizeof(*bss), Z_WAITOK);
  		unsigned index;
-@@ -589,6 +637,37 @@ set(const struct apple80211req *request, char *said, size_t said_size)
+@@ -589,6 +623,37 @@ set(const struct apple80211req *request, char *said, size_t said_size)
  	}
  	case 10:
  		return set_scan(request, said, said_size);
-+	case 383:                               /* 0193: taken, nothing done */
++	case 383:                               /* 0193: taken, nothing done (1012 also hexdumps it once) */
 +		return accepting() ? 0 : EOPNOTSUPP;
 +	case 51: {                              /* 0193: the country code: kept, not sent to the firmware */
 +		static bool shown;
