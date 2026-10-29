@@ -354,7 +354,8 @@ static void flushSurfaces(NSSet *surfaces,bool completion) {
  const bool all=flushAll();
  std::vector<IOSurfaceRef> distinct;
  distinct.reserve(surfaces.count);
- for(NBTexture *texture in surfaces)if(texture.surface)distinct.push_back(texture.surface);
+ std::vector<IOSurfaceRef> rotated;   // rotfb4: surfaces under a rotated texture, whose CPU writes the runtime must copy in again
+ for(NBTexture *texture in surfaces)if(texture.surface){distinct.push_back(texture.surface);if(texture.rotationValue)rotated.push_back(texture.surface);}
  std::sort(distinct.begin(),distinct.end());
  const auto last=std::unique(distinct.begin(),distinct.end());
  gSurfaceFlushDuplicates+=(uint64_t)(distinct.end()-last);
@@ -366,6 +367,7 @@ static void flushSurfaces(NSSet *surfaces,bool completion) {
    auto state=gSurfaceStates.find(surface);
    if(state!=gSurfaceStates.end() && state->second.known && state->second.seed==seed){gSurfaceCleanSkips++;continue;}
   }
+  if(!completion && std::find(rotated.begin(),rotated.end(),surface)!=rotated.end())nmb_rotated_planes_written();
   const uint64_t began=nowUs();const size_t bytes=IOSurfaceGetAllocSize(surface);
   sys_dcache_flush(IOSurfaceGetBaseAddress(surface),bytes);
   gSurfaceFlushBytes+=bytes;gTimeSurfaceFlush.add(began);
@@ -647,6 +649,7 @@ static void notified(void *context,uint64_t value) {
 @property(atomic) BOOL committed,failedLocally;
 @property(nonatomic) uint64_t committedUs;
 @property(nonatomic) uint32_t commitIndex;
+@property(nonatomic) BOOL rotatedFrame;   // rotfb4: a pass of it renders a rotated (landscape framebuffer) texture
 @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
 @property(nonatomic,strong) NSMutableSet *surfaces;          // every surface texture it uses (cleaned at commit if the CPU wrote it)
 @property(nonatomic,strong) NSMutableSet *writtenSurfaces;   // those the GPU may write (flushed at completion)
@@ -1018,6 +1021,7 @@ static void noteDeviceLost(const char *why) {
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface){[_surfaces addObject:texture];[_writtenSurfaces addObject:texture];}
+  if(texture.rotationValue)self.rotatedFrame=YES;
   [_resourceOwners addObject:texture];
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
   return true;
@@ -1139,9 +1143,27 @@ static void noteDeviceLost(const char *why) {
 @end
 static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSchedule];}
 // The runtime's completion: the command buffer's own reference, taken at commit, is given back here.
+// rotfb4: once per 5 s, while landscape frames render: the command buffers with a rotated pass, their GPU ms, and the runtime's rotated
+// copies (in, skipped, back, MB, dispatches) over the same 5 s.
+static void rotatedFrameStats(NBCommandBuffer *commandBuffer) {
+ static std::mutex lock;static uint64_t windowUs,frames,gpuUs,gpuMaxUs,last[5];
+ const double start=nmb_command_buffer_gpu_time(commandBuffer.handle,false),end=nmb_command_buffer_gpu_time(commandBuffer.handle,true);
+ const uint64_t took=end>start && start>0?(uint64_t)((end-start)*1e6):0;
+ std::lock_guard<std::mutex> l(lock);
+ frames++;gpuUs+=took;gpuMaxUs=std::max(gpuMaxUs,took);
+ const uint64_t now=nowUs();
+ if(!windowUs){windowUs=now;nmb_rotated_copy_stats(last);return;}
+ if(now-windowUs<5000000)return;
+ uint64_t c[5];nmb_rotated_copy_stats(c);
+ sm2_logs([NSString stringWithFormat:@"native-metal: rotated 5s: %llu cmdbufs, GPU %llu ms (mean %.1f, max %.1f) | copies in %llu skipped %llu back %llu, %llu MB, %llu dispatches",
+  (unsigned long long)frames,(unsigned long long)(gpuUs/1000),frames?gpuUs/1000.0/frames:0.0,gpuMaxUs/1000.0,(unsigned long long)(c[0]-last[0]),
+  (unsigned long long)(c[1]-last[1]),(unsigned long long)(c[2]-last[2]),(unsigned long long)((c[3]-last[3])>>20),(unsigned long long)(c[4]-last[4])].UTF8String);
+ memcpy(last,c,sizeof c);windowUs=now;frames=gpuUs=gpuMaxUs=0;
+}
 static void completed(void *context) {
  gCompleted++;
  NBCommandBuffer *commandBuffer=(__bridge_transfer NBCommandBuffer *)context;
+ if(commandBuffer.rotatedFrame)rotatedFrameStats(commandBuffer);
  {
   const uint64_t took=nowUs()-commandBuffer.committedUs;
   gTimeEncodeToCommit.count++;gTimeEncodeToCommit.total+=took;

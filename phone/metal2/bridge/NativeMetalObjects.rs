@@ -779,6 +779,23 @@ pub extern "C" fn nmb_texture_new_on_surface(buffer: *mut NmbBuffer, descriptor:
     })
 }
 
+/// rotfb4: the runtime's rotated-texture copies since the process began: copies in, copies in skipped (the frame still held the
+/// plane), copies back, bytes moved, kernel dispatches.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_rotated_copy_stats(out: *mut u64) {
+    guard((), || {
+        let out = get_mut(out as *mut [u64; 5])?;
+        *out = metal2vulkan_runtime::rotated_copy_stats();
+        Ok(())
+    })
+}
+
+/// rotfb4: the CPU wrote a rotated texture's plane (its IOSurface's seed moved): every rotated frame is copied in again.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_rotated_planes_written() {
+    metal2vulkan_runtime::rotated_planes_written();
+}
+
 /// `nmb_texture_new_on_buffer` over an IOSurface plane with the descriptor's rotation and framebufferOnly (`NmbTextureExtras`).
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_texture_new_on_surface_rotated(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64,

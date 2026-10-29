@@ -195,6 +195,8 @@ int nmb_command_buffer_wait(NmbCommandBuffer *, uint64_t timeout_ms);
 uint64_t nmb_command_buffer_status(const NmbCommandBuffer *);
 size_t nmb_command_buffer_error(const NmbCommandBuffer *, char *out, size_t size);
 double nmb_command_buffer_gpu_time(const NmbCommandBuffer *, bool end);
+void nmb_rotated_copy_stats(uint64_t out[5]);
+void nmb_rotated_planes_written(void);
 
 /* Events: an MTLEvent (shared false) or an MTLSharedEvent within this process. */
 NmbEvent *nmb_event_new(NmbDevice *, bool shared);
