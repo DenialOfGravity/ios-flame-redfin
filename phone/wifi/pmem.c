@@ -117,5 +117,22 @@ int pm_rpmh(const char *res, unsigned n, const uint32_t *off, const uint32_t *va
 		r.offset[i] = off[i];
 		r.value[i] = val[i];
 	}
-	return ioctl(pm_fd, PMEM_RPMH, &r) < 0 ? errno : 0;
+	/*
+	 * The kernel's sweet_rpmh_write() takes its lock with a try-lock and answers EBUSY while another vote is in
+	 * flight (one vote ~5-10 ms). wland and btd-bridge vote their rails at the same moment at boot: redfin r56c,
+	 * r57a, r59a, r60a klogs all show "rpmh ldoa1 ... -> 16" between btd's smpa4/ldoa14/ldoc2 votes, and wland
+	 * then gave up before the modem. Retry EBUSY for up to ~2 s, as the kernel's own ADSP code does.
+	 */
+	unsigned busy = 0;
+	int e;
+	for (;;) {
+		e = ioctl(pm_fd, PMEM_RPMH, &r) < 0 ? errno : 0;
+		if (e != EBUSY || busy >= 1000)
+			break;
+		busy++;
+		usleep(2000);
+	}
+	if (busy)
+		fprintf(stderr, "pmem: rpmh %s busy (another vote in flight): %u retries -> %d\n", res, busy, e);
+	return e;
 }
