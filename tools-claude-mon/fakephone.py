@@ -18,6 +18,7 @@ Test control (UDP --ctl-port on 127.0.0.1, one word per datagram, answer in the 
   burst N              write N bytes of filler kernel log now (ring wraps past 4 MiB = lost bytes for the PC)
   down NAME / up NAME  stop / start accepting on the named listener (e.g. usb) to test link switching
   reboot               new boottime + empty log (a new klog file on the PC)
+  badframe             send malformed S/K/T/E frames and an unknown type
   crash NAME           print a CRASH line;   hot / cool  thermal level 1 / 0 lines;  load N  busy % base
   state                JSON of the fake's state
 """
@@ -606,10 +607,26 @@ class Phone:
                 k += 114
             return 'burst %d total %d' % (n, self.total)
         if c in ('down', 'up'):
-            (self.down.add if c == 'down' else self.down.discard)(a[1])
-            if c == 'down' and self.client and self.client.get('lname') == a[1]:
-                self.client['w'].close()
-            return '%s %s' % (c, a[1])
+            nm = a[1]
+            if nm not in self.hosts:
+                return 'no listener %s' % nm
+            if c == 'down' and nm not in self.down:
+                self.down.add(nm)
+                self.listeners[nm].close()          # connection refused from now on, like a dead interface
+                if self.client and self.client.get('lname') == nm:
+                    self.client['w'].close()
+            elif c == 'up' and nm in self.down:
+                self.down.discard(nm)
+                asyncio.ensure_future(self.listen(nm))
+            return '%s %s' % (c, nm)
+        if c == 'badframe':           # garbage the collector must survive: bad JSON, short K/T, unknown type
+            if not self.client:
+                return 'no client'
+            w = self.client['w']
+            for t, pl in (('S', b'{not json'), ('K', b'abc'), ('T', b'\x01'), ('E', b'[1,'), ('Z', b'??'),
+                          ('R', b'{"cmd":"nosuch","ok":true}')):
+                w.write(self.frame(t, pl))
+            return 'sent bad frames'
         if c == 'reboot':
             self.boot = int(time.time())
             self.t0 = time.time()
@@ -642,19 +659,18 @@ class Phone:
                                'cmds': self.cmd_log[-40:], 'tx': self.tx})
         return 'unknown'
 
+    async def listen(self, name):
+        async def cb(r, w):
+            await self.handle(r, w, name)
+        self.listeners[name] = await asyncio.start_server(cb, self.hosts[name], self.a.port)
+
     async def serve(self):
         loop = asyncio.get_running_loop()
+        self.hosts = {}
         for spec in self.a.listen:
             name, _, host = spec.partition('=')
-
-            def mk(nm):
-                async def cb(r, w):
-                    if nm in self.down:
-                        w.close()
-                        return
-                    await self.handle(r, w, nm)
-                return cb
-            self.listeners[name] = await asyncio.start_server(mk(name), host, self.a.port)
+            self.hosts[name] = host
+            await self.listen(name)
         await loop.create_datagram_endpoint(lambda: self.Udp(self.control), local_addr=('127.0.0.1', self.a.ctl_port))
         await loop.create_datagram_endpoint(lambda: self.Udp(self.poke), local_addr=(self.a.poke_host, self.a.poke_port))
         print('fakephone pid %d: %s port %d, ctl udp %d, poke udp %s:%d' % (os.getpid(), self.a.listen, self.a.port,
