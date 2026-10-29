@@ -720,7 +720,8 @@ class Collector:
                                                           want.get('poll_us'), want.get('txbatch'))
         self.usb_fast = st
         msg = 'USB fast path %s: poll_us %s txbatch %s (tx %s frames / %s xfers)%s' % (
-            'set' if isinstance(want, dict) else 'read (usb_fast null: left alone)', st['poll_us'], st['txbatch'],
+            'set' if isinstance(want, dict) else ('read' if not apply else 'read (usb_fast null: left alone)'),
+            st['poll_us'], st['txbatch'],
             st['tx_frames'], st['tx_xfers'], ', ERROR ' + st['error'] if st.get('error') else '')
         if st.get('error') and st['error'].startswith('kernel without'):
             if not self.usb_fast_warned:
