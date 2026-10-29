@@ -26,6 +26,7 @@
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <math.h>
 #include <unistd.h>
 #if defined(__aarch64__)
@@ -330,6 +331,13 @@ static std::string gPrewarmDir;
 static std::mutex gPrewarmLock;
 static std::unordered_map<std::string,bool> gPrewarmSeen;   // recorded lines (the file's and this process's)
 static std::atomic<bool> gPrewarmRunning{false};
+static std::unordered_map<std::string,bool> gPrewarmUsed;   // mode 2: records CA made this process (under gPrewarmLock)
+// G6: 2 = idle priming (SWEET_PREWARM=2), 1 = the prewarm at device creation (default; 0 turns both off through prewarmOn).
+static int prewarmMode() {
+ static int mode=-1;
+ if(mode<0){const char *e=getenv("SWEET_PREWARM");mode=e && atoi(e)==2?2:1;}
+ return mode;
+}
 static bool prewarmOn() {
  static int on=-1;
  if(on<0){const char *e=getenv("SWEET_PREWARM"),*p=getprogname();
@@ -390,19 +398,15 @@ static void prewarmRecord(const std::string &vertex,const std::string &fragment,
  char opts[24];snprintf(opts,sizeof opts,"%llx",(unsigned long long)options);
  const std::string line="P1 "+vertex+" "+fragment+" "+opts+" "+hexOf(bytes,size);
  std::lock_guard<std::mutex> lock(gPrewarmLock);
+ if(prewarmMode()==2 && gPrewarmUsed.size()<4000)gPrewarmUsed.emplace(line,true);   // G6: made by CA this boot
  if(gPrewarmSeen.size()>=1000 || !gPrewarmSeen.emplace(line,true).second)return;
  if(FILE *f=fopen((gPrewarmDir+"/prewarm.v1").c_str(),"a")){fputs(line.c_str(),f);fputc('\n',f);fclose(f);}
 }
-// The prewarm itself (a utility-QoS GCD thread, from device creation).
-static void prewarmRun(std::vector<std::string> lines) {
- gPrewarmRunning=true;
- const uint64_t began=nowUs();
- const unsigned most=prewarmKnob("SWEET_PREWARM_MAX",300),budgetMs=prewarmKnob("SWEET_PREWARM_MS",30000);
- static std::vector<NmbRenderPipeline *> kept;   // the prewarmed states, for the process's life
+// Makes recorded states again (both prewarm modes): the libraries read once, kept for the process's life like the states.
+struct PrewarmMaker {
  std::unordered_map<std::string,NmbLibrary *> libraries;
- unsigned made=0,failed=0,noLibrary=0,bad=0,tried=0;
- NmbShaderCacheStats c0={},c1={};const bool haveC0=nmb_device_shader_cache_stats(gDevice,&c0);
- auto function=[&](const std::string &key,bool &missing)->NmbFunction * {
+ unsigned bad=0;
+ NmbFunction *function(const std::string &key,bool &missing) {
   const std::vector<std::string> p=splitOn(key,':');
   if(p.size()!=4){bad++;return nullptr;}
   NmbLibrary *library=nullptr;
@@ -432,28 +436,47 @@ static void prewarmRun(std::vector<std::string> lines) {
    for(size_t i=0;i<constants.size();i++){constants[i].name=names[i].empty()?nullptr:names[i].c_str();constants[i].bytes=values[i].data();}
   }
   return nmb_function_new_specialized(library,name.c_str(),constants.data(),(uint32_t)constants.size());
- };
- for(const std::string &line:lines) {
-  if(tried>=most || (nowUs()-began)/1000>=budgetMs)break;
+ }
+ // One record: -1 unreadable line (not tried), 0 made (into kept), 1 failed, 2 without its library.
+ int make(const std::string &line,std::vector<NmbRenderPipeline *> &kept) {
   const std::vector<std::string> t=splitOn(line,' ');
-  if(t.size()!=5 || t[0]!="P1"){bad++;continue;}
-  tried++;
+  if(t.size()!=5 || t[0]!="P1"){bad++;return -1;}
+  int result;
   bool missing=false;
   NmbFunction *vertex=function(t[1],missing);
   NmbFunction *fragment=t[2]=="-"?nullptr:function(t[2],missing);
   std::vector<uint8_t> bytes;
   NmbRenderPipelineDescriptor d={};
   if(!vertex || (t[2]!="-" && !fragment) || !unhex(t[4],bytes) || bytes.size()>sizeof d) {
-   if(missing)noLibrary++;else failed++;
+   result=missing?2:1;
   } else {
    memcpy(&d,bytes.data(),bytes.size());d.vertex=vertex;d.fragment=fragment;
    const NmbPipelineOptions options={strtoull(t[3].c_str(),nullptr,16),nullptr,0};
    NmbRenderPipeline *state=nmb_render_pipeline_new_with_options(gDevice,&d,&options);
-   if(state){kept.push_back(state);made++;}else failed++;
+   if(state){kept.push_back(state);result=0;}else result=1;
   }
   if(vertex)nmb_function_release(vertex);
   if(fragment)nmb_function_release(fragment);
+  return result;
  }
+};
+static std::vector<NmbRenderPipeline *> gPrewarmKept;   // the prewarmed states, for the process's life
+// The prewarm itself (a utility-QoS GCD thread, from device creation).
+static void prewarmRun(std::vector<std::string> lines) {
+ gPrewarmRunning=true;
+ const uint64_t began=nowUs();
+ const unsigned most=prewarmKnob("SWEET_PREWARM_MAX",300),budgetMs=prewarmKnob("SWEET_PREWARM_MS",30000);
+ PrewarmMaker maker;
+ unsigned made=0,failed=0,noLibrary=0,tried=0;
+ NmbShaderCacheStats c0={},c1={};const bool haveC0=nmb_device_shader_cache_stats(gDevice,&c0);
+ for(const std::string &line:lines) {
+  if(tried>=most || (nowUs()-began)/1000>=budgetMs)break;
+  const int r=maker.make(line,gPrewarmKept);
+  if(r<0)continue;
+  tried++;
+  if(r==0)made++;else if(r==2)noLibrary++;else failed++;
+ }
+ const unsigned bad=maker.bad;
  const bool haveC1=haveC0 && nmb_device_shader_cache_stats(gDevice,&c1);
  char line[400];
  snprintf(line,sizeof line,"native-metal: prewarm: %u pipelines in %llu ms (%u records, %u tried, %u failed, %u without their library, %u unreadable)"
@@ -463,6 +486,124 @@ static void prewarmRun(std::vector<std::string> lines) {
   haveC1?(unsigned long long)(c1.driver_unchanged-c0.driver_unchanged):0ull);
  sm2_logs(line);
  gPrewarmRunning=false;
+}
+// G6 (SWEET_PREWARM=2): idle priming, after UniXNU AdrenoMetal f0c3177/PrimeShaders.h (waitForQuiet). Mode 1 makes every record 200 ms
+// after device creation, while the boot animation and the first SpringBoard frames draw. Mode 2 starts SWEET_PREWARM_DELAY_S (90) s
+// after device creation, on a background-QoS thread, and makes only the records CA has not made itself this boot (rechecked before
+// each one). Before each making it waits while backboardd committed more than SWEET_PREWARM_BUSY (8) command buffers in the last
+// 250 ms (an idle 60/90 Hz desktop commits fewer, any animation more), and after such a pause until SWEET_PREWARM_QUIET_MS (500) ms
+// were quiet. backboardd publishes its commit count in /var/local/mtl2-prime-busy (one page, only with mode 2) so SpringBoard pauses
+// for backboardd's work too (its own count where the page is missing). Each record CA itself makes this boot is marked used; mode 2
+// primes only the recorded pipelines not used this boot (CA's own makings already did the rest). SWEET_PREWARM_MAX bounds the makings, SWEET_PREWARM_MS the
+// making time (pauses not counted). "native-metal: PR prime: done/total, paused N, ms" when done.
+struct PrimeBusyPage {uint32_t magic,version;std::atomic<uint64_t> commits;};
+static const uint32_t kPrimeBusyMagic=0x53505242;   // 'SPRB'
+static PrimeBusyPage *gPrimeBusyOut;                // backboardd, mode 2: its commits, published
+// backboardd's commit count (gCommits: submitted command buffers), published at each completion (a few ms late, no hunk in commit).
+static inline void primeNoteCommit() {if(PrimeBusyPage *p=gPrimeBusyOut)p->commits.store(gCommits.load(std::memory_order_relaxed),std::memory_order_relaxed);}
+static PrimeBusyPage *primeBusyMap(bool write) {
+ const int fd=open("/var/local/mtl2-prime-busy",write?O_RDWR|O_CREAT:O_RDONLY,0644);
+ if(fd<0)return nullptr;
+ if(write)fchmod(fd,0644);
+ struct stat st;
+ if(write?ftruncate(fd,4096)!=0:(fstat(fd,&st)!=0 || st.st_size<(off_t)sizeof(PrimeBusyPage))){close(fd);return nullptr;}
+ void *page=mmap(nullptr,4096,write?PROT_READ|PROT_WRITE:PROT_READ,MAP_SHARED,fd,0);
+ close(fd);
+ if(page==MAP_FAILED)return nullptr;
+ PrimeBusyPage *p=(PrimeBusyPage *)page;
+ if(write){p->version=1;p->magic=kPrimeBusyMagic;}
+ else if(p->magic!=kPrimeBusyMagic){munmap(page,4096);return nullptr;}
+ return p;
+}
+// backboardd's commits so far (its page, or this process's own count without one).
+static uint64_t primeCommitCount() {
+ static PrimeBusyPage *in;static uint64_t nextTryMs;
+ if(gPrimeBusyOut)return gCommits.load(std::memory_order_relaxed);
+ if(!in) {
+  const uint64_t ms=nowUs()/1000;
+  if(ms>=nextTryMs){in=primeBusyMap(false);nextTryMs=ms+5000;}
+ }
+ return in?in->commits.load(std::memory_order_relaxed):gCommits.load(std::memory_order_relaxed);
+}
+// backboardd's commits in the last 250 ms: samples every 50 ms while waiting; after a making (no sample in the last 250-500 ms) it takes
+// a fresh 250 ms window.
+struct PrimeGate {
+ uint64_t ms[32],n[32];unsigned head=0,count=0;
+ void sample() {ms[head]=nowUs()/1000;n[head]=primeCommitCount();head=(head+1)%32;if(count<32)count++;}
+ unsigned recent() {
+  for(int round=0;round<2;round++) {
+   sample();
+   const unsigned newest=(head+31)%32;
+   for(unsigned k=1;k<count;k++) {
+    const unsigned i=(newest+32-k)%32;
+    const uint64_t span=ms[newest]-ms[i];
+    if(span<250)continue;
+    if(span>500)break;
+    const uint64_t d=n[newest]-n[i];return (unsigned)(d*250/span);
+   }
+   count=1;head=(newest+1)%32;   // keep only the newest sample
+   usleep(250000);
+  }
+  return 0;
+ }
+};
+static void prewarmIdleRun(std::vector<std::string> lines) {
+ const unsigned delayS=prewarmKnob("SWEET_PREWARM_DELAY_S",90),busyMax=prewarmKnob("SWEET_PREWARM_BUSY",8),
+  quietMs=prewarmKnob("SWEET_PREWARM_QUIET_MS",500),most=prewarmKnob("SWEET_PREWARM_MAX",300),budgetMs=prewarmKnob("SWEET_PREWARM_MS",30000);
+ sleep(delayS);
+ const uint64_t began=nowUs();
+ std::vector<std::string> pending;
+ {
+  std::lock_guard<std::mutex> lock(gPrewarmLock);
+  for(const std::string &line:lines)if(!gPrewarmUsed.count(line))pending.push_back(line);
+ }
+ sm2_logs([NSString stringWithFormat:@"native-metal: PR prime: start, %zu of %zu records not made this boot (busy > %u per 250 ms pauses)",
+  pending.size(),lines.size(),busyMax].UTF8String);
+ PrewarmMaker maker;PrimeGate gate;
+ unsigned made=0,failed=0,noLibrary=0,tried=0,usedMeanwhile=0,paused=0;
+ uint64_t activeUs=0,pausedMs=0;
+ NmbShaderCacheStats c0={},c1={};const bool haveC0=nmb_device_shader_cache_stats(gDevice,&c0);
+ for(const std::string &line:pending) {
+  if(tried>=most || activeUs/1000>=budgetMs)break;
+  // wait for a quiet display
+  bool wasBusy=false;uint64_t pauseBegan=0,quietSince=0;
+  for(;;) {
+   const uint64_t ms=nowUs()/1000;
+   if(gate.recent()>busyMax) {
+    if(!wasBusy){wasBusy=true;paused++;pauseBegan=ms;}
+    quietSince=0;usleep(50000);continue;
+   }
+   if(!wasBusy)break;
+   if(!quietSince)quietSince=ms;
+   if(ms-quietSince>=quietMs){pausedMs+=ms-pauseBegan;break;}
+   usleep(50000);
+  }
+  {std::lock_guard<std::mutex> lock(gPrewarmLock);if(gPrewarmUsed.count(line)){usedMeanwhile++;continue;}}
+  const uint64_t t0=nowUs();
+  gPrewarmRunning=true;
+  const int r=maker.make(line,gPrewarmKept);
+  gPrewarmRunning=false;
+  activeUs+=nowUs()-t0;
+  if(r<0)continue;
+  tried++;
+  if(r==0)made++;else if(r==2)noLibrary++;else failed++;
+ }
+ const bool haveC1=haveC0 && nmb_device_shader_cache_stats(gDevice,&c1);
+ char line[480];
+ snprintf(line,sizeof line,"native-metal: PR prime: %u/%zu, paused %u, %llu ms (paused %llu ms, wall %llu ms; %u failed, %u without their library,"
+  " %u unreadable, %u made by CA meanwhile) | cache: spirv hit %llu miss %llu, drv loads %llu saves %llu same %llu",made,pending.size(),paused,
+  (unsigned long long)(activeUs/1000),(unsigned long long)pausedMs,(unsigned long long)((nowUs()-began)/1000),failed,noLibrary,maker.bad,usedMeanwhile,
+  haveC1?(unsigned long long)(c1.hits-c0.hits):0ull,haveC1?(unsigned long long)(c1.misses-c0.misses):0ull,
+  haveC1?(unsigned long long)(c1.driver_loads-c0.driver_loads):0ull,haveC1?(unsigned long long)(c1.driver_saves-c0.driver_saves):0ull,
+  haveC1?(unsigned long long)(c1.driver_unchanged-c0.driver_unchanged):0ull);
+ sm2_logs(line);
+}
+static void *prewarmIdleThread(void *arg) {
+ std::vector<std::string> *lines=(std::vector<std::string> *)arg;
+ pthread_setname_np("sweet.prime");
+ @autoreleasepool{prewarmIdleRun(*lines);}
+ delete lines;
+ return nullptr;
 }
 // At device creation: read the records (they also seed the "seen" set) and start the prewarm.
 static void prewarmStart(const char *cache) {
@@ -478,6 +619,17 @@ static void prewarmStart(const char *cache) {
    line.clear();
   }
   fclose(f);
+ }
+ if(prewarmMode()==2) {   // G6: idle priming
+  if(!strcmp(getprogname(),"backboardd") && !gPrimeBusyOut)gPrimeBusyOut=primeBusyMap(true);
+  if(lines.empty()){sm2_logs("native-metal: PR prime: no records yet");return;}
+  sm2_logs([NSString stringWithFormat:@"native-metal: PR prime: %zu records, idle priming in %u s",lines.size(),prewarmKnob("SWEET_PREWARM_DELAY_S",90)].UTF8String);
+  pthread_attr_t attr;pthread_attr_init(&attr);pthread_attr_setdetachstate(&attr,PTHREAD_CREATE_DETACHED);
+  pthread_attr_set_qos_class_np(&attr,QOS_CLASS_BACKGROUND,0);
+  pthread_t thread;auto *copy=new std::vector<std::string>(std::move(lines));
+  if(pthread_create(&thread,&attr,prewarmIdleThread,copy)!=0){delete copy;sm2_logs("native-metal: PR prime: no thread");}
+  pthread_attr_destroy(&attr);
+  return;
  }
  if(lines.empty()){sm2_logs("native-metal: prewarm: no records yet");return;}
  sm2_logs([NSString stringWithFormat:@"native-metal: prewarm: %zu records, starting",lines.size()].UTF8String);
@@ -2260,7 +2412,7 @@ static void rotatedFrameStats(NBCommandBuffer *commandBuffer) {
  memcpy(last,c,sizeof c);windowUs=now;frames=gpuUs=gpuMaxUs=0;
 }
 static void completed(void *context) {
- gCompleted++;
+ gCompleted++;primeNoteCommit();   // G6: backboardd's commits, for SpringBoard's idle priming
  NBCommandBuffer *commandBuffer=(__bridge_transfer NBCommandBuffer *)context;
  if(commandBuffer->tlCreated)commandBuffer->tlNotice=tlNow();
  if(commandBuffer.rotatedFrame)rotatedFrameStats(commandBuffer);
@@ -2273,6 +2425,88 @@ static void completed(void *context) {
   if(r.index==commandBuffer.commitIndex)r.callbackUs=took;
  }
  [commandBuffer finish];
+}
+
+// G5 (SWEET_NILENC=1): never a nil encoder, after UniXNU AdrenoMetal ce5e19e. Where renderCommandEncoderWithDescriptor:, blitCommandEncoder,
+// computeCommandEncoder(WithDispatchType:) would answer nil (after commit, a foreign attachment, the runtime refused the pass), the caller
+// gets a refusing encoder: an object of the right protocol that accepts every call and does nothing (declared selectors answer 0, any other
+// selector too). RenderBox caches an encoder's IMPs with methodForSelector: and called address 0 on nil (UniXNU i568: WidgetRenderer). The
+// command buffer is refused (if not yet committed): its commit fails locally, status error, completed handlers still run. The first
+// refusal of the process is logged once with its reason ("native-metal: NILENC: ..."). Default (unset/0): nil as before; the wrappers are
+// installed at device open only with SWEET_NILENC=1, so the default path is unchanged.
+static std::atomic<uint64_t> gNilencRefusals,gNilencUndeclared;
+@interface NBRefusingEncoder : NBObject
+@property(nonatomic,strong) id commandBuffer;
+@end
+@implementation NBRefusingEncoder
+- (void)endEncoding {}
+- (void)insertDebugSignpost:(NSString *)s {(void)s;}
+- (void)pushDebugGroup:(NSString *)s {(void)s;}
+- (void)popDebugGroup {}
+- (BOOL)respondsToSelector:(SEL)selector {return [super respondsToSelector:selector] || declaredTypes(object_getClass(self),selector)!=nullptr;}
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {
+ if(NSMethodSignature *own=[super methodSignatureForSelector:selector])return own;
+ if(!gNilencUndeclared++)sm2_logs([NSString stringWithFormat:@"native-metal: NILENC: undeclared %s %s answered nil",class_getName(object_getClass(self)),sel_getName(selector)].UTF8String);
+ return [NSMethodSignature signatureWithObjCTypes:"@@:"];
+}
+- (void)forwardInvocation:(NSInvocation *)invocation {   // silently: every call is expected to land here
+ const NSUInteger length=invocation.methodSignature.methodReturnLength;
+ if(length){std::vector<uint8_t> zero(length,0);[invocation setReturnValue:zero.data()];}
+}
+@end
+@interface NBRefusingRenderEncoder : NBRefusingEncoder
+@end
+@implementation NBRefusingRenderEncoder
+- (NSUInteger)tileWidth {return 0;}
+- (NSUInteger)tileHeight {return 0;}
+@end
+@interface NBRefusingBlitEncoder : NBRefusingEncoder
+@end
+@implementation NBRefusingBlitEncoder
+@end
+@interface NBRefusingComputeEncoder : NBRefusingEncoder
+@end
+@implementation NBRefusingComputeEncoder
+- (MTLDispatchType)dispatchType {return MTLDispatchTypeSerial;}
+@end
+static id nilencRefusing(NBCommandBuffer *commandBuffer,Class cls,const char *what) {
+ NSString *reason=commandBuffer.committed?@"after commit":(commandBuffer.encodeFailure?:lastError());
+ if(!commandBuffer.committed && !commandBuffer.encodeFailure)[commandBuffer refuse:[NSString stringWithFormat:@"%s: %@",what,reason]];
+ const uint64_t n=++gNilencRefusals;
+ if(n==1)NBLOG(@"native-metal: NILENC: refusing %s encoder instead of nil (%@); command buffer %s",what,reason,
+  commandBuffer.committed?"already committed":"refused (fails at commit)");
+ NBRefusingEncoder *encoder=[cls new];encoder.commandBuffer=commandBuffer;
+ return encoder;
+}
+static IMP gNilencRender,gNilencBlit,gNilencCompute,gNilencComputeType;
+static id nilencRender(id self,SEL cmd,MTLRenderPassDescriptor *d) {
+ id e=((id(*)(id,SEL,MTLRenderPassDescriptor *))gNilencRender)(self,cmd,d);
+ return e?:nilencRefusing((NBCommandBuffer *)self,[NBRefusingRenderEncoder class],"render");
+}
+static id nilencBlit(id self,SEL cmd) {
+ id e=((id(*)(id,SEL))gNilencBlit)(self,cmd);
+ return e?:nilencRefusing((NBCommandBuffer *)self,[NBRefusingBlitEncoder class],"blit");
+}
+static id nilencCompute(id self,SEL cmd) {
+ id e=((id(*)(id,SEL))gNilencCompute)(self,cmd);
+ return e?:nilencRefusing((NBCommandBuffer *)self,[NBRefusingComputeEncoder class],"compute");
+}
+static id nilencComputeType(id self,SEL cmd,MTLDispatchType type) {
+ id e=((id(*)(id,SEL,MTLDispatchType))gNilencComputeType)(self,cmd,type);
+ return e?:nilencRefusing((NBCommandBuffer *)self,[NBRefusingComputeEncoder class],"compute");
+}
+static void nilencInstall() {
+ const char *e=getenv("SWEET_NILENC");
+ if(!(e && atoi(e)==1) || gNilencRender)return;
+ struct {Class cls;const char *protocol;} adopt[]={{[NBRefusingRenderEncoder class],"MTLRenderCommandEncoder"},
+  {[NBRefusingBlitEncoder class],"MTLBlitCommandEncoder"},{[NBRefusingComputeEncoder class],"MTLComputeCommandEncoder"}};
+ for(auto &a:adopt)if(Protocol *p=objc_getProtocol(a.protocol))if(![a.cls conformsToProtocol:p])class_addProtocol(a.cls,p);
+ Class cb=[NBCommandBuffer class];
+ gNilencRender=method_setImplementation(class_getInstanceMethod(cb,@selector(renderCommandEncoderWithDescriptor:)),(IMP)nilencRender);
+ gNilencBlit=method_setImplementation(class_getInstanceMethod(cb,@selector(blitCommandEncoder)),(IMP)nilencBlit);
+ gNilencCompute=method_setImplementation(class_getInstanceMethod(cb,@selector(computeCommandEncoder)),(IMP)nilencCompute);
+ gNilencComputeType=method_setImplementation(class_getInstanceMethod(cb,@selector(computeCommandEncoderWithDispatchType:)),(IMP)nilencComputeType);
+ sm2_logs("native-metal: NILENC: refusing encoders on (SWEET_NILENC=1)");
 }
 
 @implementation NBQueue
@@ -3293,6 +3527,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
  prewarmStart(cache);
+ nilencInstall();   // G5
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
  {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
