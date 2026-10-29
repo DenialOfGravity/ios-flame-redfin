@@ -39,6 +39,7 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_ROOT = '/mnt/c/ClaudeProjects/iOS_Pixel5'
 USB_HOST = '192.168.7.2'
+DEFAULT_KLOG_PA = '0x101d0ef08'     # r63a (builds/xnu/ws-y-ram-aca60f47b8/KLOG_PA.txt)
 PORT = 5150
 MAX_FRAME = 4 << 20
 CLUSTERS = (('silver', range(0, 6)), ('gold', range(6, 7)), ('prime', range(7, 8)))
@@ -420,6 +421,7 @@ class Collector:
                     break
         except OSError:
             pass
+        c.append((DEFAULT_KLOG_PA, 'built-in default (r63a)'))
         seen, out = set(), []
         for pa, src in c:
             if pa.lower() not in seen:
@@ -489,10 +491,10 @@ class Collector:
         while True:
             mode = self.cfg.get('link', 'auto')
             cands = []
-            if mode in ('usb', 'auto'):
-                cands.append(('usb', self.a.usb_host))
-            if mode in ('wifi', 'auto') and self.wifi_host():
-                cands.append(('wifi', self.wifi_host()))
+            for via in (self.link_order() if mode == 'auto' else [mode]):
+                host = self.a.usb_host if via == 'usb' else self.wifi_host()
+                if host:
+                    cands.append((via, host))
             got = None
             for via, host in cands:
                 rw = await self.try_connect(host)
@@ -523,6 +525,15 @@ class Collector:
             self.reconnects += 1
             await asyncio.sleep(0.5)
 
+    def link_order(self):
+        """auto: the link with the higher measured speed test result first (logs/mon/phone.json), USB when unknown"""
+        sp = self.phone_cfg.get('speed') or {}
+        u = (sp.get('usb') or {}).get('mbps')
+        w = (sp.get('wifi') or {}).get('mbps')
+        if u is not None and w is not None and w > u:
+            return ['wifi', 'usb']
+        return ['usb', 'wifi']
+
     def link_info(self):
         rx = None
         if len(self.rx_hist) >= 2:
@@ -530,7 +541,8 @@ class Collector:
             rx = (b1 - b0) / (t1 - t0) if t1 > t0 else None
         return {'mode': self.cfg.get('link'), 'via': self.via, 'host': self.host, 'connected': self.connected,
                 'authed': self.authed, 'rtt_ms': r1(self.rtt_ms), 'since': self.link_since, 'reconnects': self.reconnects,
-                'rx_bps': rx and int(rx), 'msg': self.link_msg, 'wifi_host': self.wifi_host(), 'usb_host': self.a.usb_host}
+                'rx_bps': rx and int(rx), 'msg': self.link_msg, 'wifi_host': self.wifi_host(), 'usb_host': self.a.usb_host,
+                'speed': self.phone_cfg.get('speed') or {}, 'preferred': self.link_order()[0]}
 
     async def send(self, line):
         if not self.writer:
@@ -597,8 +609,8 @@ class Collector:
             if self.cfg.get('frames'):
                 await self.cmd('frames on')
             tasks.append(asyncio.ensure_future(self.ping_loop()))
-            if via == 'wifi' and self.cfg.get('link') == 'auto':
-                tasks.append(asyncio.ensure_future(self.usb_probe_loop()))
+            if self.cfg.get('link') == 'auto' and via != self.link_order()[0]:
+                tasks.append(asyncio.ensure_future(self.better_link_loop(via)))
             await rd
         except (asyncio.IncompleteReadError, ConnectionError, OSError, ValueError, asyncio.TimeoutError) as e:
             if self.authed or not isinstance(e, asyncio.IncompleteReadError):
@@ -642,13 +654,21 @@ class Collector:
             if rep.get('ok'):
                 self.rtt_ms = (time.perf_counter() - t0) * 1000
 
-    async def usb_probe_loop(self):
+    async def better_link_loop(self, via):
+        """auto mode on the slower (or fallback) link: switch when the preferred link answers again. The probe is a
+        bare TCP connect (no auth), which does not take the daemon's client slot."""
         while True:
             await asyncio.sleep(self.a.usb_probe_every)
-            if self.trace and self.trace.state in ('recording', 'transferring', 'stopping'):
+            if self.cfg.get('link') != 'auto':
+                return
+            best = self.link_order()[0]
+            if best == via:
+                return
+            if self.trace or self.speed is not None:
                 continue
-            if await self.tcp_ok(self.a.usb_host, self.a.port, 1.5):
-                log.info('USB answers again: switching from Wi-Fi')
+            host = self.a.usb_host if best == 'usb' else self.wifi_host()
+            if host and await self.tcp_ok(host, self.a.port, 1.5):
+                log.info('%s answers (preferred: faster by speed test): switching from %s', best, via)
                 self.writer.close()
                 return
 
@@ -985,8 +1005,9 @@ class Collector:
                                'by_wakeups': sorted(rows, key=lambda r: -(r['wakeups_s'] or 0))[:10],
                                'interval_s': round(iv, 2), 't': t}
         sf = s.get('self') or {}
-        selfv = {'cpu_pct': r1(sf.get('cpu_ms', 0) / dt_ms * 100) if dt_ms else None,
-                 'rss_mb': r1(sf.get('rss_kb', 0) / 1024.0), 'tx_bps': sf.get('tx_bps'), 'klog_bps': sf.get('klog_bps')}
+        selfv = {'cpu_pct': r1((sf.get('cpu_ms') or 0) / dt_ms * 100) if dt_ms else None,
+                 'cpu_ms_s': r1((sf.get('cpu_ms') or 0) / dt_ms * 1000) if dt_ms else None,
+                 'rss_mb': r1((sf.get('rss_kb') or 0) / 1024.0), 'tx_bps': sf.get('tx_bps'), 'klog_bps': sf.get('klog_bps')}
         krx = None
         if len(self.klog_rx_hist) >= 2:
             span = self.klog_rx_hist[-1][0] - self.klog_rx_hist[0][0]
@@ -1030,7 +1051,8 @@ class Collector:
              'temp': temps, 'lvl': snap['thermal']['level'], 'gpu': gpu['busy_pct'] if gpu and gpu_age is not None
              and gpu_age < 12 else None, 'bat_ma': bat['ma'] if bat else None, 'bat_pct': bat['pct'] if bat else None,
              'mem_free': mem['free_mb'], 'mem_used': mem['used_mb'], 'mem_comp': mem['compressed_mb'],
-             'klog_bps': s.get('klog_bps'), 'self_cpu': selfv['cpu_pct'], 'fps': fr['fps'] if fr else None,
+             'klog_bps': s.get('klog_bps') if s.get('klog_bps') is not None else krx, 'self_cpu': selfv['cpu_pct'],
+             'self_ms': selfv['cpu_ms_s'], 'fps': fr['fps'] if fr else None,
              'fb_fps': fb['fps'] if fb and fb_age is not None and fb_age < 12 else None, 'rtt': r1(self.rtt_ms)}
         self.hist.append(h)
         while self.hist and (t - self.hist[0]['t'] > self.a.history_secs or len(self.hist) > 40000):
@@ -1114,7 +1136,7 @@ class Collector:
             out.append('battery drain %d mA' % -b['ma'])
         sf = s['self']
         if sf.get('cpu_pct') and sf['cpu_pct'] > 3:
-            out.append('sweetmon itself %.1f%% CPU' % sf['cpu_pct'])
+            out.append('sweetmon itself %.1f%% CPU (%.0f ms/s)' % (sf['cpu_pct'], sf.get('cpu_ms_s') or 0))
         if s['crashes'] and s['phone']['uptime_s'] and s['phone']['uptime_s'] - s['crashes'][0]['ts'] < 60:
             c = s['crashes'][0]
             out.append('crash %s[%d] sig %d %.0f s ago' % (c['name'], c['pid'], c['sig'], s['phone']['uptime_s'] - c['ts']))
@@ -1442,7 +1464,11 @@ class Collector:
                'mbps': round(sp['bytes'] / 1e6 / el, 2) if el > 0 else None, 'phone': rep, 'via': self.via,
                'rtt_ms': r1(self.rtt_ms), 't': now_s()}
         self.speed_res = res
-        log.info('speed test %d MiB via %s: %s MB/s', mb, self.via, res['mbps'])
+        if res['ok'] and res['mbps'] and self.via:
+            self.phone_cfg.setdefault('speed', {})[self.via] = {'mbps': res['mbps'], 'mb': mb, 't': res['t'],
+                                                               'host': self.host, 'rtt_ms': res['rtt_ms']}
+            atomic_json(os.path.join(self.mon, 'phone.json'), self.phone_cfg)
+        log.info('speed test %d MiB via %s: %s MB/s (auto prefers %s)', mb, self.via, res['mbps'], self.link_order()[0])
         self.emit('speed', res)
         return res
 
@@ -1842,7 +1868,7 @@ def main():
     ap.add_argument('--retry', type=float, default=2.0)
     ap.add_argument('--connect-timeout', type=float, default=2.0)
     ap.add_argument('--ping-every', type=float, default=5.0)
-    ap.add_argument('--usb-probe-every', type=float, default=10.0)
+    ap.add_argument('--usb-probe-every', type=float, default=20.0, help='auto: probe the faster link this often')
     ap.add_argument('--history-secs', type=float, default=3600)
     ap.add_argument('--trace-grace', type=float, default=60)
     ap.add_argument('--analyze-timeout', type=float, default=900)

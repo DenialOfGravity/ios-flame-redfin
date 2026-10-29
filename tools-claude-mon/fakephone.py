@@ -369,8 +369,11 @@ class Phone:
             mb = int(a[1]) if len(a) > 1 else 16
             blk = os.urandom(CHUNK)
             t0 = time.time()
+            lim = self.a.link_mbps.get(c.get('lname'))
             for _ in range(mb):
                 await self.send(w, 'P', blk)
+                if lim:
+                    await asyncio.sleep(CHUNK / 1e6 / lim)        # this listener's simulated link speed
             await R(True, 'sent %d MiB' % mb, secs=round(time.time() - t0, 3), cpu_ms=int(mb * 4))
         elif word == 'ping':
             await R(True, ' '.join(a[1:]))
@@ -486,6 +489,7 @@ class Phone:
                  (95, 'mediaserverd'), (101, 'locationd'), (110, 'sweetmon'), (120, 'launchd'), (130, 'logd'),
                  (140, 'bluetoothd'), (150, 'thermalmonitord'), (160, 'symptomsd'), (170, 'runningboardd'),
                  (180, 'sharingd'), (190, 'nsurlsessiond'), (200, 'cfprefsd')]
+        procs += [(300 + k, 'daemon%d' % k) for k in range(max(0, self.a.nproc - len(procs)))]
         try:
             while True:
                 await asyncio.sleep(self.rate_ms / 1000 / self.speedup)
@@ -509,10 +513,10 @@ class Phone:
                      'vm': {'free': 180000 + random.randint(-2000, 2000), 'active': 120000, 'inactive': 60000,
                             'wired': 90000, 'compressed': 4000, 'spec': 3000, 'pageins': random.randint(0, 30),
                             'swapins': 0, 'faults': random.randint(1000, 5000), 'page_kb': 16},
-                     'load': [round(self.load / 25, 2), 1.2, 1.0], 'nproc': 87,
+                     'load': [round(self.load / 25, 2), 1.2, 1.0], 'nproc': len(procs),
                      'self': {'cpu_ms': random.randint(2, 9) * dt_ms // 1000, 'rss_kb': 2400,
                               'klog_bps': 900, 'tx_bps': 3000},
-                     'klog_bps': 1500 + self.load * 20}
+                     'klog_bps': None if n % 7 == 3 else 1500 + self.load * 20}     # the real daemon sometimes sends null
                 if self.top_every and n % self.top_every == 0 and self.topn:
                     rows = []
                     for pid, name in procs:
@@ -696,6 +700,8 @@ def main():
     ap.add_argument('--ctl-port', type=int, default=15199)
     ap.add_argument('--poke-host', default='127.0.0.2')
     ap.add_argument('--poke-port', type=int, default=15141)
+    ap.add_argument('--link-mbps', action='append', default=[], help='NAME=MBPS: speed test pace per listener')
+    ap.add_argument('--nproc', type=int, default=17, help='processes in the fake table (the real phone has ~300)')
     ap.add_argument('--speedup', type=float, default=1.0, help='time runs this much faster for the log/samples')
     ap.add_argument('--gen-swtr', metavar='OUT', help='write the generated small .swtr and exit')
     a = ap.parse_args()
@@ -703,6 +709,7 @@ def main():
         open(a.gen_swtr, 'wb').write(make_swtr())
         return 0
     a.listen = a.listen or ['usb=127.0.0.2', 'wifi=127.0.0.3']
+    a.link_mbps = {k: float(v) for k, _, v in (x.partition('=') for x in a.link_mbps)}
     if a.K:
         a.key = None
     elif not a.key and not a.key_file:

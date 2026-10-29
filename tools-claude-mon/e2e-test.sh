@@ -32,7 +32,7 @@ cp "$TOOLS"/sweet-trace.py "$TOOLS"/sweet-prof.py "$W/tools-claude/" 2>/dev/null
 echo 'klog PA 0x101d0ef08  (_sweet_log_total 0xfffffe0007d0ef08)' > "$W/builds/xnu/ws-y-ram-aca60f47b8/KLOG_PA.txt"
 printf 'KNOWN GOOD\nKernel:   builds/xnu/ws-y-ram-aca60f47b8/ (branch ws-y-ram)\n' > "$W/KNOWN-GOOD.txt"
 python3 "$H/collector.py" --root "$W" --make-key >/dev/null && [ -s "$W/agent/sweetmon.key" ] && ok "--make-key" || bad "--make-key"
-python3 "$H/fakephone.py" --key-file "$W/agent/sweetmon.key" --trace "$SRC" --speedup 5 --ctl-port $CTL \
+python3 "$H/fakephone.py" --key-file "$W/agent/sweetmon.key" --trace "$SRC" --speedup 5 --ctl-port $CTL --nproc 298 --link-mbps usb=20 --link-mbps wifi=60 \
 	--klog-dump "$W/fake-klog.txt" > "$W/fake.log" 2>&1 &
 FP=$!
 sleep 1
@@ -167,6 +167,26 @@ waitfor 20 'd["link"]["authed"] and d["link"]["via"]=="wifi"' && ok "auto: USB g
 ctl 'up usb' >/dev/null
 waitfor 25 'd["link"]["authed"] and d["link"]["via"]=="usb"' && ok "auto: USB back -> USB" || bad "auto back to usb"
 [ "$(post /api/link '{"link":"x"}' | j 'd["ok"]')" = False ] && ok "bad link -> 400" || bad "bad link"
+# auto prefers the faster link by speed test (USB 20 MB/s, Wi-Fi 60 MB/s in the fake), remembered in phone.json
+post /api/link '{"link":"usb"}' >/dev/null; waitfor 15 'd["link"]["authed"] and d["link"]["via"]=="usb"'
+su=$(post /api/speed '{"mb":8}' 60 | j 'd["mbps"]')
+post /api/link '{"link":"wifi"}' >/dev/null; waitfor 15 'd["link"]["authed"] and d["link"]["via"]=="wifi"'
+sw=$(post /api/speed '{"mb":8}' 60 | j 'd["mbps"]')
+post /api/link '{"link":"auto"}' >/dev/null; ctl drop >/dev/null; sleep 4
+waitfor 15 'd["link"]["authed"] and d["link"]["via"]=="wifi" and d["link"]["preferred"]=="wifi"' \
+	&& python3 -c 'import json,sys; s=json.load(open(sys.argv[1]))["speed"]; assert s["usb"]["mbps"] < s["wifi"]["mbps"]' "$W/logs/mon/phone.json" \
+	&& ok "auto prefers the faster link: usb $su MB/s, wifi $sw MB/s -> wifi (phone.json)" || bad "auto by speed (usb $su wifi $sw)"
+ctl 'down wifi' >/dev/null
+waitfor 20 'd["link"]["authed"] and d["link"]["via"]=="usb"' && ok "auto: faster Wi-Fi gone -> USB fallback" || bad "auto usb fallback"
+ctl 'up wifi' >/dev/null
+waitfor 40 'd["link"]["authed"] and d["link"]["via"]=="wifi"' && ok "auto: Wi-Fi back -> Wi-Fi" || bad "auto back to wifi"
+[ "$(curl -s $API/api/now | j 'd["procs"]["nproc"]==298 and len(d["procs"]["by_cpu"])==15 and d["self"]["cpu_ms_s"] is not None')" = True ] \
+	&& ok "now.json: process table of the top 15 + self cpu ms/s" || bad "procs/self"
+python3 - "$W"/logs/mon/metrics-*.jsonl <<'EOF2' && ok "samples without a process table and with klog_bps null handled" || bad "null/absent handling"
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1])]
+assert sum(1 for r in rows if 'top' in r) and sum(1 for r in rows if 'top' not in r), 'expected rows with and without procs'
+EOF2
 
 # 10. auth refused with a wrong key; new boot -> new klog file
 cp "$W/agent/sweetmon.key" "$W/key.save"; echo 00112233445566778899aabbccddeeff > "$W/agent/sweetmon.key"; ctl drop >/dev/null

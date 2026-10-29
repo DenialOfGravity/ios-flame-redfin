@@ -46,6 +46,7 @@ header h1 { font-size: 16px; margin: 0 6px 0 0; font-weight: 650; letter-spacing
 .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; background: var(--surface); }
 .seg button { border: 0; background: transparent; padding: 4px 9px; cursor: pointer; color: var(--ink-2); }
 .seg button.on { background: var(--accent); color: var(--accent-ink); }
+.seg button small.lsp { font-size: 11px; opacity: .85; }
 .btn { border: 1px solid var(--border); background: var(--surface); border-radius: 7px; padding: 4px 10px; cursor: pointer; }
 .btn:hover, .seg button:hover:not(.on) { background: var(--surface-2); }
 .btn:disabled { opacity: .5; cursor: default; }
@@ -116,13 +117,13 @@ a { color: var(--accent); }
     <div class="tile"><div class="k">thermal</div><div class="v" id="t-lvl">-</div></div>
     <div class="tile"><div class="k">CPU avg</div><div class="v" id="t-cpu">-</div></div>
     <div class="tile"><div class="k">GPU</div><div class="v" id="t-gpu">-</div></div>
-    <div class="tile"><div class="k">sweetmon cost</div><div class="v" id="t-self">-</div></div>
+    <div class="tile" title="the phone daemon's own CPU time per second of wall time, and its memory"><div class="k">sweetmon cost</div><div class="v" id="t-self">-</div></div>
   </div>
   <div class="ctl">
     <span class="muted">window</span>
     <div class="seg" id="win"><button data-v="60">1 m</button><button data-v="300" class="on">5 m</button><button data-v="900">15 m</button></div>
     <span class="muted">link</span>
-    <div class="seg" id="linksel"><button data-v="auto">auto</button><button data-v="usb">USB</button><button data-v="wifi">Wi-Fi</button></div>
+    <div class="seg" id="linksel" title="auto: the link with the faster speed test, USB as the fallback"><button data-v="auto">auto</button><button data-v="usb">USB <small class="lsp" id="sp-usb"></small></button><button data-v="wifi">Wi-Fi <small class="lsp" id="sp-wifi"></small></button></div>
     <button class="btn" id="speedbtn" title="send N MiB of filler from the phone and time it">speed test</button>
     <input type="number" id="speedmb" value="16" min="1" max="256" style="width:56px" title="MiB"> <span id="speedres" class="muted"></span>
     <button class="btn" id="themebtn" title="light / dark">theme</button>
@@ -338,6 +339,7 @@ function showLink(L) {
   $('#t-link').innerHTML = '<span class="dot ' + (ok ? 'st-good' : 'st-critical') + '"></span>' + (ok ? via + ' <small>' + fmt(L.rtt_ms, 1) + ' ms</small>' : 'down');
   $('#t-link').title = (L.host || '') + ' — ' + (L.msg || '') + (L.rx_bps ? ' — rx ' + fmt(L.rx_bps / 1024, 1) + ' KB/s' : '');
   for (const b of $('#linksel').children) b.classList.toggle('on', b.dataset.v === L.mode);
+  for (const k of ['usb', 'wifi']) { const sp = (L.speed || {})[k]; $('#sp-' + k).textContent = sp ? fmt(sp.mbps, 1) + ' MB/s' + (L.mode === 'auto' && L.preferred === k ? ' ★' : '') : ''; }
   const ban = $('#banner');
   if (!ok) { ban.style.display = 'block'; ban.textContent = 'Not connected to the phone: ' + (L.msg || '') + ' (USB ' + L.usb_host + ', Wi-Fi ' + (L.wifi_host || 'unknown') + ')'; } else ban.style.display = 'none';
 }
@@ -353,7 +355,7 @@ function onSnap(s) {
   $('#t-lvl').innerHTML = '<span class="dot ' + lvlClass(lv) + '"></span>level ' + lv + (lv && s.thermal.cap_mhz ? ' <small>cap ' + Object.entries(s.thermal.cap_mhz).filter((e) => e[1]).map((e) => e[0] + ' ' + e[1]).join(', ') + '</small>' : '');
   $('#t-cpu').innerHTML = fmt(s.cpu.avg) + '<small>%</small>';
   $('#t-gpu').innerHTML = s.gpu ? s.gpu.busy_pct + '<small>%</small>' : '-';
-  $('#t-self').innerHTML = fmt(s.self.cpu_pct, 1) + '<small>% CPU, ' + fmt(s.self.rss_mb, 1) + ' MB</small>';
+  $('#t-self').innerHTML = fmt(s.self.cpu_ms_s, 0) + '<small> ms/s (' + fmt(s.self.cpu_pct, 1) + '% of a core), ' + fmt(s.self.rss_mb, 1) + ' MB</small>';
   $('#hot').innerHTML = (s.hot && s.hot.length) ? s.hot.map((h, i) => i === 0 ? '<b>' + esc(h) + '</b>' : '<span>' + esc(h) + '</span>').join('') : '<span class="muted">nothing stands out</span>';
   s.cpu.busy.forEach((v, i) => { const e = $('#cv' + i); if (e) e.textContent = fmt(v) + '%'; });
   $('#tempsrc').textContent = s.temp_source || '';
@@ -495,7 +497,7 @@ async function init() {
   es.addEventListener('link', (e) => showLink(JSON.parse(e.data)));
   es.addEventListener('hello', (e) => { const d = JSON.parse(e.data); showLink(d.link); });
   es.addEventListener('trace', (e) => { const t = JSON.parse(e.data); showTrace(t); if (!ACTIVE.includes(t.state) || t.state === 'analyzing') loadTraces(); });
-  es.addEventListener('speed', (e) => { const r = JSON.parse(e.data); $('#speedres').textContent = fmt(r.mbps, 1) + ' MB/s via ' + r.via; });
+  es.addEventListener('speed', (e) => { const r = JSON.parse(e.data); $('#speedres').textContent = fmt(r.mbps, 1) + ' MB/s via ' + r.via; api('/api/status').then((st) => showLink(st.link)).catch(() => {}); });
   es.onerror = () => { const b = $('#banner'); b.style.display = 'block'; b.textContent = 'Lost the collector (http stream); retrying...'; };
   es.onopen = () => { if (S.link && S.link.authed) $('#banner').style.display = 'none'; };
 }
