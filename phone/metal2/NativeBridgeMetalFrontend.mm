@@ -1209,7 +1209,7 @@ static std::string quartzCoreCallers();
 @public
  char encNames[80];   // u-e: its vertex + fragment function names, for "E slow" draws
  // ovd (SWEET_DRAWBOX): colour attachment 0's blend and mask, the label's tail, attribute 0 (format, offset, buffer, stride)
- char dbLabel[48];uint8_t dbBlend,dbMask,dbSrc,dbDst,dbSrcA,dbDstA;uint32_t dbFmt,dbOff,dbBuf,dbStride;
+ char dbLabel[48];uint8_t dbBlend,dbMask,dbSrc,dbDst,dbSrcA,dbDstA;uint32_t dbFmt,dbOff,dbBuf,dbStride,dbCFmt,dbCOff;   // + the first 4-wide colour-like attribute after 0 (half4/float4/uchar4n)
 }
 @property(nonatomic) NmbRenderPipeline *handle;
 @end
@@ -1837,6 +1837,15 @@ static void waitForResource(id resource) {
   }
   if(got) {
    DBP(" pos %.1f,%.1f..%.1f,%.1f w%.2f..%.2f (%u)",x0,y0,x1,y1,w0,w1,got);
+   {   // the first drawn vertex's colour attribute
+    int64_t v0=start;if(ib && ix && ilen>=4)v0=(itype==MTLIndexTypeUInt16?((const uint16_t *)ix)[0]:((const uint32_t *)ix)[0])+base;
+    const size_t o=(size_t)v0*stride+p->dbCOff;float c[4];bool ok=p->dbCFmt && v0>=0;
+    if(ok && p->dbCFmt==MTLVertexFormatHalf4 && o+8<=len){const __fp16 *h=(const __fp16 *)(src+o);for(int q=0;q<4;q++)c[q]=(float)h[q];}
+    else if(ok && p->dbCFmt==MTLVertexFormatFloat4 && o+16<=len)memcpy(c,src+o,16);
+    else if(ok && p->dbCFmt==MTLVertexFormatUChar4Normalized && o+4<=len){for(int q=0;q<4;q++)c[q]=src[o+q]/255.f;}
+    else ok=false;
+    if(ok)DBP(" col %.3f,%.3f,%.3f,%.3f",c[0],c[1],c[2],c[3]);
+   }
    // as clip space with w 1, in the viewport (else the attachment): pixels
    const double vx=dbHaveVp?dbVp[0]:0,vy=dbHaveVp?dbVp[1]:0,vw=dbHaveVp?dbVp[2]:dbW,vh=dbHaveVp?dbVp[3]:dbH;
    if(w0==1 && w1==1 && x0>=-1.01f && x1<=1.01f && y0>=-1.01f && y1<=1.01f)
@@ -3602,9 +3611,11 @@ static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
   MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[0];
   state->dbBlend=a.blendingEnabled;state->dbMask=(uint8_t)a.writeMask;state->dbSrc=(uint8_t)a.sourceRGBBlendFactor;state->dbDst=(uint8_t)a.destinationRGBBlendFactor;
   state->dbSrcA=(uint8_t)a.sourceAlphaBlendFactor;state->dbDstA=(uint8_t)a.destinationAlphaBlendFactor;
-  state->dbFmt=0;
+  state->dbFmt=0;state->dbCFmt=0;
   if(MTLVertexDescriptor *v=d.vertexDescriptor){MTLVertexAttributeDescriptor *at=v.attributes[0];
-   if(at.format!=MTLVertexFormatInvalid && at.bufferIndex<31){state->dbFmt=(uint32_t)at.format;state->dbOff=(uint32_t)at.offset;state->dbBuf=(uint32_t)at.bufferIndex;state->dbStride=(uint32_t)v.layouts[at.bufferIndex].stride;}}
+   if(at.format!=MTLVertexFormatInvalid && at.bufferIndex<31){state->dbFmt=(uint32_t)at.format;state->dbOff=(uint32_t)at.offset;state->dbBuf=(uint32_t)at.bufferIndex;state->dbStride=(uint32_t)v.layouts[at.bufferIndex].stride;
+    for(unsigned k=1;k<31;k++){MTLVertexAttributeDescriptor *c=v.attributes[k];
+     if(c.bufferIndex==at.bufferIndex && (c.format==MTLVertexFormatHalf4 || c.format==MTLVertexFormatFloat4 || c.format==MTLVertexFormatUChar4Normalized)){state->dbCFmt=(uint32_t)c.format;state->dbCOff=(uint32_t)c.offset;break;}}}}
  }
  return (id<MTLRenderPipelineState>)state;
 }
