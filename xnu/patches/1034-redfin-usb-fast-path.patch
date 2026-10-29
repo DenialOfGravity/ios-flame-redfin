@@ -1,0 +1,391 @@
+From 0a5ba051b8812e874f6651326a6a9400d1712f2b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 15:10:00 +0000
+Subject: [PATCH] redfin 1034: USB Ethernet fast path (batched bulk IN, sub-ms
+ event polls), off by default
+
+Phone -> PC TCP ran at 1.23 MB/s, about one 1514-byte frame per 1.2 ms:
+ud_tx_kick_locked starts one single-TRB transfer per frame and only queues
+the next after that transfer's XferComplete, which ud_thread sees at its
+next 1 ms poll (assert_wait_deadline with default timer leeway).
+
+kern.sweet_usb_txbatch N (boot sweetusbtxb=N, 2..16) puts up to N queued
+frames in one StartTransfer, one unchained TRB per frame (each ends in a
+short packet = one ECM frame), LST|IOC on the last, in separate
+contiguous kernel memory; TX queue cap 64. kern.sweet_usb_poll_us US (boot
+sweetusbpollus=US, 50..1000) polls the event buffer every US us with
+TIMEOUT_URGENCY_SYS_CRITICAL while TX is in flight or within 5 ms of an
+event. Both 0 = the old behaviour. Counters kern.sweet_usb_tx_frames,
+_tx_xfers, _tx_drops, _rx_frames.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC47UfuRo4oy9dg357w
+---
+ bsd/dev/sweet_usb.c | 261 +++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 222 insertions(+), 39 deletions(-)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index a2bbb4e..1dc8244 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -36,6 +36,7 @@
+ #include <net/if_media.h>
+ #include <net/dlil.h>
+ #include <sys/kern_event.h>
++#include <sys/sysctl.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
+@@ -225,7 +226,8 @@ sweet_usb_probe(void)
+ #define EP_INT          5               /* 0x82 interrupt IN */
+ #define TRBCTL_NORMAL   (1u << 4)
+ 
+-#define UD_TXQ          32
++#define UD_TXQ          32              /* queue cap, one frame per transfer (known-good) */
++#define UD_TXQ_MAX      64              /* ring size; cap with kern.sweet_usb_txbatch >= 2 */
+ 
+ static struct {
+ 	vm_offset_t dwc;
+@@ -241,7 +243,7 @@ static struct {
+ 	/* network */
+ 	ifnet_t     ifp;
+ 	lck_mtx_t  *lock;           /* TX ring and TX endpoint */
+-	mbuf_t      txq[UD_TXQ];
++	mbuf_t      txq[UD_TXQ_MAX];
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
+@@ -282,6 +284,85 @@ ud_sleep_ms(unsigned ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * redfin 1034: USB Ethernet fast path, off by default. Phone -> PC ran at ~1.2 MB/s: every frame was its own
++ * StartTransfer of one TRB, the next frame waited for that transfer's XferComplete, and the event buffer is
++ * only polled every 1 ms (with timer leeway) by ud_thread, so at most one frame per poll went each way (RX:
++ * one OUT TRB, re-armed per poll; the PC's TCP ACKs came back at the same rate). Two runtime switches:
++ *  - kern.sweet_usb_txbatch N (boot sweetusbtxb=N): 0/1 = as before; 2..16 = up to N queued frames per
++ *    StartTransfer, one TRB each (no CHN, so each ends with its own short packet = one ECM frame, one host
++ *    URB), LST|IOC on the last; buffers in their own contiguous kernel memory (SMMU translation off only),
++ *    TX queue cap 64 instead of 32.
++ *  - kern.sweet_usb_poll_us US (boot sweetusbpollus=US): 0 = 0969's 1 ms / 10 ms polls; 50..1000 = poll
++ *    every US microseconds (no timer coalescing) while TX is in flight or within 5 ms of an event; the 10 s status
++ *    line and 0969's quiet count keep counting milliseconds.
++ * Counters: kern.sweet_usb_tx_frames, _tx_xfers (frames/xfers > 1 = batching), _tx_drops (queue full), _rx_frames.
++ */
++#define UD_TXB_MAX      16
++#define UD_TXB_BUF(i)   (0x800u + 0x800u * (i))     /* TRBs at 0, 2 KiB per frame after them */
++#define UD_TXB_SIZE     UD_TXB_BUF(UD_TXB_MAX)
++static vm_offset_t ud_txb_va;
++static uint64_t ud_txb_pa;
++static int ud_txbatch;          /* 0/1 = one frame per transfer */
++static int ud_poll_us;          /* 0 = 0969 polling */
++static uint64_t ud_tx_xfers, ud_tx_drops;
++
++static int
++sysctl_sweet_usb_txbatch SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, ud_txbatch, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value < 0 || value > UD_TXB_MAX) {
++		return EINVAL;
++	}
++	if (value >= 2 && ud_txb_va == 0) {
++		return ENODEV;
++	}
++	ud_txbatch = value;     /* taken at the next idle TX kick */
++	printf("SWEET USB: txbatch %d\n", value);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_usb_txbatch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_usb_txbatch, "I", "SWEET USB: frames per bulk IN transfer (0/1 one, 2..16)");
++
++static int
++sysctl_sweet_usb_poll_us SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, ud_poll_us, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value != 0 && (value < 50 || value > 1000)) {
++		return EINVAL;
++	}
++	ud_poll_us = value;
++	printf("SWEET USB: poll_us %d\n", value);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_usb_poll_us, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_usb_poll_us, "I", "SWEET USB: event poll interval while busy, us (0 = 1 ms/10 ms)");
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_usb_tx_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &ud.tx_frames, "");
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_usb_rx_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &ud.rx_frames, "");
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_usb_tx_xfers, CTLFLAG_RD | CTLFLAG_LOCKED, &ud_tx_xfers, "");
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_usb_tx_drops, CTLFLAG_RD | CTLFLAG_LOCKED, &ud_tx_drops, "");
++
++static void
++ud_sleep_us_crit(unsigned us)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
++	if (assert_wait_deadline_with_leeway(&ud.sleep_chan, THREAD_UNINT, TIMEOUT_URGENCY_SYS_CRITICAL,
++	    deadline, 0) == THREAD_WAITING) {
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
+ static int
+ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ {
+@@ -579,47 +660,103 @@ ud_rx_done(void)
+ 	ud_rx_arm();
+ }
+ 
++/* Copy one queued frame to fr (2 KiB), with the fix-ups below; frees m. 0 = dropped. */
++static uint32_t
++ud_tx_fill(mbuf_t m, uint8_t *fr)
++{
++	size_t len = mbuf_pkthdr_len(m);
++	if (len > ETHER_MAX_LEN - ETHER_CRC_LEN) {
++		mbuf_freem(m);
++		return 0;
++	}
++	mbuf_copydata(m, 0, len, (void *)fr);
++	mbuf_freem(m);
++	ud_log_frame("tx", fr, (uint32_t)len);
++	/*
++	 * ARP replies go to the Ethernet broadcast address: macOS's ECM
++	 * driver shows the host as 02:00:5e:77:ee:01 (our iMACAddress) on
++	 * the wire, but en17's own lladdr is 02:00:00:00:00:00, and its
++	 * ARP drops replies unicast to ..:01, so 192.168.7.2 never
++	 * resolved (frames carrying IP are accepted either way).
++	 */
++	if (len >= 42 && fr[12] == 0x08 && fr[13] == 0x06 && fr[20] == 0 && fr[21] == 2) {
++		memset(fr, 0xff, ETHER_ADDR_LEN);
++	}
++	/* Pad to the Ethernet minimum (60 bytes without FCS), as a MAC
++	 * would: macOS drops shorter frames, e.g. our 42-byte ARP replies,
++	 * so the Mac never resolved 192.168.7.2. */
++	while (len < 60) {
++		fr[len++] = 0;
++	}
++	/* A frame of a multiple of 512 bytes would need a zero-length
++	 * packet to end it; one pad byte does the same (IP ignores it). */
++	if ((len % 512) == 0) {
++		fr[len++] = 0;
++	}
++	return (uint32_t)len;
++}
++
++/* 1034: up to ud_txbatch queued frames in one bulk IN transfer, one TRB per frame. ud.lock held, TX idle. */
++static void
++ud_tx_kick_batch_locked(unsigned max)
++{
++	volatile uint32_t *t = NULL;
++	unsigned k = 0;
++
++	while (k < max && ud.txq_count > 0) {
++		mbuf_t m = ud.txq[ud.txq_head];
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ_MAX;
++		ud.txq_count--;
++		uint32_t len = ud_tx_fill(m, (uint8_t *)(ud_txb_va + UD_TXB_BUF(k)));
++		if (len == 0) {
++			continue;
++		}
++		flush_dcache64((addr64_t)(ud_txb_pa + UD_TXB_BUF(k)), len, TRUE);
++		uint64_t bpa = ud_txb_pa + UD_TXB_BUF(k);
++		t = (volatile uint32_t *)(ud_txb_va + 16u * k);
++		t[0] = (uint32_t)bpa;
++		t[1] = (uint32_t)(bpa >> 32);
++		t[2] = len;
++		t[3] = TRBCTL_NORMAL | TRB_HWO;         /* no CHN: its own short packet ends each frame */
++		k++;
++	}
++	if (k == 0) {
++		return;
++	}
++	t[3] |= TRB_LST | TRB_ISP_IMI | TRB_IOC;        /* one XferComplete for the batch */
++	flush_dcache64((addr64_t)ud_txb_pa, 16u * k, TRUE);
++	ud.tx_busy = true;
++	ud.tx_frames += k;
++	ud_tx_xfers++;
++	if (ud_epcmd(EP_TX, DEPCMD_STARTTRANSFER, (uint32_t)(ud_txb_pa >> 32), (uint32_t)ud_txb_pa, 0) != 0) {
++		ud.tx_busy = false;     /* no transfer started: no completion will come (ud_epcmd logged it) */
++		ud_tx_drops += k;
++	}
++}
++
+ /* Start the next queued frame if the IN endpoint is idle. ud.lock held. */
+ static void
+ ud_tx_kick_locked(void)
+ {
++	unsigned batch = (unsigned)ud_txbatch;
++	if (batch >= 2 && ud_txb_va != 0) {
++		if (!ud.tx_busy && ud.txq_count > 0 && ud.configured) {
++			ud_tx_kick_batch_locked(batch > UD_TXB_MAX ? UD_TXB_MAX : batch);
++		}
++		return;
++	}
+ 	while (!ud.tx_busy && ud.txq_count > 0 && ud.configured) {
+ 		mbuf_t m = ud.txq[ud.txq_head];
+-		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ_MAX;
+ 		ud.txq_count--;
+-		size_t len = mbuf_pkthdr_len(m);
+-		if (len > ETHER_MAX_LEN - ETHER_CRC_LEN) {
+-			mbuf_freem(m);
++		uint32_t len = ud_tx_fill(m, (uint8_t *)(ud.dma + UD_TX));
++		if (len == 0) {
+ 			continue;
+ 		}
+-		mbuf_copydata(m, 0, len, (void *)(ud.dma + UD_TX));
+-		mbuf_freem(m);
+-		ud_log_frame("tx", (const uint8_t *)(ud.dma + UD_TX), (uint32_t)len);
+-		/*
+-		 * ARP replies go to the Ethernet broadcast address: macOS's ECM
+-		 * driver shows the host as 02:00:5e:77:ee:01 (our iMACAddress) on
+-		 * the wire, but en17's own lladdr is 02:00:00:00:00:00, and its
+-		 * ARP drops replies unicast to ..:01, so 192.168.7.2 never
+-		 * resolved (frames carrying IP are accepted either way).
+-		 */
+-		uint8_t *fr = (uint8_t *)(ud.dma + UD_TX);
+-		if (len >= 42 && fr[12] == 0x08 && fr[13] == 0x06 && fr[20] == 0 && fr[21] == 2) {
+-			memset(fr, 0xff, ETHER_ADDR_LEN);
+-		}
+-		/* Pad to the Ethernet minimum (60 bytes without FCS), as a MAC
+-		 * would: macOS drops shorter frames, e.g. our 42-byte ARP replies,
+-		 * so the Mac never resolved 192.168.7.2. */
+-		while (len < 60) {
+-			((uint8_t *)(ud.dma + UD_TX))[len++] = 0;
+-		}
+-		/* A frame of a multiple of 512 bytes would need a zero-length
+-		 * packet to end it; one pad byte does the same (IP ignores it). */
+-		if ((len % 512) == 0) {
+-			((uint8_t *)(ud.dma + UD_TX))[len++] = 0;
+-		}
+ 		ud.tx_busy = true;
+ 		ud.tx_frames++;
+-		ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, (uint32_t)len, TRBCTL_NORMAL);
++		ud_tx_xfers++;
++		ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, len, TRBCTL_NORMAL);
+ 	}
+ }
+ 
+@@ -627,14 +764,18 @@ static errno_t
+ ud_if_output(ifnet_t ifp, mbuf_t m)
+ {
+ 	lck_mtx_lock(ud.lock);
+-	if (ud.txq_count == UD_TXQ || !ud.configured) {
++	unsigned cap = (ud_txbatch >= 2 && ud_txb_va != 0) ? UD_TXQ_MAX : UD_TXQ;
++	if (ud.txq_count >= cap || !ud.configured) {
++		if (ud.configured) {
++			ud_tx_drops++;
++		}
+ 		lck_mtx_unlock(ud.lock);
+ 		mbuf_freem(m);
+ 		ifnet_stat_increment_out(ifp, 0, 0, 1);
+ 		return 0;
+ 	}
+ 	ifnet_stat_increment_out(ifp, 1, mbuf_pkthdr_len(m), 0);
+-	ud.txq[(ud.txq_head + ud.txq_count) % UD_TXQ] = m;
++	ud.txq[(ud.txq_head + ud.txq_count) % UD_TXQ_MAX] = m;
+ 	ud.txq_count++;
+ 	ud_tx_kick_locked();
+ 	lck_mtx_unlock(ud.lock);
+@@ -845,11 +986,25 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	uint32_t ticks = 0;
+ 	/* redfin (0969): poll every 1 ms while events flow, every 10 ms after 200 quiet polls; sweetudpoll=1: always 1 ms */
+-	uint32_t quiet = 0, fast = 0;
++	uint32_t quiet = 0, fast = 0, sub_us = 0;
+ 	PE_parse_boot_argn("sweetudpoll", &fast, sizeof(fast));
+ 	for (;;) {
+ 		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
+-		quiet = count ? 0 : quiet < 200 ? quiet + 1 : quiet;
++		/* 1034: kern.sweet_usb_poll_us polls faster while TX is in flight or within 5 ms of an event
++		 * (not 0969's 200 ms: the live log's 100 ms datagrams would keep it on); ticks/quiet stay in ms */
++		uint32_t pus = (uint32_t)ud_poll_us;
++		bool fastpoll = pus != 0 && (quiet < 5 || ud.tx_busy || count);
++		bool tick = true;
++		if (fastpoll) {
++			sub_us += pus;
++			tick = sub_us >= 1000;
++			if (tick) {
++				sub_us -= 1000;
++			}
++		} else {
++			sub_us = 0;
++		}
++		quiet = count ? 0 : (quiet < 200 && tick) ? quiet + 1 : quiet;
+ 		if (count) {
+ 			ud_sync(UD_EVT, UD_EVT_SIZE);
+ 			for (uint32_t done = 0; done < count; done += 4) {
+@@ -862,7 +1017,7 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 			}
+ 			dwc_wr(GEVNTCOUNT, count);
+ 		}
+-		if ((++ticks % 10000) == 0) {
++		if (tick && (++ticks % 10000) == 0) {
+ 			volatile uint32_t *rt = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+ 			volatile uint32_t *tt = (volatile uint32_t *)(ud.dma + UD_TRB_TX);
+ 			ud_sync(UD_TRB_RX, 16);
+@@ -871,7 +1026,7 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 			    ud.rx_frames, ud.tx_frames, (unsigned long long)ud.events, rt[2], rt[3], tt[2], tt[3],
+ 			    ud.tx_busy, dwc_rd(DSTS));
+ 		}
+-		if (ticks <= 60000 && (ticks % 5000) == 0) {
++		if (tick && ticks <= 60000 && (ticks % 5000) == 0) {
+ 			printf("SWEET USB: t=%us DCFG %08x DCTL %08x DSTS %08x GUSB2PHYCFG %08x GUSB3PIPECTL %08x GCTL %08x GSTS %08x EVCNT %x\n",
+ 			    ticks / 1000, dwc_rd(DCFG), dwc_rd(DCTL), dwc_rd(DSTS), dwc_rd(0xc200),
+ 			    dwc_rd(0xc2c0), dwc_rd(GCTL), dwc_rd(0xc118), dwc_rd(GEVNTCOUNT));
+@@ -882,7 +1037,11 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 				    usb_rd(ud_smmu_cb, 0x68), usb_rd(ud_smmu_cb, 0x6c));
+ 			}
+ 		}
+-		ud_sleep_ms((fast == 1 || quiet < 200 || ud.tx_busy) ? 1 : 10);
++		if (fastpoll) {
++			ud_sleep_us_crit(pus);
++		} else {
++			ud_sleep_ms((fast == 1 || quiet < 200 || ud.tx_busy) ? 1 : 10);
++		}
+ 	}
+ }
+ 
+@@ -1415,6 +1574,30 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		}
+ 		ud.dma_pa = ptoa_64(pn);
+ 	}
++	/*
++	 * 1034: TX batch buffers (UD_TXB_SIZE) in their own contiguous kernel memory. Only with the cached
++	 * kernel-memory DMA path and the SMMU in its default bypass mode: sweetusbdma's write-combined window
++	 * and sweetusbsmmu=1's single identity-mapped 2 MB block do not cover them.
++	 */
++	int smmu_mode = 0, txb = 0, pollus = 0;
++	PE_parse_boot_argn("sweetusbsmmu", &smmu_mode, sizeof(smmu_mode));
++	PE_parse_boot_argn("sweetusbtxb", &txb, sizeof(txb));
++	PE_parse_boot_argn("sweetusbpollus", &pollus, sizeof(pollus));
++	if (!ud_dma_uncached && smmu_mode == 0) {
++		vm_offset_t va = 0;
++		if (kmem_alloc_contig(kernel_map, &va, UD_TXB_SIZE, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
++			ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++			if (pn) {
++				ud_txb_pa = ptoa_64(pn);
++				ud_txb_va = va;
++			}
++		}
++	}
++	ud_txbatch = (txb >= 2 && txb <= UD_TXB_MAX && ud_txb_va) ? txb : 0;
++	ud_poll_us = (pollus >= 50 && pollus <= 1000) ? pollus : 0;
++	printf("SWEET USB: fast path: txbatch %d (buffer %s at 0x%llx) poll_us %d\n", ud_txbatch,
++	    ud_txb_va ? "ok" : "none", ud_txb_pa, ud_poll_us);
+ 	ud_if_create();
+ 	if (ud_smmu_setup(ud.dma_pa) != 0) {
+ 		printf("SWEET USB: SMMU setup failed; not starting the device\n");
+-- 
+2.43.0
+
