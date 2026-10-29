@@ -1,0 +1,494 @@
+From 0b4360ee832df17cec4978a28ea5aa28b3784d45 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 17:29:29 +0000
+Subject: [PATCH] redfin 1036: GPU DCVS, kern.sweet_gpu_dcvs (default 0 = fixed
+ sweetgpufreq level)
+
+The A620 runs at the fixed sweetgpufreq level (r64u: 4 = 625 MHz) whatever the load. kern.sweet_gpu_dcvs 1 starts a
+16 ms governor: busy from the GMU XO busy counter (Linux a6xx_hw_init / a6xx_gpu_busy: CX_BUSY_MASK 0xff000000,
+POWER_COUNTER_SELECT_0 countable 0x20, XOCLK_0; CP per-submit stamps if it does not count), target ~50 %: up at once
+to the level covering 1.1 x need, top after a window > 85 % or 50 ms continuously busy, down one level after 4
+quiet windows, floor after 80 ms idle; touch / frames-flowing hints from 0970's sweet_cpufreq_boost hold the top for
+kern.sweet_gpu_dcvs_boost_ms (1000). 0964's thermal cap is the ceiling. Votes through the HFI perf vote (msg 30) with a
+20 us ack poll. Bits 2/4 drop the touch / SwapEnd boost. kern.sweet_gpu_dcvs_floor MHz (400), kern.sweet_gpu_mhz (read).
+Line: SWEET GPU DCVS 5s: 275:ms 400:ms 500:ms 625:ms ms | switches N | busy P% | boosts B capped C | floor F cap T | src gmu|cp.
+UniXNU reference: sheng GpuPowerProbe.cpp gpuDcvsThread.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC2ugyLE29nbFLJoQZd
+---
+ bsd/dev/sweet_a6xx.c    |  72 +++++++++-
+ bsd/dev/sweet_a6xx.h    |   7 +
+ bsd/dev/sweet_cpufreq.c |   4 +-
+ bsd/dev/sweet_gpu.c     | 297 +++++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 373 insertions(+), 7 deletions(-)
+
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index b1c28de..ef93e98 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -844,7 +844,14 @@ static int arc_votes(uint32_t *votes, const uint32_t *lvl, int n, const char *pr
+ 	return 0;
+ }
+ 
++static int hfi_send_us(struct a6_gpu *g, uint32_t id, uint32_t *msg, uint32_t dwords, unsigned poll_us);
+ static int hfi_send(struct a6_gpu *g, uint32_t id, uint32_t *msg, uint32_t dwords)
++{
++	return hfi_send_us(g, id, msg, dwords, 1000);
++}
++
++/* 1036: poll_us = how often the ack is looked for (1000: as before; the DCVS votes look every 20 us, 1 s at most) */
++static int hfi_send_us(struct a6_gpu *g, uint32_t id, uint32_t *msg, uint32_t dwords, unsigned poll_us)
+ {
+ 	uint32_t seq = ++g->hfi_seq;
+ 	msg[0] = (seq << 20) | (dwords << 8) | id;
+@@ -863,7 +870,9 @@ static int hfi_send(struct a6_gpu *g, uint32_t id, uint32_t *msg, uint32_t dword
+ 	wr32(h + 44, w);
+ 	wr32(GMU_REG(GMU_H2G_SET), 1);
+ 
+-	for (int t = 0; t < 1000; t++) {
++	if (poll_us == 0 || poll_us > 1000)
++		poll_us = 1000;
++	for (unsigned t = 0; t < 1000000u / poll_us; t++) {
+ 		if (rd32(GMU_REG(GMU_G2H_INFO)) & 1) {
+ 			wr32(GMU_REG(GMU_G2H_CLR), 1);
+ 			uint64_t rh = QHDR(g, HFI_Q_RESP);
+@@ -882,7 +891,10 @@ static int hfi_send(struct a6_gpu *g, uint32_t id, uint32_t *msg, uint32_t dword
+ 					return (int)buf[2];
+ 			}
+ 		}
+-		a6_delay_ms(1);
++		if (poll_us >= 1000)
++			a6_delay_ms(1);
++		else
++			a6_delay_us(poll_us);
+ 	}
+ 	a6_log("hfi: msg %u seq %u: no ack (info %x)\n", id, seq, rd32(GMU_REG(GMU_G2H_INFO)));
+ 	return -1;
+@@ -907,6 +919,62 @@ int a6_perf_vote(struct a6_gpu *g, uint32_t lvl)
+ #endif
+ }
+ 
++/*
++ * 1036: GPU DCVS (sweet_gpu.c, kern.sweet_gpu_dcvs). The same vote with a 20 us ack poll; the level table; and the GMU's
++ * busy counter as Linux a6xx_hw_init sets it up (GPU_GMU_AO_GPU_CX_BUSY_MASK 0xff000000, POWER_COUNTER_SELECT_0
++ * countable 0x20 on XOCLK_0, POWER_COUNTER_ENABLE) and a6xx_gpu_busy reads it (XOCLK_0, 19.2 MHz ticks while busy).
++ */
++int a6_perf_vote_fast(struct a6_gpu *g, uint32_t lvl)
++{
++#if A6_GPU_ID == 618
++	(void)g;
++	(void)lvl;
++	return -1;
++#else
++	static uint32_t msg[8];
++	if (lvl < 1 || (int)lvl >= NLVL)
++		return -1;
++	msg[1] = 1;
++	msg[2] = lvl;
++	msg[3] = 0;
++	return hfi_send_us(g, 30, msg, 4, 20);
++#endif
++}
++
++uint32_t a6_level_khz(uint32_t lvl)
++{
++	return (int)lvl < NLVL ? gpu_khz[lvl] : 0;
++}
++
++uint32_t a6_nlevels(void)
++{
++	return (uint32_t)NLVL - 1;	/* levels 1..n */
++}
++
++#define GMU_AO_CX_BUSY_MASK	0x23b0e
++#define GMU_PWR_CNT_ENABLE	0x1f840
++#define GMU_PWR_CNT_SEL0	0x1f841
++#define GMU_PWR_CNT_XO0_L	0x1f844
++#define GMU_PWR_CNT_XO0_H	0x1f845
++
++void a6_busy_counter_enable(void)
++{
++	wr32(GMU_REG(GMU_AO_CX_BUSY_MASK), 0xff000000u);
++	wr32(GMU_REG(GMU_PWR_CNT_SEL0), (rd32(GMU_REG(GMU_PWR_CNT_SEL0)) & ~0xffu) | 0x20u);
++	wr32(GMU_REG(GMU_PWR_CNT_ENABLE), 1);
++	a6_log("dcvs: GMU busy counter on (sel0 %x enable %x mask %x)\n", rd32(GMU_REG(GMU_PWR_CNT_SEL0)),
++	    rd32(GMU_REG(GMU_PWR_CNT_ENABLE)), rd32(GMU_REG(GMU_AO_CX_BUSY_MASK)));
++}
++
++uint64_t a6_busy_counter(void)
++{
++	uint32_t hi = rd32(GMU_REG(GMU_PWR_CNT_XO0_H)), lo = rd32(GMU_REG(GMU_PWR_CNT_XO0_L));
++	uint32_t hi2 = rd32(GMU_REG(GMU_PWR_CNT_XO0_H));
++	if (hi2 != hi)
++		lo = rd32(GMU_REG(GMU_PWR_CNT_XO0_L));
++	return (uint64_t)hi2 << 32 | lo;
++}
++
+ static int gmu_hfi(struct a6_gpu *g)
+ {
+ 	static uint32_t msg[256];
+diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
+index 1d7e86f..030accd 100644
+--- a/bsd/dev/sweet_a6xx.h
++++ b/bsd/dev/sweet_a6xx.h
+@@ -110,6 +110,13 @@ bool a6_cx_up(void);
+ bool a6_gx_up(void);
+ bool a6_cp_running(const struct a6_gpu *g);	/* GX on and the CP runs our SQE */
+ 
++/* 1036: GPU DCVS helpers */
++int a6_perf_vote_fast(struct a6_gpu *g, uint32_t lvl);	/* HFI perf vote, ack polled every 20 us; 0 = ok */
++uint32_t a6_level_khz(uint32_t lvl);			/* 0 past the table */
++uint32_t a6_nlevels(void);				/* highest level number */
++void a6_busy_counter_enable(void);			/* GMU POWER_COUNTER XOCLK_0 = GPU busy (Linux a6xx) */
++uint64_t a6_busy_counter(void);				/* 19.2 MHz ticks the GPU was busy */
++
+ uint32_t a6_pkt7(uint32_t op, uint32_t cnt);
+ uint32_t a6_pkt4(uint32_t reg, uint32_t cnt);
+ 
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 53006cd..a46eac8 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -136,9 +136,11 @@ static uint64_t cf_log_t;
+ static bool cf_boost_seen;
+ 
+ void sweet_cpufreq_boost(int why);
++extern void sweet_gpu_dcvs_boost(int why);     /* 1036: bsd/dev/sweet_gpu.c (kern.sweet_gpu_dcvs) */
+ void
+-sweet_cpufreq_boost(int why __unused)
++sweet_cpufreq_boost(int why)
+ {
++	sweet_gpu_dcvs_boost(why);      /* 1036: the GPU governor takes the same touch / frames-flowing hints */
+ 	if (!cf_boost_on || !cf_ready || cf_boost_khz == 0) {
+ 		return;
+ 	}
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 293c23f..5106a7c 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -480,17 +480,30 @@ sweet_gpu_ready(void)
+ 
+ /* redfin (0964): thermal cap on the GPU level (bsd/dev/sweet_thermal.c, sweettcap bit 2); 0 = back to the boot level. */
+ int sweet_gpu_level_cap(unsigned max_lvl);
++static uint32_t gpu_boot_lvl;           /* 1036: sweetgpufreq's level (the fixed level with kern.sweet_gpu_dcvs 0) */
++static uint32_t gpu_tcap;               /* 1036: the thermal cap last asked for (0 = none) */
++static int dcvs_on;                     /* 1036: kern.sweet_gpu_dcvs */
++static void dcvs_fixed_locked(void);
+ int
+ sweet_gpu_level_cap(unsigned max_lvl)
+ {
+ 	extern int a6_perf_vote(struct a6_gpu *g, uint32_t lvl);
+-	static uint32_t boot_lvl;
+ 	int rc = 0;
+ 	lck_mtx_lock(&sweet_gpu_lock);
+-	if (!boot_lvl) {
+-		boot_lvl = gpu.perf_level ? gpu.perf_level : 1;
++	if (!gpu_boot_lvl) {
++		gpu_boot_lvl = gpu.perf_level ? gpu.perf_level : 1;
++	}
++	gpu_tcap = max_lvl;
++	if (dcvs_on & 1) {
++		/* 1036: the governor keeps the cap as its ceiling; above it now: down at once */
++		if (max_lvl && gpu.perf_level > max_lvl) {
++			gpu.perf_level = max_lvl;
++			rc = gpu_ready ? a6_perf_vote(&gpu, max_lvl) : 0;
++		}
++		lck_mtx_unlock(&sweet_gpu_lock);
++		return rc;
+ 	}
+-	uint32_t lvl = (max_lvl && max_lvl < boot_lvl) ? max_lvl : boot_lvl;
++	uint32_t lvl = (max_lvl && max_lvl < gpu_boot_lvl) ? max_lvl : gpu_boot_lvl;
+ 	if (lvl != gpu.perf_level) {
+ 		gpu.perf_level = lvl;   /* also what a reset/recovery brings the GPU up at */
+ 		rc = gpu_ready ? a6_perf_vote(&gpu, lvl) : 0;
+@@ -499,6 +512,281 @@ sweet_gpu_level_cap(unsigned max_lvl)
+ 	return rc;
+ }
+ 
++/*
++ * ---- 1036: GPU DCVS, kern.sweet_gpu_dcvs MASK (default 0 = the fixed sweetgpufreq level, as before) ----
++ *   1  on: every 16 ms the GPU busy fraction of the last window (the GMU's XO busy counter, Linux a6xx_gpu_busy; if it
++ *      does not count, the CP's per-submit stamps) picks the level for ~50 % busy: up at once to the lowest level at
++ *      or above 1.1 x need (need = current MHz x busy / 50 %); the top after a window over 85 % busy or 50 ms busy
++ *      without a break (windows >= 95 %); down one level after 4 windows in a row that want less; the floor after
++ *      80 ms idle (windows < 3 %). Touch / SwapEnd (the 0970 boost sites) hold the top for kern.sweet_gpu_dcvs_boost_ms
++ *      (default 1000, 0 none). 0964's thermal cap is the ceiling. Votes: HFI GX perf vote (msg 30), as 0964.
++ *   2  no touch boost, 4 no SwapEnd boost
++ * kern.sweet_gpu_dcvs_floor MHz (default 400: the lowest level at or above it), kern.sweet_gpu_mhz (read: the level
++ * voted now). Line every 5 s while on: SWEET GPU DCVS 5s: MHz:ms .. | switches N | busy P% | boosts B capped C | src S.
++ * 0 again: back to sweetgpufreq's level (capped as 0964 says).
++ */
++static int dcvs_floor_mhz = 400, dcvs_boost_ms = 1000;
++static volatile uint64_t dcvs_boost_until;
++static bool dcvs_thread_up;
++static int dcvs_chan;
++static uint64_t dcvs_cp_busy;           /* fallback source: CP stamp ticks of the submits summed (gpu_stats_locked) */
++static int gpu_mhz_now;
++static void gpu_stats_locked(void);
++
++static void
++dcvs_fixed_locked(void)
++{
++	extern int a6_perf_vote(struct a6_gpu *g, uint32_t lvl);
++	if (!gpu_boot_lvl) {
++		gpu_boot_lvl = gpu.perf_level ? gpu.perf_level : 1;
++	}
++	uint32_t lvl = (gpu_tcap && gpu_tcap < gpu_boot_lvl) ? gpu_tcap : gpu_boot_lvl;
++	if (lvl != gpu.perf_level) {
++		gpu.perf_level = lvl;
++		if (gpu_ready) {
++			(void)a6_perf_vote(&gpu, lvl);
++		}
++	}
++	gpu_mhz_now = (int)(a6_level_khz(gpu.perf_level) / 1000);
++}
++
++void sweet_gpu_dcvs_boost(int why);
++void
++sweet_gpu_dcvs_boost(int why)
++{
++	/* why: 0 touch (SweetHID), 1 frames flowing (SwapEnds < 50 ms apart), 2 CPU present (0970's codes) */
++	if (!(dcvs_on & 1) || dcvs_boost_ms <= 0 || (why == 0 && (dcvs_on & 2)) || (why != 0 && (dcvs_on & 4))) {
++		return;
++	}
++	uint64_t now = mach_absolute_time(), d;
++	nanoseconds_to_absolutetime((uint64_t)dcvs_boost_ms * NSEC_PER_MSEC, &d);
++	bool was = now < dcvs_boost_until;
++	dcvs_boost_until = now + d;
++	if (!was) {
++		thread_wakeup((event_t)&dcvs_chan);     /* up now, not at the next window */
++	}
++}
++
++static void
++dcvs_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint64_t last_abs = 0, last_busy = 0, last_cp = 0, log_abs = 0;
++	uint32_t quiet = 0, idle_ms = 0, busy_ms = 0;
++	uint32_t at_ms[8] = { 0 }, switches = 0, boosts = 0, capped = 0, stuck = 0;
++	uint64_t win_busy = 0, win_ticks = 0;
++	bool use_cp = false, boosting = false, counter_on = false;
++	for (;;) {
++		if (!(dcvs_on & 1) || !gpu_ready) {
++			last_abs = 0;
++			counter_on = false;
++			assert_wait((event_t)&dcvs_chan, THREAD_UNINT);
++			if (!(dcvs_on & 1) || !gpu_ready) {
++				thread_block(THREAD_CONTINUE_NULL);
++			} else {
++				clear_wait(current_thread(), THREAD_AWAKENED);  /* switched on meanwhile */
++			}
++			continue;
++		}
++		lck_mtx_lock(&sweet_gpu_lock);
++		if (!counter_on) {
++			a6_busy_counter_enable();
++			counter_on = true;
++		}
++		gpu_stats_locked();     /* drains the CP stamps into dcvs_cp_busy (fallback source) */
++		uint64_t now = mach_absolute_time(), busy = a6_busy_counter(), cp = dcvs_cp_busy, ns = 0;
++		uint32_t nl = a6_nlevels(), cur = gpu.perf_level >= 1 && gpu.perf_level <= nl ? gpu.perf_level : nl;
++		if (last_abs == 0) {
++			last_abs = now;
++			last_busy = busy;
++			last_cp = cp;
++			lck_mtx_unlock(&sweet_gpu_lock);
++			goto sleep;
++		}
++		absolutetime_to_nanoseconds(now - last_abs, &ns);
++		uint64_t ticks = ns * 192 / 10000, db = busy - last_busy, dc = cp - last_cp;   /* 19.2 MHz */
++		last_abs = now;
++		last_busy = busy;
++		last_cp = cp;
++		/* the GMU counter: no count for 2 s while the CP stamps show work: the stamps instead (logged once) */
++		if (!use_cp && db == 0 && dc != 0 && ++stuck >= 125) {
++			use_cp = true;
++			a6_log("dcvs: GMU busy counter not counting (sel0/enable written): busy from the CP stamps\n");
++		} else if (db != 0) {
++			stuck = 0;
++		}
++		uint64_t b = use_cp ? dc : db;
++		if (ticks == 0) {
++			ticks = 1;
++		}
++		if (b > ticks) {
++			b = ticks;
++		}
++		uint32_t pct = (uint32_t)(b * 100 / ticks), win_ms = (uint32_t)(ns / NSEC_PER_MSEC);
++		win_busy += b;
++		win_ticks += ticks;
++		if (cur < 8) {
++			at_ms[cur] += win_ms;
++		}
++		uint32_t top = gpu_tcap && gpu_tcap < nl ? gpu_tcap : nl, floor = 1;
++		while (floor < top && a6_level_khz(floor) < (uint32_t)dcvs_floor_mhz * 1000) {
++			floor++;
++		}
++		busy_ms = pct >= 95 ? busy_ms + win_ms : 0;
++		idle_ms = pct < 3 ? idle_ms + win_ms : 0;
++		uint64_t need = (uint64_t)a6_level_khz(cur) * pct / 50 * 11 / 10;
++		uint32_t want = floor;
++		while (want < top && a6_level_khz(want) < need) {
++			want++;
++		}
++		bool boost = now < dcvs_boost_until;
++		if (boost && !boosting) {
++			boosts++;
++		}
++		boosting = boost;
++		uint32_t lvl = cur;
++		if (boost || pct > 85 || busy_ms >= 50) {
++			lvl = top;
++			quiet = 0;
++		} else if (want > cur) {
++			lvl = want;
++			quiet = 0;
++		} else if (idle_ms >= 80) {
++			lvl = floor;
++			quiet = 0;
++		} else if (want < cur) {
++			if (++quiet >= 4) {
++				lvl = cur - 1;
++				quiet = 0;
++			}
++		} else {
++			quiet = 0;
++		}
++		if (lvl > top) {
++			lvl = top;
++			capped++;
++		}
++		if (lvl < floor) {
++			lvl = floor;
++		}
++		if (lvl != cur) {
++			gpu.perf_level = lvl;   /* also what a reset/recovery brings the GPU up at */
++			if (a6_perf_vote_fast(&gpu, lvl) == 0) {
++				switches++;
++			}
++		}
++		gpu_mhz_now = (int)(a6_level_khz(gpu.perf_level) / 1000);
++		lck_mtx_unlock(&sweet_gpu_lock);
++		if (log_abs == 0) {
++			log_abs = now;
++		}
++		absolutetime_to_nanoseconds(now - log_abs, &ns);
++		if (ns >= 5ULL * NSEC_PER_SEC) {
++			char line[200];
++			int len = snprintf(line, sizeof(line), "SWEET GPU DCVS 5s:");
++			for (uint32_t i = 1; i <= nl && i < 8; i++) {
++				len += snprintf(line + len, sizeof(line) - len, " %u:%u", a6_level_khz(i) / 1000, at_ms[i]);
++			}
++			printf("%s ms | switches %u | busy %llu%% | boosts %u capped %u | floor %d cap %u | src %s\n", line,
++			    switches, win_ticks ? win_busy * 100 / win_ticks : 0, boosts, capped, dcvs_floor_mhz, gpu_tcap,
++			    use_cp ? "cp" : "gmu");
++			bzero(at_ms, sizeof(at_ms));
++			switches = boosts = capped = 0;
++			win_busy = win_ticks = 0;
++			log_abs = now;
++		}
++sleep:
++		{
++			uint64_t dl;
++			clock_interval_to_deadline(16, NSEC_PER_MSEC, &dl);
++			(void)assert_wait_deadline(&dcvs_chan, THREAD_UNINT, dl);
++			thread_block(THREAD_CONTINUE_NULL);
++		}
++	}
++}
++
++static int
++sysctl_sweet_gpu_dcvs SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, dcvs_on, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value < 0 || value > 7) {
++		return EINVAL;
++	}
++#if A6_GPU_ID == 618
++	if (value & 1) {
++		return ENOTSUP;         /* no runtime perf vote on the A618's legacy GMU */
++	}
++#endif
++	if ((value & 1) && !dcvs_thread_up) {
++		thread_t th;
++		if (kernel_thread_start(dcvs_thread, NULL, &th) != KERN_SUCCESS) {
++			return ENOMEM;
++		}
++		thread_deallocate(th);
++		dcvs_thread_up = true;
++	}
++	lck_mtx_lock(&sweet_gpu_lock);
++	if (!gpu_boot_lvl) {
++		gpu_boot_lvl = gpu.perf_level ? gpu.perf_level : 1;     /* sweetgpufreq's, before the governor moves it */
++	}
++	dcvs_on = value;
++	if (!(value & 1)) {
++		dcvs_fixed_locked();    /* back to sweetgpufreq's level (under the thermal cap) */
++	}
++	lck_mtx_unlock(&sweet_gpu_lock);
++	thread_wakeup((event_t)&dcvs_chan);
++	printf("SWEET GPU: dcvs %d (%s; floor %d MHz, boost %d ms, level now %u = %u MHz)\n", value,
++	    (value & 1) ? "on" : "off: fixed sweetgpufreq level", dcvs_floor_mhz, dcvs_boost_ms, gpu.perf_level,
++	    a6_level_khz(gpu.perf_level) / 1000);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_dcvs, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_gpu_dcvs, "I", "SWEET GPU: DCVS (0 fixed level, 1 on, +2 no touch boost, +4 no SwapEnd boost)");
++
++static int
++sysctl_sweet_gpu_dcvs_floor SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, dcvs_floor_mhz, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value < 0 || value > 1000) {
++		return EINVAL;
++	}
++	dcvs_floor_mhz = value;
++	printf("SWEET GPU: dcvs floor %d MHz\n", value);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_dcvs_floor, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_gpu_dcvs_floor, "I", "SWEET GPU: DCVS floor, MHz (lowest level at or above)");
++
++static int
++sysctl_sweet_gpu_dcvs_boost_ms SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, dcvs_boost_ms, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value < 0 || value > 10000) {
++		return EINVAL;
++	}
++	dcvs_boost_ms = value;
++	printf("SWEET GPU: dcvs boost %d ms\n", value);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_dcvs_boost_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_gpu_dcvs_boost_ms, "I", "SWEET GPU: DCVS touch/SwapEnd boost at the top, ms (0 none)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_mhz, CTLFLAG_RD | CTLFLAG_LOCKED, &gpu_mhz_now, 0,
++    "SWEET GPU: level voted now, MHz (set when DCVS runs or stops)");
++
+ /* ---- hangs and resets (all with sweet_gpu_lock held) ---- */
+ 
+ /*
+@@ -557,6 +845,7 @@ gpu_stats_locked(void)
+ 		gstat_own[o].busy += t;
+ 		gstat_n++;
+ 		gstat_busy += t;
++		dcvs_cp_busy += t;      /* 1036: DCVS fallback source */
+ 		if (t > gstat_longest) {
+ 			gstat_longest = t;
+ 		}
