@@ -224,6 +224,20 @@ static bool listed(void)
 		if (device && strcmp(getprogname(), "backboardd") != 0)
 			class_replaceMethod(object_getClass(device), sel_registerName("supportsExtendedXR10Formats"),
 					    imp_implementationWithBlock(^BOOL(id me) { (void)me; return YES; }), "B16@0:8");
+		/*
+		 * Render-target rotation: _MTLDevice answers YES, so Core Animation draws its landscape framebuffer as a
+		 * rotated (rotation 1/3) texture over the portrait panel surface. metal2vulkan holds such a texture through a
+		 * shadow image and a rotation kernel copy in and out of every pass: ~220 ms of GPU a frame on the Adreno 620
+		 * (r62b: GPU 99% busy, 30-60 of 60 frames a second dropped, landscape after ~10 s with no animation). Answering
+		 * NO makes CA keep the portrait framebuffer and rotate in its own composite, as on GPUs without the feature.
+		 * /var/local/mtl2-env SWEET_RT_ROTATION=1 keeps Metal's answer.
+		 */
+		const char *rt = getenv("SWEET_RT_ROTATION");
+		if (device && !(rt && atoi(rt))) {
+			class_replaceMethod(object_getClass(device), sel_registerName("supportsRenderTargetTextureRotation"),
+					    imp_implementationWithBlock(^BOOL(id me) { (void)me; return NO; }), "B16@0:8");
+			sm2_log("render-target rotation: answered NO (SWEET_RT_ROTATION=1 keeps Metal's)");
+		}
 		/* image bases, for symbolicating pstack samples (atos -o out/SweetMetal2.dSYM -l BASE ADDR) */
 		Dl_info self = { 0 }, tu = { 0 };
 		dladdr((void *)sm2_logs, &self);
