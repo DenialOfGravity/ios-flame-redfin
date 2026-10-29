@@ -221,6 +221,25 @@ def lz4_decompress_file(src, dst, progress=None):
     return n, 'pure python'
 
 
+def lz4_decompress_any(src, dst):
+    """the streaming decoder above; on a format error, the repo's tools/lz4py.py (shipped next to this file) as a
+    second opinion"""
+    try:
+        return lz4_decompress_file(src, dst)
+    except (LZ4Error, IndexError, struct.error) as e:
+        try:
+            if HERE not in sys.path:
+                sys.path.insert(0, HERE)
+            import lz4py
+        except ImportError:
+            raise e
+        log.warning('LZ4 decoder: %s; trying lz4py.py', e)
+        data = lz4py.decompress(open(src, 'rb').read())
+        with open(dst, 'wb') as f:
+            f.write(data)
+        return len(data), 'lz4py.py'
+
+
 # ---------------------------------------------------------------- klog parsing
 R_TS = re.compile(r'^\[\s*(\d+\.\d+)\]\s?(.*)$')
 R_TEMP = re.compile(r'SWEET THERMAL: silver ([\d.]+) gold ([\d.]+) prime ([\d.]+) cpuss ([\d.]+) gpu ([\d.]+) '
@@ -1317,7 +1336,7 @@ class Collector:
         outname = 'prof.bin' if tr.kind == 'prof' else 'trace.swtr'
         out = os.path.join(tr.dir, outname)
         t0 = time.time()
-        n, how = lz4_decompress_file(part, out + '.part')
+        n, how = lz4_decompress_any(part, out + '.part')
         os.replace(out + '.part', out)
         tr.decomp = {'bytes': n, 'method': how, 's': round(time.time() - t0, 2)}
         exp = (tr.end or {}).get('bytes')
