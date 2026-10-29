@@ -1,0 +1,421 @@
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 19:00:00 +0100
+Subject: [PATCH] redfin 1014 (standalone): Wi-Fi signal for wifid (live RSSI, NOISE/RATE/PHY_MODE/MCS, signal events, self-join link event)
+
+wland reports the joined network's signal (FW_RSSI, every 2-10 s); RSSI/CURRENT_NETWORK use it instead
+of the scan from before the join. NOISE 17, RATE 8, PHY_MODE 14 and MCS 57 are answered. While joined a
+timer tells wifid the signal (sweetwifilqm= / kern.sweet_wifi_lqm bits, default 0x9). A link wland made
+by itself posts SSID/BSSID/LINK changed (sweetwifilink=0: off). Edits files made by 0123 (after 1012/1013).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Standalone refresh (redfin ws-y-wifi-1014): applies on a kernel without 1012/1013; carries their includes
+(kern/clock.h, pexpert) and 1013's accepting() (sweetwifiacc=0 refuses the new answers). Code otherwise unchanged.
+---
+diff --git a/bsd/dev/flame_sta.c b/bsd/dev/flame_sta.c
+index 7e40bda..3188235 100644
+--- a/bsd/dev/flame_sta.c
++++ b/bsd/dev/flame_sta.c
+@@ -37,9 +37,11 @@ extern bool flame_wlan_transmit(const uint8_t *frame, size_t length);
+ extern void (*flame_wlan_rx_hook)(const uint8_t *frame, size_t length);
+ extern void (*flame_wlan_link_hook)(bool up);
+ extern bool flame_wlan_link_bss(struct flame_wlan_bss *bss);
++extern bool flame_wlan_link_rssi(int *rssi);
+ 
+ static struct redwood_sta_bss sta_joined_bss;
+ static int sta_last_error;
++static volatile bool sta_joining;       /* redfin 1014: wifid's join is running (its JOIN_DONE posts the link) */
+ 
+ static const uint16_t sta_freqs[] = {
+ 	2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
+@@ -95,11 +97,13 @@ sta_join(const struct redwood_sta_join *what)
+ 	for (int i = 0; i < 6; i++) {
+ 		any |= what->bssid[i] != 0;
+ 	}
++	sta_joining = true;
+ 	if (what->security == REDWOOD_STA_WPA2_PSK && what->passphrase_length == 0) {
+ 		error = flame_wlan_join_pmk(what->ssid, what->ssid_length, any ? what->bssid : NULL, what->pmk);
+ 	} else error = flame_wlan_join(what->ssid, what->ssid_length, any ? what->bssid : NULL,
+ 	    what->security == REDWOOD_STA_WPA2_PSK ? what->passphrase : NULL,
+ 	    what->security == REDWOOD_STA_WPA2_PSK ? what->passphrase_length : 0);
++	sta_joining = false;
+ 	sta_last_error = error;
+ 	bzero(&sta_joined_bss, sizeof(sta_joined_bss));
+ 	if (error == 0) {
+@@ -151,6 +155,28 @@ sta_state(struct redwood_sta_state *state)
+ 			}
+ 		}
+ 	}
++	if (state->phase == REDWOOD_STA_JOINED) {
++		/*
++		 * redfin 1014: the signal as wland last heard it (FW_RSSI every few seconds, or the last scan), not
++		 * the scan's from before the join; and the beacon's elements when wifid's join came before the
++		 * kernel heard the network (CURRENT_NETWORK without an RSN element).
++		 */
++		int rssi;
++		struct flame_wlan_bss t;        /* (on any thread: not static) */
++
++		if (flame_wlan_link_rssi(&rssi)) {
++			state->bss.rssi = (int16_t)rssi;
++		}
++		if (state->bss.elements_length == 0 && flame_wlan_link_bss(&t) && t.elements_length != 0 &&
++		    memcmp(t.bssid, state->bss.bssid, 6) == 0) {
++			state->bss.elements_length = t.elements_length < REDWOOD_STA_ELEMENTS_MOST ? t.elements_length :
++			    REDWOOD_STA_ELEMENTS_MOST;
++			memcpy(state->bss.elements, t.elements, state->bss.elements_length);
++			state->bss.beacon_interval = t.beacon_interval;
++			state->bss.capability = t.capability;
++			state->bss.frequency = state->bss.frequency ? state->bss.frequency : t.frequency;
++		}
++	}
+ 	state->last_error = sta_last_error;
+ }
+ 
+@@ -195,6 +221,20 @@ static void
+ sta_link_changed(bool up)
+ {
+ 	redwood_net_link_state(up);
++	if (up && !sta_joining) {
++		/*
++		 * redfin 1014 (as HakiOS's station-boundary boot join, and sunfish's 2026-10-28 analysis): a link wland
++		 * made by itself (its wlan.conf, or its own rejoin) is told to wifid like a join's: SSID/BSSID/LINK
++		 * changed, so wifid reads the network and the status bar shows Wi-Fi. sweetwifilink=0: not told.
++		 */
++		int on = 1;
++
++		PE_parse_boot_argn("sweetwifilink", &on, sizeof(on));
++		if (on) {
++			printf("flame wifi: link up without a join of wifid's: told to wifid\n");
++			redwood_apple80211_event(REDWOOD_STA_LINK, 1);
++		}
++	}
+ 	if (!up && sta_last_error == 0) {
+ 		redwood_sta_lost(ECONNRESET);
+ 	}
+diff --git a/bsd/dev/flame_wlan.c b/bsd/dev/flame_wlan.c
+index 4fca097..b9ce892 100644
+--- a/bsd/dev/flame_wlan.c
++++ b/bsd/dev/flame_wlan.c
+@@ -60,6 +60,8 @@ static uint8_t fw_addr[6];
+ static struct fw_link fw_link;          /* the network of the last FW_LINK up */
+ static struct flame_wlan_bss fw_link_bss;       /* ... as a scan heard it (kept: a new list empties fw_bss a while) */
+ static bool fw_link_bss_heard;
++static int16_t fw_live_rssi;           /* redfin 1014: the joined network's last signal (FW_RSSI or a scan) */
++static bool fw_live_valid;
+ #define FW_BSS_MAX      64
+ static struct flame_wlan_bss fw_bss[FW_BSS_MAX];
+ static unsigned fw_nbss;
+@@ -219,6 +221,20 @@ flame_wlan_link_bss(struct flame_wlan_bss *bss)
+ 	return have;
+ }
+ 
++/* redfin 1014: the joined network's freshest signal (wland's FW_RSSI, else the last scan): false when unknown */
++bool flame_wlan_link_rssi(int *rssi);
++bool
++flame_wlan_link_rssi(int *rssi)
++{
++	lck_mtx_lock(&fw_lock);
++	bool have = fw_link_up && (fw_live_valid || fw_link_bss_heard);
++	if (have) {
++		*rssi = fw_live_valid ? fw_live_rssi : fw_link_bss.rssi;
++	}
++	lck_mtx_unlock(&fw_lock);
++	return have;
++}
++
+ bool
+ flame_wlan_transmit(const uint8_t *frame, size_t length)
+ {
+@@ -367,6 +383,8 @@ fw_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 			if (fw_link_up && memcmp(t->bssid, fw_link.bssid, 6) == 0) {
+ 				fw_link_bss = *t;
+ 				fw_link_bss_heard = true;
++				fw_live_rssi = t->rssi;
++				fw_live_valid = true;
+ 			}
+ 		}
+ 		lck_mtx_unlock(&fw_lock);
+@@ -389,6 +407,7 @@ fw_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		if (up && h.len >= sizeof(fw_link)) {
+ 			memcpy(&fw_link, p, sizeof(fw_link));
+ 			fw_link_bss_heard = false;
++			fw_live_valid = false;
+ 			for (unsigned i = 0; i < fw_nbss; i++) {
+ 				if (memcmp(fw_bss[i].bssid, fw_link.bssid, 6) == 0) {
+ 					fw_link_bss = fw_bss[i];
+@@ -403,6 +422,22 @@ fw_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		}
+ 		break;
+ 	}
++	case FW_RSSI:                           /* redfin 1014 */
++		if (h.len >= sizeof(struct fw_rssi)) {
++			struct fw_rssi q;
++
++			memcpy(&q, p, sizeof(q));
++			lck_mtx_lock(&fw_lock);
++			if (fw_link_up && memcmp(q.bssid, fw_link.bssid, 6) == 0) {
++				fw_live_rssi = q.rssi;
++				fw_live_valid = true;
++				if (fw_link_bss_heard) {
++					fw_link_bss.rssi = q.rssi;
++				}
++			}
++			lck_mtx_unlock(&fw_lock);
++		}
++		break;
+ 	case FW_RX:
+ 		if (h.len >= 14 && h.len <= FW_FRAME_MAX && flame_wlan_rx_hook != NULL) {
+ 			flame_wlan_rx_hook(p, h.len);
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+index e2674ee..09b03ff 100644
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -32,8 +32,11 @@
+  * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
+  */
+ #include <kern/kalloc.h>
++#include <kern/clock.h>
+ #include <kern/locks.h>
++#include <kern/thread_call.h>
+ #include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
+ #include <sys/errno.h>
+ #include <sys/kern_event.h>
+ #include <sys/kernel.h>
+@@ -42,6 +45,7 @@
+ #include <sys/redwood_net.h>
+ #include <sys/redwood_sta.h>
+ #include <sys/sockio.h>
++#include <sys/sysctl.h>
+ #include <sys/systm.h>
+ 
+ #define SIOCSA80211             0x802869c8u     /* _IOW('i', 200, struct apple80211req) */
+@@ -202,6 +206,50 @@ static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
+ static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
+ static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
+ 
++/*
++ * redfin 1014: the joined network's signal for wifid (status-bar bars, Settings). The answers below (NOISE 17, RATE 8,
++ * PHY_MODE 14, MCS 57) were refused before; the link event carried rssi with snr and noise 0. While joined a timer
++ * tells wifid the signal again when it moves 2 dB, or every 10 s, as events chosen by sweetwifilqm= /
++ * sysctl kern.sweet_wifi_lqm (bits; the payloads of 17 and 39 are not known for iOS 16: tried as below):
++ *   0x1  LINK_QUALITY (17): { int32 rssi; uint32 tx rate Mbit/s } in 32 bytes (CoreWLAN's linkQualityDidChange)
++ *   0x2  RSSI_CHANGED (39): the RSSI request's answer (apple80211_rssi_data)
++ *   0x4  LINK_CHANGED (4) up again with the new rssi (the event wifid is known to read)
++ *   0x8  snr and noise filled in LINK_CHANGED (noise -95 dBm as int16 in the uint16 field)
++ * Default 0x9. kern.sweet_wifi_rssi: the last signal told (read only).
++ */
++#define NOISE_FLOOR     (-95)
++static int wifi_lqm = 0x9;
++static int wifi_lqm_rssi;
++SYSCTL_INT(_kern, OID_AUTO, sweet_wifi_lqm, CTLFLAG_RW | CTLFLAG_LOCKED, &wifi_lqm, 0, "redfin 1014: Wi-Fi signal events (bits)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_wifi_rssi, CTLFLAG_RD | CTLFLAG_LOCKED, &wifi_lqm_rssi, 0, "redfin 1014: last Wi-Fi signal told, dBm");
++static thread_call_t lqm_call;
++static bool lqm_running;
++static void lqm_tick(thread_call_param_t p0, thread_call_param_t p1);
++
++static unsigned
++link_rate(const struct redwood_sta_bss *bss)
++{
++	return bss->frequency >= 4000 ? 150 : 72;       /* HT20 MCS 7 short GI on 2.4 GHz; 5 GHz as ath10k's wcn3990 HT40 */
++}
++
++/*
++ * redfin 1014 standalone (1013 not in this kernel): sweetwifiacc=0 refuses the answers 1014 adds, as with 1013.
++ */
++static int wifi_accept = -1;
++
++static bool
++accepting(void)
++{
++	if (wifi_accept < 0) {
++		int on = 1;
++
++		PE_parse_boot_argn("sweetwifiacc", &on, sizeof(on));
++		wifi_accept = on != 0;
++	}
++	return wifi_accept != 0;
++}
++
++
+ /* ---- channels ---------------------------------------------------------------------------------------- */
+ 
+ static unsigned
+@@ -436,6 +484,41 @@ get(struct apple80211req *request)
+ 	case 103:                               /* all of it, as a scan's result */
+ 		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give_network(request, &state->bss);
+ 		break;
++	case 17: {                              /* 1014: the noise floor (no measurement: ath10k's default) */
++		struct {
++			uint32_t version, radios, unit;
++			int32_t each[4], all, each_ext[4], all_ext;
++		} answer = { .version = 1, .radios = 1, .each = { NOISE_FLOOR }, .all = NOISE_FLOOR, .each_ext = { NOISE_FLOOR },
++			     .all_ext = NOISE_FLOOR };
++
++		error = !accepting() ? EOPNOTSUPP : state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++		break;
++	}
++	case 8: {                               /* 1014: the rate, Mbit/s */
++		struct {
++			uint32_t version, radios, rate[4];
++		} answer = { .version = 1, .radios = 1, .rate = { link_rate(&state->bss) } };
++
++		error = !accepting() ? EOPNOTSUPP : state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++		break;
++	}
++	case 14: {                              /* 1014: 802.11 a/b/g/n/ac, n active (APPLE80211_MODE_*) */
++		struct {
++			uint32_t version, phy_mode, active_phy_mode;
++		} answer = { .version = 1, .phy_mode = 0x2 | 0x4 | 0x8 | 0x10 | 0x80,
++			     .active_phy_mode = state->phase == REDWOOD_STA_JOINED ? 0x10 : 0x1 };
++
++		error = !accepting() ? EOPNOTSUPP : give(request, &answer, sizeof(answer));
++		break;
++	}
++	case 57: {                              /* 1014: the MCS index */
++		struct {
++			uint32_t version, index;
++		} answer = { .version = 1, .index = 7 };
++
++		error = !accepting() ? EOPNOTSUPP : state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++		break;
++	}
+ 	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
+ 		struct {
+ 			uint32_t version, lower, upper, extended;
+@@ -613,6 +696,93 @@ post(uint32_t code, const void *data, uint32_t length)
+ 	kev_post_msg(&message);
+ }
+ 
++/* ---- 1014: the signal while joined ---------------------------------------------------------------------- */
++
++static void
++lqm_start(void)
++{
++	lck_mtx_lock(&apple80211_lock);
++	if (lqm_call == NULL) {
++		lqm_call = thread_call_allocate_with_options(lqm_tick, NULL, THREAD_CALL_PRIORITY_USER, 0);
++	}
++	bool start = lqm_call != NULL && !lqm_running;
++	lqm_running = lqm_running || start;
++	lck_mtx_unlock(&apple80211_lock);
++	if (start) {
++		thread_call_enter_delayed_with_leeway(lqm_call, NULL, 0, 0, 0);
++	}
++}
++
++static void
++lqm_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	static int told = 1000;
++	static uint64_t told_at;
++	static unsigned said;
++	struct redwood_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
++	uint64_t now = mach_absolute_time(), ten_s, two_s;
++	bool joined = false;
++
++	nanoseconds_to_absolutetime(10ull * NSEC_PER_SEC, &ten_s);
++	nanoseconds_to_absolutetime(2ull * NSEC_PER_SEC, &two_s);
++	if (state != NULL) {
++		redwood_sta_state(state);
++		joined = state->phase == REDWOOD_STA_JOINED;
++	}
++	int mask = wifi_lqm;
++	if (joined && (mask & 0x7) && (told == 1000 || state->bss.rssi - told >= 2 || told - state->bss.rssi >= 2 ||
++	    now - told_at >= ten_s)) {
++		int32_t rssi = state->bss.rssi;
++		uint32_t rate = link_rate(&state->bss);
++
++		if (mask & 0x1) {
++			struct {
++				int32_t rssi;
++				uint32_t tx_rate;
++				uint8_t unused[24];
++			} quality = { .rssi = rssi, .tx_rate = rate };
++
++			post(17, &quality, sizeof(quality));
++		}
++		if (mask & 0x2) {
++			struct {
++				uint32_t version, radios, unit;
++				int32_t each[4], all, each_ext[4], all_ext;
++			} data = { .version = 1, .radios = 1, .each = { rssi }, .all = rssi, .each_ext = { rssi }, .all_ext = rssi };
++
++			post(39, &data, sizeof(data));
++		}
++		if (mask & 0x4) {
++			struct apple80211_link_changed link = { .rssi = rssi };
++
++			if (mask & 0x8) {
++				link.snr = (uint16_t)(rssi > NOISE_FLOOR ? rssi - NOISE_FLOOR : 0);
++				link.noise = (uint16_t)(int16_t)NOISE_FLOOR;
++			}
++			post(EVENT_LINK_CHANGED, &link, sizeof(link));
++		}
++		if (said < 40) {
++			said++;
++			printf("SWEET WIFI: signal %d dBm (was %d) told to wifid (events %#x)\n", rssi, told == 1000 ? 0 : told, mask & 0x7);
++		}
++		told = rssi;
++		told_at = now;
++		wifi_lqm_rssi = rssi;
++	}
++	if (!joined) {
++		told = 1000;
++	}
++	if (state != NULL) {
++		kfree_data(state, sizeof(*state));
++	}
++	lck_mtx_lock(&apple80211_lock);
++	lqm_running = joined;
++	lck_mtx_unlock(&apple80211_lock);
++	if (joined) {
++		thread_call_enter_delayed_with_leeway(lqm_call, NULL, now + two_s, 0, THREAD_CALL_DELAY_LEEWAY);
++	}
++}
++
+ /* What the station side says has happened (bsd/dev/redwood_sta.c calls this, on its thread or the station's). */
+ void
+ redwood_apple80211_event(enum redwood_sta_event event, int status)
+@@ -648,8 +818,15 @@ redwood_apple80211_event(enum redwood_sta_event event, int status)
+ 		if (state != NULL) {
+ 			redwood_sta_state(state);
+ 			link.rssi = status == 1 ? state->bss.rssi : 0;
++			if (status == 1 && (wifi_lqm & 0x8)) {          /* 1014 */
++				link.snr = (uint16_t)(state->bss.rssi > NOISE_FLOOR ? state->bss.rssi - NOISE_FLOOR : 0);
++				link.noise = (uint16_t)(int16_t)NOISE_FLOOR;
++			}
+ 			kfree_data(state, sizeof(*state));
+ 		}
++		if (status == 1) {
++			lqm_start();
++		}
+ 		post(EVENT_SSID_CHANGED, NULL, 0);
+ 		post(EVENT_BSSID_CHANGED, NULL, 0);
+ 		post(EVENT_LINK_CHANGED, &link, sizeof(link));
+diff --git a/bsd/sys/flame_wlan.h b/bsd/sys/flame_wlan.h
+index 9107cbb..d8033a4 100644
+--- a/bsd/sys/flame_wlan.h
++++ b/bsd/sys/flame_wlan.h
+@@ -31,6 +31,7 @@ enum {
+ 	FW_LEFT = 21,			/* int32_t */
+ 	FW_LINK = 22,			/* struct fw_link: frames can pass now (up), or no longer (left or lost) */
+ 	FW_RX = 23,			/* an Ethernet frame */
++	FW_RSSI = 24,			/* struct fw_rssi: the joined network's signal, every few seconds (redfin 1014) */
+ };
+ 
+ #define FW_FRAME_MAX	1514
+@@ -55,6 +56,13 @@ struct fw_link {
+ 	uint8_t bssid[6];
+ };
+ 
++struct fw_rssi {
++	int16_t rssi;			/* dBm, as the radio last heard the joined access point */
++	uint16_t tx_rate;		/* Mbit/s, 0: not known */
++	uint8_t bssid[6];
++	uint16_t age_s;			/* how old the reading is */
++};
++
+ struct fw_bss {
+ 	uint8_t bssid[6];
+ 	uint8_t ssid[32], ssid_len;
