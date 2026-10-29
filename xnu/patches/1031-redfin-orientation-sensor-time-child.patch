@@ -1,0 +1,37 @@
+From: redfin port <noreply@anthropic.com>
+Subject: [PATCH] redfin: orientation events carry the sensor-time child CoreMotion needs
+
+CoreMotion's CLOrientationNotifier::onIohidEvent (in backboardd for BKOrientationManager, and in
+locationd) reads the sample time with sensorTimeFromHidChildEvent(): the first child of the
+orientation event must be a vendor-defined event, usage page 0xff15 usage 2, with 8 data bytes (a
+uint64 sensor time). notifyAOO then drops every sample whose time is not newer than the last one.
+Our 0971 orientation events have no children, so the time reads as 0 and every rotation is dropped
+("Skipping stale orientation (4 @ 0)" in backboardd's CoreMotion log, r59a 2026-10-29), so
+BKOrientationManager never sees a device orientation and the UI never rotates.
+
+Attach that child with the event's mach timestamp (monotonic, so always newer).
+---
+ iokit/Kernel/arm/hid/SweetHID.cpp |  9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -1241,8 +1241,17 @@
+ 		int64_t o = sweet_f2q(s->v[0], 1, 1, 0);
+ 		event = IOHIDEvent::orientationEvent(ts, kIOHIDOrientationTypeCMUsage);
+ 		if (event) {
+ 			event->setIntegerValue(kIOHIDEventFieldOrientationDeviceOrientationUsage,
+ 			    (SInt32)(gSweetKnobs.orientbase + o));
++			/* 1031: CoreMotion (sensorTimeFromHidChildEvent) wants child 0 = vendor event
++			 * {0xff15, 2} with an 8-byte sensor time; without it every sample is "stale". */
++			uint64_t st = ts;
++			IOHIDEvent *child = IOHIDEvent::vendorDefinedEvent(ts, 0xff15, 2, 0, (UInt8 *)&st,
++			    (UInt32)sizeof(st));
++			if (child) {
++				event->appendChild(child);      /* the children array retains it */
++				child->release();
++			}
+ 		}
+ 		snprintf(line, sizeof(line), "UIDeviceOrientation %lld (usage %lld)", o, gSweetKnobs.orientbase + o);
+ 		break;
