@@ -15,6 +15,7 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <deque>
 #include <chrono>
 #include <pthread.h>
 #include <pthread/qos.h>
@@ -1287,6 +1288,7 @@ static void notified(void *context,uint64_t value) {
  // and returned (waits may use the bridge's); the recorded encoder not ended yet (kept alive by its recorded creation until its
  // end or discard is replayed)
  bool encDeferred;std::atomic<bool> encCommitStarted,encCommitDone;__unsafe_unretained id encOpen;
+ uint64_t encCommitTick;   // g4: the caller's commit (mach ticks), for the submit-lag telemetry
 }
 @property(nonatomic) NmbCommandBuffer *handle;
 @property(nonatomic,strong) NBQueue *queue;
@@ -1327,20 +1329,24 @@ static void notified(void *context,uint64_t value) {
 // until the commit is replayed. A refusal at replay fails the command buffer as before (logged, completed with an error).
 // "native-metal: T enc-thread 5s:" (with the timeline) counts it. SWEET_ENCTHREAD_SPIN_US (50): the worker's spin before it sleeps;
 // SWEET_ENCTHREAD_PRI (54, CA's display thread's; 0 = user-interactive QoS only): its fixed RR priority.
+// SWEET_ENCTHREAD=3 (g4, backboardd): the same, handed over in batches (UniXNU's design; see "g4 mode 3" below).
 enum EncOp : uint8_t {EO_RENDER_NEW,EO_BLIT_NEW,EO_END,EO_DISCARD,EO_BUFFER,EO_OFFSET,EO_BYTES,EO_TEXTURE,EO_SAMPLER,EO_FENCE,EO_PIPELINE,
  EO_DSS,EO_VIEWPORT,EO_SCISSOR,EO_RASTER,EO_DEPTH_BIAS,EO_LINE_WIDTH,EO_VISIBILITY,EO_STENCIL_REF,EO_BLEND_COLOR,EO_DRAW,EO_DRAW_INDEXED,
  EO_COPY_BUFFER,EO_FILL_BUFFER,EO_COPY_TEXTURE,EO_BUFFER_TO_TEXTURE,EO_TEXTURE_TO_BUFFER,EO_MIPMAPS,EO_EVENT,EO_COMMIT,EO_COUNT};
 enum : uint8_t {ECF_RETAIN_A=1,ECF_NULL_BYTES=2};
 // target: the encoder (or, for EO_EVENT/EO_COMMIT, the command buffer, retained); a/b: the objects named; off/len: inline data
 struct EncCmd {uint8_t op,stage,flags,mask;uint32_t index;void *target,*a,*b;uint64_t u[6];uint32_t off,len;};
-struct EncChunk {std::vector<EncCmd> cmds;std::vector<uint8_t> bytes;};
+struct EncChunk {std::vector<EncCmd> cmds;std::vector<uint8_t> bytes;uint64_t handTick=0;};   // handTick: g4, mode 3's hand-off
 static void encReplay(const EncCmd &c,const uint8_t *bytes);
+// g4 (SWEET_ENCTHREAD=3, backboardd only): the same recorded commands, handed to the worker in batches (see "batched" below).
 static int encThreadMode() {
  static int mode=-1;
- if(mode<0){const char *e=getenv("SWEET_ENCTHREAD");const int v=e && *e?atoi(e):0;mode=v==2 || (v==1 && !strcmp(getprogname(),"backboardd"))?1:0;}
+ if(mode<0){const char *e=getenv("SWEET_ENCTHREAD");const int v=e && *e?atoi(e):0;const bool bb=!strcmp(getprogname(),"backboardd");
+  mode=v==2 || (v==1 && bb)?1:v==3 && bb?3:0;}
  return mode;
 }
-static bool encThreadOn() {return encThreadMode()==1;}
+static bool encThreadOn() {return encThreadMode()!=0;}
+static bool encBatched() {return encThreadMode()==3;}
 static os_unfair_lock gEqLock=OS_UNFAIR_LOCK_INIT;
 static EncChunk *gEqOpen;                        // what the worker takes next (gEqLock)
 static std::vector<EncChunk *> gEqFree;          // replayed chunks for reuse (gEqLock)
@@ -1355,6 +1361,22 @@ static std::atomic<uint64_t> gEtOps[EO_COUNT],gEtRecordTicks,gEtReplayTicks,gEtB
 static std::atomic<uint64_t> gEtFlushCalls[EF_WHY_COUNT],gEtFlushWaits[EF_WHY_COUNT],gEtFlushTicks[EF_WHY_COUNT],gEtFlushOnWorker,gEtStalls;
 static const char *const kEncFlushName[EF_WHY_COUNT]={"sched","done","resource","getbytes","compute","purgeable","replace","backpressure"};
 static __thread uint32_t tEtDepth;
+// g4: the submit's lag, per replayed commit (both modes): caller's commit -> the worker starts commitSubmit; the worker's wake (if
+// it slept after the commit was handed, else the commit) -> that start; commitSubmit's own time; a frame's first encoder -> that
+// start. Batches replayed on a big core (cpu 6-7). The 5 s "T enc-lat" line prints them (p50/p95) with batches/s.
+static std::mutex gEtLatLock;static std::vector<int64_t> gEtLat[4];   // ns: commit->submit, wake->submit, submit call, frame enc->submit
+static std::atomic<uint64_t> gEtBatchBig,gEtBatchCmds;
+static uint64_t gEqWakeTick;   // the worker's last return from its sleep (the worker's alone)
+// g4 mode 3: UniXNU's batching (UniXNU/AdrenoMetal feat/ipados27-gpu-parity 6c7b0a0 "one thread of its own, fed in batches",
+// f1f51bf "calls as closures in reused batch memory"; credit UniXNU, BSD-2-Clause-Patent): each recording thread fills a batch of
+// its own (no shared lock, no wake per command) and hands it over at 64 commands, at an encoder's end or an encoded event, at a commit (at once: the
+// worker submits it as it reaches it, no further hop) and before every flush; the worker sleeps on a
+// condition variable (no spin) and wakes once per batch handed while it sleeps. As UniXNU's: an encoder's calls and its command
+// buffer's commit come from one thread (CA's case; Metal requires the encoder ended before the commit), since another thread's
+// open batch is not handed by this thread's flush or commit. Our commands stay the compact EncCmd records
+// (UniXNU's f1f51bf moved from blocks to closures in reused memory: ours were never blocks). Not ported: mimalloc.
+static __thread EncChunk *tEqBatch;           // mode 3: this thread's batch being filled
+static std::deque<EncChunk *> gEqBatches;     // mode 3: handed over, in order (gEqSleepLock)
 // The caller's time inside a recording call (outermost only): what the display thread still pays.
 struct EtRec {
  uint64_t t0;bool outer;
@@ -1393,6 +1415,7 @@ static void *encWorkerMain(void *) {
    if(!empty){gEqIdle.store(false);continue;}
    std::unique_lock<std::mutex> l(gEqSleepLock);
    gEqWake.wait(l,[]{return !gEqIdle.load();});
+   gEqWakeTick=mach_absolute_time();   // g4 telemetry
    continue;
   }
   const uint64_t t0=mach_absolute_time();
@@ -1400,6 +1423,7 @@ static void *encWorkerMain(void *) {
   gEtReplayTicks.fetch_add(mach_absolute_time()-t0,std::memory_order_relaxed);
   const uint64_t n=k->cmds.size();
   gEtBatches.fetch_add(1,std::memory_order_relaxed);
+  gEtBatchCmds.fetch_add(n,std::memory_order_relaxed);if(encCPU()>=6)gEtBatchBig.fetch_add(1,std::memory_order_relaxed);   // g4
   uint64_t seen=gEtBatchMax.load();while(n>seen && !gEtBatchMax.compare_exchange_weak(seen,n)){}
   gEqReplayed.fetch_add(n);
   if(gEqWaiters.load()){std::lock_guard<std::mutex> l(gEqSleepLock);gEqDone.notify_all();}
@@ -1412,6 +1436,44 @@ static void *encWorkerMain(void *) {
  }
  return nullptr;
 }
+// g4 mode 3: the worker takes handed batches in order; asleep on gEqWake while there are none (UniXNU 6c7b0a0's thread).
+static void *encBatchWorkerMain(void *) {
+ pthread_setname_np("sweet.encthread");
+ const char *pri=getenv("SWEET_ENCTHREAD_PRI");const int priority=pri && *pri?atoi(pri):54;   // as mode 1 (0: QoS only, UniXNU's)
+ int pr=0;   // logged: a priority above the user range (MAXPRI_USER 63, e.g. r66's 80) is refused and leaves the QoS priority
+ if(priority>0){struct sched_param sp={};sp.sched_priority=priority;pr=pthread_setschedparam(pthread_self(),SCHED_RR,&sp);}
+ {char line[120];snprintf(line,sizeof line,"native-metal: enc-thread mode 3 worker: SCHED_RR %d -> %d",priority,pr);sm2_logs(line);}
+ encThreadNote();
+ for(;;) {
+  EncChunk *k;
+  {
+   std::unique_lock<std::mutex> l(gEqSleepLock);
+   if(gEqBatches.empty()) {
+    gEqIdle.store(true);
+    gEqWake.wait(l,[]{return !gEqBatches.empty();});
+    gEqIdle.store(false);
+    gEqWakeTick=mach_absolute_time();
+   }
+   k=gEqBatches.front();gEqBatches.pop_front();
+  }
+  const uint64_t t0=mach_absolute_time();
+  @autoreleasepool {for(const EncCmd &c:k->cmds)encReplay(c,k->bytes.data());}
+  gEtReplayTicks.fetch_add(mach_absolute_time()-t0,std::memory_order_relaxed);
+  const uint64_t n=k->cmds.size();
+  gEtBatches.fetch_add(1,std::memory_order_relaxed);
+  gEtBatchCmds.fetch_add(n,std::memory_order_relaxed);if(encCPU()>=6)gEtBatchBig.fetch_add(1,std::memory_order_relaxed);
+  uint64_t seen=gEtBatchMax.load();while(n>seen && !gEtBatchMax.compare_exchange_weak(seen,n)){}
+  gEqReplayed.fetch_add(n);
+  if(gEqWaiters.load()){std::lock_guard<std::mutex> l(gEqSleepLock);gEqDone.notify_all();}
+  k->cmds.clear();
+  if(k->bytes.capacity()>(1u<<20))std::vector<uint8_t>().swap(k->bytes);else k->bytes.clear();
+  os_unfair_lock_lock(&gEqLock);
+  if(gEqFree.size()<8){gEqFree.push_back(k);k=nullptr;}
+  os_unfair_lock_unlock(&gEqLock);
+  delete k;
+ }
+ return nullptr;
+}
 static void encStart() {
  static dispatch_once_t once;
  dispatch_once(&once,^{
@@ -1419,20 +1481,52 @@ static void encStart() {
   pthread_attr_t attr;pthread_attr_init(&attr);
   pthread_attr_set_qos_class_np(&attr,QOS_CLASS_USER_INTERACTIVE,0);
   pthread_attr_setdetachstate(&attr,PTHREAD_CREATE_DETACHED);
-  const int r=pthread_create(&gEqThread,&attr,encWorkerMain,nullptr);
+  const int r=pthread_create(&gEqThread,&attr,encBatched()?encBatchWorkerMain:encWorkerMain,nullptr);
   pthread_attr_destroy(&attr);
   if(r){NBLOG(@"native-metal: enc-thread: worker not started (%d): commands are replayed at once by the caller",r);gEqBroken=true;return;}
   gEqStarted=true;
-  sm2_logs([NSString stringWithFormat:@"native-metal: enc-thread on (SWEET_ENCTHREAD): render/blit encoders and commits replayed on 'sweet.encthread'%s",
-            r?" (NOT STARTED)":""].UTF8String);
+  sm2_logs([NSString stringWithFormat:@"native-metal: enc-thread on (SWEET_ENCTHREAD=%s): render/blit encoders and commits replayed on 'sweet.encthread'%s",
+            encBatched()?"3, batched":"1",r?" (NOT STARTED)":""].UTF8String);
  });
 }
 static bool encOnWorker() {return gEqStarted.load() && pthread_equal(pthread_self(),gEqThread);}
+// g4 mode 3: this thread's batch to the worker (UniXNU's encodeFlush), woken only if it sleeps; counted as recorded at the hand-off.
+static void encHand() {
+ EncChunk *k=tEqBatch;
+ if(!k || k->cmds.empty())return;
+ tEqBatch=nullptr;
+ const uint64_t n=k->cmds.size();
+ k->handTick=mach_absolute_time();
+ bool wake;uint64_t depth;
+ {
+  std::lock_guard<std::mutex> l(gEqSleepLock);
+  gEqBatches.push_back(k);
+  depth=gEqAppended.fetch_add(n)+n-gEqReplayed.load();   // with the push, under the lock: a flush's target covers every batch before it
+  wake=gEqIdle.load();
+ }
+ if(wake){gEtWakes.fetch_add(1,std::memory_order_relaxed);gEqWake.notify_one();}
+ uint64_t seen=gEtDepthMax.load(std::memory_order_relaxed);
+ while(depth>seen && !gEtDepthMax.compare_exchange_weak(seen,depth)){}
+ if(depth>32768)encFlush(EF_BACKPRESSURE);
+}
+static void encPushBatched(EncCmd &c,const void *extra,size_t length) {
+ EncChunk *k=tEqBatch;
+ if(!k){os_unfair_lock_lock(&gEqLock);k=encChunk();os_unfair_lock_unlock(&gEqLock);tEqBatch=k;}
+ if(extra && length) {
+  const size_t at=(k->bytes.size()+7)&~(size_t)7;
+  k->bytes.resize(at+length);memcpy(k->bytes.data()+at,extra,length);
+  c.off=(uint32_t)at;c.len=(uint32_t)length;
+ }
+ k->cmds.push_back(c);
+ // UniXNU's points, and an encoded event (outside an encoder: its commit may come from another thread); a discard precedes its commit
+ if(k->cmds.size()>=64 || c.op==EO_END || c.op==EO_EVENT || c.op==EO_COMMIT)encHand();
+}
 // Records a command (and `length` bytes of inline data) for the worker, in call order.
 static void encPush(EncCmd &c,const void *extra=nullptr,size_t length=0) {
  encStart();
  gEtOps[c.op].fetch_add(1,std::memory_order_relaxed);
  if(gEqBroken){c.off=0;c.len=(uint32_t)length;@autoreleasepool{encReplay(c,(const uint8_t *)extra);}return;}
+ if(encBatched()){encPushBatched(c,extra,length);return;}   // g4
  os_unfair_lock_lock(&gEqLock);
  EncChunk *k=gEqOpen;
  if(extra && length) {
@@ -1453,12 +1547,13 @@ static void encFlush(EncFlushWhy why) {
  if(!gEqStarted.load())return;
  gEtFlushCalls[why].fetch_add(1,std::memory_order_relaxed);
  if(encOnWorker()){gEtFlushOnWorker.fetch_add(1,std::memory_order_relaxed);return;}
+ if(encBatched())encHand();   // g4 mode 3: what this thread recorded goes first (other threads' open batches are theirs, as UniXNU's drain)
  const uint64_t target=gEqAppended.load();
  if(gEqReplayed.load()>=target)return;
  gEtFlushWaits[why].fetch_add(1,std::memory_order_relaxed);
  const uint64_t t0=mach_absolute_time();
  gEqWaiters.fetch_add(1);
- if(gEqIdle.load())encWake();
+ if(!encBatched() && gEqIdle.load())encWake();   // g4: mode 3's worker wakes on the batches themselves
  {
   std::unique_lock<std::mutex> l(gEqSleepLock);
   bool logged=false;
@@ -1967,8 +2062,17 @@ static void encReplay(const EncCmd &c,const uint8_t *bytes) {
  if(c.op==EO_COMMIT) {
   NBCommandBuffer *cb=(__bridge_transfer NBCommandBuffer *)c.target;
   cb->encCommitStarted=true;
+  const uint64_t s0=mach_absolute_time(),f0=cb->tlFrame && cb->tlFirstEncoder?tlNow():0;
   [cb commitSubmit];
+  const uint64_t s1=mach_absolute_time();
   cb->encCommitDone=true;
+  if(cb->encCommitTick && s0>=cb->encCommitTick) {   // g4: the submit's lag
+   const double tick=encTickNs();
+   const int64_t lag[4]={(int64_t)((s0-cb->encCommitTick)*tick),(int64_t)((s0-std::max(cb->encCommitTick,gEqWakeTick))*tick),
+    (int64_t)((s1-s0)*tick),f0?(int64_t)f0-(int64_t)cb->tlFirstEncoder:-1};
+   std::lock_guard<std::mutex> l(gEtLatLock);
+   for(int i=0;i<4;i++)if(lag[i]>=0 && gEtLat[i].size()<4096)gEtLat[i].push_back(lag[i]);
+  }
   gEtCommits.fetch_add(1,std::memory_order_relaxed);
   return;
  }
@@ -2329,6 +2433,7 @@ static void noteDeviceLost(const char *why) {
   ET_REC;
   if(NBEncoder *open=encOpen)if(!open->encEnded){open->encEnded=true;EncCmd d={};d.op=EO_DISCARD;d.target=(__bridge void *)open;encPush(d);}
   encOpen=nil;
+  encCommitTick=mach_absolute_time();
   EncCmd c={};c.op=EO_COMMIT;c.target=(__bridge_retained void *)self;encPush(c);
   return;
  }
@@ -3856,8 +3961,22 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
    dCommits?(repMs-recMs-flushMs)/dCommits:0,(unsigned long long)gEtDepthMax.exchange(0),(unsigned long long)(gEqAppended.load()-gEqReplayed.load()),
    (unsigned long long)(wakes-lastWakes),at?flushes:" none",gEqBroken?" | WORKER NOT STARTED (inline)":"",(unsigned long long)(onWorker-lastOnWorker),
    (unsigned long long)gEtStalls.load());
+  const uint64_t dWakes=wakes-lastWakes;   // g4
   lastRec=rec;lastRep=rep;lastBatches=batches;lastWakes=wakes;lastCommits=commits;lastOnWorker=onWorker;
   sm2_logs(line);
+  {   // g4: the submit's lag and the batches (both modes)
+   std::vector<int64_t> lat[4];
+   {std::lock_guard<std::mutex> l(gEtLatLock);for(int i=0;i<4;i++)lat[i].swap(gEtLat[i]);}
+   static uint64_t lastBig,lastCmds,lastB2;
+   const uint64_t big=gEtBatchBig.load(),cmds=gEtBatchCmds.load(),db=batches-lastB2;
+   const double secs=spanNs?spanNs/1e9:5;
+   snprintf(line,sizeof line,"native-metal: T enc-lat 5s: mode %d | commit->submit p50/p95 %.2f/%.2f ms | wake->submit %.2f/%.2f | submit call"
+    " %.2f/%.2f | frame 1st-enc->submit %.2f/%.2f (n %zu/%zu) | batches %.0f/s, %.1f cmds/batch, big-core %.0f%% | wakes %.0f/s",
+    encThreadMode(),pct(lat[0],.5),pct(lat[0],.95),pct(lat[1],.5),pct(lat[1],.95),pct(lat[2],.5),pct(lat[2],.95),pct(lat[3],.5),pct(lat[3],.95),
+    lat[0].size(),lat[3].size(),db/secs,db?(double)(cmds-lastCmds)/db:0,db?100.0*(big-lastBig)/db:0,dWakes/secs);
+   lastBig=big;lastCmds=cmds;lastB2=batches;
+   sm2_logs(line);
+  }
  }
  std::sort(hitches.begin(),hitches.end(),[](const Hitch &a,const Hitch &b){return a.every>b.every;});
  {

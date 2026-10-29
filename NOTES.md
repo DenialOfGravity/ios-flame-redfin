@@ -371,3 +371,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 0135 (U0014) the encoder's tracker maps hashed by the runtime's KeyHasher instead of SipHash, `SWEET_U0014=1`.
 - 0136 (U0015) a two-plane texture's shadow starts as its memory lies (no zero fill at creation), `SWEET_U0015=1`.
 - 0137 (U0016) a padded render/write texture aliases only where 16x4 tile stores stay inside its rows, else shadow, `SWEET_U0016=1`.
+- g4 enc2 (frontend): SWEET_ENCTHREAD=3 (backboardd) hands recorded encoder commands to 'sweet.encthread' in per-thread batches (64 / encoder end / event / commit / before a flush; UniXNU 6c7b0a0+f1f51bf design, credited), worker sleeps on a condvar; new 5 s "T enc-lat" line (commit->submit, wake->submit, submit call, frame 1st-enc->submit p50/p95, batches/s, cmds/batch, big-core %, wakes/s) for modes 1 and 3; modes 0/1/2 unchanged, default 0.
