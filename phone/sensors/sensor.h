@@ -36,6 +36,7 @@ struct sensor {
 	uint64_t ts, count, count_at_print;
 	long last_data_ms;
 	int last_error;
+	int orient_only;		/* streamed only for orientation (iOS set ReportInterval 0): samples not posted */
 };
 
 /* Where samples go (sensd: print + /dev/redwood-motion; tests: capture). */
@@ -68,5 +69,6 @@ long sensor_now_ms(void);
 /* UIDeviceOrientation (1 portrait, 2 upside down, 3 landscape left, 4 landscape right) from an Android-frame
  * accel sample, or 0 when flat/ambiguous. */
 int sensor_orientation_of(float x, float y, float z);
+int sensor_orientation_hyst(float x, float y, float z, int cur);
 
 #endif

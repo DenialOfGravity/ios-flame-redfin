@@ -202,6 +202,10 @@ static void test_decoders(void)
 	CHECK(sensor_orientation_of(0, 9.8f, 0) == 1 && sensor_orientation_of(0, -9.8f, 0) == 2);
 	CHECK(sensor_orientation_of(9.8f, 0, 0) == 3 && sensor_orientation_of(-9.8f, 0, 0) == 4);
 	CHECK(sensor_orientation_of(0.3f, 0.2f, 9.8f) == 0 && sensor_orientation_of(6.9f, 6.9f, 0) == 0);
+	CHECK(sensor_orientation_hyst(0.3f, 0.2f, 9.8f, 0) == 5 && sensor_orientation_hyst(0.3f, 0.2f, -9.8f, 1) == 6);
+	CHECK(sensor_orientation_hyst(0, 9.8f, 0, 0) == 1 && sensor_orientation_hyst(9.8f, 0, 0, 1) == 3);
+	CHECK(sensor_orientation_hyst(4.0f, 5.5f, 0, 3) == 3 && sensor_orientation_hyst(3.0f, 6.5f, 0, 3) == 1);
+	CHECK(sensor_orientation_hyst(0, 4.5f, 6.5f, 5) == 5 && sensor_orientation_hyst(0, 4.5f, 6.5f, 0) == 1 && sensor_orientation_hyst(0, 9.0f, 3.0f, 5) == 1);
 }
 
 /* ---- the fake DSP ---- */

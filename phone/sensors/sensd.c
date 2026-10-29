@@ -139,6 +139,8 @@ static void out(void *ctx, struct sensor *s, const struct motion_sample *m)
 		pthread_mutex_unlock(&inject_mu);
 	}
 	(void)ctx;
+	if (s->orient_only && m->type != MOTION_TYPE_ORIENTATION)
+		return;		/* accel kept running for orientation only: iOS asked for no accel samples */
 	if (opt.motion_fd >= 0) {
 		if (write(opt.motion_fd, m, sizeof(*m)) == (ssize_t)sizeof(*m))
 			opt.written++;
@@ -154,6 +156,10 @@ static void out(void *ctx, struct sensor *s, const struct motion_sample *m)
 		fflush(stdout);
 	} else if (opt.print == 2 && m->type == MOTION_TYPE_ORIENTATION) {
 		printf("orientation %.0f\n", m->v[0]);
+	} else if (opt.print == 0 && m->type == MOTION_TYPE_ORIENTATION) {
+		stamp();
+		printf("sensd: orientation %.0f posted\n", m->v[0]);
+		fflush(stdout);
 	}
 }
 
@@ -280,6 +286,9 @@ static void summary(struct sensor *ss, int n)
 }
 
 /* Poll every open sensor until --secs passes or a signal; returns 0, or -1 when a port failed. */
+#define ORIENT_HZ 15.0f	/* accel rate when it runs for orientation only */
+static int orient_clients_seen;
+
 static int run(struct sensor *ss, int n, int daemon)
 {
 	long t0 = sensor_now_ms(), last_print = t0, last_want = 0;
@@ -313,19 +322,45 @@ static int run(struct sensor *ss, int n, int daemon)
 			last_want = now;
 			struct motion_want w;
 			int have = opt.follow && opt.motion_fd >= 0 && ioctl(opt.motion_fd, MOTION_GET_WANT, &w) == 0;
+			int orient_want = have && opt.orient && (w.present & (1u << MOTION_ORIENT)) &&
+			    w.clients[MOTION_ORIENT] > 0;
+			if (orient_want && !orient_clients_seen) {
+				env.orient_cur = env.orient_cand = 0;	/* a new client: post the current orientation again */
+				stamp();
+				printf("sensd: orientation has %u client(s): orientation on\n", w.clients[MOTION_ORIENT]);
+			} else if (!orient_want && orient_clients_seen) {
+				stamp();
+				printf("sensd: orientation has no clients: orientation off\n");
+			}
+			orient_clients_seen = orient_want;
 			for (int i = 0; i < n; i++) {
 				struct sensor *s = &ss[i];
 				if (s->fd < 0)
 					continue;
 				int idx = s->k->motion_index;
 				float hz = s->k->default_hz;
-				int on = 1;
+				int on = 1, orient_only = 0;
 				if (have && w.interval_set[idx]) {
 					on = w.interval_us[idx] != 0;
 					if (on && !s->k->on_change) {
 						hz = 1e6f / (float)w.interval_us[idx];
 						hz = hz < 1 ? 1 : (hz > 200 ? 200 : hz);
 					}
+				}
+				/*
+				 * The orientation service has a client (backboardd): keep accel running at a low rate to feed
+				 * the orientation filter even when iOS set accel's ReportInterval to 0; its samples are then
+				 * not posted, only the orientation changes.
+				 */
+				if (!on && orient_want && idx == MOTION_ACCEL) {
+					on = orient_only = 1;
+					hz = ORIENT_HZ;
+				}
+				if (s->orient_only != orient_only) {
+					stamp();
+					printf("sensd: %s: %s\n", s->k->alias, orient_only ?
+					    "iOS wants none: kept for orientation only (samples not posted)" : "posting samples again");
+					s->orient_only = orient_only;
 				}
 				if (on && (!s->active || (!s->k->on_change && (s->hz < hz * 0.9f || s->hz > hz * 1.1f)))) {
 					stamp();
