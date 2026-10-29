@@ -1,0 +1,37 @@
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 02:00:00 +0100
+Subject: [PATCH] redfin 1016: Skywalk pipe privileges for entitled daemons (A2DP crash)
+
+bluetoothd crashed (sig 11, pc in libsystem_kernel os_channel_get_fd, far 0) each time
+headphones began A2DP streaming. Path: A2DPAudioDevice (vtable slot 0x60 returns 1:
+"Device supports Skywalk Path") -> AudioSkywalkPipe registers a user-pipe nexus provider
+and calls os_channel_create_extended, which returned NULL because the kernel refused
+privilege 12000 (klog: "SWEET Sandbox: bluetoothd privilege 12000 denied"); the pipe
+then passes the NULL channel to os_channel_get_fd. identityservicesd (12000, 12001)
+and rapportd (12000) are refused the same way.
+
+Grant PRIV_SKYWALK_REGISTER_USER_PIPE / _KERNEL_PIPE / _LOW_LATENCY_CHANNEL through the
+0913 table: kernel, platform binaries, or holders of the matching
+com.apple.private.skywalk.* entitlement (bluetoothd has register-user-pipe).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index dd2c7a5..f8d2a5e 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -432,6 +432,12 @@ static const struct {
+ 	{ PRIV_NET_RESTRICTED_ROUTE_NC_READ, "com.apple.private.network.route-nc-read" },
+ 	{ PRIV_NET_VALIDATED_RESOLVER, "com.apple.private.network.validated-resolver" },
+ 	{ PRIV_GLOBAL_PROC_INFO, "com.apple.private.kernel.global-proc-info" },
++	/* 1016: Skywalk nexus privileges. bluetoothd registers a user-pipe nexus for A2DP audio
++	   (AudioSkywalkPipe); denied, os_channel_create_extended returned NULL and bluetoothd crashed
++	   in os_channel_get_fd(NULL) the moment headphones started streaming. */
++	{ PRIV_SKYWALK_REGISTER_USER_PIPE, "com.apple.private.skywalk.register-user-pipe" },
++	{ PRIV_SKYWALK_REGISTER_KERNEL_PIPE, "com.apple.private.skywalk.register-kernel-pipe" },
++	{ PRIV_SKYWALK_LOW_LATENCY_CHANNEL, "com.apple.private.skywalk.low-latency-channel" },
+ };
+ 
+ static bool
+-- 
+2.43.0
