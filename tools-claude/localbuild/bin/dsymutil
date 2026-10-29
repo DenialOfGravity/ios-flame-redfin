@@ -1,0 +1,3 @@
+#!/bin/sh
+d=$(command -v dsymutil-21 || ls /usr/lib/llvm-*/bin/dsymutil 2>/dev/null | sort -V | tail -1)
+exec "$d" "$@"

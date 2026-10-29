@@ -1,0 +1,58 @@
+#!/bin/bash
+# xcrun for building on Linux (after UniXNU's scripts/linux/xcrun).
+#   LB_MODE=xnu   XNU's makefiles: -show-sdk-path = $UNIXNU_SDKROOT (the build's fakeroot), tools from the Command
+#                 Line Tools layout of $LB_TC (cctools ld64, mig, iig, the clang shim), then PATH.
+#   otherwise     iOS userland: -show-sdk-path = the real SDK from xtool ($IOS_SDK / $MAC_SDK), clang = the
+#                 distribution's clang through ios-clang (ld64.lld), Apple tool names mapped to LLVM's.
+set -u
+TCD=${LB_TC:-$HOME/redfin-build/toolchain}
+PLAT=$HOME/.swiftpm/swift-sdks/darwin.artifactbundle/Developer/Platforms
+sdk_path() {
+	case $1 in
+	iphoneos*) echo "${IOS_SDK:-$(ls -d "$PLAT"/iPhoneOS.platform/Developer/SDKs/iPhoneOS[0-9]*.sdk | sort -V | tail -1)}";;
+	macosx*|"") echo "${MAC_SDK:-$(ls -d "$PLAT"/MacOSX.platform/Developer/SDKs/MacOSX[0-9]*.sdk | sort -V | tail -1)}";;
+	*) echo "xcrun: unknown sdk $1" >&2; return 1;;
+	esac
+}
+find_tool() {
+	local t=$1 d
+	if [ "${LB_MODE:-}" = xnu ]; then
+		for d in "$TCD/CommandLineTools/usr/bin" "$TCD/XcodeDefault.xctoolchain/usr/bin"; do
+			[ -x "$d/$t" ] && { echo "$d/$t"; return 0; }
+		done
+	else
+		case $t in
+		clang|cc|gcc) t=ios-clang;; clang++|c++|g++) t=ios-clang++;;
+		ld) echo "${XTOOL_LD_DIR:-$HOME/.swiftpm/swift-sdks/darwin.artifactbundle/toolset/bin/orig}/ld64.lld"; return 0;; ar|ranlib|libtool) [ "$t" = libtool ] && t=llvm-libtool-darwin || t=llvm-$t;;
+		esac
+		[ -x "$TCD/lb-bin/$t" ] && { echo "$TCD/lb-bin/$t"; return 0; }
+	fi
+	command -v "$t" 2>/dev/null && return 0
+	command -v "llvm-$t" 2>/dev/null && return 0
+	return 1
+}
+sdk=
+while [ $# -gt 0 ]; do
+	case $1 in
+	-sdk|--sdk) sdk=$2; shift 2;;
+	-verbose|--verbose|-log|--log|-no-cache|--no-cache|-kill-cache|--kill-cache) shift;;
+	-toolchain|--toolchain) shift 2;;
+	-f|-find|--find)
+		find_tool "${2:-}" || { [ "${LB_MODE:-}" = xnu ] || echo "xcrun: cannot find ${2:-}" >&2; exit 1; }; exit 0;;
+	-show-sdk-path|--show-sdk-path)
+		if [ "${LB_MODE:-}" = xnu ]; then echo "${UNIXNU_SDKROOT:-/}"; else sdk_path "$sdk"; fi; exit;;
+	-show-sdk-version|--show-sdk-version|-show-sdk-platform-version|--show-sdk-platform-version)
+		if [ "${LB_MODE:-}" = xnu ]; then echo "${UNIXNU_SDK_VERSION:-14.0}"
+		else basename "$(sdk_path "$sdk")" .sdk | sed 's/^[A-Za-z]*//'; fi; exit;;
+	-show-sdk-build-version|--show-sdk-build-version) echo "${UNIXNU_SDK_BUILD:-23A344}"; exit;;
+	-show-sdk-platform-path|--show-sdk-platform-path)
+		if [ "${LB_MODE:-}" = xnu ]; then echo "${UNIXNU_SDKROOT:-/}/Platform"; else dirname "$(dirname "$(dirname "$(sdk_path "$sdk")")")"; fi; exit;;
+	--version) echo "xcrun version 70 (redfin localbuild shim)"; exit;;
+	-*) shift;;
+	*) break;;
+	esac
+done
+[ $# -gt 0 ] || exit 0
+t=$(find_tool "$1") || { echo "xcrun: cannot find $1" >&2; exit 1; }
+shift
+exec "$t" "$@"
