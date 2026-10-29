@@ -67,6 +67,26 @@ static std::atomic<int64_t> gLiveCpuFast{-1},gLiveEncStat{-1},gLiveFnStat{-1},gL
 // (backboardd command buffers with a framebuffer pass) every render pass and draw as "DB" lines: pipeline functions + label,
 // blend, write mask, viewport, scissor, the position attribute's bounding box (raw and in pixels) and the vertex uniform bytes.
 static std::atomic<int32_t> gDrawboxLeft{0};static std::atomic<uint32_t> gDrawboxSeq{0};
+// g9 SWEET_DEADFILL (env or /var/local/mtl2-live, read at each render encoder's creation; default 0 = off). 1: a draw that is a
+// full-target opaque constant-colour fill (Core Animation's "draw.PBGRAXm_A2Xhf" pipeline: no blending, all channels written, no
+// depth/stencil, untextured; viewport/scissor the whole attachment; every vertex the same colour with alpha 1; position bbox covering
+// the attachment in pixels) is held; the encoder's later calls are recorded behind it until the next draw. If that draw is such a fill
+// too, the held one is dropped (it would be completely overwritten); otherwise the held draw and the recorded calls go out in their
+// order before it. Nothing else is reordered. 2: also, while no draw went out yet, the encoder's creation is held when its colour
+// attachment 0 loads (Load or DontCare) and it has no other attachment: if its first surviving draw is such a fill, the pass clears
+// to the fill's colour instead and the draw is dropped (A6xx fast clear). "native-metal: DF 5s:" counts them (with the timeline).
+static std::atomic<int64_t> gLiveDeadfill{-1};
+static std::atomic<uint64_t> gDfDeferred{0},gDfDropped{0},gDfCleared{0},gDfPx{0};static std::atomic<int32_t> gDfCapturing{0};
+static int deadfillMode() {
+ static const int env=[]{const char *e=getenv("SWEET_DEADFILL");return e && *e?atoi(e):0;}();
+ const int64_t live=gLiveDeadfill.load(std::memory_order_relaxed);
+ return live>=0?(int)live:env;
+}
+// g9 SWEET_LUMA_BOOST=0 (env or /var/local/mtl2-live; unset = CA unchanged): Core Animation's luma boost pass (one full-screen
+// luma_boost_lph draw a frame) off. QuartzCore 16.7 reads CA_DISABLE_LUMA_BOOST from the environment once, before the plugin's
+// setenv; it is debug option 91 of its table (CA_COLOR_FLUSH = 0 .. CA_PRINT_FILM_GRAIN = 152) and the render path tests that byte
+// every frame, so CASetDebugOption(91, 1) turns the pass off live (backboardd, the render server). Restored (0) when the knob goes.
+static void lumaKnob(int64_t live);
 
 static uint32_t cpuFast() {
  static const uint32_t bits=[]{const char *e=getenv("SWEET_CPUFAST");return e && *e?(uint32_t)strtoul(e,nullptr,0):kCpuFastDefault;}();
@@ -185,6 +205,23 @@ static uint64_t encSlowTicks() {
  const int64_t live=gLiveEncSlowMs.load(std::memory_order_relaxed);
  return live>0?(uint64_t)(live*1e6/encTickNs()):ticks;
 }
+// g9: SWEET_LUMA_BOOST (live: 0/1 from /var/local/mtl2-live, -1: the env's, else leave CA alone or restore what was set)
+static void lumaKnob(int64_t live) {
+ static int applied=-1;   // what was set: 1 disabled, 0 restored, -1 never touched
+ static const bool bb=!strcmp(getprogname(),"backboardd");
+ if(!bb)return;
+ int want=-1;
+ if(live>=0)want=live==0?1:0;
+ else{const char *e=getenv("SWEET_LUMA_BOOST");if(e && *e)want=strcmp(e,"0")?0:1;else if(applied==1)want=0;}
+ if(want<0 || want==applied)return;
+ static void (*set)(int,uint8_t)=(void (*)(int,uint8_t))dlsym(RTLD_DEFAULT,"CASetDebugOption");
+ static int (*get)(int)=(int (*)(int))dlsym(RTLD_DEFAULT,"CAGetDebugOption");
+ char text[200];
+ if(!set){snprintf(text,sizeof text,"native-metal: luma: SWEET_LUMA_BOOST=%d NOT applied (no CASetDebugOption)",want?0:1);sm2_logs(text);applied=want;return;}
+ set(91,(uint8_t)want);applied=want;
+ snprintf(text,sizeof text,"native-metal: luma: SWEET_LUMA_BOOST=%d applied: CASetDebugOption(91 = CA_DISABLE_LUMA_BOOST, %d), reads back %d",want?0:1,want,get?get(91):-1);
+ sm2_logs(text);
+}
 // once a second at most (one thread wins the slot): the file's mtime; on a change, parse it and publish the values
 static void liveKnobsPoll() {
  static std::atomic<uint64_t> next{0};
@@ -193,12 +230,13 @@ static void liveKnobsPoll() {
  const uint64_t now=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
  uint64_t due=next.load(std::memory_order_relaxed);
  if(now<due || !next.compare_exchange_strong(due,now+1000000000ull))return;
+ {static bool lumaFirst=false;if(!lumaFirst){lumaFirst=true;lumaKnob(-1);}}   // g9: the env's SWEET_LUMA_BOOST at the first poll
  struct stat st;
  const bool have=stat("/var/local/mtl2-live",&st)==0;
  if(have==had && (!have || (st.st_mtimespec.tv_sec==seen.tv_sec && st.st_mtimespec.tv_nsec==seen.tv_nsec)))return;
  had=have;
  seen=have?st.st_mtimespec:(struct timespec){0,0};
- int64_t cf=-1,es=-1,fs=-1,ms=-1,sc=-1,er=-1;
+ int64_t cf=-1,es=-1,fs=-1,ms=-1,sc=-1,er=-1,df=-1,lb=-1;
  if(FILE *f=have?fopen("/var/local/mtl2-live","r"):nullptr) {
   char line[256];
   while(fgets(line,sizeof line,f)) {
@@ -214,18 +252,21 @@ static void liveKnobsPoll() {
    else if(!strcmp(line,"SWEET_M2V_SCRATCH"))sc=*v && strcmp(v,"0")?1:0;   // u-combo: as the bridge reads the env
    else if(!strcmp(line,"SWEET_ENCTHREAD_REPLACE"))er=*v=='1'?1:0;
    else if(!strcmp(line,"SWEET_DRAWBOX") && atoi(v)>0)gDrawboxLeft.store(std::min(atoi(v),20));   // ovd
+   else if(!strcmp(line,"SWEET_DEADFILL") && *v)df=atoi(v);   // g9
+   else if(!strcmp(line,"SWEET_LUMA_BOOST") && *v)lb=strcmp(v,"0")?1:0;   // g9
   }
   fclose(f);
  }
  gLiveCpuFast.store(cf,std::memory_order_relaxed);gLiveEncStat.store(es,std::memory_order_relaxed);
  gLiveFnStat.store(fs,std::memory_order_relaxed);gLiveEncSlowMs.store(ms,std::memory_order_relaxed);
  gLiveEncReplace.store(er,std::memory_order_relaxed);
+ gLiveDeadfill.store(df,std::memory_order_relaxed);lumaKnob(lb);   // g9
  if(gLiveScratch.exchange(sc)!=sc)nmb_sweet_scratch_live((int32_t)sc);   // u-combo: the bridge, from its next pass
- char text[300];
+ char text[360];
  snprintf(text,sizeof text,"native-metal: live: %s -> SWEET_CPUFAST=0x%x SWEET_ENCSTAT=%d SWEET_FNSTAT=%d SWEET_ENC_SLOW_MS=%llu"
-  " SWEET_M2V_SCRATCH=%s SWEET_ENCTHREAD_REPLACE=%s",
+  " SWEET_M2V_SCRATCH=%s SWEET_ENCTHREAD_REPLACE=%s SWEET_DEADFILL=%d SWEET_LUMA_BOOST=%s",
   have?"/var/local/mtl2-live read":"no /var/local/mtl2-live (env values)",cpuFast(),encStatOn(),fnStatOn(),
-  (unsigned long long)llround(encSlowTicks()*encTickNs()/1e6),sc<0?"env":sc?"1":"0",er<0?"env":er?"1":"0");
+  (unsigned long long)llround(encSlowTicks()*encTickNs()/1e6),sc<0?"env":sc?"1":"0",er<0?"env":er?"1":"0",deadfillMode(),lb<0?"env":lb?"1":"0");
  sm2_logs(text);
 }
 struct EncTLS {uint64_t ticks[EC_COUNT];uint32_t n[EC_COUNT];uint32_t depth;uint64_t scopes;};
@@ -1530,8 +1571,10 @@ static void encPushBatched(EncCmd &c,const void *extra,size_t length) {
  // UniXNU's points, and an encoded event (outside an encoder: its commit may come from another thread); a discard precedes its commit
  if(k->cmds.size()>=64 || c.op==EO_END || c.op==EO_EVENT || c.op==EO_COMMIT)encHand();
 }
+static bool dfStash(EncCmd &c,const void *extra,size_t length);   // g9: an encoder capturing behind a held fill keeps it
 // Records a command (and `length` bytes of inline data) for the worker, in call order.
 static void encPush(EncCmd &c,const void *extra=nullptr,size_t length=0) {
+ if(gDfCapturing.load(std::memory_order_relaxed)>0 && c.op>=EO_BUFFER && c.op<=EO_DRAW_INDEXED && dfStash(c,extra,length))return;   // g9
  encStart();
  gEtOps[c.op].fetch_add(1,std::memory_order_relaxed);
  if(gEqBroken){c.off=0;c.len=(uint32_t)length;@autoreleasepool{encReplay(c,(const uint8_t *)extra);}return;}
@@ -1625,14 +1668,33 @@ static void fnReport() {
 @public
  // ovd (SWEET_DRAWBOX): this encoder logs (its command buffer's DB frame, pass index); vertex-stage buffers and bytes by index (0..7)
  uint32_t dbFrame,dbPass,dbDraws;__unsafe_unretained id dbVb[8];NSUInteger dbVbOff[8];std::vector<uint8_t> dbVbytes[8];
+ // g9 (SWEET_DEADFILL): vertex-stage bindings tracked (dfTrack); calls recorded behind a held fill (dfCapturing: dfList, inline
+ // data in dfBytes; an entry whose op is EO_COUNT is skipped), the held draw's index there (-1: none), the creation held (mode 2),
+ // and whether the encoder is a direct one (encDeferred only while capturing)
+ bool dfTrack,dfCapturing,dfPending,dfDirect,dfHeldPx;int8_t dfMode;int32_t dfHeld;uint32_t dfHeldD;float dfHeldCol[4];
+ std::vector<EncCmd> dfList;std::vector<uint8_t> dfBytes;NmbRenderPassDescriptor *dfPass;uint64_t dfPx,dfHeldBind;
  bool encDeferred,encEnded;   // u-encthread: recorded for the worker (then `handle` is the worker's alone); endEncoding recorded
 }
 @property(nonatomic) NmbEncoder *handle;
 @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
 - (bool)check:(bool)ok what:(const char *)what;
+- (void)dfCapture;
+- (void)dfRelease:(bool)drop clear:(bool)clear;
 @end
 // u-encthread: a recording call on an encoder already ended fails its command buffer (never recorded: the encoder may be gone).
 #define ENC_LIVE() do{if(encEnded){[self.commandBuffer refuse:@"encoder call after endEncoding"];return;}}while(0)
+// g9: a recording call of an encoder capturing behind a held fill: kept (with its inline data) until the hold resolves
+static bool dfStash(EncCmd &c,const void *extra,size_t length) {
+ NBEncoder *e=(__bridge NBEncoder *)c.target;
+ if(!e || !e->dfCapturing)return false;
+ if(extra && length) {
+  const size_t at=(e->dfBytes.size()+7)&~(size_t)7;
+  e->dfBytes.resize(at+length);memcpy(e->dfBytes.data()+at,extra,length);
+  c.off=(uint32_t)at;c.len=(uint32_t)length;
+ }
+ e->dfList.push_back(c);
+ return true;
+}
 static void waitForResource(id resource) {
  ENC_SCOPE(EC_WAIT,"waitForResource");
  if(encThreadOn())encFlush(EF_RESOURCE);   // u-encthread: committed command buffers are in gInFlight once replayed
@@ -1650,12 +1712,53 @@ static void waitForResource(id resource) {
  gTimeResourceWait.add(began);
 }
 @implementation NBEncoder
-- (void)dealloc {if(_handle)nmb_encoder_discard(_handle);}
+- (void)dealloc {if(_handle)nmb_encoder_discard(_handle);delete dfPass;if(dfCapturing)gDfCapturing.fetch_sub(1);}
 - (bool)check:(bool)ok what:(const char *)what {
  if(!ok)[_commandBuffer refuse:[NSString stringWithFormat:@"%s: %@",what,lastError()]];
  return ok;
 }
+// g9 (SWEET_DEADFILL): start holding (the calls from here are recorded into dfList; a direct encoder records as a deferred one)
+- (void)dfCapture {
+ if(dfCapturing)return;
+ dfCapturing=true;gDfCapturing.fetch_add(1);
+ dfDirect=!encDeferred;encDeferred=true;
+}
+// mode 2: the held creation made now (a clear to the held fill's colour when `clear`)
+- (void)dfCreate:(bool)clear {
+ if(!dfPending)return;
+ NmbRenderPassDescriptor pass=*dfPass;delete dfPass;dfPass=nullptr;dfPending=false;
+ if(clear){pass.colors[0].load=MTLLoadActionClear;for(int i=0;i<4;i++)pass.colors[0].clear[i]=dfHeldCol[i];}
+ NBCommandBuffer *cb=_commandBuffer;
+ if(dfDirect) {
+  NmbEncoder *h=cb.committed?nullptr:nmb_render_encoder_new(cb.handle,&pass);
+  if(!h)[cb refuse:[NSString stringWithFormat:@"renderCommandEncoder: %@",lastError()]];
+  _handle=h;
+ } else {
+  EncCmd c={};c.op=EO_RENDER_NEW;c.target=(__bridge_retained void *)self;   // released as its end (or discard) is replayed
+  const bool was=dfCapturing;dfCapturing=false;encPush(c,&pass,sizeof pass);dfCapturing=was;
+ }
+}
+// the hold ends: `drop` drops the held fill (`clear`: the held creation clears to its colour instead); the recorded calls go out in order
+- (void)dfRelease:(bool)drop clear:(bool)clear {
+ if(!dfCapturing)return;
+ if(dfHeld>=0 && drop)dfList[(size_t)dfHeld].op=EO_COUNT;
+ dfCapturing=false;gDfCapturing.fetch_sub(1);
+ [self dfCreate:clear];
+ if(dfDirect)encDeferred=false;
+ std::vector<EncCmd> list;list.swap(dfList);std::vector<uint8_t> bytes;bytes.swap(dfBytes);
+ for(EncCmd c:list) {
+  if(c.op==EO_COUNT)continue;
+  if(dfDirect){c.target=(__bridge void *)self;encReplay(c,bytes.data());}
+  else encPush(c,c.len?bytes.data()+c.off:nullptr,c.len);
+ }
+ dfHeld=-1;dfDirect=false;
+}
 - (void)endEncoding {
+ if(dfCapturing) {   // g9: a fill still held at the end is the pass's last draw: it goes out (mode 2: a pass of only fills clears)
+  const bool clearIt=dfPending && dfHeld>=0 && dfHeldPx;
+  if(clearIt){gDfCleared.fetch_add(1);gDfPx.fetch_add(dfPx);if(dbFrame){char l[120];snprintf(l,sizeof l,"native-metal: DB f%u p%u d%u DF cleared (pass end)",dbFrame,dbPass,dfHeldD);sm2_logs(l);}}
+  [self dfRelease:clearIt clear:clearIt];
+ }
  static EncSite renderEnd{"endEncoding(render)",EC_ENC},blitEnd{"endEncoding(blit)",EC_ENC},computeEnd{"endEncoding(compute)",EC_ENC};
  EncScope encScope_([self respondsToSelector:@selector(setRenderPipelineState:)]?&renderEnd:
                     [self respondsToSelector:@selector(setComputePipelineState:)]?&computeEnd:&blitEnd);
@@ -1682,7 +1785,7 @@ static void waitForResource(id resource) {
 - (void)popDebugGroup {}
 // Stage 0 compute, 1 vertex, 2 fragment (the bridge's numbering).
 - (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setBuffer");
- if(dbFrame && stage==1 && index<8){dbVb[index]=buffer;dbVbOff[index]=offset;dbVbytes[index].clear();}   // ovd
+ if((dbFrame || dfTrack) && stage==1 && index<8){dbVb[index]=buffer;dbVbOff[index]=offset;dbVbytes[index].clear();}   // ovd, g9
  if(stage==1 && index==0 && fnStatOn()){tFnVb0=buffer;tFnVb0Off=offset;tFnVb0Enc=(__bridge const void *)self;}
  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
  if(encDeferred) {
@@ -1723,7 +1826,7 @@ static void waitForResource(id resource) {
  [self check:nmb_encoder_set_sampler(_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"];
 }
 - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setBytes");
- if(dbFrame && stage==1 && index<8){dbVb[index]=nil;dbVbytes[index].assign((const uint8_t *)bytes,(const uint8_t *)bytes+(bytes?std::min<NSUInteger>(length,65536):0));}   // ovd
+ if((dbFrame || dfTrack) && stage==1 && index<8){dbVb[index]=nil;dbVbytes[index].assign((const uint8_t *)bytes,(const uint8_t *)bytes+(bytes?std::min<NSUInteger>(length,65536):0));}   // ovd
  if(stage<3 && fnStatOn()){FnSnap &f=tFnBytes[stage];f.n=(uint16_t)std::min<NSUInteger>(64,length);f.index=(uint16_t)index;if(bytes)memcpy(f.b,bytes,f.n);}
  if(encDeferred) {   // the bytes are the caller's only during the call: copied
   ET_REC;ENC_LIVE();
@@ -1747,7 +1850,7 @@ static void waitForResource(id resource) {
 - (void)updateFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:true];}
 - (void)waitForFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:false];}
 - (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setBufferOffset");
- if(dbFrame && stage==1 && index<8)dbVbOff[index]=offset;   // ovd
+ if((dbFrame || dfTrack) && stage==1 && index<8)dbVbOff[index]=offset;   // ovd, g9
  if(encDeferred) {
   ET_REC;ENC_LIVE();
   EncCmd c={};c.op=EO_OFFSET;c.stage=(uint8_t)stage;c.index=(uint32_t)index;c.target=(__bridge void *)self;c.u[0]=offset;
@@ -1798,6 +1901,7 @@ static void waitForResource(id resource) {
  bool haveViewport,haveScissor;double lastViewport[6];uint64_t lastScissor[4];
  // ovd: the bound pipeline, viewport/scissor as set (any CPUFAST), the colour attachment's size and load action
  NBRenderPipeline *dbPipe;double dbVp[4];uint64_t dbSc[4];bool dbHaveVp,dbHaveSc;uint32_t dbW,dbH,dbLoad;
+ bool dfDss,dfClipKind;   // g9: a depth/stencil state was set; the last fill tested was in clip space (else pixels)
 }
 @end
 @implementation NBRenderEncoder
@@ -1858,8 +1962,124 @@ static void waitForResource(id resource) {
   for(size_t q=0;q+4<=dbVbytes[k].size() && q<64;q+=4){float f;memcpy(&f,dbVbytes[k].data()+q,4);DBP(" %.4g",f);}
   break;
  }
+ // g9: and the first vertex buffer other than the position's (CA's transform when it is not set as bytes): 16 floats at its offset
+ for(uint32_t k=0;k<8;k++) if(k!=buf && dbVbytes[k].empty() && dbVb[k] && [dbVb[k] isKindOfClass:[NBBuffer class]]) {
+  const uint8_t *c=(const uint8_t *)[(id<MTLBuffer>)dbVb[k] contents];const NSUInteger l=[(id<MTLBuffer>)dbVb[k] length];
+  if(!c || dbVbOff[k]>=l)continue;
+  DBP(" b%u+%lu:",k,(unsigned long)dbVbOff[k]);
+  for(size_t q=0;q+4<=l-dbVbOff[k] && q<64;q+=4){float f;memcpy(&f,c+dbVbOff[k]+q,4);DBP(" %.4g",f);}
+  break;
+ }
 #undef DBP
  sm2_logs(line);
+}
+// g9 (SWEET_DEADFILL): is this draw a full-target opaque constant-colour fill? Only Core Animation's untextured, unblended
+// "draw.PBGRAXm_A2Xhf" pipeline (all channels written), one instance of triangles, no depth/stencil state, viewport and scissor
+// the whole attachment (or unset), the position attribute (float4, w 1) spanning exactly [0,W]x[0,H] pixels or [-1,1] clip space,
+// and every drawn vertex's colour attribute the same with alpha 1. Its colour into col.
+- (bool)dfIsFill:(uint32_t)prim start:(uint32_t)start count:(uint32_t)count inst:(uint32_t)inst index:(id<MTLBuffer>)ib type:(uint32_t)itype
+          offset:(NSUInteger)ioff base:(int32_t)base color:(float *)col {
+ NBRenderPipeline *p=dbPipe;
+ if(!p || dfDss || inst!=1 || (prim!=MTLPrimitiveTypeTriangle && prim!=MTLPrimitiveTypeTriangleStrip) || count<3 || count>64)return false;
+ if(strcmp(p->dbLabel,"draw.PBGRAXm_A2Xhf") || p->dbBlend || p->dbMask!=0xf)return false;
+ if(p->dbFmt!=MTLVertexFormatFloat4 && p->dbFmt!=MTLVertexFormatFloat2)return false;
+ if(p->dbCFmt!=MTLVertexFormatHalf4 && p->dbCFmt!=MTLVertexFormatFloat4 && p->dbCFmt!=MTLVertexFormatUChar4Normalized)return false;
+ if(!dbW || !dbH || p->dbBuf>=8)return false;
+ if(dbHaveVp && (dbVp[0]!=0 || dbVp[1]!=0 || dbVp[2]!=dbW || dbVp[3]!=dbH))return false;
+ if(dbHaveSc && (dbSc[0]!=0 || dbSc[1]!=0 || dbSc[2]!=dbW || dbSc[3]!=dbH))return false;
+ const uint8_t *src=nullptr;size_t len=0;
+ if(!dbVbytes[p->dbBuf].empty()){src=dbVbytes[p->dbBuf].data();len=dbVbytes[p->dbBuf].size();}
+ else if(id vb=dbVb[p->dbBuf]){if(![vb isKindOfClass:[NBBuffer class]])return false;const uint8_t *c=(const uint8_t *)[(id<MTLBuffer>)vb contents];
+  const NSUInteger l=[(id<MTLBuffer>)vb length];if(c && dbVbOff[p->dbBuf]<l){src=c+dbVbOff[p->dbBuf];len=l-dbVbOff[p->dbBuf];}}
+ if(!src)return false;
+ const uint8_t *ix=nullptr;size_t ilen=0;
+ if(ib){if(![(id)ib isKindOfClass:[NBBuffer class]])return false;const uint8_t *c=(const uint8_t *)[(id<MTLBuffer>)ib contents];const NSUInteger l=[(id<MTLBuffer>)ib length];
+  if(!c || ioff>=l)return false;ix=c+ioff;ilen=l-ioff;}
+ const int comps=p->dbFmt==MTLVertexFormatFloat4?4:2;
+ const uint32_t stride=p->dbStride?p->dbStride:(uint32_t)comps*4;
+ if(!(prim==MTLPrimitiveTypeTriangle?count==6:count==4))return false;   // one rectangle: two triangles
+ float x0=1e30f,y0=1e30f,x1=-1e30f,y1=-1e30f;float c0[4]={0,0,0,0};float vx[6],vy[6];
+ for(uint32_t k=0;k<count;k++) {
+  int64_t v;
+  if(ib){if(itype==MTLIndexTypeUInt16){if((k+1)*2>ilen)return false;v=((const uint16_t *)ix)[k];}else{if((k+1)*4>ilen)return false;v=((const uint32_t *)ix)[k];}v+=base;}
+  else v=(int64_t)start+k;
+  if(v<0)return false;
+  const size_t o=(size_t)v*stride+p->dbOff;if(o+comps*4>len)return false;
+  float q[4]={0,0,0,1};memcpy(q,src+o,comps*4);
+  if(q[3]!=1)return false;
+  vx[k]=q[0];vy[k]=q[1];
+  x0=std::min(x0,q[0]);x1=std::max(x1,q[0]);y0=std::min(y0,q[1]);y1=std::max(y1,q[1]);
+  const size_t co=(size_t)v*stride+p->dbCOff;float c[4];
+  if(p->dbCFmt==MTLVertexFormatHalf4){if(co+8>len)return false;const __fp16 *h=(const __fp16 *)(src+co);for(int i=0;i<4;i++)c[i]=(float)h[i];}
+  else if(p->dbCFmt==MTLVertexFormatFloat4){if(co+16>len)return false;memcpy(c,src+co,16);}
+  else{if(co+4>len)return false;for(int i=0;i<4;i++)c[i]=src[co+i]/255.f;}
+  if(k==0)memcpy(c0,c,sizeof c0);else if(memcmp(c0,c,sizeof c0))return false;
+ }
+ if(c0[3]!=1)return false;
+ const bool pixels=fabsf(x0)<=0.01f && fabsf(y0)<=0.01f && fabsf(x1-(float)dbW)<=0.01f && fabsf(y1-(float)dbH)<=0.01f;
+ const bool clip=fabsf(x0+1)<=1e-4f && fabsf(y0+1)<=1e-4f && fabsf(x1-1)<=1e-4f && fabsf(y1-1)<=1e-4f;
+ if(!pixels && !clip)return false;
+ // the two triangles cover the rectangle: their vertices are its corners, each triangle three distinct ones, and the two they share
+ // are opposite corners (a diagonal)
+ int cr[6];
+ for(uint32_t k=0;k<count;k++) {
+  const bool lx=vx[k]==x0,hx=vx[k]==x1,ly=vy[k]==y0,hy=vy[k]==y1;
+  if(!(lx||hx) || !(ly||hy))return false;
+  cr[k]=(hx?1:0)|(hy?2:0);
+ }
+ const int t0[3]={cr[0],cr[1],cr[2]},t1[3]={prim==MTLPrimitiveTypeTriangle?cr[3]:cr[1],prim==MTLPrimitiveTypeTriangle?cr[4]:cr[2],prim==MTLPrimitiveTypeTriangle?cr[5]:cr[3]};
+ auto distinct=[](const int *t){return t[0]!=t[1] && t[1]!=t[2] && t[0]!=t[2];};
+ if(!distinct(t0) || !distinct(t1))return false;
+ int shared[3],ns=0;
+ for(int a=0;a<3;a++)for(int b=0;b<3;b++)if(t0[a]==t1[b] && ns<3)shared[ns++]=t0[a];
+ if(ns!=2 || (shared[0]^shared[1])!=3)return false;
+ memcpy(col,c0,sizeof c0);
+ dfClipKind=clip;
+ return true;
+}
+// g9: the vertex stage's bindings other than the position's (CA's transform/uniforms): a held fill is dropped only for a fill drawn
+// with the same ones (same positions and same transform: the same pixels)
+- (uint64_t)dfBindHash {
+ const uint32_t buf=dbPipe?dbPipe->dbBuf:99;uint64_t h=1469598103934665603ull;
+ auto mix=[&](const void *p,size_t n){const uint8_t *b=(const uint8_t *)p;for(size_t i=0;i<n;i++){h^=b[i];h*=1099511628211ull;}};
+ for(uint32_t k=0;k<8;k++) {
+  if(k==buf)continue;
+  // the bound bytes (CA's per-draw uniforms come from a ring buffer at changing offsets: their contents, not where they are)
+  if(!dbVbytes[k].empty()){mix(&k,sizeof k);mix(dbVbytes[k].data(),std::min<size_t>(dbVbytes[k].size(),256));}
+  else if(id vb=dbVb[k]) {
+   mix(&k,sizeof k);
+   if([vb isKindOfClass:[NBBuffer class]]){const uint8_t *c=(const uint8_t *)[(id<MTLBuffer>)vb contents];const NSUInteger l=[(id<MTLBuffer>)vb length];
+    if(c && dbVbOff[k]<l)mix(c+dbVbOff[k],std::min<size_t>(l-dbVbOff[k],256));else{const void *o=(__bridge const void *)vb;mix(&o,sizeof o);}}
+   else{const void *o=(__bridge const void *)vb;mix(&o,sizeof o);}
+  }
+ }
+ return h;
+}
+// g9: before a draw goes out: resolve a held fill against it. True: this draw is held itself (it is a fill), recorded as the stash's next entry.
+- (void)dfDraw:(uint32_t)prim start:(uint32_t)start count:(uint32_t)count inst:(uint32_t)inst index:(id<MTLBuffer>)ib type:(uint32_t)itype
+        offset:(NSUInteger)ioff base:(int32_t)base {
+ float col[4];
+ const bool fill=[self dfIsFill:prim start:start count:count inst:inst index:ib type:itype offset:ioff base:base color:col];
+ const uint32_t d=dbDraws?dbDraws-1:0;
+ if(fill) {
+  const uint64_t bind=[self dfBindHash]^(dfClipKind?0x9e3779b97f4a7c15ull:0);
+  if(dfCapturing && dfHeld>=0 && bind!=dfHeldBind) {   // a fill under another transform: the held one goes out first (kept)
+   const bool clearIt=false;[self dfRelease:clearIt clear:clearIt];
+  }
+  if(dfCapturing && dfHeld>=0) {   // the held fill is completely overwritten by this one
+   dfList[(size_t)dfHeld].op=EO_COUNT;gDfDropped.fetch_add(1);gDfPx.fetch_add(dfPx);
+   if(dbFrame){char l[120];snprintf(l,sizeof l,"native-metal: DB f%u p%u d%u DF dropped (overwritten by d%u)",dbFrame,dbPass,dfHeldD,d);sm2_logs(l);}
+  }
+  gDfDeferred.fetch_add(1);
+  [self dfCapture];
+  dfHeld=(int32_t)dfList.size();dfHeldD=d;memcpy(dfHeldCol,col,sizeof col);dfPx=(uint64_t)dbW*dbH;dfHeldBind=bind;dfHeldPx=!dfClipKind;
+  return;
+ }
+ if(!dfCapturing)return;
+ const bool clearIt=dfPending && dfHeld>=0 && dfHeldPx;   // mode 2: the first surviving draw of the pass is a fill (in pixels): a clear instead
+ if(clearIt){gDfCleared.fetch_add(1);gDfPx.fetch_add(dfPx);if(dbFrame){char l[160];snprintf(l,sizeof l,"native-metal: DB f%u p%u d%u DF cleared (load->clear %.3f,%.3f,%.3f,%.3f)",dbFrame,dbPass,dfHeldD,
+  dfHeldCol[0],dfHeldCol[1],dfHeldCol[2],dfHeldCol[3]);sm2_logs(l);}}
+ [self dfRelease:clearIt clear:clearIt];
 }
 // u-e: a draw past the slow threshold: its pipeline, and the VkPipelines the runtime made in this frame so far (it makes them at draws).
 - (void)encDescribeSlowDraw {
@@ -1899,6 +2119,7 @@ static void waitForResource(id resource) {
 - (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:1];}
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:2];}
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)state {ENC_SCOPE(EC_BIND,"setDepthStencilState");
+ if(state)dfDss=true;   // g9
  if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
  if(encDeferred) {
   ET_REC;ENC_LIVE();
@@ -1907,7 +2128,7 @@ static void waitForResource(id resource) {
  [self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"];
 }
 - (void)setViewport:(MTLViewport)v {ENC_SCOPE(EC_BIND,"setViewport");
- if(dbFrame){dbVp[0]=v.originX;dbVp[1]=v.originY;dbVp[2]=v.width;dbVp[3]=v.height;dbHaveVp=true;}   // ovd
+ if(dbFrame || dfTrack){dbVp[0]=v.originX;dbVp[1]=v.originY;dbVp[2]=v.width;dbVp[3]=v.height;dbHaveVp=true;}   // ovd
  const double values[6]={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
  // u-cpu 0x2: the same bits as the viewport set last (bitwise: a NaN or -0 is sent again unless it is the very value)
  const bool fast=cpuFast()&CPUFAST_VIEWPORT;
@@ -1924,7 +2145,7 @@ static void waitForResource(id resource) {
  gCfViewportSent.fetch_add(1,std::memory_order_relaxed);
 }
 - (void)setScissorRect:(MTLScissorRect)r {ENC_SCOPE(EC_BIND,"setScissorRect");
- if(dbFrame){dbSc[0]=r.x;dbSc[1]=r.y;dbSc[2]=r.width;dbSc[3]=r.height;dbHaveSc=true;}   // ovd
+ if(dbFrame || dfTrack){dbSc[0]=r.x;dbSc[1]=r.y;dbSc[2]=r.width;dbSc[3]=r.height;dbHaveSc=true;}   // ovd
  const uint64_t values[4]={r.x,r.y,r.width,r.height};
  const bool fast=cpuFast()&CPUFAST_VIEWPORT;
  if(fast && haveScissor && !memcmp(values,lastScissor,sizeof values)){gCfScissorSkips.fetch_add(1,std::memory_order_relaxed);return;}
@@ -1996,6 +2217,7 @@ static void waitForResource(id resource) {
  gDraws++;self.commandBuffer->encodedWork.draws++;
  if(fnStatOn())fnNote((__bridge const void *)self,encPipeline,(uint32_t)n,(uint32_t)i,s);
  if(dbFrame)[self dbDraw:(uint32_t)t start:(uint32_t)s count:(uint32_t)n inst:(uint32_t)i index:nil type:0 offset:0 base:0];   // ovd
+ if(dfTrack)[self dfDraw:(uint32_t)t start:(uint32_t)s count:(uint32_t)n inst:(uint32_t)i index:nil type:0 offset:0 base:0];   // g9
  if(encDeferred) {
   ET_REC;ENC_LIVE();
   EncCmd c={};c.op=EO_DRAW;c.target=(__bridge void *)self;c.u[0]=(uint64_t)t;c.u[1]=(uint32_t)s;c.u[2]=(uint32_t)n;c.u[3]=(uint32_t)i;c.u[4]=(uint32_t)b;
@@ -2018,6 +2240,7 @@ static void waitForResource(id resource) {
  gDraws++;self.commandBuffer->encodedWork.draws++;
  if(fnStatOn())fnNote((__bridge const void *)self,encPipeline,(uint32_t)n,(uint32_t)i,0);
  if(dbFrame)[self dbDraw:(uint32_t)t start:0 count:(uint32_t)n inst:(uint32_t)i index:b type:(uint32_t)k offset:o base:(int32_t)v];   // ovd
+ if(dfTrack)[self dfDraw:(uint32_t)t start:0 count:(uint32_t)n inst:(uint32_t)i index:b type:(uint32_t)k offset:o base:(int32_t)v];   // g9
  if(encDeferred) {
   ET_REC;
   EncCmd c={};c.op=EO_DRAW_INDEXED;c.target=(__bridge void *)self;c.a=(__bridge void *)b;c.u[0]=(uint64_t)t;c.u[1]=(uint64_t)(uint32_t)n<<32|(uint32_t)i;
@@ -2399,6 +2622,23 @@ static void noteDeviceLost(const char *why) {
    (t && [(id)t isKindOfClass:[NBTexture class]] && ((NBTexture *)t).surface)?IOSurfaceGetID(((NBTexture *)t).surface):0u);
   sm2_logs(line);
  }
+ // g9 (SWEET_DEADFILL, backboardd): fills tracked; mode 2 holds the creation of a pass that loads colour 0 and has nothing else attached
+ static const bool dfProc=!strcmp(getprogname(),"backboardd");
+ if(const int mode=dfProc?deadfillMode():0) {
+  id<MTLTexture> t=d.colorAttachments[0].texture;
+  re->dfTrack=true;re->dfMode=(int8_t)mode;re->dfHeld=-1;re->dbW=t?(uint32_t)t.width:0;re->dbH=t?(uint32_t)t.height:0;
+  bool alone=t && !d.depthAttachment.texture && !d.stencilAttachment.texture && !d.visibilityResultBuffer;
+  for(unsigned i=1;i<8 && alone;i++)if(d.colorAttachments[i].texture)alone=false;
+  const MTLLoadAction load=d.colorAttachments[0].loadAction;
+  const MTLPixelFormat pf=t?t.pixelFormat:MTLPixelFormatInvalid;   // 8-bit unorm targets only: a clear value and a written colour store alike
+  if(mode>=2 && alone && (pf==MTLPixelFormatBGRA8Unorm || pf==MTLPixelFormatRGBA8Unorm) && (load==MTLLoadActionLoad || load==MTLLoadActionDontCare) && !self.committed) {
+   if(!tlFirstEncoder && tlCreated)tlFirstEncoder=tlNow();
+   re.commandBuffer=self;re->dfPass=new NmbRenderPassDescriptor(pass);re->dfPending=true;
+   if(encDeferred){re->encDeferred=true;encOpen=re;}
+   [re dfCapture];
+   return re;
+  }
+ }
  if(encDeferred)return [self deferredEncoder:re op:EO_RENDER_NEW pass:&pass what:@"renderCommandEncoder"];
  return [self encoder:re handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
 }
@@ -2526,6 +2766,7 @@ static void noteDeviceLost(const char *why) {
  dispatch_group_enter(_schedulingHandlers);
  if(encDeferred) {   // u-encthread: the rest (in flight, surface cleans, handlers, the bridge's commit) is the worker's, in order
   ET_REC;
+  if(NBEncoder *open=encOpen)if(!open->encEnded && open->dfCapturing)[open dfRelease:false clear:false];   // g9: its creation recorded first
   if(NBEncoder *open=encOpen)if(!open->encEnded){open->encEnded=true;EncCmd d={};d.op=EO_DISCARD;d.target=(__bridge void *)open;encPush(d);}
   encOpen=nil;
   encCommitTick=mach_absolute_time();
@@ -4029,6 +4270,15 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
    gCfScissorSent.load()};
   uint64_t d[6];for(int i=0;i<6;i++)d[i]=cf[i]-lastCf[i];
   memcpy(lastCf,cf,sizeof lastCf);
+  {   // g9: SWEET_DEADFILL in the window
+   static uint64_t lastDf[4];const uint64_t df[4]={gDfDeferred.load(),gDfDropped.load(),gDfCleared.load(),gDfPx.load()};
+   if(deadfillMode() || memcmp(df,lastDf,sizeof df)) {
+    char dl[200];snprintf(dl,sizeof dl,"native-metal: DF 5s: deferred %llu dropped %llu cleared %llu px_saved %llu (mode %d)",(unsigned long long)(df[0]-lastDf[0]),
+     (unsigned long long)(df[1]-lastDf[1]),(unsigned long long)(df[2]-lastDf[2]),(unsigned long long)(df[3]-lastDf[3]),deadfillMode());
+    sm2_logs(dl);
+   }
+   memcpy(lastDf,df,sizeof df);
+  }
   snprintf(line,sizeof line,"native-metal: T cpufast 5s: bits 0x%x | answers memo %llu asked %llu | viewport skipped %llu sent %llu | scissor skipped %llu sent %llu",
    cpuFast(),(unsigned long long)d[0],(unsigned long long)d[1],(unsigned long long)d[2],(unsigned long long)d[3],(unsigned long long)d[4],
    (unsigned long long)d[5]);
