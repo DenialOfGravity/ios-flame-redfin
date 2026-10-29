@@ -371,3 +371,5 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 0135 (U0014) the encoder's tracker maps hashed by the runtime's KeyHasher instead of SipHash, `SWEET_U0014=1`.
 - 0136 (U0015) a two-plane texture's shadow starts as its memory lies (no zero fill at creation), `SWEET_U0015=1`.
 - 0137 (U0016) a padded render/write texture aliases only where 16x4 tile stores stay inside its rows, else shadow, `SWEET_U0016=1`.
+- bridge 0160 `SWEET_FP16=wide|native` (default off): `wide` keeps half in f32 without the f16 round trip; `native` takes MetalHalfArithmetic/Conversion/Fma so half + - * fma are 16-bit ops. In cache key.
+- bridge 0161 `SWEET_M2V_CONTRACT=1` (default off): AIR ops with `contract`/`fast` emitted without NoContraction (incl. kept-apart adds, 16-bit half ops); colour-write rounding keeps it. In cache key.
