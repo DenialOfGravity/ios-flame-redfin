@@ -1793,6 +1793,24 @@ static void ycbcrRefresh(NBTexture *texture) {
  const uint64_t rotation=descriptorRotation(d);
  NBTexture *texture=nil;
  if(rotation) {
+  // SweetMetal2 (rotfb3): a rotated texture is a shadow image plus a tight buffer, a staging buffer and the rotation kernel's sets
+  // (metal2vulkan rotated.rs): ~2 x the surface's bytes of GPU pool and ~20 small allocations each. r62b: Core Animation asked for
+  // them again and again in landscape and backboardd's pool grew 194 -> 451 MB in 30 s (live <256K 2654 -> 4453) until it crashed.
+  // The last few are kept and handed out again for the same surface memory, rotation and descriptor.
+  struct RotKey {uint64_t id,base,bytes,offset,row,rotation,fbo,type,format,width,height,usage,options;};
+  const RotKey key={(uint64_t)IOSurfaceGetID(surface),(uint64_t)(uintptr_t)base,(uint64_t)bytes,(uint64_t)offset,(uint64_t)row,rotation,
+                    descriptorFramebufferOnly(d)?1u:0u,(uint64_t)d.textureType,sweetFormat((uint64_t)d.pixelFormat),(uint64_t)d.width,
+                    (uint64_t)d.height,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
+  static std::mutex rotLock;static std::vector<std::pair<RotKey,NBTexture *>> rotCache;static uint64_t rotMade,rotHits;
+  {
+   std::lock_guard<std::mutex> l(rotLock);
+   for(size_t i=0;i<rotCache.size();i++) if(!memcmp(&rotCache[i].first,&key,sizeof key)) {
+    NBTexture *hit=rotCache[i].second;auto entry=rotCache[i];rotCache.erase(rotCache.begin()+(long)i);rotCache.insert(rotCache.begin(),entry);
+    if(++rotHits==1 || rotHits%500==0)sm2_logs([NSString stringWithFormat:@"native-metal: rotated surface textures: %llu made, %llu reused",
+                                                (unsigned long long)rotMade,(unsigned long long)rotHits].UTF8String);
+    return (id<MTLTexture>)hit;
+   }
+  }
   NmbTextureDescriptor descriptor;
   if(textureDescriptor(d,&descriptor)) {
    const NmbTextureExtras extras={rotation,descriptorFramebufferOnly(d)?1u:0u};
@@ -1803,6 +1821,13 @@ static void ycbcrRefresh(NBTexture *texture) {
     texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
     texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;
     NmbTextureExtras made={0,0};nmb_texture_extras(handle,&made);texture.rotationValue=made.rotation;texture.framebufferOnlyValue=made.framebuffer_only!=0;
+    texture.plane=plane;[texture holdSurface:surface];
+    std::lock_guard<std::mutex> l(rotLock);
+    rotCache.insert(rotCache.begin(),{key,texture});
+    if(rotCache.size()>3)rotCache.pop_back();      // CA's landscape chain is 2-3 surfaces; the oldest goes when its last user lets it go
+    if(++rotMade<=24 || rotMade%200==0)sm2_logs([NSString stringWithFormat:@"native-metal: rotated surface texture #%llu (rotation %llu): surface %zux%zu id %u, texture %lux%lu fmt %lu usage %#lx (%llu reused so far)",
+      (unsigned long long)rotMade,(unsigned long long)rotation,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetID(surface),
+      (unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.pixelFormat,(unsigned long)d.usage,(unsigned long long)rotHits].UTF8String);
    }
   }
   noteSurfaceTexture(surface,d,plane,planes,offset,row,texture?(rotation==1?"made (rotation 1)":rotation==2?"made (rotation 2)":rotation==3?"made (rotation 3)":"made (rotation 4)")
