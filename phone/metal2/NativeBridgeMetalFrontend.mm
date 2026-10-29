@@ -63,6 +63,11 @@ static const uint32_t kCpuFastDefault=CPUFAST_ANSWERS|CPUFAST_VIEWPORT;
 // SWEET_ENCTHREAD (a command buffer's mode is fixed at creation; switching would reorder commits against the worker's queue),
 // SWEET_ENCTHREAD_PRI/_SPIN_US (worker start), SWEET_M2V_COLOR_WRITES (compiled SPIR-V, cache keys), SWEET_TU_* (Turnip).
 static std::atomic<int64_t> gLiveCpuFast{-1},gLiveEncStat{-1},gLiveFnStat{-1},gLiveEncSlowMs{-1},gLiveScratch{-1},gLiveEncReplace{-1};
+// ovd: SWEET_DRAWBOX=N (in /var/local/mtl2-live, backboardd with the timeline; each change of the file re-arms, at most 20): for the next N frames
+// (backboardd command buffers with a framebuffer pass) every render pass and draw as "DB" lines: pipeline functions + label,
+// blend, write mask, viewport, scissor, the position attribute's bounding box (raw and in pixels) and the vertex uniform bytes.
+static std::atomic<int32_t> gDrawboxLeft{0};static std::atomic<uint32_t> gDrawboxSeq{0};
+
 static uint32_t cpuFast() {
  static const uint32_t bits=[]{const char *e=getenv("SWEET_CPUFAST");return e && *e?(uint32_t)strtoul(e,nullptr,0):kCpuFastDefault;}();
  const int64_t live=gLiveCpuFast.load(std::memory_order_relaxed);
@@ -208,6 +213,7 @@ static void liveKnobsPoll() {
    else if(!strcmp(line,"SWEET_ENC_SLOW_MS") && atof(v)>0)ms=(int64_t)atof(v);
    else if(!strcmp(line,"SWEET_M2V_SCRATCH"))sc=*v && strcmp(v,"0")?1:0;   // u-combo: as the bridge reads the env
    else if(!strcmp(line,"SWEET_ENCTHREAD_REPLACE"))er=*v=='1'?1:0;
+   else if(!strcmp(line,"SWEET_DRAWBOX") && atoi(v)>0)gDrawboxLeft.store(std::min(atoi(v),20));   // ovd
   }
   fclose(f);
  }
@@ -1202,6 +1208,8 @@ static std::string quartzCoreCallers();
 @interface NBRenderPipeline : NBObject {
 @public
  char encNames[80];   // u-e: its vertex + fragment function names, for "E slow" draws
+ // ovd (SWEET_DRAWBOX): colour attachment 0's blend and mask, the label's tail, attribute 0 (format, offset, buffer, stride)
+ char dbLabel[48];uint8_t dbBlend,dbMask,dbSrc,dbDst,dbSrcA,dbDstA;uint32_t dbFmt,dbOff,dbBuf,dbStride;
 }
 @property(nonatomic) NmbRenderPipeline *handle;
 @end
@@ -1284,6 +1292,7 @@ static void notified(void *context,uint64_t value) {
  // u-e: the encoding thread's counts at the first encoder (EncScope), its CPU time, CPU, and the runtime's VkPipeline makings then
  EncTLS encStart;uint64_t encCpuStart,encThread,encVkStart[2];int8_t encCpu0;EncFrame encFrame;
  bool tlFrame,tlWaitedCompleted,tlWaitedScheduled;
+ uint32_t dbFrame,dbPasses;   // ovd: SWEET_DRAWBOX frame number (0: not logged), passes so far
  // u-encthread: recorded for the worker (SWEET_ENCTHREAD, fixed at creation); the commit was replayed (the bridge has it);
  // and returned (waits may use the bridge's); the recorded encoder not ended yet (kept alive by its recorded creation until its
  // end or discard is replayed)
@@ -1614,6 +1623,8 @@ static void fnReport() {
 }
 @interface NBEncoder : NBObject {
 @public
+ // ovd (SWEET_DRAWBOX): this encoder logs (its command buffer's DB frame, pass index); vertex-stage buffers and bytes by index (0..7)
+ uint32_t dbFrame,dbPass,dbDraws;__unsafe_unretained id dbVb[8];NSUInteger dbVbOff[8];std::vector<uint8_t> dbVbytes[8];
  bool encDeferred,encEnded;   // u-encthread: recorded for the worker (then `handle` is the worker's alone); endEncoding recorded
 }
 @property(nonatomic) NmbEncoder *handle;
@@ -1671,6 +1682,7 @@ static void waitForResource(id resource) {
 - (void)popDebugGroup {}
 // Stage 0 compute, 1 vertex, 2 fragment (the bridge's numbering).
 - (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setBuffer");
+ if(dbFrame && stage==1 && index<8){dbVb[index]=buffer;dbVbOff[index]=offset;dbVbytes[index].clear();}   // ovd
  if(stage==1 && index==0 && fnStatOn()){tFnVb0=buffer;tFnVb0Off=offset;tFnVb0Enc=(__bridge const void *)self;}
  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
  if(encDeferred) {
@@ -1711,6 +1723,7 @@ static void waitForResource(id resource) {
  [self check:nmb_encoder_set_sampler(_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"];
 }
 - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setBytes");
+ if(dbFrame && stage==1 && index<8){dbVb[index]=nil;dbVbytes[index].assign((const uint8_t *)bytes,(const uint8_t *)bytes+(bytes?std::min<NSUInteger>(length,65536):0));}   // ovd
  if(stage<3 && fnStatOn()){FnSnap &f=tFnBytes[stage];f.n=(uint16_t)std::min<NSUInteger>(64,length);f.index=(uint16_t)index;if(bytes)memcpy(f.b,bytes,f.n);}
  if(encDeferred) {   // the bytes are the caller's only during the call: copied
   ET_REC;ENC_LIVE();
@@ -1734,6 +1747,7 @@ static void waitForResource(id resource) {
 - (void)updateFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:true];}
 - (void)waitForFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:false];}
 - (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setBufferOffset");
+ if(dbFrame && stage==1 && index<8)dbVbOff[index]=offset;   // ovd
  if(encDeferred) {
   ET_REC;ENC_LIVE();
   EncCmd c={};c.op=EO_OFFSET;c.stage=(uint8_t)stage;c.index=(uint32_t)index;c.target=(__bridge void *)self;c.u[0]=offset;
@@ -1782,9 +1796,62 @@ static void waitForResource(id resource) {
  uint64_t rasterCull,rasterWinding,rasterFill;   // Metal's defaults (0) until set (were associated objects: a global lock and an NSNumber each)
  // u-cpu 0x2: the values the last accepted setViewport:/setScissorRect: set (have*: one was accepted)
  bool haveViewport,haveScissor;double lastViewport[6];uint64_t lastScissor[4];
+ // ovd: the bound pipeline, viewport/scissor as set (any CPUFAST), the colour attachment's size and load action
+ NBRenderPipeline *dbPipe;double dbVp[4];uint64_t dbSc[4];bool dbHaveVp,dbHaveSc;uint32_t dbW,dbH,dbLoad;
 }
 @end
 @implementation NBRenderEncoder
+// ovd (SWEET_DRAWBOX): one "DB" line for a draw: where its pixels can go (viewport, scissor) and where its vertices are.
+- (void)dbDraw:(uint32_t)prim start:(uint32_t)start count:(uint32_t)count inst:(uint32_t)inst index:(id<MTLBuffer>)ib type:(uint32_t)itype
+        offset:(NSUInteger)ioff base:(int32_t)base {
+ NBRenderPipeline *p=dbPipe;const uint32_t d=dbDraws++;
+ char line[1400];size_t at=0;
+#define DBP(...) do{at+=snprintf(line+at,at<sizeof line?sizeof line-at:0,__VA_ARGS__);}while(0)
+ DBP("native-metal: DB f%u p%u d%u %s [%s] bl%d m%x f%d/%d/%d/%d prim%u n%u i%u%s",dbFrame,dbPass,d,p?p->encNames:"?",p?p->dbLabel:"?",p?p->dbBlend:-1,p?p->dbMask:0,
+  p?p->dbSrc:0,p?p->dbDst:0,p?p->dbSrcA:0,p?p->dbDstA:0,prim,count,inst,ib?" idx":"");
+ if(dbHaveVp)DBP(" vp %.0f,%.0f %.0fx%.0f",dbVp[0],dbVp[1],dbVp[2],dbVp[3]);else DBP(" vp -");
+ if(dbHaveSc)DBP(" sc %llu,%llu %llux%llu",(unsigned long long)dbSc[0],(unsigned long long)dbSc[1],(unsigned long long)dbSc[2],(unsigned long long)dbSc[3]);else DBP(" sc -");
+ // the position attribute (pipeline attribute 0) of the vertices drawn: float2/3/4 or half2/4
+ const uint32_t fmt=p?p->dbFmt:0,buf=p?p->dbBuf:99;
+ const uint8_t *src=nullptr;size_t len=0;
+ if(fmt && buf<8) {
+  if(!dbVbytes[buf].empty()){src=dbVbytes[buf].data();len=dbVbytes[buf].size();}
+  else if(id vb=dbVb[buf]){if([vb respondsToSelector:@selector(contents)]){const uint8_t *c=(const uint8_t *)[(id<MTLBuffer>)vb contents];NSUInteger l=[(id<MTLBuffer>)vb length];
+   if(c && dbVbOff[buf]<l){src=c+dbVbOff[buf];len=l-dbVbOff[buf];}}}
+ }
+ const int comps=fmt==MTLVertexFormatFloat2?2:fmt==MTLVertexFormatFloat3?3:fmt==MTLVertexFormatFloat4?4:fmt==MTLVertexFormatHalf2?-2:fmt==MTLVertexFormatHalf4?-4:0;
+ if(src && comps) {
+  const uint8_t *ix=nullptr;size_t ilen=0;
+  if(ib){const uint8_t *c=(const uint8_t *)[ib contents];NSUInteger l=[ib length];if(c && ioff<l){ix=c+ioff;ilen=l-ioff;}}
+  float x0=1e30f,y0=1e30f,x1=-1e30f,y1=-1e30f,w0=1e30f,w1=-1e30f;uint32_t got=0;
+  const uint32_t stride=p->dbStride?p->dbStride:(uint32_t)(abs(comps)*(comps>0?4:2));
+  for(uint32_t k=0;k<count && k<4096;k++) {
+   int64_t v;
+   if(ib){if(!ix)break;if(itype==MTLIndexTypeUInt16){if((k+1)*2>ilen)break;v=((const uint16_t *)ix)[k];}else{if((k+1)*4>ilen)break;v=((const uint32_t *)ix)[k];}v+=base;}
+   else v=(int64_t)start+k;
+   const size_t o=(size_t)v*stride+p->dbOff;if(v<0 || o+(comps>0?comps*4:-comps*2)>len)continue;
+   float c4[4]={0,0,0,1};
+   if(comps>0)memcpy(c4,src+o,comps*4);else{const __fp16 *h=(const __fp16 *)(src+o);for(int q=0;q<-comps;q++)c4[q]=(float)h[q];}
+   x0=std::min(x0,c4[0]);x1=std::max(x1,c4[0]);y0=std::min(y0,c4[1]);y1=std::max(y1,c4[1]);
+   const float w=(comps==4||comps==-4)?c4[3]:1;w0=std::min(w0,w);w1=std::max(w1,w);got++;
+  }
+  if(got) {
+   DBP(" pos %.1f,%.1f..%.1f,%.1f w%.2f..%.2f (%u)",x0,y0,x1,y1,w0,w1,got);
+   // as clip space with w 1, in the viewport (else the attachment): pixels
+   const double vx=dbHaveVp?dbVp[0]:0,vy=dbHaveVp?dbVp[1]:0,vw=dbHaveVp?dbVp[2]:dbW,vh=dbHaveVp?dbVp[3]:dbH;
+   if(w0==1 && w1==1 && x0>=-1.01f && x1<=1.01f && y0>=-1.01f && y1<=1.01f)
+    DBP(" px %.0f,%.0f %.0fx%.0f",vx+(x0*0.5+0.5)*vw,vy+(0.5-y1*0.5)*vh,(x1-x0)*0.5*vw,(y1-y0)*0.5*vh);
+  } else DBP(" pos none");
+ } else DBP(" pos ?fmt%u buf%u",fmt,buf);
+ // the vertex stage's other bytes (CA's transform/uniforms): the first set index other than the position's, 16 floats
+ for(uint32_t k=0;k<8;k++) if(k!=buf && !dbVbytes[k].empty()) {
+  DBP(" u%u/%zu:",k,dbVbytes[k].size());
+  for(size_t q=0;q+4<=dbVbytes[k].size() && q<64;q+=4){float f;memcpy(&f,dbVbytes[k].data()+q,4);DBP(" %.4g",f);}
+  break;
+ }
+#undef DBP
+ sm2_logs(line);
+}
 // u-e: a draw past the slow threshold: its pipeline, and the VkPipelines the runtime made in this frame so far (it makes them at draws).
 - (void)encDescribeSlowDraw {
  uint64_t work[10]={};NBCommandBuffer *cb=self.commandBuffer;
@@ -1796,6 +1863,7 @@ static void waitForResource(id resource) {
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {ENC_SCOPE(EC_BIND,"setRenderPipelineState");
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
  if(encStatOn() || fnStatOn())memcpy(encPipeline,((NBRenderPipeline *)state)->encNames,sizeof encPipeline);
+ dbPipe=(NBRenderPipeline *)state;   // ovd
  if(encDeferred) {
   ET_REC;ENC_LIVE();
   EncCmd c={};c.op=EO_PIPELINE;c.target=(__bridge void *)self;c.a=(__bridge_retained void *)state;c.flags=ECF_RETAIN_A;encPush(c);return;
@@ -1830,6 +1898,7 @@ static void waitForResource(id resource) {
  [self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"];
 }
 - (void)setViewport:(MTLViewport)v {ENC_SCOPE(EC_BIND,"setViewport");
+ if(dbFrame){dbVp[0]=v.originX;dbVp[1]=v.originY;dbVp[2]=v.width;dbVp[3]=v.height;dbHaveVp=true;}   // ovd
  const double values[6]={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
  // u-cpu 0x2: the same bits as the viewport set last (bitwise: a NaN or -0 is sent again unless it is the very value)
  const bool fast=cpuFast()&CPUFAST_VIEWPORT;
@@ -1846,6 +1915,7 @@ static void waitForResource(id resource) {
  gCfViewportSent.fetch_add(1,std::memory_order_relaxed);
 }
 - (void)setScissorRect:(MTLScissorRect)r {ENC_SCOPE(EC_BIND,"setScissorRect");
+ if(dbFrame){dbSc[0]=r.x;dbSc[1]=r.y;dbSc[2]=r.width;dbSc[3]=r.height;dbHaveSc=true;}   // ovd
  const uint64_t values[4]={r.x,r.y,r.width,r.height};
  const bool fast=cpuFast()&CPUFAST_VIEWPORT;
  if(fast && haveScissor && !memcmp(values,lastScissor,sizeof values)){gCfScissorSkips.fetch_add(1,std::memory_order_relaxed);return;}
@@ -1916,6 +1986,7 @@ static void waitForResource(id resource) {
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {ENC_SCOPE(EC_DRAW,"drawPrimitives");
  gDraws++;self.commandBuffer->encodedWork.draws++;
  if(fnStatOn())fnNote((__bridge const void *)self,encPipeline,(uint32_t)n,(uint32_t)i,s);
+ if(dbFrame)[self dbDraw:(uint32_t)t start:(uint32_t)s count:(uint32_t)n inst:(uint32_t)i index:nil type:0 offset:0 base:0];   // ovd
  if(encDeferred) {
   ET_REC;ENC_LIVE();
   EncCmd c={};c.op=EO_DRAW;c.target=(__bridge void *)self;c.u[0]=(uint64_t)t;c.u[1]=(uint32_t)s;c.u[2]=(uint32_t)n;c.u[3]=(uint32_t)i;c.u[4]=(uint32_t)b;
@@ -1937,6 +2008,7 @@ static void waitForResource(id resource) {
  [self.commandBuffer.resourceOwners addObject:b];
  gDraws++;self.commandBuffer->encodedWork.draws++;
  if(fnStatOn())fnNote((__bridge const void *)self,encPipeline,(uint32_t)n,(uint32_t)i,0);
+ if(dbFrame)[self dbDraw:(uint32_t)t start:0 count:(uint32_t)n inst:(uint32_t)i index:b type:(uint32_t)k offset:o base:(int32_t)v];   // ovd
  if(encDeferred) {
   ET_REC;
   EncCmd c={};c.op=EO_DRAW_INDEXED;c.target=(__bridge void *)self;c.a=(__bridge void *)b;c.u[0]=(uint64_t)t;c.u[1]=(uint64_t)(uint32_t)n<<32|(uint32_t)i;
@@ -2308,8 +2380,18 @@ static void noteDeviceLost(const char *why) {
   [_resourceOwners addObject:d.visibilityResultBuffer];
   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
  }
- if(encDeferred)return [self deferredEncoder:[NBRenderEncoder new] op:EO_RENDER_NEW pass:&pass what:@"renderCommandEncoder"];
- return [self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+ NBRenderEncoder *re=[NBRenderEncoder new];
+ if(gDrawboxLeft.load(std::memory_order_relaxed)>0 && timelineOn()) {   // ovd: SWEET_DRAWBOX
+  if(!dbFrame)dbFrame=gDrawboxSeq.fetch_add(1)+1;
+  re->dbFrame=dbFrame;re->dbPass=dbPasses++;
+  id<MTLTexture> t=d.colorAttachments[0].texture;re->dbW=t?(uint32_t)t.width:0;re->dbH=t?(uint32_t)t.height:0;re->dbLoad=(uint32_t)d.colorAttachments[0].loadAction;
+  char line[200];snprintf(line,sizeof line,"native-metal: DB f%u p%u pass %ux%u fmt %lu load %u store %lu surface %u",dbFrame,re->dbPass,re->dbW,re->dbH,
+   t?(unsigned long)t.pixelFormat:0ul,re->dbLoad,(unsigned long)d.colorAttachments[0].storeAction,
+   (t && [(id)t isKindOfClass:[NBTexture class]] && ((NBTexture *)t).surface)?IOSurfaceGetID(((NBTexture *)t).surface):0u);
+  sm2_logs(line);
+ }
+ if(encDeferred)return [self deferredEncoder:re op:EO_RENDER_NEW pass:&pass what:@"renderCommandEncoder"];
+ return [self encoder:re handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
 }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {ENC_SCOPE(EC_CB,"addScheduledHandler");if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block {ENC_SCOPE(EC_CB,"addCompletedHandler");if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
@@ -2403,6 +2485,10 @@ static void noteDeviceLost(const char *why) {
 }
 - (void)commit {
  liveKnobsPoll();   // u-lab
+ if(dbFrame) {   // ovd
+  if(tlFrame)gDrawboxLeft.fetch_sub(1);
+  char line[120];snprintf(line,sizeof line,"native-metal: DB f%u commit, %u passes, framebuffer %d, %d frames left",dbFrame,dbPasses,tlFrame,gDrawboxLeft.load());sm2_logs(line);
+ }
  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
  self.committed=YES;
  self.committedUs=nowUs();
@@ -3511,6 +3597,15 @@ static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
  if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;
  snprintf(state->encNames,sizeof state->encNames,"%s + %s",d.vertexFunction.name.UTF8String?:"-",d.fragmentFunction.name.UTF8String?:"-");
+ {   // ovd
+  const char *l=d.label.UTF8String?:"-";if(!strncmp(l,"com.apple.coreanimation.",24))l+=24;snprintf(state->dbLabel,sizeof state->dbLabel,"%s",l);
+  MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[0];
+  state->dbBlend=a.blendingEnabled;state->dbMask=(uint8_t)a.writeMask;state->dbSrc=(uint8_t)a.sourceRGBBlendFactor;state->dbDst=(uint8_t)a.destinationRGBBlendFactor;
+  state->dbSrcA=(uint8_t)a.sourceAlphaBlendFactor;state->dbDstA=(uint8_t)a.destinationAlphaBlendFactor;
+  state->dbFmt=0;
+  if(MTLVertexDescriptor *v=d.vertexDescriptor){MTLVertexAttributeDescriptor *at=v.attributes[0];
+   if(at.format!=MTLVertexFormatInvalid && at.bufferIndex<31){state->dbFmt=(uint32_t)at.format;state->dbOff=(uint32_t)at.offset;state->dbBuf=(uint32_t)at.bufferIndex;state->dbStride=(uint32_t)v.layouts[at.bufferIndex].stride;}}
+ }
  return (id<MTLRenderPipelineState>)state;
 }
 - (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)d error:(NSError **)error {
