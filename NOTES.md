@@ -350,3 +350,10 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   `BT_HCI_TRANSPORT=H4BC:POSIX:com.apple.uart.bluetooth,3000000` (tools-claude/bt-launchd.py --transport). Userland:
   phone/bt/bluetool.c (BlueTool stand-in: every request result 0 after btd is up; `--bluetool`), btd bridge HCI compat
   (vendor answers carry the sub-opcode, Unknown Command / LE Command Disallowed -> success; `--bridge-raw` off).
+
+SweetMetal2 bridge patches (phone/metal2/bridge/patches, applied in name order onto metal2vulkan 720ef1ce):
+- 0120 (was ws-y-rotfb4's bridge 0103) rotated-copy-skip-and-tiles: a rotated (landscape framebuffer) texture's copy in is skipped
+  while nothing but its own copy back wrote the plane (`SWEET_M2V_ROT_SKIP=0` off), rotation kernel in 8x8 tiles, one-region copy
+  back (`SWEET_M2V_ROT_ROWS=1` per row), `native-metal: rotated 5s` stats. Renumbered in ws-z-merge (ws-u-combo's 0103-0111 keep
+  their numbers) and regenerated on top of them: encoder.rs records call 0107's sweet_seed::written and rotated::note_writes; the
+  one-region copy back and the stats apply to turned frames only (0104's rotation-0 repack copies back per row, as on ws-u-combo).
