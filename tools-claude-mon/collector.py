@@ -618,6 +618,7 @@ class Collector:
                     f.set_result({'ok': False, 'msg': 'link lost'})
             if self.link_msg == 'ok':
                 self.link_msg = 'link lost'
+            self.write_now_link()
             self.klog_flush_partial()
             self.save_state()
             tr = self.trace
@@ -693,12 +694,14 @@ class Collector:
         if self.cfg.get('klog_off'):
             return
         self.klog_ok = None
+        refused = []
         for pa, src in self.pa_candidates():
             rep = await self.cmd('klog %s' % pa, timeout=15)
             if rep.get('ok'):
                 self.klog_pa = pa
-                self.klog_ok = 'ok (%s from %s)' % (pa, src)
+                self.klog_ok = 'ok (%s from %s)' % (pa, src) + ('; refused: ' + '; '.join(refused) if refused else '')
                 break
+            refused.append('%s (%s): %s' % (pa, src, rep.get('msg')))
             log.warning('klog %s (%s) refused: %s', pa, src, rep.get('msg'))
             self.klog_ok = 'klog %s (%s) refused: %s' % (pa, src, rep.get('msg'))
         else:
@@ -1038,6 +1041,24 @@ class Collector:
         except OSError as e:
             log.warning('writing now.json/metrics: %s', e)
         self.emit('sample', {'snap': snap, 'h': h})
+
+    def now_view(self):
+        if not self.snap:
+            return {'link': self.link_info(), 'msg': 'no sample yet'}
+        v = dict(self.snap)
+        v['link'] = self.link_info()
+        v['age_s'] = round(now_s() - self.snap['t'], 1)
+        v['stale'] = not self.authed
+        if self.trace:
+            v['trace'] = self.trace.info()
+        return v
+
+    def write_now_link(self):
+        """link changes between samples (phone gone): now.json shows it, with the last sample marked stale"""
+        try:
+            atomic_json(os.path.join(self.mon, 'now.json'), self.now_view())
+        except OSError:
+            pass
 
     def write_metrics(self, h, snap):
         day = time.strftime('%Y%m%d')
@@ -1495,7 +1516,7 @@ class Collector:
             await self.sse_client(w)
             return
         if path == '/api/now':
-            return self.respond(w, 200, self.snap or {'link': self.link_info(), 'msg': 'no sample yet'})
+            return self.respond(w, 200, self.now_view())
         if path == '/api/status':
             return self.respond(w, 200, self.status())
         if path == '/api/history':
@@ -1555,6 +1576,8 @@ class Collector:
             self.save_cfg()
             rep = await self.cmd('frames %s' % ('on' if on else 'off')) if self.authed else {'ok': True, 'msg':
                                                                                              'saved; sent on connect'}
+            if not on:
+                self.frames_last = None
             return self.respond(w, 200, rep)
         if path == '/api/klog-pa':
             pa = str(J.get('pa') or J.get('value') or '')

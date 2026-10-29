@@ -12,7 +12,7 @@ CTL=15199
 FAIL=0
 ok() { echo "PASS $*"; }
 bad() { echo "FAIL $*"; FAIL=$((FAIL + 1)); }
-ctl() { python3 -c 'import socket,sys; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(3); s.sendto(sys.argv[1].encode(),("127.0.0.1",int(sys.argv[2]))); print(s.recv(65536).decode())' "$1" $CTL; }
+ctl() { python3 -c 'import socket,sys; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(3); s.sendto(sys.argv[1].encode(),("127.0.0.1",int(sys.argv[2]))); print(s.recv(65536).decode())' "$*" $CTL; }
 j() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {"d": d}))' "$1"; }
 post() { curl -s -m ${3:-30} -X POST -H 'Content-Type: application/json' -d "$2" "$API$1"; }
 waitfor() {	# SECS PYEXPR-on-/api/now
