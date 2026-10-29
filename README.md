@@ -1,4 +1,4 @@
-# ios-flame-redfin
+# ios-redfin
 
 **Apple's iOS 16 running on a Google Pixel 5.**
 
@@ -59,19 +59,19 @@ ABL (Google's bootloader, unlocked)
 
 `main` still carries the inherited base. **The redfin work lives on branches:**
 
-- [`known-good-r57a-kernel`](https://github.com/DenialOfGravity/ios-flame-redfin/tree/known-good-r57a-kernel): the
+- [`known-good-r57a-kernel`](https://github.com/DenialOfGravity/ios-redfin/tree/known-good-r57a-kernel): the
   kernel the current known-good image runs (258 patches), with the redfin docs and tools.
 - `ws-*` branches: workstreams (GPU, display pacing, Wi-Fi/Bluetooth, storage, ...), merged into integration
   branches once tested on the phone. `builds-*` branches hold CI build outputs.
 
 | Path | What |
 | --- | --- |
-| `xnu/patches/` | 0001-0081 from ios-sweet, 0082-0124 from ios-flame, 0125-0160 from the sunfish series, **0900-1030 for redfin** ([one line per patch](https://github.com/DenialOfGravity/ios-flame-redfin/blob/known-good-r57a-kernel/NOTES.md#redfin-patches)) |
+| `xnu/patches/` | 0001-0081 from ios-sweet, 0082-0124 from ios-flame, 0125-0160 from the sunfish series, **0900-1030 for redfin** ([one line per patch](https://github.com/DenialOfGravity/ios-redfin/blob/known-good-r57a-kernel/NOTES.md#redfin-patches)) |
 | `shim/` | The bare-metal shim ABL boots (`shim/build.sh`) |
 | `tools/` | Host tools: ADT and payload, `redfin-boot.sh` (build and boot an image), root image and install scripts for WSL, log pulls, camera tables, GPU and Metal debugging |
 | `phone/` | Code that runs in iOS: `metal2/` + `turnip/` (Metal on Turnip), `audio/` (RedwoodAudio.driver), `wifi/` (wland), `bt/` (btd, bluetool), `fastrpc/` (fastrpcd), `sensors/`, `tools/` (psx, pstack, lsreg, oslog, ...) |
 | `.github/workflows/` | CI builds of the kernel, shim, userland and Metal bundle |
-| [`docs/redfin/`](https://github.com/DenialOfGravity/ios-flame-redfin/tree/known-good-r57a-kernel/docs/redfin) | Port plan and hardware map, quality-of-life plan (power, audio, sensors, Bluetooth), direct-scanout plan |
+| [`docs/redfin/`](https://github.com/DenialOfGravity/ios-redfin/tree/known-good-r57a-kernel/docs/redfin) | Port plan and hardware map, quality-of-life plan (power, audio, sensors, Bluetooth), direct-scanout plan |
 | [NOTES.md](NOTES.md), [HANDOFF.md](HANDOFF.md) | Hardware facts, Google ABL boot image rules, patch notes; the engineering log |
 | [RECOVERY.md](RECOVERY.md), [DEVICE.md](DEVICE.md) | Back to stock Android; the test phone and host setup |
 | `docs/ios-sweet/` | ios-sweet's README and notes (the history of patches 0001-0081) |
