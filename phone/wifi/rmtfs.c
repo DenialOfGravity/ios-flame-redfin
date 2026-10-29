@@ -53,15 +53,22 @@ int rmtfs_init(void)
 	struct timeval bt;
 	size_t btl = sizeof(bt);
 	sysctlbyname("kern.boottime", &bt, &btl, NULL, 0);
+	/* kern.boottime comes from the RTC (1970 here) and could repeat across reboots: kern.bootsessionuuid decides
+	   when both this boot and the file have one */
+	char uuid[40] = "-", fuuid[40] = "-";
+	btl = sizeof(uuid) - 1;
+	if (sysctlbyname("kern.bootsessionuuid", uuid, &btl, NULL, 0) || !uuid[0] || strchr(uuid, ' '))
+		snprintf(uuid, sizeof(uuid), "-");
 	FILE *f = fopen(RMTFS_DIR "/.buffer", "r");
 	long long fb = 0;
 	unsigned long long fpa = 0;
 	if (f) {
-		if (fscanf(f, "%lld %llx", &fb, &fpa) != 2)
+		if (fscanf(f, "%lld %llx %39s", &fb, &fpa, fuuid) < 2)
 			fpa = 0;
 		fclose(f);
 	}
-	if (fpa && fb == (long long)bt.tv_sec) {
+	int same = strcmp(uuid, "-") && strcmp(fuuid, "-") ? !strcmp(uuid, fuuid) : fb == (long long)bt.tv_sec;
+	if (fpa && same) {
 		buf_pa = fpa;
 		printf("rmtfs: buffer %llx from this boot's first run\n", (unsigned long long)buf_pa);
 	} else {
@@ -77,7 +84,7 @@ int rmtfs_init(void)
 		if (hyp_assign(buf_pa, BUF_SIZE, src, 1, dst, 2))
 			return -1;
 		if ((f = fopen(RMTFS_DIR "/.buffer", "w"))) {
-			fprintf(f, "%lld %llx\n", (long long)bt.tv_sec, (unsigned long long)buf_pa);
+			fprintf(f, "%lld %llx %s\n", (long long)bt.tv_sec, (unsigned long long)buf_pa, uuid);
 			fclose(f);
 		}
 	}

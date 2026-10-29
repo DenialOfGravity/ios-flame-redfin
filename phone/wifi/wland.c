@@ -15,8 +15,10 @@
  *   wland boot              power votes + PAS boot of the modem + wait for ready
  *   wland smmu              the WLAN DMA stream through a translation-off SMMU bank (radio.c)
  *   wland up [SECS]         all of it from a fresh boot, then the radio: copy engines, WMI, passive scans
- *   wland auto              the boot job (launchd org.iosonpixel.wland): `up 0` once per phone boot, log in
- *                           /var/local/wland.log (last boot's: .prev); off with /var/local/wland.off or sweetwifi=0
+ *   wland auto              the boot job (launchd org.iosonpixel.wland): `up 0` once per phone boot in a child that
+ *                           is started again (5 tries, back-off) if it ends before the modem boot; log in
+ *                           /var/local/wland.log (last boot's: .prev), progress in /var/local/wland.boot;
+ *                           off with /var/local/wland.off or sweetwifi=0
  * While joined, SIGUSR1 drops the link (tests the rejoin).
  */
 #include <stdio.h>
@@ -26,6 +28,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/sysctl.h>
+#include <sys/wait.h>
 #include <sys/time.h>
 #include "pmem.h"
 #include "ipcc.h"
@@ -38,6 +41,8 @@
 #include "radio.h"
 #include "ipnet.h"
 #include "bridge.h"
+
+static void set_stage(const char *stage);	/* wland auto: progress in /var/local/wland.boot (no-op otherwise) */
 
 /* cmd-db aux levels (as in the GPU's arc votes) */
 /* Every cmd-db entry: name, RPMh slave (3 ARC, 4 VRM, 5 BCM), address. */
@@ -506,6 +511,7 @@ static int boot_modem(void)
 		return -1;
 	pm_wr(meta_pa, meta, meta_len);
 	uint64_t r1 = 0;
+	set_stage("modem");	/* from here on TrustZone holds modem state: a second try in this boot is untested */
 	int64_t rc = scm(1, 2 | (2u << 6), PAS_MODEM, meta_pa, 0, &r1);
 	printf("boot: init image (%zu bytes metadata at %llx) -> %lld/%llx\n", meta_len, (unsigned long long)meta_pa,
 	       (long long)rc, (unsigned long long)r1);
@@ -731,10 +737,13 @@ static int net(unsigned secs)
 			printf("net: WLFW bring-up failed\n");
 		} else if (!getenv("WLAND_NO_RADIO")) {
 			delay_ms(100);	/* topaz: only after mission mode; before it a CE access hangs the bus */
-			if (radio_start())
+			if (radio_start()) {
 				printf("net: radio start failed\n");
-			else if (bridge_open() != 0 && conf_ssid[0] && ipnet_init())
-				printf("net: no utun: joining without IP\n");
+			} else {
+				set_stage("radio");
+				if (bridge_open() != 0 && conf_ssid[0] && ipnet_init())
+					printf("net: no utun: joining without IP\n");
+			}
 		}
 	}
 	radio_summary();
@@ -753,8 +762,8 @@ static int up(unsigned secs)
 }
 
 /*
- * The boot job: `up 0` at most once per phone boot (a second modem boot in the same phone boot is untested and
- * MSA/rmtfs hangs wedge a CPU), unless switched off. stdout/stderr go to /var/local/wland.log.
+ * The boot job: `up 0` once per phone boot, supervised (auto_up below), unless switched off. stdout/stderr go to
+ * /var/local/wland.log.
  */
 #define WLAND_LOG	"/var/local/wland.log"
 #define WLAND_STAMP	"/var/local/wland.boot"
@@ -777,6 +786,8 @@ struct memlimit_properties { int32_t active; uint32_t active_attr; int32_t inact
 #endif
 
 static int stamp_out = -1;
+static volatile int stamp_done = 1;
+static pthread_t stamp_tid;
 
 static void *stamp_thread(void *arg)
 {
@@ -799,6 +810,7 @@ static void *stamp_thread(void *arg)
 		if (write(stamp_out, out, (size_t)n + l) < 0)
 			break;
 	}
+	stamp_done = 1;
 	return NULL;
 }
 
@@ -806,27 +818,152 @@ static void stamp_log(void)
 {
 	int fds[2];
 	pthread_t t;
+	(void)stamp_tid;
 	if (getenv("WLAND_NOSTAMP") || !access("/var/local/wland.nostamp", F_OK))
 		return;
 	if ((stamp_out = dup(1)) < 0 || pipe(fds))
 		return;
 	fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL) | O_NONBLOCK);
+	stamp_done = 0;
 	if (pthread_create(&t, NULL, stamp_thread, (void *)(intptr_t)fds[0])) {
+		stamp_done = 1;
 		close(fds[0]);
 		close(fds[1]);
 		return;
 	}
-	pthread_detach(t);
+	stamp_tid = t;
 	dup2(fds[1], 1);
 	dup2(fds[1], 2);
 	close(fds[1]);
 }
 
-static int auto_up(void)
+/*
+ * Before exit: give the stamping thread the lines still in the pipe. exit() ends every thread at once, so whatever a
+ * dying wland wrote last was lost: r59a's boot run left a 0-byte wland.log, r60a's ended at the SMMU line, r56c's at
+ * "wland auto: boot" (each one had died at the ldoa1 vote, see pmem.c pm_rpmh). Closing our write ends gives the
+ * thread EOF unless a netsvc child still holds one, hence the bound.
+ */
+static void stamp_flush(void)
+{
+	if (stamp_out < 0 || stamp_done)
+		return;
+	fflush(stdout);
+	fflush(stderr);
+	int nul = open("/dev/null", O_WRONLY);
+	if (nul >= 0) {
+		dup2(nul, 1);
+		dup2(nul, 2);
+		close(nul);
+	}
+	for (int i = 0; i < 200 && !stamp_done; i++)
+		usleep(10000);
+}
+
+/*
+ * /var/local/wland.boot: "BOOTTIME STAGE PID TRY" (an older wland wrote only "BOOTTIME"). STAGE, written as the run
+ * gets there:
+ *   start  power votes, SMMU, SMP2P item: all of it can be done again (votes are absolute, the SMMU step and the
+ *          SMP2P item see they are done; nothing has been hyp_assign'd or handed to TrustZone yet)
+ *   modem  the PAS init SMC for the modem has been made (wland.c boot_modem): a second modem boot in this phone boot
+ *          is untested and MSA/rmtfs assigns that hang in TrustZone wedge a CPU: never retried automatically
+ *   radio  the radio is up
+ *   gaveup every try ended before "modem"
+ */
+static long auto_boot = -1;	/* kern.boottime of this boot once `wland auto` runs; -1 = not the boot job */
+static int auto_boot_us;	/* its microseconds: the RTC-based seconds can repeat across RAM reboots */
+static char auto_uuid[40] = "-";	/* kern.bootsessionuuid: new every boot, unaffected by the clock being set */
+
+static void boot_id(struct timeval *bt)
+{
+	size_t n = sizeof(*bt);
+	memset(bt, 0, sizeof(*bt));
+	sysctlbyname("kern.boottime", bt, &n, NULL, 0);
+	char u[40] = "";
+	n = sizeof(u) - 1;
+	if (!sysctlbyname("kern.bootsessionuuid", u, &n, NULL, 0) && u[0] && !strchr(u, ' '))
+		snprintf(auto_uuid, sizeof(auto_uuid), "%s", u);
+}
+static int auto_try;
+
+/* the stamp is from this boot: by bootsessionuuid when both have one, else by kern.boottime */
+static int stamp_this_boot(long b, int us, const char *uuid)
+{
+	if (strcmp(uuid, "-") && strcmp(auto_uuid, "-"))
+		return !strcmp(uuid, auto_uuid);
+	return b == auto_boot && (us < 0 || us == auto_boot_us);
+}
+
+static void stamp_write(long boot, const char *stage, int pid, int try)
+{
+	FILE *f = fopen(WLAND_STAMP ".new", "w");
+	if (!f)
+		return;
+	fprintf(f, "%ld.%06d %s %d %d %s\n", boot, auto_boot_us, stage, pid, try, auto_uuid);
+	fclose(f);
+	rename(WLAND_STAMP ".new", WLAND_STAMP);
+}
+
+/* 0 = no stamp; 1 = stamp read (stage "" and *us -1 for the old one-field format) */
+static int stamp_read(long *boot, int *us, char *stage, size_t ssz, int *pid, int *try, char *uuid, size_t usz)
+{
+	char line[160] = "", st[16] = "", uu[40] = "-";
+	*us = -1;
+	FILE *f = fopen(WLAND_STAMP, "r");
+	if (!f)
+		return 0;
+	if (!fgets(line, sizeof(line), f))
+		line[0] = 0;
+	fclose(f);
+	*pid = 0;
+	*try = 0;
+	char *dot = strchr(line, '.');
+	if (sscanf(line, "%ld", boot) != 1)
+		return 0;
+	if (dot && sscanf(dot + 1, "%d %15s %d %d %39s", us, st, pid, try, uu) < 1)
+		*us = -1;
+	snprintf(stage, ssz, "%s", st);
+	snprintf(uuid, usz, "%s", uu);
+	return 1;
+}
+
+static void set_stage(const char *stage)
+{
+	if (auto_boot < 0)
+		return;
+	stamp_write(auto_boot, stage, getpid(), auto_try);
+	printf("wland: stage %s (%s)\n", stage, WLAND_STAMP);
+}
+
+static void lift_memlimit(int *mrc)
 {
 	/* launchd's per-process limit for a job killed us while the modem firmware loaded (jetsam reason 7) */
 	struct memlimit_properties ml = { 2048, 0, 2048, 0 };
-	int mrc = memorystatus_control(7, getpid(), 0, &ml, sizeof(ml));
+	*mrc = memorystatus_control(7, getpid(), 0, &ml, sizeof(ml));
+}
+
+#define AUTO_TRIES	5
+
+/* `wland up` / `wland boot` by hand record their stages too, so a later `wland auto` in this boot leaves the modem alone */
+static void stage_init(void)
+{
+	struct timeval bt;
+	boot_id(&bt);
+	auto_boot = (long)bt.tv_sec;
+	auto_boot_us = (int)bt.tv_usec;
+}
+
+/* the supervisor passes SIGUSR1 (drop the link, the rejoin test) on to the bring-up child */
+static volatile pid_t auto_child;
+static void forward_usr1(int sig)
+{
+	if (auto_child > 0)
+		kill(auto_child, sig);
+}
+
+static int auto_up(void)
+{
+	int mrc;
+	lift_memlimit(&mrc);
 	char args[1024] = "";
 	size_t n = sizeof(args) - 1;
 	sysctlbyname("kern.bootargs", args, &n, NULL, 0);
@@ -834,32 +971,95 @@ static int auto_up(void)
 		fprintf(stderr, "wland: off (/var/local/wland.off or sweetwifi=0)\n");
 		return 0;
 	}
-	struct timeval bt = { 0 };
-	n = sizeof(bt);
-	sysctlbyname("kern.boottime", &bt, &n, NULL, 0);
-	char stamp[32] = "", now[32];
-	snprintf(now, sizeof(now), "%ld\n", (long)bt.tv_sec);
-	FILE *f = fopen(WLAND_STAMP, "r");
-	if (f) {
-		if (!fgets(stamp, sizeof(stamp), f))
-			stamp[0] = 0;
-		fclose(f);
+	struct timeval bt;
+	boot_id(&bt);
+	auto_boot = (long)bt.tv_sec;
+	auto_boot_us = (int)bt.tv_usec;
+	long sboot = -1;
+	char sstage[16] = "", suuid[40];
+	int sus = -1, spid = 0, stry = 0;
+	if (stamp_read(&sboot, &sus, sstage, sizeof(sstage), &spid, &stry, suuid, sizeof(suuid)) &&
+	    stamp_this_boot(sboot, sus, suuid)) {
+		/* the same boot: only an early stop ("start" with its process gone, or "gaveup") may run again */
+		int alive = spid > 0 && (kill(spid, 0) == 0 || errno == EPERM);
+		if (!((!strcmp(sstage, "start") && !alive) || !strcmp(sstage, "gaveup"))) {
+			fprintf(stderr, "wland: already started in this boot (stage %s, pid %d%s)\n", sstage[0] ? sstage : "?",
+				spid, alive ? ", running" : "");
+			return 1;
+		}
 	}
-	if (!strcmp(stamp, now)) {
-		fprintf(stderr, "wland: already started in this boot\n");
-		return 1;
-	}
-	if ((f = fopen(WLAND_STAMP, "w"))) {
-		fputs(now, f);
-		fclose(f);
-	}
+	signal(SIGPIPE, SIG_IGN);	/* the log pipe's reader is in the supervisor: never let a write kill a bring-up */
+	stamp_write(auto_boot, "start", getpid(), 0);
 	rename(WLAND_LOG, WLAND_LOG ".prev");
 	if (freopen(WLAND_LOG, "a", stdout))
 		dup2(fileno(stdout), 2);
 	setvbuf(stdout, NULL, _IONBF, 0);
+	setvbuf(stderr, NULL, _IONBF, 0);
 	stamp_log();
-	printf("wland auto: boot %ld, memory limit 2048 MB -> %d\n", (long)bt.tv_sec, mrc);
-	return up(0);
+	printf("wland auto: boot %ld, memory limit 2048 MB -> %d%s%s\n", auto_boot, mrc, sstage[0] ? ", last stamp stage " : "",
+	       sstage);
+
+	/*
+	 * Supervisor: the bring-up runs in a child; this process (launchd's job: it must stay, launchd kills the job's
+	 * process group when it exits) waits. A child that ends before the "modem" stage is started again after 3, 6,
+	 * 12, 24 s. One that ends later is not (see above); one stuck in TrustZone is never killed or restarted.
+	 */
+	int rc = 1;
+	for (auto_try = 1; auto_try <= AUTO_TRIES; auto_try++) {
+		pid_t pid = fork();
+		if (pid < 0) {
+			printf("wland auto: try %d: fork: %s; running in this process\n", auto_try, strerror(errno));
+			set_stage("start");
+			rc = up(0);
+			printf("wland auto: up returned %d\n", rc);
+			break;
+		}
+		if (pid == 0) {
+			signal(SIGUSR1, SIG_DFL);	/* net() sets its own handler */
+			lift_memlimit(&mrc);
+			stamp_write(auto_boot, "start", getpid(), auto_try);
+			printf("wland auto: try %d/%d, pid %d, memory limit -> %d\n", auto_try, AUTO_TRIES, getpid(), mrc);
+			int r = up(0);
+			printf("wland auto: try %d: up returned %d\n", auto_try, r);
+			fflush(stdout);
+			_exit(r ? 1 : 0);
+		}
+		auto_child = pid;
+		signal(SIGUSR1, forward_usr1);
+		int status = 0;
+		while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+			;
+		auto_child = 0;
+		long b;
+		char stage[16] = "?";
+		int u, p, t;
+		char uu[40];
+		if (!stamp_read(&b, &u, stage, sizeof(stage), &p, &t, uu, sizeof(uu)) || !stamp_this_boot(b, u, uu))
+			snprintf(stage, sizeof(stage), "?");
+		if (WIFSIGNALED(status))
+			printf("wland auto: try %d (pid %d) killed by signal %d at stage %s\n", auto_try, pid, WTERMSIG(status), stage);
+		else
+			printf("wland auto: try %d (pid %d) exited with status %d at stage %s\n", auto_try, pid,
+			       WIFEXITED(status) ? WEXITSTATUS(status) : -1, stage);
+		rc = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+		if (strcmp(stage, "start")) {
+			printf("wland auto: not retrying: %s\n", !strcmp(stage, "radio") ? "the radio was up (modem already booted)" :
+			       !strcmp(stage, "modem") ? "the modem was already handed to TrustZone in this boot (reboot the phone)" :
+							     "unknown stage");
+			break;
+		}
+		if (auto_try == AUTO_TRIES) {
+			stamp_write(auto_boot, "gaveup", getpid(), auto_try);
+			printf("wland auto: giving up after %d tries (`wland auto` by hand tries again)\n", AUTO_TRIES);
+			break;
+		}
+		stamp_write(auto_boot, "start", getpid(), auto_try);	/* (this process is alive: no second `wland auto`) */
+		unsigned wait = 3u << (auto_try - 1);
+		printf("wland auto: stopped before the modem boot: safe to retry; try %d in %u s\n", auto_try + 1, wait);
+		sleep(wait);
+	}
+	stamp_flush();
+	return rc;
 }
 
 int main(int argc, char **argv)
@@ -938,6 +1138,7 @@ int main(int argc, char **argv)
 		return auto_up();
 	} else if (!strcmp(c, "up")) {
 		/* everything from a fresh phone boot: SMP2P, the modem, GLINK + QRTR; the WLAN SMMU stream first */
+		stage_init();
 		return up(argc > 2 ? (unsigned)atoi(argv[2]) : 20);
 	} else if (!strcmp(c, "smmu")) {
 		return smmu_wlan_identity() ? 1 : 0;
@@ -946,6 +1147,7 @@ int main(int argc, char **argv)
 	} else if (!strcmp(c, "wlan-power")) {
 		return wlan_power() ? 1 : 0;
 	} else if (!strcmp(c, "boot")) {
+		stage_init();
 		return boot_modem() ? 1 : 0;
 	} else if (!strcmp(c, "bcm") && argc > 3) {
 		/* a BCM (bus) vote: x = average, y = peak, in the BCM's own units (0x3fff = its top level); commit + valid */
