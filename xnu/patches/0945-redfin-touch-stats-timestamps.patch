@@ -1,0 +1,535 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Tue, 27 Oct 2026 00:30:00 +0100
+Subject: [PATCH] 0945 redfin: touch statistics; sectouchx (IRQ timestamps, READ_ALL, probe, priority)
+
+Always on, nothing sent changes: sweet_sects.c prints every 5 s while
+touching `SWEET SECTS: 5s: events N (moves M, batched B) rate R/s | dt
+p50/p95/max ms | gaps>20ms G | irq->dispatch p50/p95 us | wake p50/p95 us |
+per drain avg A max B (C us max) | x X` (sample time = the attention
+interrupt), and SweetHID.cpp prints `SWEET HID: real|swipe: moves N dt
+p5/p50/p95/max ms | gaps>20ms G | dispatch avg/max us` from the HID
+timestamps iOS gets (5 s, or at lift after >= 10 moves).
+
+sectouchx= (default 0 = as before):
+ 0x1 HID timestamp = the attention interrupt (sec_ts_isr), a finger's
+     moves in one drain sent once at the newest position
+ 0x2 READ_ALL_EVENT for >= 3 queued events (left_event), 500 us wait
+ 0x4 read-only probe of SET_TOUCHFUNCTION (0x30) and SET_REPORT_RATE (0x34)
+ 0x8 touch thread at priority 92 (kernel default 81)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012QkUEmU1e5mpqdW3Jfop6S
+---
+  bsd/dev/sweet_sects.c             | 243 +++++++++++++++++++++++++++++++++++++-
+  iokit/Kernel/arm/hid/SweetHID.cpp | 119 ++++++++++++++++++-
+  2 files changed, 355 insertions(+), 7 deletions(-)
+
+diff --git a/bsd/dev/sweet_sects.c b/bsd/dev/sweet_sects.c
+index 4ccb205..c0fcacd 100644
+--- a/bsd/dev/sweet_sects.c
++++ b/bsd/dev/sweet_sects.c
+@@ -22,6 +22,17 @@
+  * Boot-args: sectouch=1 on (default off until it has run on a phone),
+  * sectouchdelay=N start after N s, sectouchlog=1 log every event,
+  * sectouchirq=0 poll instead of taking the attention interrupt.
++ *
++ * 0945: one statistics line every 5 s while touching (always on, no change
++ * to what is sent), and sectouchx=BITS (default 0 = the path as before):
++ *   0x1 HID timestamp = the attention interrupt's time (Linux: sec_ts_isr
++ *       ktime_get, one input frame per IRQ), not the time of dispatch; a
++ *       finger's moves read in one drain go out once, at the newest position
++ *   0x2 queued events in one READ_ALL_EVENT (0x61) transfer when the first
++ *       event says >= 3 more wait (left_event, as sec_ts_read_event)
++ *   0x4 read-only probe at start: log SET_TOUCHFUNCTION (0x30) and
++ *       SET_REPORT_RATE (0x34) as the IC returns them
++ *   0x8 touch thread at priority 92 instead of the kernel default 81
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -37,6 +48,9 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_hid_touch_at(int finger, int down, int x, int y, uint64_t stamp);
++extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter,
++    integer_t priority, thread_t *new_thread);
+ void sweet_sects_init(void);
+ 
+ #define ST_SE_PA        0x00880000u     /* spi@880000, QUPv3 wrap0 SE0 */
+@@ -106,6 +120,8 @@ void sweet_sects_init(void);
+ #define SEC_READ_ID             0x52u
+ #define SEC_READ_BOOT_STATUS    0x55u
+ #define SEC_READ_ONE_EVENT      0x60u
++#define SEC_READ_ALL_EVENT      0x61u
++#define SEC_CMD_SET_REPORT_RATE 0x34u
+ #define SEC_CMD_CLEAR_EVENTS    0x62u
+ #define SEC_READ_TS_STATUS      0xafu
+ #define SEC_STATUS_APP_MODE     0x20u
+@@ -210,6 +226,7 @@ extern bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), v
+ extern void sweet_spi_mask(uint32_t intid, bool masked);
+ static volatile bool st_irq_on;
+ static volatile uint32_t st_irqs, st_irq_others;
++static volatile uint64_t st_irq_t;      /* 0945: mach time of the last attention interrupt */
+ 
+ static void
+ st_irq(__unused void *arg)
+@@ -217,6 +234,7 @@ st_irq(__unused void *arg)
+ 	if (st_rd(st.west, ST_INTR_STATUS(ST_PIN_IRQ)) & 1u) {
+ 		st_wr(st.west, ST_INTR_CFG(ST_PIN_IRQ), ST_INTR_CFG_ON); /* masked until the thread has read */
+ 		st_wr(st.west, ST_INTR_STATUS(ST_PIN_IRQ), 0);
++		st_irq_t = mach_absolute_time();
+ 		st_irqs++;
+ 		thread_wakeup(&st_sleep_chan);
+ 	} else if (++st_irq_others > 1000) {
+@@ -479,7 +497,7 @@ st_read(uint8_t reg, uint8_t *out, unsigned n)
+ 		if (err) {
+ 			return err;
+ 		}
+-		delay(100);     /* sec_ts_spi_delay default */
++		delay(reg == SEC_READ_ALL_EVENT ? 500 : 100);     /* sec_ts_spi_delay */
+ 		memset(rx, 0, sizeof(rx));
+ 		err = st_xfer(SPI_RX_ONLY, rx, rlen);
+ 		if (err) {
+@@ -524,6 +542,160 @@ st_wait_ready(uint8_t ack, unsigned tries)
+ 	return ETIMEDOUT;
+ }
+ 
++/*
++ * 0945 part A: measurement (always on). Sample time = the attention
++ * interrupt that started the drain (the drain start when polled). Per 5 s
++ * window: events read, coordinate moves, moves of a finger beyond its first
++ * in one drain (batched), dt between a finger's samples in consecutive
++ * drains, dt > 20 ms where the finger moved >= 8 px (stalls), interrupt ->
++ * sweet_hid_touch latency, interrupt -> thread running (wake), events and
++ * time per drain.
++ */
++#define STX_IRQ_STAMP   0x1u
++#define STX_READ_ALL    0x2u
++#define STX_PROBE       0x4u
++#define STX_PRIO        0x8u
++#define ST_STAT_N       1024u
++#define ST_GAP_US       20000u
++#define ST_GAP_PX       8
++static uint32_t st_x;
++static struct {
++	uint64_t t;             /* this drain's sample time */
++	bool irq;               /* started by an interrupt */
++	uint32_t seen;          /* fingers with a sample in this drain */
++	uint32_t pend;          /* sectouchx & 1: moves held to the end of the drain */
++	int px[ST_MAX], py[ST_MAX];
++} std_;
++static struct {
++	uint64_t start;
++	uint32_t events, moves, batched, gaps, drains, drain_ev_max, drain_us_max;
++	uint64_t drain_ev_sum, dt_sum;
++	uint32_t n_dt, n_lat, n_wake, n_rate;
++	uint32_t dt[ST_STAT_N], lat[ST_STAT_N], wake[ST_STAT_N];
++	uint64_t last_t[ST_MAX];
++	int last_x[ST_MAX], last_y[ST_MAX];
++} sts;
++
++static uint32_t
++st_us(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000u > 0xffffffffull ? 0xffffffffu : (uint32_t)(ns / 1000u);
++}
++
++static void
++st_put(uint32_t *a, uint32_t *n, uint32_t v)
++{
++	if (*n < ST_STAT_N) {
++		a[(*n)++] = v;
++	}
++}
++
++static uint32_t
++st_pct(uint32_t *a, uint32_t n, unsigned pct)
++{
++	if (n == 0) {
++		return 0;
++	}
++	for (uint32_t i = 1; i < n; ++i) {      /* insertion sort, n <= 1024, once per 5 s */
++		uint32_t v = a[i], j = i;
++		while (j > 0 && a[j - 1] > v) {
++			a[j] = a[j - 1];
++			--j;
++		}
++		a[j] = v;
++	}
++	return a[(n - 1u) * pct / 100u];
++}
++
++#define ST_MS(v) (v) / 1000u, ((v) % 1000u) / 100u
++
++static void
++st_stat_report(uint64_t now)
++{
++	uint64_t win;
++	if (!sts.start) {
++		return;
++	}
++	nanoseconds_to_absolutetime(5ull * NSEC_PER_SEC, &win);
++	if (now - sts.start < win) {
++		return;
++	}
++	uint32_t d50 = st_pct(sts.dt, sts.n_dt, 50), d95 = st_pct(sts.dt, sts.n_dt, 95);
++	uint32_t dmax = sts.n_dt ? sts.dt[sts.n_dt - 1] : 0;
++	uint32_t l50 = st_pct(sts.lat, sts.n_lat, 50), l95 = st_pct(sts.lat, sts.n_lat, 95);
++	uint32_t w50 = st_pct(sts.wake, sts.n_wake, 50), w95 = st_pct(sts.wake, sts.n_wake, 95);
++	uint32_t rate = sts.dt_sum ? (uint32_t)((uint64_t)sts.n_rate * 1000000u / sts.dt_sum) : 0;
++	uint32_t avg10 = sts.drains ? (uint32_t)(sts.drain_ev_sum * 10u / sts.drains) : 0;
++	printf("SWEET SECTS: 5s: events %u (moves %u, batched %u) rate %u/s | dt p50/p95/max %u.%u/%u.%u/%u.%u ms"
++	    " | gaps>20ms %u | irq->dispatch p50/p95 %u/%u us | wake p50/p95 %u/%u us"
++	    " | per drain avg %u.%u max %u (%u us max) | x %#x\n",
++	    sts.events, sts.moves, sts.batched, rate, ST_MS(d50), ST_MS(d95), ST_MS(dmax),
++	    sts.gaps, l50, l95, w50, w95, avg10 / 10u, avg10 % 10u, sts.drain_ev_max,
++	    sts.drain_us_max, st_x);
++	sts.start = 0;
++	sts.events = sts.moves = sts.batched = sts.gaps = sts.drains = 0;
++	sts.drain_ev_max = sts.drain_us_max = 0;
++	sts.drain_ev_sum = sts.dt_sum = 0;
++	sts.n_dt = sts.n_lat = sts.n_wake = sts.n_rate = 0;
++}
++
++/* A coordinate sample of finger id (press or move) at panel x, y. */
++static void
++st_stat_move(unsigned id, int x, int y, bool press)
++{
++	uint32_t bit = 1u << id;
++	sts.moves++;
++	if (std_.seen & bit) {
++		sts.batched++;          /* more than one sample of this finger in one drain */
++	} else {
++		std_.seen |= bit;
++		if (!press && sts.last_t[id]) {
++			uint32_t dt = st_us(std_.t - sts.last_t[id]);
++			int d = (x > sts.last_x[id] ? x - sts.last_x[id] : sts.last_x[id] - x) +
++			    (y > sts.last_y[id] ? y - sts.last_y[id] : sts.last_y[id] - y);
++			st_put(sts.dt, &sts.n_dt, dt);
++			if (dt < 100000u) {
++				sts.dt_sum += dt;
++				sts.n_rate++;
++			}
++			if (dt > ST_GAP_US && d >= ST_GAP_PX) {
++				sts.gaps++;
++			}
++		}
++		sts.last_t[id] = std_.t;
++	}
++	sts.last_x[id] = x;
++	sts.last_y[id] = y;
++}
++
++/* To SweetHID; sectouchx & 1 stamps it with the sample (interrupt) time. */
++static void
++st_emit(unsigned id, int down, int x, int y)
++{
++	if (down && std_.irq) {
++		st_put(sts.lat, &sts.n_lat, st_us(mach_absolute_time() - std_.t));
++	}
++	if (st_x & STX_IRQ_STAMP) {
++		sweet_hid_touch_at((int)id, down, x, y, std_.t);
++	} else {
++		sweet_hid_touch((int)id, down, x, y);
++	}
++}
++
++/* sectouchx & 1: the held moves, one per finger, at the end of a drain. */
++static void
++st_flush(void)
++{
++	for (unsigned id = 0; std_.pend && id < ST_MAX; ++id) {
++		if (std_.pend & (1u << id)) {
++			std_.pend &= ~(1u << id);
++			st_emit(id, 1, std_.px[id], std_.py[id]);
++		}
++	}
++}
++
+ static void
+ st_handle(const uint8_t ev[8])
+ {
+@@ -551,21 +723,35 @@ st_handle(const uint8_t ev[8])
+ 	y = st.max_y > 0 ? y * ST_PANEL_H / (st.max_y + 1) : y;
+ 	bool palm = ttype == SEC_TTYPE_PALM || ttype == SEC_TTYPE_GRIP;
+ 	if ((action == SEC_ACT_PRESS || action == SEC_ACT_MOVE) && !palm) {
++		bool press = !(st.active & (1u << id));
+ 		st.active |= 1u << id;
+ 		st.x[id] = x;
+ 		st.y[id] = y;
+-		sweet_hid_touch((int)id, 1, x, y);
++		st_stat_move(id, x, y, press);
++		if ((st_x & STX_IRQ_STAMP) && !press) {
++			std_.pend |= 1u << id;  /* newest position wins; sent at the end of the drain */
++			std_.px[id] = x;
++			std_.py[id] = y;
++		} else {
++			st_emit(id, 1, x, y);
++		}
+ 	} else if (action == SEC_ACT_RELEASE || palm) {
+ 		if (st.active & (1u << id)) {
+ 			st.active &= ~(1u << id);
+-			sweet_hid_touch((int)id, 0, st.x[id], st.y[id]);
++			if (std_.pend & (1u << id)) {
++				std_.pend &= ~(1u << id);
++				st_emit(id, 1, std_.px[id], std_.py[id]);
++			}
++			st_emit(id, 0, st.x[id], st.y[id]);
+ 		}
++		sts.last_t[id] = 0;
+ 	}
+ }
+ 
+ static void
+ st_release_all(void)
+ {
++	st_flush();
+ 	for (unsigned id = 0; id < ST_MAX; ++id) {
+ 		if (st.active & (1u << id)) {
+ 			sweet_hid_touch((int)id, 0, st.x[id], st.y[id]);
+@@ -655,6 +841,17 @@ st_thread(void *arg, wait_result_t result)
+ 		printf("SWEET SECTS: sense on err=%d\n", err);
+ 		goto out;
+ 	}
++	if (st_x & STX_PROBE) {
++		uint8_t fn[2] = {0}, rr[1] = {0};
++		int e1 = st_read(SEC_CMD_SET_TOUCHFUNC, fn, sizeof(fn));
++		int e2 = st_read(SEC_CMD_SET_REPORT_RATE, rr, sizeof(rr));
++		printf("SWEET SECTS: probe touchfunction err=%d %02x %02x report-rate err=%d %02x\n",
++		    e1, fn[0], fn[1], e2, rr[0]);
++	}
++	unsigned all_max = (st.fifo_words * 4u - SEC_RD_HDR - 1u) / 8u;
++	if (all_max > 7u) {
++		all_max = 7u;           /* st_read's 64-byte frame */
++	}
+ 	int irq = 1;
+ 	(void)PE_parse_boot_argn("sectouchirq", &irq, sizeof(irq));
+ 	if (irq) {
+@@ -670,6 +867,11 @@ st_thread(void *arg, wait_result_t result)
+ 		/* The IRQ line (level low) says events are queued; when polling also
+ 		 * read every ~100 ms in case the line does not work as assumed. */
+ 		bool poll = st_irq_on || (++ticks % 12u) == 0;
++		uint64_t t0 = mach_absolute_time(), irq_t = st_irq_t;
++		std_.irq = st_irq_on && st_irqs != seen && irq_t && irq_t <= t0;
++		std_.t = std_.irq ? irq_t : t0;
++		std_.seen = 0;
++		unsigned drained = 0;
+ 		for (unsigned n = 0; n < 32 && (poll || st_irq_asserted()) && !st.dead; ++n) {
+ 			poll = false;
+ 			if (st_read(SEC_READ_ONE_EVENT, ev, sizeof(ev))) {
+@@ -684,8 +886,37 @@ st_thread(void *arg, wait_result_t result)
+ 			if (events++ < 32 && !st.log) {
+ 				st_log_event("first", ev);
+ 			}
++			if (!sts.start) {
++				sts.start = t0;
++			}
++			if (drained++ == 0 && std_.irq) {
++				st_put(sts.wake, &sts.n_wake, st_us(t0 - irq_t));
++			}
++			sts.events++;
+ 			st_handle(ev);
++			/* sectouchx & 2: the rest of the queue in one transfer (sec_ts_read_event). */
++			unsigned left = ev[7] & 0x3fu;
++			if ((st_x & STX_READ_ALL) && left >= 3u && all_max >= 3u) {
++				uint8_t all[7 * 8];
++				unsigned k = left < all_max ? left : all_max;
++				if (st_read(SEC_READ_ALL_EVENT, all, k * 8u) == 0) {
++					for (unsigned i = 0; i < k && all[i * 8u]; ++i) {
++						sts.events++;
++						drained++;
++						st_handle(&all[i * 8u]);
++					}
++				}
++			}
++		}
++		st_flush();
++		if (drained) {
++			uint32_t us = st_us(mach_absolute_time() - t0);
++			sts.drains++;
++			sts.drain_ev_sum += drained;
++			sts.drain_ev_max = drained > sts.drain_ev_max ? drained : sts.drain_ev_max;
++			sts.drain_us_max = us > sts.drain_us_max ? us : sts.drain_us_max;
+ 		}
++		st_stat_report(mach_absolute_time());
+ 		if (!st_irq_on) {
+ 			if (irq && st_irq_others > 1000 && st_irq_others < 2000) {
+ 				st_irq_others = 2000;
+@@ -728,11 +959,15 @@ sweet_sects_init(void)
+ 	st.started = true;
+ 	(void)PE_parse_boot_argn("sectouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sectouchlog", &st.log, sizeof(st.log));
++	(void)PE_parse_boot_argn("sectouchx", &st_x, sizeof(st_x));
+ 	if (!enabled) {
+ 		printf("SWEET SECTS: disabled (sectouch=1 enables the redfin sec_ts driver)\n");
+ 		return;
+ 	}
+-	kern_return_t kr = kernel_thread_start(st_thread, NULL, &thread);
++	printf("SWEET SECTS: sectouchx %#x\n", st_x);
++	kern_return_t kr = (st_x & STX_PRIO) ?
++	    kernel_thread_start_priority(st_thread, NULL, 92, &thread) :
++	    kernel_thread_start(st_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 6d98131..f635a6b 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -366,7 +366,7 @@ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+-	void touch(int finger, bool down, int x, int y);
++	void touch(int finger, bool down, int x, int y, uint64_t stamp = 0);
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Digitizer; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Dig_TouchScreen; }
+@@ -460,10 +460,111 @@ SweetHIDTouch::start(IOService *provider)
+ 	return true;
+ }
+ 
++/*
++ * 0945: what iOS sees, per source: real fingers, and finger 9 (tap / swipe
++ * from the command channel). Intervals between the HID timestamps of one
++ * contact's consecutive moves, stalls (> 20 ms while moving >= 8 px), and the
++ * time dispatchEvent takes. One line every 5 s, or when the source lifts its
++ * last finger after >= 10 moves (one scroll or one swipe).
++ */
++extern "C" void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
++extern "C" void nanoseconds_to_absolutetime(uint64_t nanoseconds, uint64_t *result);
++#define SWEET_TS_N 1024u
++static struct {
++	uint64_t start, disp_sum;
++	uint32_t n, moves, gaps, disp_max, disp_n;
++	uint32_t dt[SWEET_TS_N];
++} gTouchStat[2];
++static uint64_t gTouchLastT[SWEET_TOUCH_FINGERS];
++static int gTouchLastX[SWEET_TOUCH_FINGERS], gTouchLastY[SWEET_TOUCH_FINGERS];
++
++static uint32_t
++sweetTouchUs(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000u > 0xffffffffull ? 0xffffffffu : (uint32_t)(ns / 1000u);
++}
++
++static void
++sweetTouchStat(IOLock *lock, const bool *fingersDown, int finger, bool was, bool down, bool moved,
++    uint64_t stamp, int x, int y, uint32_t dispUs)
++{
++	int src = finger == 9 ? 1 : 0;
++	uint32_t v[5] = {0}, n, moves, gaps, dmax, davg;
++	bool report = false;
++	uint64_t now = mach_absolute_time(), win;
++
++	nanoseconds_to_absolutetime(5000000000ull, &win);
++	IOLockLock(lock);
++	auto &st = gTouchStat[src];
++	if (!st.start && down) {
++		st.start = now;
++	}
++	st.disp_sum += dispUs;
++	st.disp_n++;
++	st.disp_max = dispUs > st.disp_max ? dispUs : st.disp_max;
++	if (was && down && moved) {
++		st.moves++;
++		if (gTouchLastT[finger] && stamp >= gTouchLastT[finger]) {
++			uint32_t dt = sweetTouchUs(stamp - gTouchLastT[finger]);
++			int d = (x > gTouchLastX[finger] ? x - gTouchLastX[finger] : gTouchLastX[finger] - x) +
++			    (y > gTouchLastY[finger] ? y - gTouchLastY[finger] : gTouchLastY[finger] - y);
++			if (st.n < SWEET_TS_N) {
++				st.dt[st.n++] = dt;
++			}
++			if (dt > 20000u && d >= 8) {
++				st.gaps++;
++			}
++		}
++	}
++	gTouchLastT[finger] = down ? stamp : 0;
++	gTouchLastX[finger] = x;
++	gTouchLastY[finger] = y;
++	bool lifted = was && !down;
++	for (int i = 0; lifted && i < SWEET_TOUCH_FINGERS; i++) {
++		if (fingersDown[i] && (i == 9) == (src == 1)) {
++			lifted = false;
++		}
++	}
++	if (st.start && (now - st.start >= win || (lifted && st.n >= 10))) {
++		for (uint32_t i = 1; i < st.n; ++i) {   /* insertion sort, n <= 1024 */
++			uint32_t t = st.dt[i], j = i;
++			while (j > 0 && st.dt[j - 1] > t) {
++				st.dt[j] = st.dt[j - 1];
++				--j;
++			}
++			st.dt[j] = t;
++		}
++		if (st.n) {
++			v[0] = st.dt[(st.n - 1) * 5 / 100];
++			v[1] = st.dt[(st.n - 1) * 50 / 100];
++			v[2] = st.dt[(st.n - 1) * 95 / 100];
++			v[3] = st.dt[st.n - 1];
++		}
++		report = true;
++	}
++	n = st.n;
++	moves = st.moves;
++	gaps = st.gaps;
++	dmax = st.disp_max;
++	davg = st.disp_n ? (uint32_t)(st.disp_sum / st.disp_n) : 0;
++	if (report || (lifted && st.n < 10)) {
++		bzero(&st, sizeof(st));
++	}
++	IOLockUnlock(lock);
++	if (report) {
++		IOLog("SWEET HID: %s: moves %u (dt %u) dt p5/p50/p95/max %u.%u/%u.%u/%u.%u/%u.%u ms"
++		    " | gaps>20ms %u | dispatch avg/max %u/%u us\n", src ? "swipe" : "real", moves, n,
++		    v[0] / 1000, v[0] % 1000 / 100, v[1] / 1000, v[1] % 1000 / 100,
++		    v[2] / 1000, v[2] % 1000 / 100, v[3] / 1000, v[3] % 1000 / 100, gaps, davg, dmax);
++	}
++}
++
+ void
+-SweetHIDTouch::touch(int finger, bool down, int x, int y)
++SweetHIDTouch::touch(int finger, bool down, int x, int y, uint64_t stamp)
+ {
+-	uint64_t now = mach_absolute_time();
++	uint64_t now = stamp ? stamp : mach_absolute_time();
+ 	IOHIDEvent *collection;
+ 	bool any = false;
+ 
+@@ -576,8 +677,11 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		IOLog("SWEET HID: touch %d %s at %d,%d%s\n", finger, down ? "down" : "up", x, y,
+ 		    fEdge[finger] ? " edge" : "");
+ 	}
++	uint64_t t1 = mach_absolute_time();
+ 	dispatchEvent(collection);
++	uint32_t dispUs = sweetTouchUs(mach_absolute_time() - t1);
+ 	collection->release();
++	sweetTouchStat(fLock, fDown, finger, was, down, moved, now, x, y, dispUs);
+ }
+ 
+ /* key: 0 power (side button), 1 volume up, 2 volume down, 3 home */
+@@ -594,6 +698,15 @@ sweet_hid_key(int key, int down)
+ 	}
+ }
+ 
++/* 0945: with the sample's own time (mach absolute) as the HID timestamp. */
++extern "C" void
++sweet_hid_touch_at(int finger, int down, int x, int y, uint64_t stamp)
++{
++	if (gSweetTouch) {
++		gSweetTouch->touch(finger, down != 0, x, y, stamp);
++	}
++}
++
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {
+-- 
+2.39.0
+

@@ -1,0 +1,1005 @@
+From 4612d4dfedd474b50606c905ea87b85bcbb2dc6f Mon Sep 17 00:00:00 2001
+From: WS-D <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 00:36:59 +0100
+Subject: [PATCH 1/3] 0950 redfin: ADSP FastRPC channel, /dev/redwood-fastrpc,
+ SMMU identity
+
+sweet_adsp.c answers the DSP's fastrpcglink-apps-dsp (64 intents of 0x64
+bytes, as the DT) and glink_ssr channels. /dev/redwood-fastrpc (one opener,
+0600) carries 40-byte FastRPC messages to the DSP (write; ENOTCONN before
+the DSP has opened the channel) and its answers back (read; blocking unless
+O_NONBLOCK; ECONNRESET once the DSP has given up). ioctl FASTRPC_SMMU_IDENTITY
+gives stream 0x1403-0x1405 a context bank of the apps SMMU with translation
+off (the 0921 / radio.c way, logged with SMR/S2CR/CBAR/SCTLR); messages whose
+session (addr >> 32) has no stream set up are refused. ioctl FASTRPC_ALLOC
+(addition to the plan's ABI): contiguous RAM below 4 GiB from the GPU pool
+(sweet_gpu_pool_alloc, as the camera's frames: XNU's RAM starts at 4 GiB
+here), zeroed through a device mapping, kept for the DSP (32 buffers, reused
+at the same size); the range handed out is logged. Boot-arg adsp=2: the DSP
+is started when /dev/redwood-fastrpc is first opened (fastrpcd is up before
+the sensors PD asks for its files), adsp=1 as before; adsp_fastrpc=0: the
+old way; =2: every message logged. adsp_sleep=1: our SMP2P item
+also carries Android's other APPS entries, "sleepstate" = 1 (APPS awake)
+and "rdbg" = 0. adsp_qlog=1: IPCRTR datagrams and intent events logged
+(SWEET QLOG:, first 200 lines, then one line per 100 datagrams). Poke f 0/1/2/3/5: status, the DSP's words
+and last words, QRTR services, SMMU identity, SMMU faults.
+---
+ bsd/dev/sweet_adsp.c | 794 ++++++++++++++++++++++++++++++++++++++++++-
+ bsd/dev/sweet_poke.c |   6 +
+ 2 files changed, 794 insertions(+), 6 deletions(-)
+
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+index c219cd8..ed004b1 100644
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -111,6 +111,18 @@
+ #include <sys/vnode_internal.h>
+ #include <vm/vm_kern.h>
+ #include <sys/redwood_audio.h>
++/* (0950: /dev/redwood-fastrpc) */
++#include <sys/param.h>
++#include <sys/conf.h>
++#include <sys/fcntl.h>
++#include <sys/ioccom.h>
++#include <sys/proc.h>
++#include <sys/select.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <vm/pmap.h>
++#include <arm/caches_internal.h>
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ /* (sys/redwood_input.h of HackiOS: what the battery manager below would hand on) */
+@@ -157,6 +169,26 @@ static uint32_t last_step, pause_ms = 2200, listen_seconds = 3;
+ static uint32_t step;                   /* the one being performed */
+ static uint32_t new_from;               /* the first of the steps that have not been seen to work: they wait */
+ static char last_write[96] = "nothing written";
++/*
++ * 0950: adsp_sleep=1: our SMP2P item carries every entry Android's kernel makes in it (dt: the children of
++ * qcom,smp2p-adsp with qcom,smem-state-cells, in order), at Android's boot values: "master-kernel" 0,
++ * "sleepstate" 1 (smp2p-sleepstate: bit 0 = APPS awake, set at its probe), "rdbg" 0. adsp_sleep=0 (the
++ * default): "master-kernel" only, as before.
++ * adsp_qlog=1: every QRTR datagram on IPCRTR (both ways: header and the first 48 bytes) and every intent
++ * event of that channel logged, the first 200 lines, then one line per 100 datagrams.
++ */
++static uint32_t adsp_sleep, adsp_qlog;
++static uint32_t qlog_lines, qlog_packets, qlog_in, qlog_out;
++
++static bool
++qlog_line(void)
++{
++	if (!adsp_qlog || qlog_lines >= 200) {
++		return false;
++	}
++	qlog_lines++;
++	return true;
++}
+ static bool leaving;                    /* on the way back to the loader after a panic: no lock is taken, nothing sleeps */
+ 
+ /*
+@@ -1654,7 +1686,24 @@ step_our_item(void)
+ 	for (uint32_t word = 0; word < 4; word++) {
+ 		smem_poke(our_item + SMP2P_AT_NAME(0) + 4 * word, name[word]);
+ 	}
+-	smem_poke(our_item + SMP2P_AT_COUNTS, 16 | 1u << 16);
++	uint32_t entries = 1;
++	if (adsp_sleep) {
++		static const struct {
++			const char *name;
++			uint32_t value;
++		} more[] = { { "sleepstate", 1 }, { "rdbg", 0 } };
++
++		for (unsigned e = 0; e < sizeof(more) / sizeof(more[0]); e++, entries++) {
++			bzero(name, sizeof(name));
++			strlcpy((char *)name, more[e].name, sizeof(name));
++			for (uint32_t word = 0; word < 4; word++) {
++				smem_poke(our_item + SMP2P_AT_NAME(entries) + 4 * word, name[word]);
++			}
++			smem_poke(our_item + SMP2P_AT_VALUE(entries), more[e].value);
++		}
++		printf("adsp: %u: adsp_sleep=1: our item also has \"sleepstate\" = 1 (APPS awake) and \"rdbg\" = 0, as Android's\n", step);
++	}
++	smem_poke(our_item + SMP2P_AT_COUNTS, 16 | entries << 16);
+ 	smem_poke(our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8);
+ 	settle();
+ 	smem_poke(our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8 | SMP2P_VERSION);
+@@ -1856,7 +1905,7 @@ struct glink_packet {
+  * carries APR, the audio services' own protocol (below; Android's apr_tal_rpmsg.c asks for no
+  * particular intents: what the DSP sends there is a few hundred bytes, up to a few kilobytes).
+  */
+-enum { CHANNEL_QRTR, CHANNEL_APR, CHANNEL_PMIC, CHANNELS };
++enum { CHANNEL_QRTR, CHANNEL_APR, CHANNEL_PMIC, CHANNEL_FASTRPC, CHANNEL_SSR, CHANNELS };
+ 
+ struct glink_channel {
+ 	const char *name;
+@@ -1874,7 +1923,7 @@ struct glink_channel {
+ 	struct {
+ 		uint32_t size, fill;
+ 		uint8_t *data;
+-	} our_intents[24];                      /* what the DSP may send into; an intent's number is its place here + 1 */
++	} our_intents[80];                      /* what the DSP may send into; an intent's number is its place here + 1 (0950: 24 -> 80, FastRPC's 64) */
+ 	uint32_t our_intent_count;
+ 	struct glink_packet *first, *last;      /* received, in order */
+ };
+@@ -1894,9 +1943,35 @@ static struct {
+ 		[CHANNEL_APR] = { .name = "apr_audio_svc", .ours = 2, .intents = { { 0x200, 8 }, { 0x1000, 4 }, { 0x2000, 2 } } },
+ 		/* the battery manager's (battmgr below): answers of a few dozen bytes, a name of 128 */
+ 		[CHANNEL_PMIC] = { .name = "PMIC_RTR_ADSP_APPS", .ours = 3, .intents = { { 0x200, 6 }, { 0x1000, 2 }, { 0, 0 } } },
++		/*
++		 * 0950: FastRPC (dt: qcom,msm_fastrpc_rpmsg qcom,intents <0x64 0x40>: the DSP's answers, 16 to 32 bytes;
++		 * /dev/redwood-fastrpc below), and glink_ssr (dt: qcom,adsp_glink_ssr), answered so it is not left
++		 * hanging; what comes on it is only logged. adsp_fastrpc=0: neither is answered (the old way).
++		 */
++		[CHANNEL_FASTRPC] = { .name = "fastrpcglink-apps-dsp", .ours = 4, .intents = { { 0x64, 0x40 }, { 0, 0 }, { 0, 0 } } },
++		[CHANNEL_SSR] = { .name = "glink_ssr", .ours = 5, .intents = { { 0x100, 4 }, { 0, 0 }, { 0, 0 } } },
+ 	},
+ };
+ 
++/* 0950: FastRPC's and glink_ssr's channels are answered unless adsp_fastrpc=0 (below, /dev/redwood-fastrpc) */
++static uint32_t fastrpc_mode = 1;
++static volatile bool fastrpc_dsp_gone;
++static bool fastrpc_start_on_open;             /* adsp=2: the DSP is started by the first open of the device */
++static bool fastrpc_started_by_open;
++static void fastrpc_start_dsp(void);           /* (below redwood_adsp_init) */
++
++static bool
++glink_wanted(unsigned c)
++{
++	if (c == CHANNEL_FASTRPC || c == CHANNEL_SSR) {
++		if (fastrpc_mode == 0) {
++			return false;
++		}
++		fastrpc_dsp_gone = false;       /* (the DSP has (re)opened them: it is there) */
++	}
++	return true;
++}
++
+ static struct glink_channel *
+ glink_theirs(uint32_t theirs)
+ {
+@@ -2114,7 +2189,7 @@ glink_pump(void)
+ 			glink_advance(length);
+ 			channel = NULL;
+ 			for (unsigned c = 0; c < CHANNELS; c++) {
+-				if (strcmp(name, glink.channel[c].name) == 0) {
++				if (strcmp(name, glink.channel[c].name) == 0 && glink_wanted(c)) {
+ 					channel = &glink.channel[c];
+ 				}
+ 			}
+@@ -2160,6 +2235,10 @@ glink_pump(void)
+ 						channel->their_intents[n].in_use = false;
+ 						channel->their_intents[n].size = words[0];
+ 						channel->their_intents[n].id = words[1];
++						if (channel == &glink.channel[CHANNEL_QRTR] && qlog_line()) {
++							printf("SWEET QLOG: IPCRTR: the DSP offers intent %u of %u bytes (slot %u)\n", words[1],
++							    words[0], n);
++						}
+ 						break;
+ 					}
+ 				}
+@@ -2173,6 +2252,10 @@ glink_pump(void)
+ 				if (channel->their_intents[n].there && channel->their_intents[n].id == message.param2) {
+ 					channel->their_intents[n].in_use = false;
+ 					channel->their_intents[n].there = message.command == GLINK_DONE_REUSE;
++					if (channel == &glink.channel[CHANNEL_QRTR] && qlog_line()) {
++						printf("SWEET QLOG: IPCRTR: the DSP is done with intent %u%s\n", message.param2,
++						    message.command == GLINK_DONE_REUSE ? " (reused)" : " (gone)");
++					}
+ 				}
+ 			}
+ 			glink_advance(length);
+@@ -2191,6 +2274,9 @@ glink_pump(void)
+ 				if (message.param1 == glink.channel[c].theirs || message.param1 == glink.channel[c].ours) {
+ 					glink.channel[c].request_answered = true;
+ 					glink.channel[c].request_granted = message.param2 != 0;
++					if (c == CHANNEL_QRTR && qlog_line()) {
++						printf("SWEET QLOG: IPCRTR: our intent request %s\n", message.param2 ? "GRANTED" : "REFUSED");
++					}
+ 				}
+ 			}
+ 			break;
+@@ -2308,8 +2394,25 @@ glink_send(struct glink_channel *channel, const void *data, uint32_t length)
+ 			channel->request_answered = false;
+ 			glink_say(GLINK_INTENT_REQUEST, channel->ours, length, NULL, 0);
+ 			asked = true;
++			if (channel == &glink.channel[CHANNEL_QRTR] && qlog_line()) {
++				printf("SWEET QLOG: IPCRTR: no intent of the DSP's holds %u bytes: one asked for\n", length);
++			}
+ 		}
+ 		if (waited >= 5000 || (!fits && asked && channel->request_answered && !channel->request_granted)) {
++			if (channel == &glink.channel[CHANNEL_QRTR] && qlog_line()) {
++				unsigned there = 0, busy = 0;
++				uint32_t biggest = 0;
++
++				for (unsigned n = 0; n < sizeof(channel->their_intents) / sizeof(channel->their_intents[0]); n++) {
++					if (channel->their_intents[n].there) {
++						there++;
++						busy += channel->their_intents[n].in_use;
++						biggest = MAX(biggest, channel->their_intents[n].size);
++					}
++				}
++				printf("SWEET QLOG: IPCRTR: %u bytes NOT SENT after %u ms: %u intents of the DSP's (%u in use, the biggest %u "
++				    "bytes), %u bytes of room in our queue\n", length, waited, there, busy, biggest, glink_room());
++			}
+ 			lck_mtx_unlock(&glink_lock);
+ 			return found < 0 ? ENOBUFS : EAGAIN;
+ 		}
+@@ -2345,6 +2448,37 @@ static struct {
+ } qrtr_servers[64];
+ static uint32_t qrtr_peer, qrtr_in, qrtr_out, qrtr_hellos, qrtr_lookups;
+ 
++/* adsp_qlog=1: one datagram (dir "<" from the DSP, ">" to it) */
++static void
++qlog_packet(const char *dir, const struct qrtr_header *h, const uint8_t *data, uint32_t length, int error)
++{
++	char hex[3 * 48 + 1];
++	uint32_t n = MIN(length, 48u);
++
++	if (!adsp_qlog) {
++		return;
++	}
++	qlog_packets++;
++	if (*dir == '<') {
++		qlog_in++;
++	} else {
++		qlog_out++;
++	}
++	if (!qlog_line()) {
++		if (qlog_packets % 100 == 0) {
++			printf("SWEET QLOG: %u datagrams (%u from the DSP, %u to it)\n", qlog_packets, qlog_in, qlog_out);
++		}
++		return;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		snprintf(hex + 3 * i, 4, " %02x", data[i]);
++	}
++	hex[3 * n] = '\0';
++	printf("SWEET QLOG: %s type %u %u:%#x -> %u:%#x confirm %u, %u bytes%s%s:%s\n", dir, h->type, h->from_node, h->from_port,
++	    h->to_node, h->to_port, h->confirm, length, error ? ", NOT SENT: error " : "", error ? (error == ENOBUFS ? "ENOBUFS" :
++	    error == EAGAIN ? "EAGAIN" : error == ENOTCONN ? "ENOTCONN" : "other") : "", hex);
++}
++
+ static int
+ qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to_port, const void *data, uint32_t length)
+ {
+@@ -2365,6 +2499,7 @@ qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to
+ 	packet->to_port = to_port;
+ 	memcpy(packet + 1, data, length);
+ 	error = glink_send(&glink.channel[CHANNEL_QRTR], packet, (uint32_t)sizeof(*packet) + padded);
++	qlog_packet(">", packet, data, length, error);
+ 	kfree_data(packet, sizeof(*packet) + padded);
+ 	qrtr_out += error == 0;
+ 	return error;
+@@ -2461,6 +2596,7 @@ qrtr_input(const uint8_t *data, uint32_t length)
+ 	if (qrtr_peer == 0) {
+ 		qrtr_peer = header.from_node;
+ 	}
++	qlog_packet("<", &header, data + at, header.size, 0);
+ 	if (header.type == QRTR_RESUME_TX) {
+ 		return;
+ 	}
+@@ -2899,6 +3035,623 @@ battmgr_stop(void)
+ 
+ static volatile bool link_wanted, link_runs;
+ 
++/* ---- FastRPC (0950): the channel fastrpcglink-apps-dsp, /dev/redwood-fastrpc, the DSP's SMMU streams ---- */
++
++/*
++ * The DSP's FastRPC framework is how its protection domains call the operating system: the
++ * sensors PD reads its configuration and registry with it (Android's adsprpc.c and the
++ * adsp_listener of libadsprpc; Linux's drivers/misc/fastrpc.c and hexagonrpcd). Every call is one
++ * message of 40 bytes on the channel fastrpcglink-apps-dsp, which the DSP opens and we answer
++ * (as Linux does when its rpmsg driver binds), and one answer of 16 (or 32) bytes back:
++ *   message: s32 client (0 for the kernel's own calls), s32 thread, u64 ctx (idx << 4 | PD),
++ *            u32 handle, u32 scalars, u64 addr, u64 size of the arguments' buffer
++ *   answer:  u64 ctx, s32 result (32 bytes: + flags, early-wake time, version)
++ * Everything else -- the buffer's layout, the contexts, the listener loop that serves the DSP's
++ * calls to us -- is userland's: phone/fastrpc/fastrpcd (a port of hexagonrpcd) writes messages to
++ * /dev/redwood-fastrpc and reads the answers back. This file only carries them and checks that an
++ * address is one the DSP can reach:
++ *   addr = IOVA | session << 32: session 3, 4 or 5 is the context bank adsprpc's DT gives the
++ *          streams 0x1403-0x1405 (adsprpc.c: smmu.cb = SID & 0xf). FASTRPC_SMMU_IDENTITY sends such
++ *          a stream to a context bank of the apps SMMU (0x15000000) with translation off, as the
++ *          camera's IFE streams (0921) and the WLAN's (phone/wifi/radio.c) go: IOVA == PA, so the
++ *          buffers must be below 4 GiB. A message whose session has not been set up is refused.
++ *   FASTRPC_ALLOC (an addition to the plan's ABI): physically contiguous RAM below 4 GiB, from the
++ *          GPU's pool (sweet_gpu_pool_alloc(), as the camera's frames: HLOS RAM below 4 GiB that XNU
++ *          never maps -- XNU's own RAM starts at 4 GiB on this port, so kmem_alloc_contig can never
++ *          give any). The kernel zeroes it through a device mapping; /dev/pmem reads and writes it the
++ *          same way (uncached, so no cache maintenance; 32-bit aligned offsets and lengths). What is
++ *          handed out is never given back (the DSP may keep a mapping of it after the daemon has gone):
++ *          a closed device's buffers are handed out again to the next opener (same size).
++ *   read() blocks for an answer (O_NONBLOCK: EAGAIN), and returns ECONNRESET once the DSP has given
++ *          up, so the daemon ends and launchd starts it again for a DSP that is back. Before the DSP
++ *          has opened the channel, write() returns ENOTCONN and read() waits (EAGAIN).
++ *   adsp=2: the DSP is started when the device is first opened (fastrpcd is running, so its sensors
++ *          PD finds its files), not beside the system's start as adsp=1 does; adsp_fastrpc=0 with
++ *          adsp=2 starts it at once.
++ * The device is one opener at a time; the channel stays answered while the DSP keeps it open,
++ * whether the device is open or not. Boot-arg adsp_fastrpc=0: neither the channel nor glink_ssr is
++ * answered and there is no device (the old way); adsp_fastrpc=2: every message and answer logged.
++ */
++struct fastrpc_message {
++	int32_t client, thread;
++	uint64_t ctx;
++	uint32_t handle, scalars;
++	uint64_t addr, size;
++};
++struct fastrpc_smmu_identity {
++	uint32_t sid;
++};
++struct fastrpc_alloc {
++	uint64_t size, pa;
++};
++#define FASTRPC_SMMU_IDENTITY   _IOW('f', 1, struct fastrpc_smmu_identity)
++#define FASTRPC_ALLOC           _IOWR('f', 2, struct fastrpc_alloc)
++#define FASTRPC_SID_FIRST       0x1403u         /* dt: qcom,msm_fastrpc_compute_cb10-12 iommus <&apps_smmu 0x1403..0x1405 0> */
++#define FASTRPC_SIDS            3u
++#define FASTRPC_SESSION(sid)    ((sid) & 0xfu)
++#define FASTRPC_ANSWERS         64
++#define FASTRPC_ANSWER_MAX      64
++#define FASTRPC_POOL            32
++#define FASTRPC_ALLOC_MAX       (16u << 20)
++#define FASTRPC_LOGGED          64
++#define SMMU_PA                 0x15000000u     /* dt: apps-smmu@15000000 */
++
++static LCK_MTX_DECLARE(fastrpc_lock, &adsp_lock_group);
++static struct {
++	bool open;
++	pid_t pid;
++	uint8_t answer[FASTRPC_ANSWERS][FASTRPC_ANSWER_MAX];
++	uint8_t answer_length[FASTRPC_ANSWERS];
++	uint32_t head, tail;                    /* answers waiting: tail..head */
++	uint32_t sent, answered, dropped, refused, logged;
++	struct fastrpc_message last;            /* the last message sent (for the log when the DSP gives up) */
++	struct selinfo select;
++	struct {
++		uint64_t pa, size;              /* pa 0: an empty entry */
++		bool in_use;
++	} pool[FASTRPC_POOL];
++	uint64_t pool_lo, pool_hi;              /* the range handed out, for the log */
++	/* the apps SMMU */
++	vm_offset_t gr0, gr1, cb_page;
++	uint32_t psize, npage, cb;              /* cb: ours + 1; 0: none yet */
++	bool identity[FASTRPC_SIDS];
++	uint32_t smr[FASTRPC_SIDS];
++} fastrpc;
++static int fastrpc_major = -1;
++
++/* An answer from the DSP. From the link's thread. */
++static void
++fastrpc_input(const uint8_t *data, uint32_t length)
++{
++	uint64_t ctx = 0;
++	int32_t result = 0;
++	bool dropped = false;
++
++	if (length >= 12) {
++		memcpy(&ctx, data, 8);
++		memcpy(&result, data + 8, 4);
++	}
++	lck_mtx_lock(&fastrpc_lock);
++	if (!fastrpc.open || fastrpc.head - fastrpc.tail >= FASTRPC_ANSWERS) {
++		fastrpc.dropped++;
++		dropped = true;
++	} else {
++		uint32_t at = fastrpc.head % FASTRPC_ANSWERS;
++
++		bzero(fastrpc.answer[at], FASTRPC_ANSWER_MAX);
++		memcpy(fastrpc.answer[at], data, length < FASTRPC_ANSWER_MAX ? length : FASTRPC_ANSWER_MAX);
++		fastrpc.answer_length[at] = (uint8_t)(length < FASTRPC_ANSWER_MAX ? length : FASTRPC_ANSWER_MAX);
++		fastrpc.head++;
++		fastrpc.answered++;
++		wakeup(&fastrpc.head);
++		selwakeup(&fastrpc.select);
++	}
++	lck_mtx_unlock(&fastrpc_lock);
++	if (fastrpc_mode >= 2 || dropped || result != 0 || fastrpc.answered <= FASTRPC_LOGGED) {
++		printf("SWEET FASTRPC: < ctx %#llx result %d (%u bytes)%s\n", ctx, result, length,
++		    dropped ? (fastrpc.open ? ": NO ROOM, dropped" : ": nobody has the device open, dropped") : "");
++	}
++}
++
++/* The DSP has given up, or the link is down: whoever waits for an answer hears ECONNRESET. */
++static void
++fastrpc_dsp_down(const char *why)
++{
++	fastrpc_dsp_gone = true;
++	lck_mtx_lock(&fastrpc_lock);
++	wakeup(&fastrpc.head);
++	selwakeup(&fastrpc.select);
++	lck_mtx_unlock(&fastrpc_lock);
++	if (fastrpc_mode != 0) {
++		printf("SWEET FASTRPC: the DSP is gone (%s): %u messages sent, %u answers, %u dropped, %u refused; the last message: "
++		    "handle %u scalars %#x (method %u) ctx %#llx addr %#llx\n", why, fastrpc.sent, fastrpc.answered, fastrpc.dropped,
++		    fastrpc.refused, fastrpc.last.handle, fastrpc.last.scalars, (fastrpc.last.scalars >> 24) & 0x1f, fastrpc.last.ctx,
++		    fastrpc.last.addr);
++	}
++}
++
++/*
++ * The apps SMMU: stream SID through a context bank with translation off (sweet_cam.c cap_smmu_up(),
++ * phone/wifi/radio.c smmu_wlan_identity()). One bank for the three streams, one match register each
++ * (mask 0). Only the pages used are mapped: global space 0 (ID, SMRs, S2CRs), 1 (CBARs) and the bank's.
++ */
++static int
++fastrpc_smmu_identity(uint32_t sid)
++{
++	unsigned s = sid - FASTRPC_SID_FIRST;
++	uint32_t id0, id1, nsmr, ncb, free_smr = ~0u, cb = ~0u;
++	uint64_t used[4] = { 0 };
++	vm_offset_t page = 0;
++	int error = 0;
++
++	if (sid < FASTRPC_SID_FIRST || s >= FASTRPC_SIDS) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&fastrpc_lock);
++	if (fastrpc.identity[s]) {
++		lck_mtx_unlock(&fastrpc_lock);
++		return 0;
++	}
++	if (fastrpc.gr0 == 0) {
++		fastrpc.gr0 = ml_io_map(SMMU_PA, 0x1000);
++	}
++	id0 = rd(fastrpc.gr0 + 0x20);
++	id1 = rd(fastrpc.gr0 + 0x24);
++	nsmr = id0 & 0xff;
++	ncb = id1 & 0xff;
++	fastrpc.psize = (id1 >> 31) ? 0x10000 : 0x1000;
++	fastrpc.npage = 1u << (((id1 >> 28) & 7) + 1);
++	if ((uint64_t)fastrpc.npage * fastrpc.psize * 2 != 0x100000 || nsmr > 128) {
++		printf("SWEET FASTRPC: SMMU ID0 %#x ID1 %#x: a layout not known here\n", id0, id1);
++		error = ENODEV;
++		goto out;
++	}
++	if (fastrpc.gr1 == 0) {
++		fastrpc.gr1 = ml_io_map(SMMU_PA + fastrpc.psize, 0x1000);
++	}
++	for (uint32_t i = 0; i < nsmr; i++) {
++		uint32_t smr = rd(fastrpc.gr0 + 0x800 + 4 * i), s2cr = rd(fastrpc.gr0 + 0xc00 + 4 * i);
++		uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
++
++		if (!(smr >> 31)) {
++			free_smr = free_smr == ~0u ? i : free_smr;
++			continue;
++		}
++		if (((s2cr >> 16) & 3) == 0) {
++			used[(s2cr & 0xff) / 64] |= 1ull << ((s2cr & 0xff) % 64);
++		}
++		if (((id ^ sid) & ~mask & 0x7fff) != 0) {
++			continue;
++		}
++		/* somebody (the boot loader, an earlier run) already routes this stream */
++		if (((s2cr >> 16) & 3) == 1) {
++			printf("SWEET FASTRPC: SMMU: SID %#x already bypasses the SMMU (SMR%u %#x, S2CR %#x): used as it is\n", sid, i, smr,
++			    s2cr);
++			fastrpc.identity[s] = true;
++			fastrpc.smr[s] = i;
++			goto out;
++		}
++		if (((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) + 1 == fastrpc.cb) {
++			fastrpc.identity[s] = true;
++			fastrpc.smr[s] = i;
++			goto out;
++		}
++		printf("SWEET FASTRPC: SMMU: SID %#x is already routed by SMR%u %#x (S2CR %#x, CBAR %#x): LEFT ALONE, refused\n", sid,
++		    i, smr, s2cr, ((s2cr >> 16) & 3) == 0 ? rd(fastrpc.gr1 + 4 * (s2cr & 0xff)) : 0);
++		error = EBUSY;
++		goto out;
++	}
++	if (fastrpc.cb != 0) {
++		cb = fastrpc.cb - 1;
++	} else {
++		/* the lowest bank that nothing points at, nobody set up, and that is not translating */
++		for (uint32_t c = 0; c < ncb && c < 256 && cb == ~0u; c++) {
++			if ((used[c / 64] & (1ull << (c % 64))) || rd(fastrpc.gr1 + 4 * c) != 0) {
++				continue;
++			}
++			page = ml_io_map_unmappable(SMMU_PA + (fastrpc.npage + c) * fastrpc.psize, 0x1000, VM_WIMG_IO);
++			if (page != 0 && !(rd(page) & 1u)) {
++				cb = c;
++				break;
++			}
++			page = 0;               /* (a translating bank: its mapping is left, kernel_map has room; no unmap of a part page) */
++		}
++	}
++	if (free_smr == ~0u || cb == ~0u) {
++		printf("SWEET FASTRPC: SMMU: no free match register (%d) or context bank (%d)\n", (int)free_smr, (int)cb);
++		error = ENOSPC;
++		goto out;
++	}
++	if (fastrpc.cb == 0) {
++		fastrpc.cb_page = page;
++		fastrpc.cb = cb + 1;
++		wr(page + 0x58, 0xffffffffu);           /* FSR */
++		wr(page + 0x20, 0);                     /* TTBR0 */
++		wr(page + 0x24, 0);
++		wr(page + 0x30, 0);                     /* TCR */
++		wr(page + 0x10, 0);                     /* TCR2 */
++		wr(page + 0x38, 0);                     /* MAIR */
++		wr(page + 0x3c, 0);
++		wr(fastrpc.gr1 + 0x800 + 4 * cb, 1);    /* CBA2R: AArch64 */
++		wr(fastrpc.gr1 + 4 * cb, 0x1f000);      /* CBAR: S1, S2 bypass, as ABL's banks */
++		wr(page, 0xe0);                         /* SCTLR: fault config, M = 0 (no translation) */
++	}
++	wr(fastrpc.gr0 + 0xc00 + 4 * free_smr, cb);                     /* S2CR: translate (type 0) through it */
++	wr(fastrpc.gr0 + 0x800 + 4 * free_smr, 1u << 31 | sid);        /* SMR: valid, this stream only, last */
++	wr(fastrpc.gr0 + 0x70, 0);                                      /* sTLBGSYNC */
++	for (int i = 0; i < 1000 && (rd(fastrpc.gr0 + 0x74) & 1u); i++) {
++		sleep_us(10);
++	}
++	fastrpc.identity[s] = true;
++	fastrpc.smr[s] = free_smr;
++	printf("SWEET FASTRPC: SMMU: SID %#x (session %u) -> CB%u (translation off) via SMR%u: SMR %#x S2CR %#x CBAR %#x SCTLR %#x\n",
++	    sid, FASTRPC_SESSION(sid), cb, free_smr, rd(fastrpc.gr0 + 0x800 + 4 * free_smr), rd(fastrpc.gr0 + 0xc00 + 4 * free_smr),
++	    rd(fastrpc.gr1 + 4 * cb), rd(fastrpc.cb_page));
++out:
++	lck_mtx_unlock(&fastrpc_lock);
++	return error;
++}
++
++/* The bank's faults, if any (poke f 5): what the DSP touched that it may not. */
++static void
++fastrpc_smmu_faults(void)
++{
++	uint32_t fsr;
++
++	if (fastrpc.cb == 0 || fastrpc.cb_page == 0) {
++		printf("SWEET FASTRPC: SMMU: no bank of ours yet\n");
++		return;
++	}
++	fsr = rd(fastrpc.cb_page + 0x58);
++	printf("SWEET FASTRPC: SMMU CB%u: FSR %#x FAR %#x%08x FSYNR0 %#x; global FSR %#x FSYNR0 %#x FSYNR1 %#x%s\n", fastrpc.cb - 1,
++	    fsr, rd(fastrpc.cb_page + 0x64), rd(fastrpc.cb_page + 0x60), rd(fastrpc.cb_page + 0x68), rd(fastrpc.gr0 + 0x48),
++	    rd(fastrpc.gr0 + 0x50), rd(fastrpc.gr0 + 0x54), (fsr & 0x800001feu) ? ": A FAULT (cleared now)" : ": no fault");
++	if (fsr & 0x800001feu) {
++		wr(fastrpc.cb_page + 0x58, fsr);
++	}
++}
++
++extern int sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa);       /* bsd/dev/sweet_gpu.c */
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++
++/* Zero pool RAM (XNU has no mapping of it): through a device mapping, 2 MB at a time, 64-bit stores. */
++static bool
++fastrpc_zero(uint64_t pa, uint64_t size)
++{
++	const uint64_t win = 2u << 20;
++
++	for (uint64_t at = 0; at < size; at += win) {
++		uint64_t n = MIN(win, size - at);
++		vm_offset_t va = ml_io_map_unmappable((vm_offset_t)(pa + at), (vm_size_t)n, VM_WIMG_IO);
++		volatile uint64_t *w = (volatile uint64_t *)va;
++
++		if (va == 0) {
++			return false;
++		}
++		for (uint64_t i = 0; i < n / 8; i++) {
++			w[i] = 0;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		ml_io_unmap(va, (vm_size_t)n);
++	}
++	return true;
++}
++
++static int
++fastrpc_alloc(struct fastrpc_alloc *a)
++{
++	vm_size_t size = round_page(a->size);
++	uint64_t pa = 0;
++	int slot = -1, reused = -1;
++
++	if (size == 0 || size > FASTRPC_ALLOC_MAX) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&fastrpc_lock);
++	for (int i = 0; i < FASTRPC_POOL; i++) {
++		if (fastrpc.pool[i].pa != 0 && !fastrpc.pool[i].in_use && fastrpc.pool[i].size == size) {
++			fastrpc.pool[i].in_use = true;
++			pa = fastrpc.pool[i].pa;
++			reused = i;
++			break;
++		}
++		if (fastrpc.pool[i].pa == 0 && fastrpc.pool[i].size == 0 && slot < 0) {
++			slot = i;
++		}
++	}
++	if (reused < 0) {
++		if (slot < 0) {
++			lck_mtx_unlock(&fastrpc_lock);
++			printf("SWEET FASTRPC: all %u buffers for the DSP handed out (%#llx-%#llx): no %lu bytes more\n", FASTRPC_POOL,
++			    fastrpc.pool_lo, fastrpc.pool_hi, (unsigned long)size);
++			return ENOSPC;
++		}
++		fastrpc.pool[slot].size = size;         /* reserved while the pool is asked */
++		fastrpc.pool[slot].in_use = true;
++	}
++	lck_mtx_unlock(&fastrpc_lock);
++	if (reused < 0) {
++		if (sweet_gpu_pool_alloc(size, &pa) != 0 || pa == 0 || pa + size > 0x100000000ull) {
++			printf("SWEET FASTRPC: no %lu bytes below 4 GiB in the GPU pool%s\n", (unsigned long)size,
++			    pa ? " (above 4 GiB: kept back, not used)" : "");
++			if (pa == 0) {
++				lck_mtx_lock(&fastrpc_lock);
++				fastrpc.pool[slot].size = 0;
++				fastrpc.pool[slot].in_use = false;
++				lck_mtx_unlock(&fastrpc_lock);
++			}
++			return ENOMEM;
++		}
++	}
++	if (!fastrpc_zero(pa, size)) {
++		printf("SWEET FASTRPC: %lu bytes at %#llx: no mapping to zero them; not handed out\n", (unsigned long)size, pa);
++		lck_mtx_lock(&fastrpc_lock);
++		if (reused >= 0) {
++			fastrpc.pool[reused].in_use = false;
++		} else {
++			fastrpc.pool[slot].pa = pa;     /* ours from the pool: kept, free for the next try */
++			fastrpc.pool[slot].in_use = false;
++		}
++		lck_mtx_unlock(&fastrpc_lock);
++		return ENOMEM;
++	}
++	a->pa = pa;
++	if (reused >= 0) {
++		return 0;
++	}
++	lck_mtx_lock(&fastrpc_lock);
++	fastrpc.pool[slot].pa = pa;
++	if (fastrpc.pool_lo == 0 || pa < fastrpc.pool_lo) {
++		fastrpc.pool_lo = pa;
++	}
++	if (pa + size > fastrpc.pool_hi) {
++		fastrpc.pool_hi = pa + size;
++	}
++	lck_mtx_unlock(&fastrpc_lock);
++	printf("SWEET FASTRPC: %lu bytes for the DSP at %#llx (GPU pool; buffer %d, all of them within %#llx-%#llx)\n",
++	    (unsigned long)size, pa, slot, fastrpc.pool_lo, fastrpc.pool_hi);
++	return 0;
++}
++
++static int
++fastrpc_open(__unused dev_t dev, __unused int flags, __unused int devtype, proc_t p)
++{
++	lck_mtx_lock(&fastrpc_lock);
++	if (fastrpc.open) {
++		lck_mtx_unlock(&fastrpc_lock);
++		return EBUSY;
++	}
++	fastrpc.open = true;
++	fastrpc.pid = proc_pid(p);
++	fastrpc.head = fastrpc.tail = 0;
++	bool start = fastrpc_start_on_open && !fastrpc_started_by_open;
++	if (start) {
++		fastrpc_started_by_open = true;
++		fastrpc_dsp_gone = false;       /* (a DSP about to start has not given up: writes see ENOTCONN, reads wait) */
++	}
++	lck_mtx_unlock(&fastrpc_lock);
++	printf("SWEET FASTRPC: /dev/redwood-fastrpc opened by pid %d; the channel is %s%s%s\n", proc_pid(p),
++	    glink.channel[CHANNEL_FASTRPC].open ? "OPEN" : "NOT OPEN (yet)", fastrpc_dsp_gone ? ", THE DSP HAS GIVEN UP" : "",
++	    start ? "; adsp=2: starting the DSP now" : "");
++	if (start) {
++		fastrpc_start_dsp();
++	}
++	return 0;
++}
++
++static int
++fastrpc_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	lck_mtx_lock(&fastrpc_lock);
++	fastrpc.open = false;
++	fastrpc.head = fastrpc.tail = 0;
++	for (int i = 0; i < FASTRPC_POOL; i++) {
++		fastrpc.pool[i].in_use = false;
++	}
++	selthreadclear(&fastrpc.select);
++	lck_mtx_unlock(&fastrpc_lock);
++	printf("SWEET FASTRPC: /dev/redwood-fastrpc closed (pid %d): %u messages sent, %u answers, %u dropped, %u refused\n",
++	    fastrpc.pid, fastrpc.sent, fastrpc.answered, fastrpc.dropped, fastrpc.refused);
++	return 0;
++}
++
++static int
++fastrpc_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	struct fastrpc_message m;
++	uint32_t session;
++	int error;
++
++	if (uio_resid(uio) != sizeof(m)) {
++		return EINVAL;
++	}
++	if ((error = uiomove((caddr_t)&m, sizeof(m), uio)) != 0) {
++		return error;
++	}
++	if (fastrpc_dsp_gone) {
++		return ECONNRESET;
++	}
++	if (!glink.channel[CHANNEL_FASTRPC].open) {
++		return ENOTCONN;
++	}
++	session = (uint32_t)(m.addr >> 32);
++	if ((m.addr != 0 || m.size != 0) && (session < FASTRPC_SESSION(FASTRPC_SID_FIRST) ||
++	    session >= FASTRPC_SESSION(FASTRPC_SID_FIRST) + FASTRPC_SIDS ||
++	    !fastrpc.identity[session - FASTRPC_SESSION(FASTRPC_SID_FIRST)] || m.size > (64u << 20))) {
++		if (fastrpc.refused++ < 8) {
++			printf("SWEET FASTRPC: a message with addr %#llx size %#llx: its session has no stream set up "
++			    "(FASTRPC_SMMU_IDENTITY first), refused\n", m.addr, m.size);
++		}
++		return EPERM;
++	}
++	error = glink_send(&glink.channel[CHANNEL_FASTRPC], &m, sizeof(m));
++	if (error == 0) {
++		fastrpc.last = m;
++		fastrpc.sent++;
++	}
++	if (fastrpc_mode >= 2 || error != 0 || fastrpc.sent <= FASTRPC_LOGGED) {
++		printf("SWEET FASTRPC: > client %d thread %d ctx %#llx handle %u scalars %#x (method %u, %u in %u out) addr %#llx size "
++		    "%#llx%s\n", m.client, m.thread, m.ctx, m.handle, m.scalars, (m.scalars >> 24) & 0x1f, (m.scalars >> 16) & 0xff,
++		    (m.scalars >> 8) & 0xff, m.addr, m.size, error ? ": NOT SENT" : "");
++	}
++	return error;
++}
++
++static int
++fastrpc_read(__unused dev_t dev, struct uio *uio, int ioflag)
++{
++	uint8_t answer[FASTRPC_ANSWER_MAX];
++	uint32_t length;
++	int error = 0;
++
++	lck_mtx_lock(&fastrpc_lock);
++	while (fastrpc.head == fastrpc.tail) {
++		if (fastrpc_dsp_gone) {
++			lck_mtx_unlock(&fastrpc_lock);
++			return ECONNRESET;
++		}
++		if (ioflag & IO_NDELAY) {
++			lck_mtx_unlock(&fastrpc_lock);
++			return EWOULDBLOCK;
++		}
++		error = msleep(&fastrpc.head, &fastrpc_lock, PCATCH | PZERO, "fastrpc", NULL);
++		if (error != 0) {
++			lck_mtx_unlock(&fastrpc_lock);
++			return error;
++		}
++	}
++	length = fastrpc.answer_length[fastrpc.tail % FASTRPC_ANSWERS];
++	memcpy(answer, fastrpc.answer[fastrpc.tail % FASTRPC_ANSWERS], length);
++	fastrpc.tail++;
++	lck_mtx_unlock(&fastrpc_lock);
++	return uiomove((caddr_t)answer, (int)MIN((user_ssize_t)length, uio_resid(uio)), uio);
++}
++
++static int
++fastrpc_select(__unused dev_t dev, int which, void *wql, proc_t p)
++{
++	int ready = 1;
++
++	if (which == FREAD) {
++		lck_mtx_lock(&fastrpc_lock);
++		ready = fastrpc.head != fastrpc.tail || fastrpc_dsp_gone;
++		if (!ready) {
++			selrecord(p, &fastrpc.select, wql);
++		}
++		lck_mtx_unlock(&fastrpc_lock);
++	}
++	return ready;
++}
++
++static int
++fastrpc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused proc_t p)
++{
++	switch (cmd) {
++	case FASTRPC_SMMU_IDENTITY:
++		return fastrpc_smmu_identity(((struct fastrpc_smmu_identity *)data)->sid);
++	case FASTRPC_ALLOC:
++		return fastrpc_alloc((struct fastrpc_alloc *)data);
++	default:
++		return ENOTTY;
++	}
++}
++
++static const struct cdevsw fastrpc_cdevsw = {
++	.d_open       = fastrpc_open,
++	.d_close      = fastrpc_close,
++	.d_read       = fastrpc_read,
++	.d_write      = fastrpc_write,
++	.d_ioctl      = fastrpc_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = fastrpc_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++static void
++fastrpc_init(void)
++{
++	PE_parse_boot_argn("adsp_fastrpc", &fastrpc_mode, sizeof(fastrpc_mode));
++	if (fastrpc_mode == 0) {
++		printf("SWEET FASTRPC: off (adsp_fastrpc=0): fastrpcglink-apps-dsp and glink_ssr are left unanswered\n");
++		return;
++	}
++	fastrpc_major = cdevsw_add(-1, &fastrpc_cdevsw);
++	if (fastrpc_major < 0) {
++		printf("SWEET FASTRPC: cdevsw_add failed (%d)\n", fastrpc_major);
++		return;
++	}
++	void *node = devfs_make_node(makedev(fastrpc_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "redwood-fastrpc");
++	printf("SWEET FASTRPC: /dev/redwood-fastrpc %s (major %d, adsp_fastrpc=%u)\n", node ? "ready" : "FAILED", fastrpc_major,
++	    fastrpc_mode);
++}
++
++/* What arrives on glink_ssr (nothing is expected: the DSP answers there what we never ask). */
++static void
++ssr_input(const uint8_t *data, uint32_t length)
++{
++	uint32_t w[4] = { 0, 0, 0, 0 };
++
++	memcpy(w, data, length < sizeof(w) ? length : sizeof(w));
++	printf("SWEET FASTRPC: glink_ssr: %u bytes: %#x %#x %#x %#x\n", length, w[0], w[1], w[2], w[3]);
++}
++
++/* poke f N [A]: see NOTES.md (0950, 0951, 0956) */
++int sweet_adsp_poke(unsigned what, uint64_t a, uint64_t b);
++int
++sweet_adsp_poke(unsigned what, __unused uint64_t a, __unused uint64_t b)
++{
++	struct smp2p words;
++	unsigned services = 0;
++
++	switch (what) {
++	case 0:
++		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
++			services += qrtr_servers[i].there;
++		}
++		printf("SWEET FASTRPC: status: DSP %s%s, link %s; channels: IPCRTR %s, apr %s, fastrpc %s, glink_ssr %s; device %s (pid %d); "
++		    "%u sent, %u answers (%u waiting), %u dropped, %u refused; SMMU CB%d, sessions %d%d%d; QRTR node %u, %u services\n",
++		    dsp_started ? "started" : "NOT STARTED", fastrpc_dsp_gone ? " BUT GONE" : "", link_runs ? "up" : "down",
++		    glink.channel[CHANNEL_QRTR].open ? "open" : "-", glink.channel[CHANNEL_APR].open ? "open" : "-",
++		    glink.channel[CHANNEL_FASTRPC].open ? "open" : "-", glink.channel[CHANNEL_SSR].open ? "open" : "-",
++		    fastrpc.open ? "open" : "closed", fastrpc.pid, fastrpc.sent, fastrpc.answered, fastrpc.head - fastrpc.tail,
++		    fastrpc.dropped, fastrpc.refused, (int)fastrpc.cb - 1, fastrpc.identity[0], fastrpc.identity[1], fastrpc.identity[2],
++		    qrtr_peer, services);
++		return 0;
++	case 1:
++		if (dsp_words(&words)) {
++			show_words("the DSP's SMP2P words", &words);
++		}
++		show_crash_reason();
++		return 0;
++	case 2:
++		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
++			if (qrtr_servers[i].there) {
++				printf("SWEET QRTR: service %u (%#x) version %u instance %u at node %u port %u\n", qrtr_servers[i].service,
++				    qrtr_servers[i].service, qrtr_servers[i].instance & 0xff, qrtr_servers[i].instance >> 8,
++				    qrtr_servers[i].node, qrtr_servers[i].port);
++			}
++		}
++		return 0;
++	case 3:
++		return fastrpc_smmu_identity((uint32_t)a);
++	case 5:
++		fastrpc_smmu_faults();
++		return 0;
++	default:
++		printf("SWEET FASTRPC: poke f: 0 status, 1 the DSP's words and last words, 2 QRTR services, 3 SID: SMMU identity, "
++		    "4 announce pd-mapper again, 5 SMMU faults\n");
++		return EINVAL;
++	}
++}
++
++
+ static void
+ link_thread(__unused void *parameter, __unused wait_result_t result)
+ {
+@@ -2918,6 +3671,7 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
+ 				gave_up = true;
+ 				printf("adsp: link: THE AUDIO DSP SAYS IT HAS GIVEN UP (\"slave-kernel\" = %#x)\n", dsp_state(&words));
+ 				show_crash_reason();
++				fastrpc_dsp_down("it has given up");
+ 			}
+ 		}
+ 		for (;;) {
+@@ -2943,6 +3697,10 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
+ 				qrtr_input(packet->data, packet->length);
+ 			} else if (from == CHANNEL_PMIC) {
+ 				battmgr_input(packet->data, packet->length);
++			} else if (from == CHANNEL_FASTRPC) {
++				fastrpc_input(packet->data, packet->length);
++			} else if (from == CHANNEL_SSR) {
++				ssr_input(packet->data, packet->length);
+ 			} else {
+ 				apr_input(packet->data, packet->length);
+ 			}
+@@ -2982,6 +3740,7 @@ link_stop(void)
+ 	lck_mtx_unlock(&glink_lock);
+ 	bzero(qrtr_servers, sizeof(qrtr_servers));
+ 	qrtr_peer = 0;
++	fastrpc_dsp_down("the link is down");
+ }
+ 
+ /* ---- step 8: GLINK's queues, looked at -------------------------------------------------------------- */
+@@ -3262,9 +4021,12 @@ redwood_adsp_init(void)
+ 	thread_t thread;
+ 
+ 	PE_parse_boot_argn("adsp_step", &last_step, sizeof(last_step));
+-	if (last_step == 0 && (!PE_parse_boot_argn("adsp", &on, sizeof(on)) || on != 1)) {
++	if (last_step == 0 && (!PE_parse_boot_argn("adsp", &on, sizeof(on)) || (on != 1 && on != 2))) {
+ 		return;
+ 	}
++	PE_parse_boot_argn("adsp_sleep", &adsp_sleep, sizeof(adsp_sleep));    /* 0950: Android's SMP2P entries */
++	PE_parse_boot_argn("adsp_qlog", &adsp_qlog, sizeof(adsp_qlog));       /* 0950: IPCRTR datagrams logged */
++	fastrpc_init();                         /* 0950: /dev/redwood-fastrpc (adsp_fastrpc=0: not) */
+ 	if (last_step == 0) {
+ 		/* all of it, on a thread of its own, and left up */
+ 		last_step = STEPS;
+@@ -3273,12 +4035,18 @@ redwood_adsp_init(void)
+ 		pause_ms = 0;
+ 		listen_seconds = 1;
+ 		new_from = STEPS + 1;
++		if (on == 2 && fastrpc_mode != 0) {
++			/* adsp=2: when fastrpcd first opens /dev/redwood-fastrpc (fastrpc_open), so the sensors PD finds its files */
++			fastrpc_start_on_open = true;
++			tell("adsp: the audio DSP will be brought up when /dev/redwood-fastrpc is first opened (adsp=2)\n");
++			return;
++		}
+ 		if (kernel_thread_start(whole_thread, NULL, &thread) != KERN_SUCCESS) {
+ 			printf("adsp: no thread: the audio DSP is not brought up\n");
+ 			return;
+ 		}
+ 		thread_deallocate(thread);
+-		tell("adsp: the audio DSP is being brought up beside the system's start (adsp=1)\n");
++		tell("adsp: the audio DSP is being brought up beside the system's start (adsp=%u)\n", on);
+ 		return;
+ 	}
+ 	if (last_step > STEPS) {
+@@ -3297,4 +4065,18 @@ redwood_adsp_init(void)
+ 	}
+ 	thread_deallocate(thread);
+ }
++
++/* adsp=2: the first open of /dev/redwood-fastrpc starts the steps (all of them, left up), as adsp=1 does at boot. */
++static void
++fastrpc_start_dsp(void)
++{
++	thread_t thread;
++
++	if (kernel_thread_start(whole_thread, NULL, &thread) != KERN_SUCCESS) {
++		printf("adsp: no thread: the audio DSP is not brought up (adsp=2)\n");
++		return;
++	}
++	thread_deallocate(thread);
++	tell("adsp: the audio DSP is being brought up: /dev/redwood-fastrpc was opened (adsp=2)\n");
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_poke.c b/bsd/dev/sweet_poke.c
+index 2b423c2..e29ef86 100644
+--- a/bsd/dev/sweet_poke.c
++++ b/bsd/dev/sweet_poke.c
+@@ -134,6 +134,12 @@ poke_line(const char *s, const char *end, unsigned lineno)
+ 	uint64_t a = 0, b = 0, c = 0, d = 0;
+ 	bool ha = poke_num(&s, end, &a), hb = poke_num(&s, end, &b);
+ 	bool hc = poke_num(&s, end, &c), hd = poke_num(&s, end, &d);
++	if (op == 'f') {
++		/* redfin (0950, WS-D): f N [A]: the audio DSP's FastRPC/QRTR (bsd/dev/sweet_adsp.c sweet_adsp_poke; f 9: help) */
++		extern int sweet_adsp_poke(unsigned what, uint64_t a, uint64_t b);
++		printf("POKE: f %llu -> %d\n", a, sweet_adsp_poke((unsigned)a, b, c));
++		return;
++	}
+ 	volatile uint32_t *r = NULL;
+ 	if (op != '@' && op != 's' && op != 'v' && op != 't' && op != 'c') {
+ 		if (!ha || (a & 3) || !(r = poke_reg(a))) {
+-- 
+2.43.0
+

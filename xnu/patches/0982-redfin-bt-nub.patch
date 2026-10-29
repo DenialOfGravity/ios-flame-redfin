@@ -1,0 +1,376 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WS-B <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 15:02:02 +0100
+Subject: [PATCH] 0982 redfin: Bluetooth nub properties + AppleOLYHAL (sweetbtnub)
+
+Carry the D22AP /arm-io/uart1/bluetooth properties (raw bytes: 4-byte LE OSData, NUL-terminated OSData strings, as the iPhone X tree) on the "bluetooth" and
+"marconi-bt" stand-in nubs (transport-encoding 3, transport-speed 3000000,
+vendor 0x5ac / product 0x12a0, supported-profiles 0x2ffb, coex 2, compatible
+"bluetooth,n88", local/bluetooth-address, empty voice-record) so bluetoothd
+picks a transport; the function-* GPIO properties are left off (no GPIO nub
+to point them at; /dev/btwake covers wake). sweetbtnub is now a bitmask:
+1 "bluetooth", 2 "marconi-bt", 4 an empty AppleOLYHAL service (BlueTool
+matches IOProviderClass AppleOLYHAL). Property reads on all three, and
+user-client requests, are logged (IOUserClient.cpp). Default off.
+
+
+---
+ bsd/dev/sweet_geniuart.c        |   3 +
+ iokit/Kernel/IOUserClient.cpp   |  36 ++++++
+ iokit/Kernel/arm/SweetBTNub.cpp | 232 ++++ ++++++++++++++++++++++++++++
+ iokit/conf/files.arm64          |   1 +
+ 4 files changed, 254 insertions(+)
+ create mode 100644 iokit/Kernel/arm/SweetBTNub.cpp
+
+diff --git a/bsd/dev/sweet_geniuart.c b/bsd/dev/sweet_geniuart.c
+index 6c1bb88..d37e021 100644
+--- a/bsd/dev/sweet_geniuart.c
++++ b/bsd/dev/sweet_geniuart.c
+@@ -878,9 +878,12 @@ sweet_geniuart_cmd(unsigned what)
+ 	return e ? e : (int)total;
+ }
+ 
++extern void SweetBTNubStart(void);
++
+ void
+ sweet_geniuart_init(void)
+ {
++	SweetBTNubStart();      /* 0982: stand-in "bluetooth" / "marconi-bt" nubs (sweetbtnub=1|2|3) */
+ 	uint32_t on = 0;
+ 	PE_parse_boot_argn("btuart", &on, sizeof(on));
+ 	if (!on) {
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index 56c0ad5..5911cb0 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -2660,6 +2660,27 @@ sweet_iolog_dict(const char *name, const char *what, OSObject *dict, const char
+ }
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* redfin 0982: every property read from the sweetbtnub stand-in nubs (iokit/Kernel/arm/SweetBTNub.cpp) */
++extern "C" bool SweetBTNubIs(const void *entry);
++static uint32_t sweet_btnub_reads;
++
++static void
++sweet_btnub_read(IORegistryEntry *entry, const char *key, const char *how)
++{
++	if (!SweetBTNubIs(entry) || sweet_btnub_reads >= 500) {
++		return;
++	}
++	sweet_btnub_reads++;
++	char pname[32];
++	proc_selfname(pname, (int)sizeof(pname));
++	OSObject *v = key ? entry->copyProperty(key) : NULL;
++	IOLog("SWEET BTNUB: %s reads %s.%s (%s) -> %s\n", pname, entry->getName(), key ? key : "*", how,
++	    key ? (v ? "found" : "MISSING") : "all");
++	OSSafeReleaseNULL(v);
++}
++#endif
++
+ kern_return_t
+ internal_io_service_get_matching_services(
+ 	mach_port_t main_port,
+@@ -3656,6 +3677,9 @@ is_io_registry_entry_get_property_bytes(
+ 	IOReturn            ret = kIOReturnSuccess;
+ 
+ 	CHECK( IORegistryEntry, registry_entry, entry );
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_btnub_read(entry, property_name, "bytes");
++#endif
+ 
+ #if CONFIG_MACF
+ 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
+@@ -3724,6 +3748,9 @@ is_io_registry_entry_get_property(
+ 	OSObject *          obj;
+ 
+ 	CHECK( IORegistryEntry, registry_entry, entry );
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_btnub_read(entry, property_name, "get");
++#endif
+ 
+ #if CONFIG_MACF
+ 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
+@@ -3771,6 +3798,9 @@ is_io_registry_entry_get_property_recursively(
+ 	OSObject *          obj;
+ 
+ 	CHECK( IORegistryEntry, registry_entry, entry );
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_btnub_read(entry, property_name, "recursive");
++#endif
+ 
+ #if CONFIG_MACF
+ 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
+@@ -3864,6 +3894,9 @@ is_io_registry_entry_get_properties_bin_buf(
+ 	void                 * editRef = NULL;
+ 
+ 	CHECK(IORegistryEntry, registry_entry, entry);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_btnub_read(entry, NULL, "all");
++#endif
+ 
+ #if CONFIG_MACF
+ 	GetPropertiesEditorRef ref;
+@@ -3961,6 +3994,9 @@ is_io_registry_entry_get_property_bin_buf(
+ 	const OSSymbol *    sym;
+ 
+ 	CHECK( IORegistryEntry, registry_entry, entry );
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_btnub_read(entry, property_name, "bin");
++#endif
+ 
+ #if CONFIG_MACF
+ 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
+diff --git a/iokit/Kernel/arm/SweetBTNub.cpp b/iokit/Kernel/arm/SweetBTNub.cpp
+new file mode 100644
+index 0000000..f77138f
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetBTNub.cpp
+@@ -0,0 +1,232 @@
++/*
++ * redfin 0982: stand-in Bluetooth nubs for bluetoothd / BlueTool. The probe boots showed them waiting on
++ * IOKit notifications for IONameMatch "marconi-bt" and "bluetooth" (device-tree nubs, the "bluetooth"
++ * child of the BT UART under /arm-io on an iPhone), reading "transport-encoding" (MISSING), and BlueTool
++ * also matching IOProviderClass "AppleOLYHAL". Boot-arg sweetbtnub (default 0: nothing), a bitmask:
++ *   1 = a service named "bluetooth", 2 = "marconi-bt", 4 = an (empty) AppleOLYHAL service.
++ * The nubs now carry the D22AP /arm-io/uart1/bluetooth properties (transport-encoding 3, transport-speed
++ * 3000000, vendor/product id, supported-profiles, coex, compatible "bluetooth,n88"), so bluetoothd picks
++ * a transport; the probe's "DeviceTree transport = 0x..." / "HCI Transport is set to ..." lines say which.
++ * The GPIO function properties (function-bt_wake, function-power_enable) are left off on purpose: they
++ * reference a GPIO-controller phandle we have no stand-in for, and /dev/btwake (0983) covers wake.
++ * Every property read from a nub is logged found/MISSING (IOUserClient.cpp sweet_btnub_read); user-client
++ * requests are refused and logged with the type; setProperties keys are logged. Log lines "SWEET BTNUB:".
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSCollectionIterator.h>
++
++extern "C" {
++#include <pexpert/pexpert.h>
++#include <sys/proc.h>
++void SweetBTNubStart(void);
++bool SweetBTNubIs(const void *entry);
++}
++
++class SweetBTNub : public IOService
++{
++	OSDeclareDefaultStructors(SweetBTNub);
++
++public:
++	virtual IOReturn newUserClient(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties,
++	    IOUserClient ** handler) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetBTNub, IOService);
++
++/*
++ * AppleOLYHAL stand-in: BlueTool matches IOProviderClass "AppleOLYHAL" and waits for a service of that
++ * class. This empty one lets the match succeed; a user-client request on it is the next thing we want to
++ * see (which selectors BlueTool calls), so it is refused and logged rather than served.
++ */
++class AppleOLYHAL : public IOService
++{
++	OSDeclareDefaultStructors(AppleOLYHAL);
++
++public:
++	virtual IOReturn newUserClient(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties,
++	    IOUserClient ** handler) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleOLYHAL, IOService);
++
++static SweetBTNub * sweet_btnubs[2];
++static AppleOLYHAL * sweet_olyhal;
++static unsigned sweet_btnub_lines;
++
++IOReturn
++AppleOLYHAL::newUserClient(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties,
++    IOUserClient ** handler)
++{
++	char p[32];
++	proc_selfname(p, sizeof(p));
++	if (sweet_btnub_lines++ < 500) {
++		IOLog("SWEET BTNUB: %s asks AppleOLYHAL for a user client of type %u%s: refused\n", p, (unsigned) type,
++		    properties ? " (with properties)" : "");
++	}
++	return kIOReturnUnsupported;
++}
++
++static void
++who(char * name, int len)
++{
++	proc_selfname(name, len);
++}
++
++IOReturn
++SweetBTNub::newUserClient(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties,
++    IOUserClient ** handler)
++{
++	char p[32];
++	who(p, sizeof(p));
++	if (sweet_btnub_lines++ < 500) {
++		IOLog("SWEET BTNUB: %s asks %s for a user client of type %u%s: refused\n", p, getName(), (unsigned) type,
++		    properties ? " (with properties)" : "");
++	}
++	return kIOReturnUnsupported;
++}
++
++IOReturn
++SweetBTNub::setProperties(OSObject * properties)
++{
++	char p[32];
++	who(p, sizeof(p));
++	OSDictionary * d = OSDynamicCast(OSDictionary, properties);
++	OSCollectionIterator * it = d ? OSCollectionIterator::withCollection(d) : NULL;
++	OSSymbol * k;
++	while (it && (k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++		if (sweet_btnub_lines++ < 500) {
++			IOLog("SWEET BTNUB: %s sets %s.%s\n", p, getName(), k->getCStringNoCopy());
++		}
++	}
++	OSSafeReleaseNULL(it);
++	return kIOReturnSuccess;
++}
++
++bool
++SweetBTNubIs(const void * entry)
++{
++	return entry != NULL && (entry == sweet_btnubs[0] || entry == sweet_btnubs[1] || entry == sweet_olyhal);
++}
++
++static void
++put_data(IORegistryEntry * nub, const char * key, const void * bytes, unsigned len)
++{
++	OSData * v = OSData::withBytes(bytes, len);
++	if (v) {
++		nub->setProperty(key, v);
++		v->release();
++	}
++}
++
++static void
++put_u32(IORegistryEntry * nub, const char * key, uint32_t value)
++{
++	const uint8_t b[4] = { (uint8_t)value, (uint8_t)(value >> 8), (uint8_t)(value >> 16), (uint8_t)(value >> 24) };
++	put_data(nub, key, b, sizeof(b));       /* 4 bytes, little-endian */
++}
++
++/* D22AP WLAN identity (iPhone X tree: /arm-io/uart2/wlan, compatible "wlan-pcie-uart,bcm4357", and the apcie
++ * bridge3 "wlan" pcie-device; module-instance "herculese"). The tree has no vendor-id/device-id on the WLAN
++ * nodes (they come from PCIe config space), so those are the Broadcom PCI IDs: vendor 0x14e4, BCM4357 device
++ * 0x4488. libMobileGestalt (kMGQWifiVendor) and BlueTool read vendor-id from the AppleOLYHAL service. */
++static void
++put_wlan_identity(IORegistryEntry * e)
++{
++	put_data(e, "device_type", "wlan", 5);
++	static const char compat[] = "wlan-pcie,bcm4357\0wlan-pcie,bcm";    /* NUL-separated list, as in the tree */
++	put_data(e, "compatible", compat, sizeof(compat));
++	put_data(e, "module-instance", "herculese", 10);
++	e->setProperty("vendor-id", 0x14e4ULL, 32);    /* OSNumber: AppleOLYHAL is a kext service, not a DT node */
++	e->setProperty("device-id", 0x4488ULL, 32);
++}
++
++static SweetBTNub *
++publish(IOService * platform, const char * name)
++{
++	SweetBTNub * nub = OSTypeAlloc(SweetBTNub);
++	if (nub == NULL || !nub->init()) {
++		OSSafeReleaseNULL(nub);
++		return NULL;
++	}
++	static const uint8_t mac[6] = { 0x02, 0x50, 0x49, 0x58, 0x45, 0x4d };   /* tools/mkadt.py mac-address-bluetooth0 */
++	OSData * d = OSData::withBytes(mac, sizeof(mac));
++	if (d) {
++		nub->setProperty("local-mac-address", d);
++		nub->setProperty("bluetooth-address", d);
++		d->release();
++	}
++	/* D22AP /arm-io/uart1/bluetooth (compatible "bluetooth,n88"): raw bytes, as the iPhone X device tree stores them
++	 * (bluetoothd sends getBytes:range: to what it reads, so an OSNumber aborts it); the nub's name (IONameMatch) is setName() below. */
++	put_data(nub, "device_type", "bluetooth", 10);
++	put_data(nub, "compatible", "bluetooth,n88", 14);
++	put_u32(nub, "transport-encoding", 3);
++	put_u32(nub, "transport-speed", 3000000);
++	put_u32(nub, "vendor-id", 0x5ac);
++	put_u32(nub, "product-id", 0x12a0);
++	put_u32(nub, "supported-profiles", 0x2ffb);
++	put_u32(nub, "coex", 2);
++	OSData * empty = OSData::withCapacity(0);
++	if (empty) {
++		nub->setProperty("voice-record", empty);       /* <> on D22 */
++		empty->release();
++	}
++	nub->setProperty("SweetBTNub", true);
++	if (!nub->attach(platform)) {
++		nub->release();
++		return NULL;
++	}
++	nub->setName(name);
++	if (!nub->start(platform)) {
++		nub->detach(platform);
++		nub->release();
++		return NULL;
++	}
++	nub->registerService();
++	IOLog("SWEET BTNUB: published \"%s\" under %s\n", name, platform->getName());
++	return nub;
++}
++
++void
++SweetBTNubStart(void)
++{
++	uint32_t which = 0;
++	PE_parse_boot_argn("sweetbtnub", &which, sizeof(which));
++	IOService * platform = IOService::getPlatform();
++	if (!which || platform == NULL || sweet_btnubs[0] || sweet_btnubs[1]) {
++		return;
++	}
++	if (which & 1) {
++		sweet_btnubs[0] = publish(platform, "bluetooth");
++	}
++	if (which & 2) {
++		sweet_btnubs[1] = publish(platform, "marconi-bt");
++	}
++	if ((which & 4) && sweet_olyhal == NULL) {
++		AppleOLYHAL * oly = OSTypeAlloc(AppleOLYHAL);
++		if (oly && oly->init() && oly->attach(platform)) {
++			oly->setName("AppleOLYHAL");
++			oly->setProperty("SweetBTNub", true);
++			put_wlan_identity(oly);
++			if (oly->start(platform)) {
++				oly->registerService();
++				sweet_olyhal = oly;
++				IOLog("SWEET BTNUB: published AppleOLYHAL under %s\n", platform->getName());
++			} else {
++				oly->detach(platform);
++				OSSafeReleaseNULL(oly);
++			}
++		} else {
++			OSSafeReleaseNULL(oly);
++		}
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 898752d..b2871d5 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -19,6 +19,7 @@ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitc
+ iokit/Kernel/arm/SweetAccelerator.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetAMFI.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/RedwoodWLAN.cpp                                 optional iokitcpp
++iokit/Kernel/arm/SweetBTNub.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/MiniIONetworkStack.cpp                          optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+-- 
+2.43.0
+

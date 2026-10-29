@@ -1,0 +1,852 @@
+From a1cd383038bde66c03c8689f48a3fb4cc971988e Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Tue, 27 Oct 2026 09:15:07 +0100
+Subject: [PATCH] 0992 redfin: sampling profiler for one process (p prof), p
+ disp, p phase
+
+p prof start NAME|PID [HZ [SECS [DEPTH [WAITHZ]]]] samples the process's threads:
+a local timer at HZ cross-calls only the CPUs whose active thread belongs to the
+task; the handler records the interrupted user pc/lr (or the kernel pc plus the
+user state saved at entry) and a fault-free frame-pointer walk (AT S1E0R + the
+physical aperture). WAITHZ adds off-CPU samples from a kernel thread. The buffer
+(8 MiB contiguous) is read over /dev/pmem; tools-claude/sweet-prof.py makes the
+profile. p disp logs the display power state. p phase NAME flushes the FB,
+SCANOUT and GPU stats windows, logs SWEET PHASE: NAME and marks the profile, so
+bench stats lines align with gesture phases.
+---
+ bsd/dev/sweet_gpu.c                   |  22 +-
+ bsd/dev/sweet_poke.c                  |   6 +
+ bsd/dev/sweet_sample.c                |  53 +++
+ iokit/Kernel/arm/SweetFramebuffer.cpp |  37 ++
+ osfmk/arm64/sweet_prof.c              | 625 ++++++++++++++++++++++++++
+ osfmk/conf/files.arm64                |   1 +
+ 6 files changed, 743 insertions(+), 1 deletion(-)
+ create mode 100644 osfmk/arm64/sweet_prof.c
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index f754b2d..bbce154 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -407,6 +407,7 @@ static struct { uint32_t lo, hi; int culprit; } lost[LOST_RING];	/* 0941: culpri
+ #define GSTAT_OWNERS    6
+ static uint32_t gstat_next = 1;
+ static uint64_t gstat_abs;
++static bool gstat_force;     /* 0991: p phase: the line now, whatever the window */
+ static int gstat_pid[A6_TS_SLOTS];
+ static struct { int pid; uint32_t n; uint64_t busy; } gstat_own[GSTAT_OWNERS + 1];     /* last: everyone else */
+ static uint32_t gstat_n, gstat_missed;
+@@ -447,9 +448,13 @@ gpu_stats_locked(void)
+ 		gstat_abs = now;
+ 	}
+ 	absolutetime_to_nanoseconds(now - gstat_abs, &ns);
+-	if (ns < 5000000000ULL) {
++	if (ns < 5000000000ULL && !gstat_force) {
+ 		return;
+ 	}
++	gstat_force = false;
++	if (ns < 1000000) {
++		ns = 1000000;
++	}
+ 	if (gstat_n) {
+ 		char who[160] = "", name[24];
+ 		size_t w = 0;
+@@ -472,6 +477,21 @@ gpu_stats_locked(void)
+ 	gstat_abs = now;
+ }
+ 
++/* 0991: p phase (SweetFramebuffer.cpp): the GPU stats line for the phase that ends; the window restarts now */
++void sweet_gpu_stats_flush(void);
++void
++sweet_gpu_stats_flush(void)
++{
++	if (!gpu_ready) {
++		return;
++	}
++	lck_mtx_lock(&sweet_gpu_lock);
++	gstat_force = true;
++	gpu_stats_locked();
++	gstat_force = false;
++	lck_mtx_unlock(&sweet_gpu_lock);
++}
++
+ static void
+ gpu_note_submit_locked(void)
+ {
+diff --git a/bsd/dev/sweet_poke.c b/bsd/dev/sweet_poke.c
+index 60d78b0..1ffdea4 100644
+--- a/bsd/dev/sweet_poke.c
++++ b/bsd/dev/sweet_poke.c
+@@ -134,6 +134,12 @@ poke_line(const char *s, const char *end, unsigned lineno)
+ 		while (q < end && (*q == ' ' || *q == '\t')) {
+ 			q++;
+ 		}
++		if (end - q >= 4 && !strncmp(q, "prof", 4) && (end - q == 4 || q[4] == ' ')) {
++			/* 0991: p prof ... = the sampling profiler (osfmk/arm64/sweet_prof.c) */
++			extern void sweet_prof_cmd(const char *s, const char *end);
++			sweet_prof_cmd(q, end);
++			return;
++		}
+ 		if (q < end && *q >= 'a' && *q <= 'z') {
+ 			extern void sweet_fb_cmd(const char *s, const char *end);
+ 			sweet_fb_cmd(q, end);
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index b40eccd..9d591ab 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -78,6 +78,59 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++/*
++ * 0991: the task of a process by pid (pid >= 0) or by name (the first match), with a task reference, for the
++ * profiler (osfmk/arm64/sweet_prof.c).
++ */
++task_t sweet_prof_find_task(const char *name, size_t len, int pid, int *pid_out, char *name_out, size_t name_len);
++
++struct sweet_prof_find {
++	const char *name;
++	size_t      len;
++	int         pid;
++};
++
++static int
++sweet_prof_find_proc(proc_t p, void *arg)
++{
++	struct sweet_prof_find *f = arg;
++	char name[32];
++	if (f->pid >= 0) {
++		return PROC_RETURNED;
++	}
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (strlen(name) == f->len && strncmp(name, f->name, f->len) == 0) {
++		f->pid = proc_pid(p);
++		return PROC_RETURNED_DONE;
++	}
++	return PROC_RETURNED;
++}
++
++task_t
++sweet_prof_find_task(const char *name, size_t len, int pid, int *pid_out, char *name_out, size_t name_len)
++{
++	if (pid < 0) {
++		struct sweet_prof_find f = { .name = name, .len = len, .pid = -1 };
++		proc_iterate(PROC_ALLPROCLIST, sweet_prof_find_proc, &f, NULL, NULL);
++		pid = f.pid;
++	}
++	if (pid < 0) {
++		return TASK_NULL;
++	}
++	proc_t p = proc_find(pid);
++	if (p == PROC_NULL) {
++		return TASK_NULL;
++	}
++	task_t task = proc_task(p);
++	if (task != TASK_NULL) {
++		task_reference(task);
++		*pid_out = pid;
++		proc_name(pid, name_out, (int)name_len);
++	}
++	proc_rele(p);
++	return task;
++}
++
+ void
+ sweet_sample_start(void)
+ {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 682a868..33a0f92 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2866,9 +2866,46 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+  *                          CP waits for the latch (2; boot-arg sweetscangate)
+  *   p scanout corners 0|1  0986: corner mattes drawn into each direct frame (default off)
+  */
++extern "C" void sweet_gpu_stats_flush(void);     /* 0991 */
++extern "C" void sweet_prof_cmd(const char *s, const char *end);   /* 0991 */
++
+ void
+ AppleCLCD::fbCmd(const char *s, const char *end)
+ {
++	if (end - s >= 4 && !strncmp(s, "disp", 4)) {
++		/* 0991: p disp: the display power state, for scripts (tools-claude/redfin-fpsbench.sh) */
++		IOLog("SWEET FB: display %s (p disp; scanout %s)\n", fPowerOff ? "off" : "on", sweet_scan_live() ? "direct" : "panel buffer");
++		return;
++	}
++	if (end - s >= 5 && !strncmp(s, "phase", 5)) {
++		/*
++		 * 0991: p phase NAME: the FB, SCANOUT and GPU stats lines of the phase that ends now (when it had frames),
++		 * their windows restart, then "SWEET PHASE: NAME" (and a profiler mark). Every stats line between two
++		 * PHASE lines covers only that phase (tools-claude/fps-parse.py).
++		 */
++		const char *q = s + 5;
++		while (q < end && *q == ' ') {
++			q++;
++		}
++		uint64_t now = mach_absolute_time();
++		IOLockLock(fLock);
++		fStWin = 1;
++		IOLockUnlock(fLock);
++		statLine(now);
++		IOLockLock(fLock);
++		if (sweet_scan.on) {
++			sweet_scan.stWin = 1;
++			sweet_scan_stats_locked(now);
++		}
++		sweet_scan.stWin = now;
++		IOLockUnlock(fLock);
++		sweet_gpu_stats_flush();
++		IOLog("SWEET PHASE: %.*s\n", (int)(end - q > 60 ? 60 : end - q), q);
++		char mk[72];
++		snprintf(mk, sizeof(mk), "prof mark %.*s", (int)(end - q > 56 ? 56 : end - q), q);
++		sweet_prof_cmd(mk, mk + strlen(mk));
++		return;
++	}
+ 	if (end - s >= 8 && !strncmp(s, "swapdone", 8)) {
+ 		/* 0987: p swapdone [MASK | trace]: 1 swap-complete tick, 2 trace (trace = re-arm with 2 set); no argument: state */
+ 		const char *q = s + 8;
+diff --git a/osfmk/arm64/sweet_prof.c b/osfmk/arm64/sweet_prof.c
+new file mode 100644
+index 0000000..1460f34
+--- /dev/null
++++ b/osfmk/arm64/sweet_prof.c
+@@ -0,0 +1,625 @@
++/*
++ * 0991 redfin: a sampling profiler for one process (p prof), kernel-assisted, no userland helper.
++ *
++ *   p prof start NAME|PID [HZ [SECS [DEPTH [WAITHZ]]]]   defaults 1000 Hz, 10 s, 24 frames, 0 (max 4000, 120, 60, 200)
++ *   p prof stop | p prof mark TEXT | p prof dump | p prof   (dump: the buffer line again; no argument: state)
++ *
++ * On-CPU samples: a timer (one CPU, TIMER_CALL_LOCAL, no leeway) at HZ samples its own CPU and cross-calls only the
++ * CPUs whose active thread is one of the task's threads (a pointer list refreshed every 20 ms in thread context;
++ * pointers are only compared, never dereferenced, so idle cores are never woken). The handler (interrupt context)
++ * reads the interrupted state (cpu_int_state): from EL0 the exact user pc/lr/fp; from EL1 (a syscall or fault of
++ * the task) the kernel pc plus the user state saved at entry. The user frame-pointer chain is walked without
++ * faults: AT S1E0R (mmu_uvtop, the interrupted task's TTBR0 is live) and the physical aperture, managed DRAM only.
++ * Off-CPU samples (WAITHZ > 0): a kernel thread records the saved user state and chain (pmap_find_pa, no faults)
++ * of each of the task's threads that is not on a CPU, with its thread state (waiting or runnable).
++ *
++ * The buffer (8 MiB, physically contiguous, allocated once) is read over /dev/pmem; the PA and length are in the
++ * "SWEET PROF: done" line. Layout (little-endian): struct prof_hdr at 0, text at 256 ("T tid name" per thread,
++ * "I addr path" per image outside the shared cache), records from 16384:
++ *   u64 abs, u64 tid, u8 kind (1 user, 2 kernel, 3 mark, 4 off-CPU), u8 cpu, u8 n, u8 flags, u32 aux (kind 4: the
++ *   thread state), u64 kernel pc (kind 2), then n u64: pc, lr, return addresses (kind 3: the text).
++ * PC side: tools-claude/sweet-prof.py.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <mach/mach_types.h>
++#include <mach/mach_time.h>
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <kern/timer_call.h>
++#include <kern/sched_prim.h>
++#include <kern/clock.h>
++#include <kern/misc_protos.h>
++#include <arm/cpu_data_internal.h>
++#include <arm/cpu_internal.h>
++#include <arm/cpu_number.h>
++#include <arm/thread.h>
++#include <arm/pmap.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_map.h>
++#include <vm/vm_shared_region.h>
++#include <machine/atomic.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <string.h>
++#include <stdarg.h>
++
++#define PMIN(a, b) ((a) < (b) ? (a) : (b))
++#define PMAX(a, b) ((a) > (b) ? (a) : (b))
++
++extern task_t sweet_prof_find_task(const char *name, size_t len, int pid, int *pid_out, char *name_out, size_t name_len);
++extern void sweet_prof_cmd(const char *s, const char *end);
++extern vm_offset_t vm_kernel_slide;
++extern int vsnprintf(char *, size_t, const char *, va_list);
++
++#define PROF_SIZE_MAX   (8u << 20)
++#define PROF_TEXT       256u
++#define PROF_REC0       16384u
++#define PROF_DEPTH_MAX  60
++#define PROF_THREADS    160
++
++#define PROF_IDLE       0
++#define PROF_RUN        1
++#define PROF_STOPPING   2
++
++struct prof_hdr {
++	char     magic[8];              /* "SWPROF1" */
++	uint32_t rec0, text_size;
++	uint64_t used;                  /* record bytes from rec0 */
++	uint64_t start_abs, end_abs;
++	uint32_t hz, depth, wait_hz, pid;
++	uint64_t slide, sr_base, sr_size, mh, kslide;
++	uint32_t ticks, samples, ksamples, wsamples;
++	uint32_t dropped, xbusy, xfail, marks;
++	uint32_t tb_num, tb_den, ncpu, overruns;
++	char     name[32];
++};
++
++struct prof_rec {
++	uint64_t abs, tid;
++	uint8_t  kind, cpu, n, flags;
++	uint32_t aux;
++	uint64_t kpc;
++};
++
++static struct {
++	uint8_t          *buf;
++	uint64_t          pa;
++	uint32_t          cap;          /* record bytes available */
++	volatile int      state;
++	task_t            task;
++	int               pid;
++	char              name[32];
++	uint32_t          hz, depth, wait_hz;
++	uint64_t          interval, next, start_abs, end_abs, stop_abs;
++	uint64_t          used;
++	thread_t          threads[PROF_THREADS];
++	volatile uint32_t nthreads;
++	uint32_t          ticks, samples, ksamples, wsamples, dropped, xbusy, xfail, marks, overruns;
++	uint32_t          text_size;
++} prof;
++
++static timer_call_data_t prof_timer;
++static bool prof_timer_ready;
++
++/* Reserve and fill one record; any context. */
++static void
++prof_put(uint8_t kind, uint8_t cpu, uint64_t tid, uint64_t kpc, uint32_t aux, const uint64_t *w, uint32_t n)
++{
++	uint32_t sz = (uint32_t)sizeof(struct prof_rec) + n * 8;
++	uint64_t off = os_atomic_add_orig(&prof.used, (uint64_t)sz, relaxed);
++	if (off + sz > prof.cap) {
++		os_atomic_add(&prof.used, -(uint64_t)sz, relaxed);      /* keep "used" = the bytes written */
++		os_atomic_inc(&prof.dropped, relaxed);
++		return;
++	}
++	struct prof_rec *r = (struct prof_rec *)(void *)(prof.buf + PROF_REC0 + off);
++	r->abs = mach_absolute_time();
++	r->tid = tid;
++	r->kind = kind;
++	r->cpu = cpu;
++	r->n = (uint8_t)n;
++	r->flags = 0;
++	r->aux = aux;
++	r->kpc = kpc;
++	memcpy(r + 1, w, n * 8);
++}
++
++/* User frame chain via AT S1E0R (the current TTBR0), interrupt context; no faults. */
++static uint32_t
++prof_walk_uv(uint64_t fp, uint64_t *out, uint32_t max)
++{
++	uint32_t n = 0;
++	while (n < max && fp != 0 && (fp & 7) == 0 && (fp >> 47) == 0) {
++		pmap_paddr_t pa = mmu_uvtop((vm_offset_t)fp), pa2;
++		if (pa == 0 || !pmap_valid_address(pa)) {
++			break;
++		}
++		pa2 = ((fp + 8) & 0xfff) ? pa + 8 : mmu_uvtop((vm_offset_t)(fp + 8));
++		if (pa2 == 0 || !pmap_valid_address(pa2)) {
++			break;
++		}
++		uint64_t next = *(volatile uint64_t *)phystokv(pa);
++		out[n++] = *(volatile uint64_t *)phystokv(pa2);
++		if (next <= fp || next - fp > (16u << 20)) {
++			break;
++		}
++		fp = next;
++	}
++	return n;
++}
++
++/* The same through a pmap (thread context; pmap_find_pa takes the pmap lock, never faults). */
++static uint32_t
++prof_walk_pmap(pmap_t pmap, uint64_t fp, uint64_t *out, uint32_t max)
++{
++	uint32_t n = 0;
++	while (n < max && fp != 0 && (fp & 7) == 0 && (fp >> 47) == 0) {
++		pmap_paddr_t pa = pmap_find_pa(pmap, fp), pa2;
++		if (pa == 0 || !pmap_valid_address(pa)) {
++			break;
++		}
++		pa2 = ((fp + 8) & 0xfff) ? pa + 8 : pmap_find_pa(pmap, fp + 8);
++		if (pa2 == 0 || !pmap_valid_address(pa2)) {
++			break;
++		}
++		uint64_t next = *(volatile uint64_t *)phystokv(pa);
++		out[n++] = *(volatile uint64_t *)phystokv(pa2);
++		if (next <= fp || next - fp > (16u << 20)) {
++			break;
++		}
++		fp = next;
++	}
++	return n;
++}
++
++/* Interrupt context, on the CPU to sample: the interrupted thread, if it is the task's. */
++static void
++prof_sample_here(void)
++{
++	thread_t th = current_thread();
++	if (prof.state != PROF_RUN || th == THREAD_NULL || get_threadtask(th) != prof.task) {
++		return;
++	}
++	arm_saved_state_t *is = (arm_saved_state_t *)getCpuDatap()->cpu_int_state;
++	arm_saved_state_t *src;
++	uint64_t kpc = 0, w[2 + PROF_DEPTH_MAX];
++	uint8_t kind;
++	if (is != NULL && is_saved_state64(is) && PSR64_IS_USER(get_saved_state_cpsr(is))) {
++		kind = 1;
++		src = is;
++	} else {
++		kind = 2;
++		src = get_user_regs(th);
++		if (is != NULL && is_saved_state64(is)) {
++			kpc = get_saved_state_pc(is);
++		}
++	}
++	if (src == NULL || !is_saved_state64(src)) {
++		return;
++	}
++	w[0] = get_saved_state_pc(src);
++	w[1] = get_saved_state_lr(src);
++	uint32_t n = 2 + prof_walk_uv(get_saved_state_fp(src), w + 2, prof.depth);
++	prof_put(kind, (uint8_t)cpu_number(), thread_tid(th), kpc, 0, w, n);
++	if (kind == 1) {
++		os_atomic_inc(&prof.samples, relaxed);
++	} else {
++		os_atomic_inc(&prof.ksamples, relaxed);
++	}
++}
++
++static void
++prof_xcall(__unused void *arg)
++{
++	prof_sample_here();
++}
++
++static void
++prof_tick(__unused timer_call_param_t p0, __unused timer_call_param_t p1)
++{
++	if (prof.state != PROF_RUN) {
++		return;
++	}
++	uint64_t now = mach_absolute_time();
++	int me = cpu_number(), maxc = ml_get_max_cpu_number();
++	uint32_t nth = prof.nthreads;
++	prof.ticks++;
++	for (int i = 0; i <= maxc; i++) {
++		cpu_data_t *cd;
++		if (i == me || (cd = cpu_datap(i)) == NULL) {
++			continue;
++		}
++		thread_t at = cd->cpu_active_thread;
++		bool hit = false;
++		for (uint32_t k = 0; k < nth; k++) {
++			if (prof.threads[k] == at) {
++				hit = true;
++				break;
++			}
++		}
++		if (!hit) {
++			continue;
++		}
++		if (cd->cpu_signal & (SIGPxcall | SIGPdisabled)) {
++			prof.xbusy++;           /* an earlier cross-call is still pending (or the core is going down) */
++			continue;
++		}
++		if (cpu_xcall(i, prof_xcall, &prof) != KERN_SUCCESS) {
++			prof.xfail++;
++		}
++	}
++	prof_sample_here();
++	if (now >= prof.end_abs) {
++		prof.state = PROF_STOPPING;
++		thread_wakeup((event_t)&prof.state);
++		return;
++	}
++	prof.next += prof.interval;
++	if (prof.next <= now) {
++		prof.overruns++;
++		prof.next = now + prof.interval;
++	}
++	timer_call_enter(&prof_timer, prof.next, TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL);
++}
++
++static bool
++prof_on_cpu(thread_t th)
++{
++	int maxc = ml_get_max_cpu_number();
++	for (int i = 0; i <= maxc; i++) {
++		cpu_data_t *cd = cpu_datap(i);
++		if (cd != NULL && cd->cpu_active_thread == th) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* Thread context: the pointer list (and with WAITHZ the off-CPU samples) under the task lock. */
++static void
++prof_scan(bool wait)
++{
++	task_t task = prof.task;
++	pmap_t pmap = get_task_pmap(task);
++	thread_t th;
++	uint32_t n = 0;
++	uint64_t w[2 + PROF_DEPTH_MAX];
++	task_lock(task);
++	queue_iterate(&task->threads, th, thread_t, task_threads) {
++		if (n < PROF_THREADS) {
++			prof.threads[n++] = th;
++		}
++		if (!wait || prof_on_cpu(th)) {
++			continue;
++		}
++		arm_saved_state_t *us = get_user_regs(th);
++		if (us == NULL || !is_saved_state64(us)) {
++			continue;
++		}
++		w[0] = get_saved_state_pc(us);
++		w[1] = get_saved_state_lr(us);
++		uint32_t k = 2 + prof_walk_pmap(pmap, get_saved_state_fp(us), w + 2, prof.depth);
++		prof_put(4, 0xff, thread_tid(th), 0, (uint32_t)th->state, w, k);
++		prof.wsamples++;
++	}
++	task_unlock(task);
++	for (uint32_t i = n; i < prof.nthreads; i++) {
++		prof.threads[i] = THREAD_NULL;
++	}
++	prof.nthreads = n;
++}
++
++static void
++prof_text(const char *fmt, ...) __printflike(1, 2);
++static void
++prof_text(const char *fmt, ...)
++{
++	va_list ap;
++	uint32_t room = PROF_REC0 - PROF_TEXT - prof.text_size;
++	if (room < 2) {
++		return;
++	}
++	va_start(ap, fmt);
++	int k = vsnprintf((char *)prof.buf + PROF_TEXT + prof.text_size, room, fmt, ap);
++	va_end(ap);
++	if (k > 0) {
++		prof.text_size += PMIN((uint32_t)k, room - 1);
++	}
++}
++
++/* Thread context, the task still referenced: thread names, images outside the shared cache, the header. */
++static void
++prof_finish(void)
++{
++	task_t task = prof.task;
++	vm_map_t map = get_task_map(task);
++	struct prof_hdr *h = (struct prof_hdr *)(void *)prof.buf;
++	uint64_t slide = 0, srb = 0, srs = 0;
++	vm_shared_region_t sr = vm_shared_region_get(task);
++	thread_t th;
++	char tn[64];
++	if (sr != NULL) {
++		slide = sr->sr_slide;
++		srb = sr->sr_base_address;
++		srs = sr->sr_size;
++		vm_shared_region_deallocate(sr);
++	}
++	prof.text_size = 0;
++	task_lock(task);
++	queue_iterate(&task->threads, th, thread_t, task_threads) {
++		tn[0] = 0;
++		thread_get_thread_name(th, tn);
++		tn[sizeof(tn) - 1] = 0;
++		prof_text("T %llu %s\n", thread_tid(th), tn);
++	}
++	task_unlock(task);
++	/* dyld_all_image_infos (64-bit): version, infoArrayCount, infoArray -> {load address, path, mod date} */
++	uint64_t aii = task->all_image_info_addr, hdr[2] = { 0, 0 };
++	if (task->active && aii != 0 && vm_map_read_user(map, aii, hdr, sizeof(hdr)) == KERN_SUCCESS) {
++		uint32_t count = PMIN((uint32_t)(hdr[0] >> 32), 4096u), shown = 0;
++		for (uint32_t i = 0; i < count && shown < 48; i++) {
++			uint64_t e[3];
++			char path[160];
++			if (vm_map_read_user(map, hdr[1] + i * 24ull, e, sizeof(e)) != KERN_SUCCESS) {
++				break;
++			}
++			if (e[0] >= srb && e[0] < srb + srs) {
++				continue;       /* in the shared cache: the slide covers it */
++			}
++			bzero(path, sizeof(path));
++			if (e[1] == 0 || vm_map_read_user(map, e[1], path, sizeof(path) - 1) != KERN_SUCCESS) {
++				/* the path may end close to an unmapped page: try a shorter read */
++				if (e[1] == 0 || vm_map_read_user(map, e[1], path, 48) != KERN_SUCCESS) {
++					strlcpy(path, "?", sizeof(path));
++				}
++			}
++			path[sizeof(path) - 1] = 0;
++			prof_text("I 0x%llx %s\n", e[0], path);
++			shown++;
++		}
++	}
++	mach_timebase_info_data_t tb;
++	clock_timebase_info(&tb);
++	bzero(h, sizeof(*h));
++	memcpy(h->magic, "SWPROF1", 8);
++	h->rec0 = PROF_REC0;
++	h->text_size = prof.text_size;
++	h->used = prof.used;
++	h->start_abs = prof.start_abs;
++	h->end_abs = prof.stop_abs;
++	h->hz = prof.hz;
++	h->depth = prof.depth;
++	h->wait_hz = prof.wait_hz;
++	h->pid = (uint32_t)prof.pid;
++	h->slide = slide;
++	h->sr_base = srb;
++	h->sr_size = srs;
++	h->mh = task->mach_header_vm_address;
++	h->kslide = vm_kernel_slide;
++	h->ticks = prof.ticks;
++	h->samples = prof.samples;
++	h->ksamples = prof.ksamples;
++	h->wsamples = prof.wsamples;
++	h->dropped = prof.dropped;
++	h->xbusy = prof.xbusy;
++	h->xfail = prof.xfail;
++	h->marks = prof.marks;
++	h->tb_num = tb.numer;
++	h->tb_den = tb.denom;
++	h->ncpu = (uint32_t)ml_get_max_cpu_number() + 1;
++	h->overruns = prof.overruns;
++	strlcpy(h->name, prof.name, sizeof(h->name));
++}
++
++static void
++prof_dump_line(const char *what)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(prof.stop_abs - prof.start_abs, &ns);
++	printf("SWEET PROF: %s %s[%d] %llu ms at %u Hz depth %u wait %u Hz: %u user + %u kernel + %u off-CPU samples, "
++	    "%u marks, %u ticks (%u late), %u dropped, xcall busy %u fail %u | pa 0x%llx bytes %llu "
++	    "(agent: files read /dev/pmem 0x%llx %llu OUT)\n", what, prof.name, prof.pid, ns / 1000000, prof.hz, prof.depth,
++	    prof.wait_hz, prof.samples, prof.ksamples, prof.wsamples, prof.marks, prof.ticks, prof.overruns, prof.dropped,
++	    prof.xbusy, prof.xfail, prof.pa, (uint64_t)PROF_REC0 + prof.used, prof.pa, (uint64_t)PROF_REC0 + prof.used);
++}
++
++static void
++prof_worker(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t ms = prof.wait_hz ? PMAX(1000u / prof.wait_hz, 5u) : 20u;
++	while (prof.state == PROF_RUN) {
++		prof_scan(prof.wait_hz != 0);
++		assert_wait_timeout((event_t)&prof.state, THREAD_UNINT, ms, NSEC_PER_MSEC);
++		if (prof.state != PROF_RUN) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++			break;
++		}
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++	timer_call_cancel(&prof_timer);
++	prof.stop_abs = mach_absolute_time();
++	delay(3000);            /* cross-calls in flight land (they check the state as well) */
++	prof_finish();
++	task_deallocate(prof.task);
++	prof.task = TASK_NULL;
++	prof.nthreads = 0;
++	prof_dump_line("done");
++	os_atomic_thread_fence(release);
++	prof.state = PROF_IDLE;
++}
++
++static bool
++prof_word(const char **p, const char *end, const char *w)
++{
++	size_t n = strlen(w);
++	const char *s = *p;
++	while (s < end && *s == ' ') {
++		s++;
++	}
++	if ((size_t)(end - s) >= n && !strncmp(s, w, n) && (s + n == end || s[n] == ' ' || s[n] == '\n')) {
++		*p = s + n;
++		return true;
++	}
++	return false;
++}
++
++static uint32_t
++prof_num(const char **p, const char *end, uint32_t dflt)
++{
++	const char *s = *p;
++	while (s < end && *s == ' ') {
++		s++;
++	}
++	if (s >= end || *s < '0' || *s > '9') {
++		*p = s;
++		return dflt;
++	}
++	uint32_t v = 0;
++	while (s < end && *s >= '0' && *s <= '9') {
++		v = v * 10 + (uint32_t)(*s++ - '0');
++	}
++	*p = s;
++	return v;
++}
++
++static void
++prof_stop_wait(void)
++{
++	if (prof.state == PROF_RUN) {
++		prof.state = PROF_STOPPING;
++		thread_wakeup((event_t)&prof.state);
++	}
++	for (int i = 0; i < 300 && prof.state != PROF_IDLE; i++) {
++		delay(10000);
++	}
++}
++
++/* "prof ..." (the poke's "p prof ..."; bsd/dev/sweet_poke.c) */
++void
++sweet_prof_cmd(const char *s, const char *end)
++{
++	const char *q = s + 4;
++	if (prof_word(&q, end, "start")) {
++		if (prof.state != PROF_IDLE) {
++			printf("SWEET PROF: busy (p prof stop first)\n");
++			return;
++		}
++		while (q < end && *q == ' ') {
++			q++;
++		}
++		const char *nm = q;
++		while (q < end && *q != ' ' && *q != '\n') {
++			q++;
++		}
++		size_t nl = (size_t)(q - nm);
++		int pid = -1;
++		if (nl > 0 && nm[0] >= '0' && nm[0] <= '9') {
++			const char *t = nm;
++			pid = (int)prof_num(&t, q, 0);
++		}
++		uint32_t hz = PMIN(PMAX(prof_num(&q, end, 1000), 10u), 4000u);
++		uint32_t secs = PMIN(PMAX(prof_num(&q, end, 10), 1u), 120u);
++		uint32_t depth = PMIN(prof_num(&q, end, 24), (uint32_t)PROF_DEPTH_MAX);
++		uint32_t whz = PMIN(prof_num(&q, end, 0), 200u);
++		if (nl == 0) {
++			printf("SWEET PROF: usage p prof start NAME|PID [HZ [SECS [DEPTH [WAITHZ]]]]\n");
++			return;
++		}
++		if (prof.buf == NULL) {
++			vm_offset_t va = 0;
++			uint32_t size;
++			for (size = PROF_SIZE_MAX; size >= (1u << 20); size >>= 1) {
++				if (kmem_alloc_contig(kernel_map, &va, size, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO,
++				    VM_KERN_MEMORY_DIAG) == KERN_SUCCESS) {
++					break;
++				}
++			}
++			if (size < (1u << 20)) {
++				printf("SWEET PROF: no contiguous buffer\n");
++				return;
++			}
++			prof.buf = (uint8_t *)va;
++			prof.pa = kvtophys(va);
++			prof.cap = size - PROF_REC0;
++		}
++		task_t task = sweet_prof_find_task(nm, nl, pid, &prof.pid, prof.name, sizeof(prof.name));
++		if (task == TASK_NULL) {
++			printf("SWEET PROF: no process %.*s\n", (int)nl, nm);
++			return;
++		}
++		if (!prof_timer_ready) {
++			timer_call_setup(&prof_timer, prof_tick, NULL);
++			prof_timer_ready = true;
++		}
++		bzero(prof.buf, PROF_REC0);
++		prof.task = task;
++		prof.hz = hz;
++		prof.depth = depth;
++		prof.wait_hz = whz;
++		prof.used = 0;
++		prof.ticks = prof.samples = prof.ksamples = prof.wsamples = prof.dropped = 0;
++		prof.xbusy = prof.xfail = prof.marks = prof.overruns = 0;
++		prof.text_size = 0;
++		nanoseconds_to_absolutetime(1000000000ull / hz, &prof.interval);
++		uint64_t len;
++		nanoseconds_to_absolutetime((uint64_t)secs * NSEC_PER_SEC, &len);
++		prof.nthreads = 0;
++		prof.state = PROF_RUN;
++		prof_scan(false);
++		prof.start_abs = prof.stop_abs = mach_absolute_time();
++		prof.end_abs = prof.start_abs + len;
++		thread_t wt;
++		if (kernel_thread_start_priority(prof_worker, NULL, MINPRI_KERNEL + 10, &wt) != KERN_SUCCESS) {
++			prof.state = PROF_IDLE;
++			task_deallocate(task);
++			prof.task = TASK_NULL;
++			printf("SWEET PROF: no worker thread\n");
++			return;
++		}
++		thread_deallocate(wt);
++		prof.next = prof.start_abs + prof.interval;
++		timer_call_enter(&prof_timer, prof.next, TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL);
++		printf("SWEET PROF: start %s[%d] %u Hz %u s depth %u wait %u Hz, %u threads, buffer %u KiB at pa 0x%llx\n",
++		    prof.name, prof.pid, hz, secs, depth, whz, prof.nthreads, (prof.cap + PROF_REC0) >> 10, prof.pa);
++		return;
++	}
++	if (prof_word(&q, end, "stop")) {
++		prof_stop_wait();
++		if (prof.state != PROF_IDLE) {
++			printf("SWEET PROF: stop: still stopping\n");
++		}
++		return;
++	}
++	if (prof_word(&q, end, "mark")) {
++		uint64_t w[8];
++		while (q < end && *q == ' ') {
++			q++;
++		}
++		size_t n = PMIN((size_t)(end - q), sizeof(w) - 1);
++		bzero(w, sizeof(w));
++		memcpy(w, q, n);
++		if (prof.state == PROF_RUN) {
++			prof_put(3, (uint8_t)cpu_number(), 0, 0, 0, w, (uint32_t)((n + 8) / 8));
++			prof.marks++;
++		}
++		printf("SWEET PROF: mark %.*s%s\n", (int)n, q, prof.state == PROF_RUN ? "" : " (not running)");
++		return;
++	}
++	if (prof_word(&q, end, "dump")) {
++		prof_stop_wait();
++		if (prof.buf == NULL || prof.state != PROF_IDLE) {
++			printf("SWEET PROF: nothing to dump\n");
++			return;
++		}
++		prof_dump_line("dump");
++		return;
++	}
++	printf("SWEET PROF: %s; p prof start NAME|PID [HZ [SECS [DEPTH [WAITHZ]]]] | stop | mark TEXT | dump\n",
++	    prof.state == PROF_RUN ? "running" : prof.state == PROF_STOPPING ? "stopping" : "idle");
++	if (prof.state == PROF_RUN) {
++		printf("SWEET PROF: %s[%d]: %u user + %u kernel + %u off-CPU samples, %llu bytes, %u threads\n", prof.name,
++		    prof.pid, prof.samples, prof.ksamples, prof.wsamples, prof.used, prof.nthreads);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index b0dad49..bf106dd 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -41,6 +41,7 @@ osfmk/arm/arm_timer.c		standard
+ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
++osfmk/arm64/sweet_prof.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard
+-- 
+2.43.0
+

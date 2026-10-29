@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Tue, 27 Oct 2026 13:00:00 +0100
+Subject: [PATCH] 0991 redfin: direct scanout gate 2: no dropped frames (queue of 3)
+
+r40a gate 2: 221 of 1302 CP waits ran to the 50 ms release. Frame K+1's GPU
+work sits in the ring behind a CP wait for frame K on screen; when K+1's
+SwapEnd replaced a K still waiting for its fence, K was never shown and
+K+1 never drew until the release. With gate 2 frames now queue (3 behind
+the waiting one) and flip in order; a frame that is dropped anyway (queue
+full, or late) raises the word to its number first. 5 s gate line: queued,
+overflow.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 682a868..dbf20f3 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2238,6 +2238,8 @@ static struct {
+ 	bool          thread;
+ 	uint32_t      stride;           /* rows of the surfaces the geometry was set for */
+ 	SweetSurface *next, *flipping, *shown;  /* retained, displayUse held (fLock) */
++	struct { SweetSurface *s; uint32_t fence, swap; uint64_t seq, abs; } later[3];  /* 0991: gate 2 queue after next */
++	uint32_t      laterN, stQueued, stOverflow;
+ 	uint32_t      nextFence, nextSwap, flipSwap, flipFrame, shownSwap;
+ 	uint64_t      nextSeq, flipSeq, shownSeq, seq;
+ 	uint64_t      nextAbs, flipSwapAbs, flipAbs;
+@@ -2321,6 +2323,32 @@ sweet_scan_drop_all_locked(void)
+ 	sweet_scan_drop(&sweet_scan.next);
+ 	sweet_scan_drop(&sweet_scan.flipping);
+ 	sweet_scan_drop(&sweet_scan.shown);
++	while (sweet_scan.laterN > 0) {
++		sweet_scan_drop(&sweet_scan.later[--sweet_scan.laterN].s);
++	}
++}
++
++/*
++ * 0991: with gate 2 no frame may be dropped: the GPU work of frame K+1 sits in the ring behind a CP wait for frame K
++ * on screen, so a K replaced by K+1 before its flip was never shown and K+1 never drew (r40a: 221 of 1302 CP waits
++ * ran to the 50 ms release). Frames that come while one is waiting go into a queue of 3 and are flipped in order.
++ */
++static void
++sweet_scan_pop_locked(void)
++{
++	if (sweet_scan.next != NULL || sweet_scan.laterN == 0) {
++		return;
++	}
++	sweet_scan.next = sweet_scan.later[0].s;
++	sweet_scan.nextFence = sweet_scan.later[0].fence;
++	sweet_scan.nextSwap = sweet_scan.later[0].swap;
++	sweet_scan.nextSeq = sweet_scan.later[0].seq;
++	sweet_scan.nextAbs = sweet_scan.later[0].abs;
++	sweet_scan.laterN--;
++	for (uint32_t i = 0; i < sweet_scan.laterN; i++) {
++		sweet_scan.later[i] = sweet_scan.later[i + 1];
++	}
++	sweet_scan.later[sweet_scan.laterN].s = NULL;
+ }
+ 
+ /* The pipes into the direct geometry, showing surface s (its fence has landed). Without fLock. */
+@@ -2446,9 +2474,40 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+ 		s->release();
+ 		return false;
+ 	}
++	sweet_scan_pop_locked();
++	if (sweet_scan.next != NULL && sweet_scan.gate == 2 && sweet_scan.laterN < 3) {
++		/* 0991: queued behind the waiting one, not dropped */
++		sweet_scan_hold(s);
++		s->release();
++		uint32_t i = sweet_scan.laterN++;
++		sweet_scan.later[i].s = s;
++		sweet_scan.later[i].fence = fence;
++		sweet_scan.later[i].swap = get32(rec, 0x50);
++		sweet_scan.later[i].seq = ++sweet_scan.seq;
++		sweet_scan.later[i].abs = now;
++		sweet_scan.lastSwap = sweet_scan.later[i].swap;
++		sweet_scan.gatePid = proc_selfpid();
++		sweet_scan.gateSeq = sweet_scan.later[i].seq;
++		sweet_scan.stQueued++;
++		sweet_scan.stFrames++;
++		IOLockWakeup(fb->fLock, &sweet_scan, false);
++		IOLockUnlock(fb->fLock);
++		return true;
++	}
+ 	if (sweet_scan.next != NULL) {
+ 		sweet_scan.stDropped++;         /* a newer frame before the last one was flipped */
++		if (sweet_scan.gate == 2) {
++			sweet_scan.stOverflow++;        /* 0991: never shown: its CP waiters go on */
++			sweet_scan_word_locked((uint32_t)sweet_scan.nextSeq);
++		}
+ 		sweet_scan_drop(&sweet_scan.next);
++		sweet_scan_pop_locked();
++		if (sweet_scan.next != NULL) {
++			/* (the queue was full: the oldest went; this frame goes to the end) */
++			sweet_scan_word_locked((uint32_t)sweet_scan.nextSeq);
++			sweet_scan_drop(&sweet_scan.next);
++			sweet_scan_pop_locked();
++		}
+ 	}
+ 	sweet_scan_hold(s);
+ 	s->release();
+@@ -2654,7 +2713,9 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
+ 		absolutetime_to_nanoseconds(now - sweet_scan.nextAbs, &ns);
+ 		if (ns > 200 * NSEC_PER_MSEC) {
+ 			sweet_scan.stLate++;            /* the GPU never got there: not shown */
++			sweet_scan_word_locked((uint32_t)sweet_scan.nextSeq);     /* 0991: its CP waiters go on */
+ 			sweet_scan_drop(&sweet_scan.next);
++			sweet_scan_pop_locked();
+ 			IOLockWakeup(fb->fLock, &sweet_scan.shownSeq, false);
+ 			return false;
+ 		}
+@@ -2680,6 +2741,7 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
+ 	sweet_scan.next = NULL;
+ 	uint64_t sSeq = sweet_scan.nextSeq, sAbs = sweet_scan.nextAbs;    /* 0979: a newer frame may come while entering */
+ 	uint32_t sSwap = sweet_scan.nextSwap;
++	sweet_scan_pop_locked();        /* 0991: the next queued frame (gate 2) waits for this one's latch */
+ 	if (!sweet_scan.geom) {
+ 		/* the first direct frame: switch the pipes (they show s once it returns) */
+ 		sweet_scan.entering = true;
+@@ -2764,11 +2826,12 @@ sweet_scan_stats_locked(uint64_t now)
+ 		absolutetime_to_nanoseconds(sweet_scan.stGateAbs, &gw);
+ 		uint64_t cw = 0;    /* 0986 */
+ 		absolutetime_to_nanoseconds(sweet_scan.stCornerAbs, &cw);
+-		IOLog("SWEET SCANOUT: 5s gate %u: submits %u waited %u (avg %llu us) timeout %u | cp waits %u released %u | "
+-		    "corners %u (avg %llu us)\n", sweet_scan.gate, sweet_scan.stGate, sweet_scan.stGateWait,
++		IOLog("SWEET SCANOUT: 5s gate %u: submits %u waited %u (avg %llu us) timeout %u | cp waits %u released %u queued %u "
++		    "overflow %u | corners %u (avg %llu us)\n", sweet_scan.gate, sweet_scan.stGate, sweet_scan.stGateWait,
+ 		    sweet_scan.stGateWait ? gw / 1000 / sweet_scan.stGateWait : 0, sweet_scan.stGateTimeout, sweet_scan.stGpuWait,
+-		    sweet_scan.stGpuRelease, sweet_scan.stCorners, sweet_scan.stCorners ? cw / 1000 / sweet_scan.stCorners : 0);
+-		sweet_scan.stGpuWait = sweet_scan.stGpuRelease = 0;
++		    sweet_scan.stGpuRelease, sweet_scan.stQueued, sweet_scan.stOverflow, sweet_scan.stCorners,
++		    sweet_scan.stCorners ? cw / 1000 / sweet_scan.stCorners : 0);
++		sweet_scan.stGpuWait = sweet_scan.stGpuRelease = sweet_scan.stQueued = sweet_scan.stOverflow = 0;
+ 		sweet_scan.stCornerAbs = 0;
+ 		sweet_scan.stCorners = 0;
+ 		sweet_scan.stGateAbs = 0;
+-- 
+2.43.0
+

@@ -1,0 +1,235 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Mon, 26 Oct 2026 23:30:00 +0100
+Subject: [PATCH] 0944 redfin: present at SwapEnd, vsync ticks on the TE
+
+sweetfbx & 4 (off by default; needs the present thread): SwapEnd queues the
+frame (two deep) and the present thread blits it at once instead of on the
+next 60 Hz tick; a third SwapEnd is held until one has gone (50 ms at most,
+then the newest waiting frame is replaced). A present put off by the GPU is
+retried every 1 ms (a newer waiting frame replaces it), and a landed 0905
+flip is flushed at once. The vsync tick is phased to INTF1's tear check:
+the TE frame counter and read-pointer line give the time of the last TE,
+the next tick goes 0.5 ms after a TE; a stopped counter leaves the ticks
+free-running. With the bit clear nothing changes.
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 158 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 156 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 8a28d2f..7b71882 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -191,6 +191,15 @@ public:
+ 	void          statShown(uint64_t swapAbs);
+ 	void          statLine(uint64_t now);
+ 	void          fbCmd(const char *s, const char *end);
++	/* 0944 (sweetfbx & 4): frames queued at SwapEnd for the present thread, ticks phased to the TE (fLock) */
++	bool          fSwapQ;
++	uint8_t      *fQ;             /* two swap records */
++	uint64_t      fQAbs[2];
++	uint32_t      fQHead, fQn;
++	uint64_t      fQRetry;        /* a put-off present is tried again from then on */
++	uint32_t      fTeFrame, fTeStale, fTeLogs;
++	void          phaseTick(uint64_t now);
++	bool          queueSwap(const uint8_t *rec, uint64_t now);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -574,8 +583,14 @@ AppleCLCD::start(IOService *provider)
+ 	fPresentRec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 	int pt = 1;
+ 	PE_parse_boot_argn("sweetfb_thread", &pt, sizeof(pt));
++	/* 0944: sweetfbx & 4 (needs the present thread) */
++	fQ = (sweet_fbx & SWEET_FBX_SWAPQ) && pt ? (uint8_t *)IOMallocData(2 * SWEET_FB_SWAP_REC_SIZE) : NULL;
+ 	if (pt && fPresentRec != NULL && IOCreateThread(&AppleCLCD::presentLoop, this) != NULL) {
+ 		fPresentThread = true;
++		fSwapQ = fQ != NULL;
++	}
++	if ((sweet_fbx & SWEET_FBX_SWAPQ) && !fSwapQ) {
++		IOLog("SWEET FB: sweetfbx 0x4 needs the present thread (sweetfb_thread): off\n");
+ 	}
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -643,6 +658,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (fb->fNextVsync <= now) {
+ 		fb->fNextVsync = now + fb->fVsyncAbs;
+ 	}
++	if (sweet_fbx & SWEET_FBX_SWAPQ) {
++		fb->phaseTick(now);	/* 0944: the next tick just after a TE */
++	}
+ 	sender->wakeAtTime(fb->fNextVsync);
+ 	sweet_gpu_flip_poll();	/* 0905: a finished frame in the back buffer goes on screen at this vsync */
+ 	sweet_gpu_present_poll();	/* 0943: blit->fence latency */
+@@ -722,8 +740,17 @@ AppleCLCD::presentLoop(void *arg)
+ 	AppleCLCD *fb = (AppleCLCD *)arg;
+ 	for (;;) {
+ 		IOLockLock(fb->fLock);
+-		while (!fb->fPresentReq) {
+-			if (sweet_gpu_present_poll()) {
++		for (;;) {
++			/* 0944: a queued frame goes at once (a put-off one again 1 ms later) */
++			bool queued = fb->fSwapQ && fb->fQn != 0 && !fb->fPowerOff;
++			if (fb->fPresentReq || (queued && mach_absolute_time() >= fb->fQRetry)) {
++				break;
++			}
++			bool out = sweet_gpu_present_poll();
++			if (fb->fSwapQ && out) {
++				sweet_gpu_flip_poll();	/* 0944: a landed frame flips at once, latched by the next TE */
++			}
++			if (out || queued) {
+ 				/* 0943: a blit is out: look at its fence every 1 ms (the stats' blit->fence latency) */
+ 				uint64_t dl;
+ 				clock_interval_to_deadline(1, kMillisecondScale, &dl);
+@@ -732,7 +759,43 @@ AppleCLCD::presentLoop(void *arg)
+ 				IOLockSleep(fb->fLock, &fb->fPresentReq, THREAD_UNINT);
+ 			}
+ 		}
++		if (!fb->fPresentReq) {
++			/* 0944: the oldest queued frame to the panel */
++			uint32_t h = fb->fQHead;
++			memcpy(fb->fPresentRec, fb->fQ + h * SWEET_FB_SWAP_REC_SIZE, SWEET_FB_SWAP_REC_SIZE);
++			fb->fPresentRecAbs = fb->fQAbs[h];
++			IOLockUnlock(fb->fLock);
++			uint64_t t0 = mach_absolute_time();
++			fb->fPresentBusy = false;
++			fb->present(fb->fPresentRec);
++			fb->fStatPresentAbs += mach_absolute_time() - t0;
++			bool shown = !fb->fPresentBusy, pop = shown;
++			IOLockLock(fb->fLock);
++			if (!shown) {
++				/* the GPU still has the present before last (or a flip is not latched): a newer frame replaces it */
++				pop = fb->fQn >= 2;
++				fb->fStDropped += pop;
++				clock_interval_to_deadline(1, kMillisecondScale, &fb->fQRetry);
++			} else {
++				fb->fQRetry = 0;
++			}
++			if (pop && fb->fQn != 0 && fb->fQHead == h) {
++				fb->fQHead = (h + 1) % 2;
++				fb->fQn--;
++				IOLockWakeup(fb->fLock, &fb->fQn, true);   /* a held SwapEnd may go on */
++			}
++			IOLockUnlock(fb->fLock);
++			if (shown) {
++				fb->fStatPresents++;
++				fb->statShown(fb->fPresentRecAbs);
++			}
++			continue;
++		}
+ 		fb->fPresentReq = false;
++		if (fb->fSwapQ && fb->fDirty) {
++			fb->fQn = 0;    /* 0944: the display came back on: the latest frame, not the queued ones */
++			IOLockWakeup(fb->fLock, &fb->fQn, true);
++		}
+ 		bool go = fb->fDirty && !fb->fPowerOff;
+ 		if (go) {
+ 			memcpy(fb->fPresentRec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+@@ -811,6 +874,10 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	fStLastSwap = now;
+ 	fStSwaps++;
+ 	fStDropped += fDirty;
++	if (fSwapQ && queueSwap(rec, now)) {
++		IOLockUnlock(fLock);
++		return;
++	}
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fPendingAbs = now;
+ 	fDirty = true;
+@@ -1096,6 +1163,93 @@ sweet_fb_cmd(const char *s, const char *end)
+ 	sweet_fb_instance->fbCmd(s, end);
+ }
+ 
++/*
++ * ---- 0944 (sweetfbx & 4): present at SwapEnd, ticks on the TE ----
++ *
++ * SwapEnd queues the frame (two at most) and wakes the present thread, which blits it at once instead of on the
++ * next tick (where it waited up to a period and then queued behind backboardd's next GPU job). A third SwapEnd is
++ * held until the oldest frame has gone to the GPU (at most 50 ms, then it replaces the newest waiting frame):
++ * back-pressure, as upstream hackios MiniIOMobileFramebuffer. A present put off because the GPU still has the
++ * one before last is tried again every 1 ms; a newer frame waiting replaces it. With the fLock.
++ */
++bool
++AppleCLCD::queueSwap(const uint8_t *rec, uint64_t now)
++{
++	if (fPowerOff) {
++		fQn = 0;                /* off: the latest frame for when it comes back on (fPending) */
++		IOLockWakeup(fLock, &fQn, true);
++		return false;
++	}
++	if (fQn >= 2) {
++		uint64_t dl;
++		clock_interval_to_deadline(50, kMillisecondScale, &dl);
++		while (fQn >= 2 && !fPowerOff &&
++		    IOLockSleepDeadline(fLock, &fQn, dl, THREAD_UNINT) != THREAD_TIMED_OUT) {
++		}
++	}
++	uint32_t slot;
++	if (fQn >= 2) {
++		slot = (fQHead + 1) % 2;        /* still full: the newest waiting frame is never shown */
++		fStDropped++;
++	} else {
++		slot = (fQHead + fQn) % 2;
++		fQn++;
++	}
++	memcpy(fQ + slot * SWEET_FB_SWAP_REC_SIZE, rec, SWEET_FB_SWAP_REC_SIZE);
++	fQAbs[slot] = now;
++	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);  /* the latest, for a redraw */
++	fPendingAbs = now;
++	IOLockWakeup(fLock, &fPresentReq, true);
++	return true;
++}
++
++/*
++ * The vsync tick on the panel's TE: INTF1's tear check counts TE frames (INT_COUNT 31:16) and, since the last TE,
++ * lines from VSYNC_INIT_VAL at one per vsync_count 19.2 MHz clocks. The next tick is put 0.5 ms after the TE
++ * nearest a period from now. A frame counter that stops (4 ticks) leaves the ticks free-running; the 0905 flip
++ * follows the same ticks. Register reads only inside the MDP window (sweet_mdp_rd).
++ */
++void
++AppleCLCD::phaseTick(uint64_t now)
++{
++	uint32_t ic = sweet_mdp_rd(SWEET_INTF1 + INTF_TEAR_INT_COUNT);
++	uint32_t cnt = sweet_mdp_rd(SWEET_INTF1 + INTF_TEAR_SYNC_VSYNC) & 0x7ffff;
++	uint32_t init = sweet_mdp_rd(SWEET_INTF1 + INTF_TEAR_INIT_VAL) & 0xffff;
++	uint32_t frame = ic >> 16, line = ic & 0xffff;
++	if (frame == fTeFrame) {
++		if (++fTeStale == 4) {
++			IOLog("SWEET FB: TE frame counter stopped at %u (int_count %08x): free-running ticks\n", frame, ic);
++		}
++		return;
++	}
++	if (fTeStale >= 4) {
++		IOLog("SWEET FB: TE frame counter moving again (%u)\n", frame);
++	}
++	fTeFrame = frame;
++	fTeStale = 0;
++	if (cnt == 0 || line < init || fVsyncAbs == 0) {
++		return;
++	}
++	uint64_t ns = (uint64_t)(line - init) * cnt * 625 / 12, since, lead;   /* 19.2 MHz clocks -> ns */
++	nanoseconds_to_absolutetime(ns, &since);
++	nanoseconds_to_absolutetime(500000, &lead);
++	if (since > 2 * fVsyncAbs || since > now) {
++		return;
++	}
++	uint64_t next = now - since + lead;
++	while (next < now + fVsyncAbs / 2) {
++		next += fVsyncAbs;
++	}
++	if (fTeLogs < 3) {
++		uint64_t in;
++		absolutetime_to_nanoseconds(next - now, &in);
++		fTeLogs++;
++		IOLog("SWEET FB: tick phased: TE %llu us ago (frame %u line %u init %u count %u), next in %llu us\n",
++		    ns / 1000, frame, line, init, cnt, in / 1000);
++	}
++	fNextVsync = next;
++}
++
+ static uint32_t sweet_fb_gpu_why_logged;
+ 
+ /* Why presentGPU fell back to the CPU copy, logged once per reason. */
+-- 
+2.39.0
+

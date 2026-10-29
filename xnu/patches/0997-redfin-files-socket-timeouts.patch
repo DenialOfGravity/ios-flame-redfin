@@ -1,0 +1,214 @@
+From b310a2ad19b3d1a9789898416ff92ca38120b5f7 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Wed, 28 Oct 2026 12:22:10 +0100
+Subject: [PATCH] 0997 redfin: file server socket timeouts (a quiet peer wedged
+ the one server thread), p fs [reset] state on the log
+
+---
+ bsd/dev/sweet_files.c | 98 ++++++++++++++++++++++++++++++++++++++++++-
+ bsd/dev/sweet_poke.c  | 10 +++++
+ 2 files changed, 106 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/sweet_files.c b/bsd/dev/sweet_files.c
+index dedded7..fc707ce 100644
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -15,6 +15,16 @@
+  *
+  * Errors: "ERR <errno>\n". Paths have no spaces. Started with the USB
+  * gadget (sweet_usb.c) when the interface comes up.
++ *
++ * 0997: one thread serves the connections one after another, and its socket
++ * calls had no timeouts: a connection whose peer went quiet (half-open after
++ * a client timeout, a lost RST over the USB link, a zero window) held it in
++ * sock_receive/sock_send for good, while new connections still completed in
++ * the listen backlog and then waited for a reply that never came (r41a, r46a:
++ * "timeout at the header read", ssh/pokes/UDP log fine). Now each accepted
++ * socket gets SO_RCVTIMEO/SO_SNDTIMEO (15 s without progress ends it), and
++ * the poke "p fs" logs the server's state; "p fs reset" shuts the current
++ * connection down (sock_shutdown) to free a stuck server without a reboot.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -32,18 +42,54 @@
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <libkern/libkern.h>
++#include <kern/locks.h>
++#include <mach/mach_time.h>
++#include <kern/clock.h>
+ 
+ extern int sweet_vfs_mkdir(const char *path, int mode);
+ extern int sweet_vfs_symlink(const char *target, const char *link);
+ extern int sweet_vfs_unlink(const char *path);
+ extern kern_return_t thread_terminate(thread_t);
+ void sweet_files_start(void);
++void sweet_files_cmd(const char *s, const char *end);
+ 
+ #define SF_BUF  (64 * 1024)
++#define SF_TIMEOUT_S    15      /* 0997: no progress for this long ends a connection */
+ 
+ static char *sf_buf;
+ static int sf_chan;
+ 
++/* 0997: the server's state for p fs (sf_lock guards sf_cur against the close) */
++enum { SF_START, SF_ACCEPT, SF_LINE, SF_RECV, SF_SEND, SF_FILE, SF_CLOSE };
++static const char *const sf_state_name[] = { "starting", "accept", "header", "recv data", "send", "file i/o", "close" };
++static volatile int sf_state;
++static volatile uint64_t sf_since;
++static uint64_t sf_conns, sf_done, sf_tmo, sf_bytes_out, sf_bytes_in, sf_resets;
++static int sf_last_err, sf_opt_err;
++static char sf_req[80];
++static socket_t sf_cur;
++static LCK_GRP_DECLARE(sweet_files_grp, "sweet_files");
++static LCK_MTX_DECLARE(sweet_files_lock, &sweet_files_grp);
++
++static void
++sf_set(int st)
++{
++	sf_state = st;
++	sf_since = mach_absolute_time();
++}
++
++static int
++sf_note(int err)
++{
++	if (err) {
++		sf_last_err = err;
++		if (err == EWOULDBLOCK) {
++			sf_tmo++;
++		}
++	}
++	return err;
++}
++
+ static void
+ sf_sleep_ms(int ms)
+ {
+@@ -68,7 +114,9 @@ sf_recv(socket_t so, void *buf, size_t len, size_t *got, int flags)
+ {
+ 	struct iovec iov = { .iov_base = buf, .iov_len = len };
+ 	struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+-	return sock_receive(so, &msg, flags, got);
++	int err = sock_receive(so, &msg, flags, got);
++	sf_bytes_in += *got;
++	return sf_note(err);
+ }
+ 
+ static int
+@@ -77,7 +125,9 @@ sf_recv_all(socket_t so, void *buf, size_t len)
+ 	size_t off = 0;
+ 	while (off < len) {
+ 		size_t got = 0;
++		sf_set(SF_RECV);
+ 		int err = sf_recv(so, (char *)buf + off, len - off, &got, MSG_WAITALL);
++		sf_state = SF_FILE;
+ 		if (err) {
+ 			return err;
+ 		}
+@@ -97,9 +147,13 @@ sf_send(socket_t so, const void *buf, size_t len)
+ 		struct iovec iov = { .iov_base = (char *)buf + off, .iov_len = len - off };
+ 		struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+ 		size_t sent = 0;
++		int st = sf_state;
++		sf_set(SF_SEND);
+ 		int err = sock_send(so, &msg, 0, &sent);
++		sf_bytes_out += sent;
++		sf_state = st;
+ 		if (err) {
+-			return err;
++			return sf_note(err);
+ 		}
+ 		off += sent;
+ 	}
+@@ -269,10 +323,13 @@ sf_handle(socket_t so)
+ 	static char line[1100];
+ 	char a[512], b[512];
+ 	unsigned long long n = 0;
++	sf_set(SF_LINE);
+ 	int err = sf_line(so, line, sizeof(line));
+ 	if (err) {
+ 		return;
+ 	}
++	strlcpy(sf_req, line, sizeof(sf_req));
++	sf_set(SF_FILE);
+ 	a[0] = b[0] = 0;
+ 	if (!strncmp(line, "PUT ", 4)) {
+ 		unsigned mode = 0644;
+@@ -362,15 +419,52 @@ sf_thread(void *arg __unused, wait_result_t wr __unused)
+ 		sf_sleep_ms(1000);
+ 	}
+ 	printf("SWEET FILES: listening on tcp 2223\n");
++	struct timeval tv = { .tv_sec = SF_TIMEOUT_S, .tv_usec = 0 };
+ 	for (;;) {
+ 		socket_t c = NULL;
++		sf_set(SF_ACCEPT);
+ 		if (sock_accept(ls, NULL, 0, 0, NULL, NULL, &c) != 0 || c == NULL) {
+ 			sf_sleep_ms(100);
+ 			continue;
+ 		}
++		sf_conns++;
++		sf_req[0] = 0;
++		int e1 = sock_setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));   /* 0997 */
++		int e2 = sock_setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
++		sf_opt_err = e1 ? e1 : e2;
++		lck_mtx_lock(&sweet_files_lock);
++		sf_cur = c;
++		lck_mtx_unlock(&sweet_files_lock);
+ 		sf_handle(c);
++		sf_set(SF_CLOSE);
++		lck_mtx_lock(&sweet_files_lock);
++		sf_cur = NULL;
++		lck_mtx_unlock(&sweet_files_lock);
+ 		sock_close(c);
++		sf_done++;
++	}
++}
++
++/* 0997: p fs [reset] (bsd/dev/sweet_poke.c): the server's state on the log; reset: shut the current connection down */
++void
++sweet_files_cmd(const char *s, const char *end)
++{
++	bool reset = end - s >= 5 && !strncmp(s, "reset", 5);
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - sf_since, &ns);
++	int st = sf_state;
++	lck_mtx_lock(&sweet_files_lock);
++	bool busy = sf_cur != NULL;
++	if (reset && busy) {
++		(void)sock_shutdown(sf_cur, SHUT_RDWR);
++		sf_resets++;
+ 	}
++	lck_mtx_unlock(&sweet_files_lock);
++	printf("SWEET FILES: state %s for %llu ms%s, request \"%s\", connections %llu done %llu, timeouts %llu, resets %llu, "
++	    "last err %d, sockopt err %d, bytes out %llu in %llu%s\n",
++	    (unsigned)st < sizeof(sf_state_name) / sizeof(sf_state_name[0]) ? sf_state_name[st] : "?", ns / 1000000,
++	    busy ? " (a connection open)" : "", sf_req, sf_conns, sf_done, sf_tmo, sf_resets, sf_last_err, sf_opt_err,
++	    sf_bytes_out, sf_bytes_in, reset ? (busy ? "; reset: connection shut down" : "; reset: no connection") : "");
+ }
+ 
+ void
+diff --git a/bsd/dev/sweet_poke.c b/bsd/dev/sweet_poke.c
+index 1ffdea4..33d386d 100644
+--- a/bsd/dev/sweet_poke.c
++++ b/bsd/dev/sweet_poke.c
+@@ -140,6 +140,16 @@ poke_line(const char *s, const char *end, unsigned lineno)
+ 			sweet_prof_cmd(q, end);
+ 			return;
+ 		}
++		if (end - q >= 2 && q[0] == 'f' && q[1] == 's' && (end - q == 2 || q[2] == ' ' || q[2] == '\n')) {
++			/* 0997: p fs [reset] = the file server's state (bsd/dev/sweet_files.c) */
++			extern void sweet_files_cmd(const char *s, const char *end);
++			q += 2;
++			while (q < end && (*q == ' ' || *q == '\t')) {
++				q++;
++			}
++			sweet_files_cmd(q, end);
++			return;
++		}
+ 		if (q < end && *q >= 'a' && *q <= 'z') {
+ 			extern void sweet_fb_cmd(const char *s, const char *end);
+ 			sweet_fb_cmd(q, end);
+-- 
+2.43.0
+

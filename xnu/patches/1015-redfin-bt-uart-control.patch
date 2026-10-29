@@ -1,0 +1,263 @@
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 20:00:00 +0100
+Subject: [PATCH] redfin 1015: kernel control com.apple.uart.bluetooth on the BT bridge
+
+iOS 16 bluetoothd/BlueTool reach the Bluetooth UART through a PF_SYSTEM kernel control
+(com.apple.uart[.sk].bluetooth), not a tty (ios-asteroids docs/BT_IOS_TRANSPORT.md). With btbridge=1 the
+bridge (1010) now also registers com.apple.uart.bluetooth: client bytes to h2b (btd), btd bytes to the
+socket; termios get/set kept and logged. btbridge=3: nodes only. bluetoothd needs
+BT_HCI_TRANSPORT=H4BC:POSIX:com.apple.uart.bluetooth,3000000 (tools-claude/bt-launchd.py).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/bsd/dev/sweet_btbridge.c b/bsd/dev/sweet_btbridge.c
+index 8d20808..51324e6 100644
+--- a/bsd/dev/sweet_btbridge.c
++++ b/bsd/dev/sweet_btbridge.c
+@@ -26,10 +26,14 @@
+ #include <sys/uio.h>
+ #include <sys/select.h>
+ #include <miscfs/devfs/devfs.h>
++#include <sys/kern_control.h>
++#include <sys/kpi_mbuf.h>
+ #include <kern/locks.h>
+ #include <pexpert/pexpert.h>
+ 
+ void sweet_btbridge_init(void);
++static void br_ctl_drain(void);
++static void br_ctl_init(void);
+ 
+ #define MINOR_HOST      0       /* cu.bluetooth / uart.bluetooth */
+ #define MINOR_BRIDGE    1       /* btbridge */
+@@ -236,6 +240,12 @@ br_write(dev_t dev, struct uio *uio, int ioflag)
+ 		/* data arrived for the reader of this ring */
+ 		wakeup(r);
+ 		selwakeup(&r->sel);
++		if (m == MINOR_BRIDGE) {
++			/* 1015: btd's bytes for a kernel-control client (bluetoothd) go to its socket */
++			lck_mtx_unlock(&br_lock);
++			br_ctl_drain();
++			lck_mtx_lock(&br_lock);
++		}
+ 	}
+ 	lck_mtx_unlock(&br_lock);
+ 	return 0;
+@@ -316,5 +326,218 @@ sweet_btbridge_init(void)
+ 	void *d = devfs_make_node(makedev(major, MINOR_WAKE), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "btwake");
+ 	printf("SWEET BTBR: /dev/cu.bluetooth %s, /dev/uart.bluetooth %s, /dev/btbridge %s, /dev/btwake %s (major %d)\n",
+ 	    a ? "ok" : "failed", b ? "ok" : "failed", c ? "ok" : "failed", d ? "ok" : "failed", major);
++	if (!(on & 2)) {
++		br_ctl_init();
++	}
++}
++
++/*
++ * ---- redfin 1015: the kernel control com.apple.uart.bluetooth --------------------------------------------
++ *
++ * iOS 16's bluetoothd and BlueTool do not read a tty: they open a PF_SYSTEM kernel control named
++ * com.apple.uart[.sk].bluetooth (AppleOnboardSerial's, absent here), set termios through
++ * getsockopt/setsockopt(SYSPROTO_CONTROL, TIOCGETA 0x40487413 / TIOCSETA 0x80487414) and then stream H4
++ * bytes (ios-asteroids docs/BT_IOS_TRANSPORT.md, from disassembly; their Poco F1 WCN3990 works this way).
++ * This control is the same pipe as /dev/cu.bluetooth: what the client sends goes to h2b (btd reads it on
++ * /dev/btbridge), what btd writes to b2h is queued on the client's socket. Not privileged (bluetoothd runs as
++ * mobile), one client at a time (a new one replaces the old). bluetoothd's default is the Skywalk name
++ * (.sk.), which needs a channel we do not have: its launchd job gets
++ * BT_HCI_TRANSPORT=H4BC:POSIX:com.apple.uart.bluetooth,3000000 (tools-claude/bt-launchd.py).
++ * termios is kept and given back, nothing reaches the UART (btd owns its speed). btbridge=3: no control.
++ */
++static kern_ctl_ref br_ctl_ref;
++static uint32_t br_ctl_unit;            /* 0: no client */
++static bool br_ctl_draining;
++static uint8_t br_termios[72];          /* struct termios as userland passes it (iOS: 72 bytes) */
++static uint32_t br_ctl_opts_said, br_ctl_sent, br_ctl_queued;
++static uint32_t br_ctl_hex_said, br_ctl_err_said;  /* diag: client bytes in hex, enqueue errors */
++
++static errno_t
++br_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, void **unitinfo)
++{
++	char who[32] = "?";
++	proc_selfname(who, sizeof(who));
++	lck_mtx_lock(&br_lock);
++	uint32_t old = br_ctl_unit;
++	br_ctl_unit = sac->sc_unit;
++	br.b2h.head = br.b2h.tail = 0;          /* a new client starts clean (as a fresh open would) */
++	lck_mtx_unlock(&br_lock);
++	*unitinfo = NULL;
++	printf("SWEET BTBR: kernel control connected by %s (unit %u%s)%s\n", who, sac->sc_unit, old ? ", replaces the last" : "",
++	    br.bridge_open ? "" : ", no btd yet");
++	return 0;
++}
++
++static errno_t
++br_ctl_disconnect(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo)
++{
++	lck_mtx_lock(&br_lock);
++	if (br_ctl_unit == unit) {
++		br_ctl_unit = 0;
++	}
++	lck_mtx_unlock(&br_lock);
++	printf("SWEET BTBR: kernel control unit %u gone (%u bytes in, %u out; unread by btd %u, unsent to client %u, btd %s)\n",
++	    unit, br_ctl_sent, br_ctl_queued, br.h2b.head - br.h2b.tail, br.b2h.head - br.b2h.tail,
++	    br.bridge_open ? "open" : "not open");
++	return 0;
++}
++
++/* client -> btd: into h2b, waiting up to 2 s for room */
++static errno_t
++br_ctl_send(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, mbuf_t m, __unused int flags)
++{
++	errno_t error = 0;
++	lck_mtx_lock(&br_lock);
++	for (mbuf_t n = m; n != NULL && error == 0; n = mbuf_next(n)) {
++		const uint8_t *p = mbuf_data(n);
++		size_t len = mbuf_len(n);
++		if (len > 0 && br_ctl_hex_said < 24) {      /* diag: what the client sends */
++			br_ctl_hex_said++;
++			printf("SWEET BTBR: client sends %zu bytes (btd %s, h2b unread %u):", len, br.bridge_open ? "open" : "not open",
++			    br.h2b.head - br.h2b.tail);
++			for (size_t i = 0; i < len && i < 32; i++) {
++				printf(" %02x", p[i]);
++			}
++			printf("\n");
++		}
++		while (len > 0) {
++			if (ring_space(&br.h2b) == 0) {
++				struct timespec ts = { 2, 0 };
++				if (msleep(&br.h2b, &br_lock, PZERO, "btbrctl", &ts) == EWOULDBLOCK) {
++					br.dropped += (uint32_t)len;
++					error = ENOBUFS;
++					break;
++				}
++				continue;
++			}
++			uint32_t at = br.h2b.head % BR_RING, run = BR_RING - at;
++			if (run > ring_space(&br.h2b)) {
++				run = ring_space(&br.h2b);
++			}
++			if (run > len) {
++				run = (uint32_t)len;
++			}
++			memcpy(br.h2b.buf + at, p, run);
++			br.h2b.head += run;
++			p += run;
++			len -= run;
++			br_ctl_sent += run;
++			wakeup(&br.h2b);
++			selwakeup(&br.h2b.sel);
++		}
++	}
++	lck_mtx_unlock(&br_lock);
++	mbuf_freem(m);
++	return error;
++}
++
++/* btd -> client: what fits in the socket now; the rest when the client reads (br_ctl_rcvd) */
++static void
++br_ctl_drain(void)
++{
++	uint8_t chunk[1024];
++	lck_mtx_lock(&br_lock);
++	if (br_ctl_draining || br_ctl_unit == 0) {
++		lck_mtx_unlock(&br_lock);
++		return;
++	}
++	br_ctl_draining = true;
++	while (br_ctl_unit != 0 && ring_used(&br.b2h) != 0) {
++		uint32_t unit = br_ctl_unit, at = br.b2h.tail % BR_RING, run = BR_RING - at;
++		if (run > ring_used(&br.b2h)) {
++			run = ring_used(&br.b2h);
++		}
++		if (run > sizeof(chunk)) {
++			run = sizeof(chunk);
++		}
++		memcpy(chunk, br.b2h.buf + at, run);
++		lck_mtx_unlock(&br_lock);
++		errno_t e = ctl_enqueuedata(br_ctl_ref, unit, chunk, run, 0);
++		lck_mtx_lock(&br_lock);
++		if (e != 0) {
++			if (br_ctl_err_said++ < 8) {
++				printf("SWEET BTBR: ctl_enqueuedata unit %u, %u bytes -> %d\n", unit, run, e);
++			}
++			break;                  /* the socket is full: br_ctl_rcvd drains again */
++		}
++		if (br_ctl_queued == 0) {
++			printf("SWEET BTBR: first %u bytes from btd to the client\n", run);
++		}
++		br.b2h.tail += run;
++		br_ctl_queued += run;
++		wakeup(&br.b2h);                /* room for btd's writes */
++		selwakeup(&br.b2h.sel);
++	}
++	br_ctl_draining = false;
++	lck_mtx_unlock(&br_lock);
++}
++
++static void
++br_ctl_rcvd(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, __unused int flags)
++{
++	br_ctl_drain();
++}
++
++static errno_t
++br_ctl_setopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, int opt, void *data, size_t len)
++{
++	if ((uint32_t)opt == 0x80487414u && data != NULL && len <= sizeof(br_termios)) {      /* TIOCSETA */
++		memcpy(br_termios, data, len);
++	}
++	if (br_ctl_opts_said++ < 24) {
++		/* struct termios (arm64): c_iflag, c_oflag, c_cflag, c_lflag (8 bytes each), c_cc[20], c_ispeed, c_ospeed */
++		uint64_t cflag = 0, ospeed = 0;
++		if (len >= 72 && data != NULL) {
++			memcpy(&cflag, (uint8_t *)data + 16, 8);
++			memcpy(&ospeed, (uint8_t *)data + 64, 8);
++		}
++		printf("SWEET BTBR: control setopt %#x (%zu bytes)%s c_cflag %#llx speed %llu\n", (uint32_t)opt, len,
++		    (uint32_t)opt == 0x80487414u ? " termios:" : "", cflag, ospeed);
++	}
++	return 0;
++}
++
++static errno_t
++br_ctl_getopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, int opt, void *data, size_t *len)
++{
++	if (br_ctl_opts_said++ < 24) {
++		printf("SWEET BTBR: control getopt %#x (%zu bytes)\n", (uint32_t)opt, len ? *len : 0);
++	}
++	if ((uint32_t)opt == 0x40487413u) {                    /* TIOCGETA */
++		if (data != NULL && len != NULL) {
++			size_t n = *len < sizeof(br_termios) ? *len : sizeof(br_termios);
++			memcpy(data, br_termios, n);
++			*len = n;
++		}
++		return 0;
++	}
++	if (data != NULL && len != NULL) {
++		bzero(data, *len);
++	}
++	return 0;
++}
++
++static void
++br_ctl_init(void)
++{
++	struct kern_ctl_reg reg;
++	bzero(&reg, sizeof(reg));
++	strlcpy(reg.ctl_name, "com.apple.uart.bluetooth", sizeof(reg.ctl_name));
++	reg.ctl_flags = CTL_FLAG_REG_SOCK_STREAM | CTL_FLAG_REG_EXTENDED;
++	reg.ctl_sendsize = 64 * 1024;
++	reg.ctl_recvsize = 64 * 1024;
++	reg.ctl_connect = br_ctl_connect;
++	reg.ctl_disconnect = br_ctl_disconnect;
++	reg.ctl_send = br_ctl_send;
++	reg.ctl_setopt = br_ctl_setopt;
++	reg.ctl_getopt = br_ctl_getopt;
++	reg.ctl_rcvd = br_ctl_rcvd;
++	/* termios defaults: 3 Mbaud raw (8N1, CREAD, CRTS_IFLOW|CCTS_OFLOW = 0x38b00) until the client sets its own */
++	uint64_t cflag = 0x38b00, speed = 3000000;
++	memcpy(br_termios + 16, &cflag, 8);
++	memcpy(br_termios + 56, &speed, 8);
++	memcpy(br_termios + 64, &speed, 8);
++	errno_t e = ctl_register(&reg, &br_ctl_ref);
++	printf("SWEET BTBR: kernel control com.apple.uart.bluetooth -> %d (id %u)\n", e, reg.ctl_id);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

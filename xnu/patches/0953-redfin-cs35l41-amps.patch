@@ -1,0 +1,1382 @@
+From b9d5aceb8993923cb368717640e5603c801c1667 Mon Sep 17 00:00:00 2001
+From: WS-A <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 00:43:03 +0100
+Subject: [PATCH] redfin: CS35L41 amplifiers in ASP bypass + HackiOS speaker
+ guard (sound=3, poke a tone/gain/off)
+
+---
+ bsd/conf/files          |   2 +
+ bsd/dev/sweet_cs35l41.c | 687 ++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_guard.c   | 324 +++++++++++++++++++
+ bsd/dev/sweet_sound.c   | 223 ++++++++++++-
+ 4 files changed, 1222 insertions(+), 14 deletions(-)
+ create mode 100644 bsd/dev/sweet_cs35l41.c
+ create mode 100644 bsd/dev/sweet_guard.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 9d43a9b..9779f28 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,8 @@ bsd/dev/sweet_torch.c			standard
+ bsd/dev/sweet_cam.c			standard
+ bsd/dev/sweet_audio.c			standard
+ bsd/dev/sweet_sound.c			standard
++bsd/dev/sweet_cs35l41.c			standard
++bsd/dev/sweet_guard.c			standard
+ bsd/dev/sweet_adsp.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_poke.c			standard
+diff --git a/bsd/dev/sweet_cs35l41.c b/bsd/dev/sweet_cs35l41.c
+new file mode 100644
+index 0000000..2372597
+--- /dev/null
++++ b/bsd/dev/sweet_cs35l41.c
+@@ -0,0 +1,687 @@
++/*
++ * redfin (Pixel 5): the two Cirrus Logic CS35L41 speaker amplifiers. Patch 0953 (WS-A).
++ *
++ * Where they are (live DT i2c@98c000, lito-redbull-audio.dtsi): I2C 0x40 (cs35l41_l, bottom speaker,
++ * "cirrus,left-channel-amp", ASP RX slot 0) and 0x41 (cs35l41_r, earpiece-top, prefix "R", slot 1) on
++ * QUPv3 SE9, the DRV2624's bus: every transfer goes through bsd/dev/sweet_haptic.c's
++ * sweet_se9_xfer(), under its lock (so sweethaptic=1 must have brought the bus up). Reset lines:
++ * PM8150L GPIO11 (0x40, SID 4 peripheral 0xca) and PM7250B GPIO11 (0x41, SID 2 peripheral 0xca): the 0x41
++ * node's reset-gpios still names PM8150L GPIO10, but on production redfin (lito-redfin-proto1_1-audio.dtsi,
++ * lito-v2-redfin-evt-audio.dtsi, the live DT) that pin's pinctrl is disabled and its pinctrl-0 drives
++ * reset_pin_bottom_default1_1 = PM7250B GPIO11 output-high instead -- that is the real reset line; boost 1.0 uH / 15 uF / 3700 mA peak, ASP SDOUT hi-Z 3, HW noise gate 0x3f.
++ *
++ * How they are set up: the redbull kernel's sound/soc/codecs/cs35l41.c without its DSP: probe (OTP boot
++ * done, DEVID 0x35a40, REVID, the per-revision errata patch, the OTP trim unpack with
++ * cs35l41-tables.c's map, Halo core held), cs35l41_set_pdata() (boost K1/K2/slope/LBST/IPK, hi-Z,
++ * noise gate), the DAI as kona.c sets it for QUIN_TDM_RX (DSP_A, codec slave, NB/NF; 48 kHz, 32-bit
++ * slots, 24-bit words), SCLK 6.144 MHz as the PLL reference (cs35l41_pll_sysclk 0x28) and the FS
++ * monitor window for it, "PCM Source" ASP (0x08: the ASP's RX1 straight to the amplifier: bypass, no
++ * speaker-protection firmware), "AMP PCM Gain" 17 as Android's mixer paths, the digital volume as
++ * "how far under Android's level" (Digital PCM Volume 817 = 0 dB, 1/8 dB steps), DRE on; power-up
++ * as cs35l41_main_amp_event() (the pup patch, GLOBAL_EN) and power-down (GLOBAL_EN off, PDN_DONE,
++ * the pdn patch). Errors (amp short, boost short/OVP/UVP, over-temperature) power both down at once.
++ *
++ * The reset lines are PMIC GPIOs: a write to them is an SPMI write, so it happens only with boot-arg
++ * sndgpio=1 (allow-list: PM8150L GPIO11, PM7250B GPIO11 and PM7250B GPIO6, the microphones' LDO, nothing else, and
++ * only on channels this EE owns, as sweet_haptic.c does for PM7250B GPIO1). Without it the amplifiers
++ * are probed as the boot chain left them, and if they do not answer the line states are only read.
++ *
++ * Log lines: "SWEET AMP: ...".
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern int sweet_se9_xfer(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr);
++
++bool sweet_amp_prepare(void);
++bool sweet_amp_start(void);
++bool sweet_amp_volume(uint32_t below);
++bool sweet_amp_healthy(void);
++void sweet_amp_stop(void);
++bool sweet_amp_ready(void);
++void sweet_amp_status(void);
++int sweet_audio_pmic_gpio(unsigned sid, unsigned peripheral, int high);
++
++#define SAY(...)                printf("SWEET AMP: " __VA_ARGS__)
++
++static void
++sleep_ms(uint32_t ms)
++{
++	delay_for_interval(ms, NSEC_PER_MSEC);
++}
++
++/* ---- PMIC GPIOs over SPMI (the APPS EE's channels, as sweet_haptic.c's hap_spmi()) -------------------------- */
++
++#define SP_CORE_PA              0x0c440000u
++#define SP_CHNLS_PA             0x0c600000u
++#define SP_OBS_PA               0x0e600000u
++#define SP_CNFG_PA              0x0c40a000u
++
++static vm_offset_t sp_core, sp_cnfg, sp_obs;
++static vm_offset_t sp_chnl[3];                  /* the three allowed peripherals' write channels, mapped once */
++static uint32_t pmic_writes = 0;                /* boot-arg sndgpio */
++static LCK_GRP_DECLARE(amp_lock_group, "sweet-amp");
++static LCK_MTX_DECLARE(spmi_lock, &amp_lock_group);
++
++static const struct {
++	unsigned sid, peripheral;
++	const char *name;
++} allowed[3] = {
++	{ 4, 0xca, "PM8150L GPIO11 (CS35L41 0x40 reset)" },
++	{ 2, 0xca, "PM7250B GPIO11 (CS35L41 0x41 reset)" },
++	{ 2, 0xc5, "PM7250B GPIO6 (audio LDO, mic 1)" },
++};
++
++static uint32_t
++mrd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++mwr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static int
++spmi(unsigned which, unsigned reg, bool write, uint8_t *val)
++{
++	unsigned ppid = (allowed[which].sid << 8) | allowed[which].peripheral, n, apid = 0xffff, owner = 7;
++	vm_offset_t ch;
++
++	if (sp_core == 0) {
++		sp_core = ml_io_map(SP_CORE_PA, 0x2000);
++		sp_cnfg = ml_io_map(SP_CNFG_PA, 0x1000);
++		sp_obs = ml_io_map(SP_OBS_PA, 0x10000);
++	}
++	n = mrd(sp_core, 4) & 0x7ffu;
++	for (unsigned i = 0; i < n && i < 512; i++) {
++		uint32_t map = mrd(sp_core, 0x900u + 4u * i);
++		unsigned o;
++
++		if (!map || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		o = mrd(sp_cnfg, 0x700u + 4u * i) & 7u;
++		if (apid == 0xffff || o == 0) {
++			apid = i;
++			owner = o;
++		}
++	}
++	if (apid == 0xffff || (write && owner != 0)) {
++		SAY("spmi %s %s reg %#x refused (apid %#x owner %u)\n", write ? "write" : "read", allowed[which].name, reg, apid, owner);
++		return -1;
++	}
++	if (write) {
++		if (sp_chnl[which] == 0) {
++			sp_chnl[which] = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++		}
++		ch = sp_chnl[which];
++		mwr(ch, 0x10, *val);
++	} else {
++		ch = sp_obs + 0x80u * apid;
++	}
++	mwr(ch, 0x00, ((write ? 0u : 1u) << 27) | ((reg & 0xffu) << 4));
++	for (unsigned i = 0; i < 1000; i++) {
++		uint32_t st = mrd(ch, 0x08);
++
++		if (st & 1u) {
++			if (st & 0x0eu) {
++				SAY("spmi %s reg %#x status %#x\n", allowed[which].name, reg, st);
++				return -1;
++			}
++			if (!write) {
++				*val = (uint8_t)mrd(ch, 0x18);
++			}
++			return 0;
++		}
++		delay(1);
++	}
++	SAY("spmi %s reg %#x timeout\n", allowed[which].name, reg);
++	return -1;
++}
++
++static void
++gpio_look(unsigned which)
++{
++	uint8_t type = 0, sub = 0, st = 0, mode = 0, vin = 0, src = 0, en = 0;
++
++	lck_mtx_lock(&spmi_lock);
++	(void)spmi(which, 0x04, false, &type);
++	(void)spmi(which, 0x05, false, &sub);
++	(void)spmi(which, 0x08, false, &st);
++	(void)spmi(which, 0x40, false, &mode);
++	(void)spmi(which, 0x41, false, &vin);
++	(void)spmi(which, 0x44, false, &src);
++	(void)spmi(which, 0x46, false, &en);
++	lck_mtx_unlock(&spmi_lock);
++	SAY("%s: type %#x sub %#x status %#x mode %#x vin %#x out-src %#x en %#x\n", allowed[which].name, type, sub, st, mode, vin,
++	    src, en);
++}
++
++/*
++ * One of the allowed PMIC GPIOs as an output, high or low (high < 0: only looked at). Only with sndgpio=1.
++ * DIG_VIN_CTL 0x41 = 1 (power-source 1), DIG_OUT_SOURCE_CTL 0x44 = 0x80 high / 0 low, MODE_CTL 0x40 = 1, EN_CTL 0x46 = 0x80.
++ */
++int
++sweet_audio_pmic_gpio(unsigned sid, unsigned peripheral, int high)
++{
++	unsigned which;
++	uint8_t type = 0, v;
++	int err = 0;
++
++	PE_parse_boot_argn("sndgpio", &pmic_writes, sizeof(pmic_writes));
++	for (which = 0; which < 3 && (allowed[which].sid != sid || allowed[which].peripheral != peripheral); which++) {
++	}
++	if (which == 3) {
++		SAY("PMIC GPIO %u:%#x is not on the allow-list\n", sid, peripheral);
++		return EPERM;
++	}
++	if (high < 0 || !pmic_writes) {
++		gpio_look(which);
++		if (high >= 0) {
++			SAY("%s NOT driven %s: SPMI writes need sndgpio=1\n", allowed[which].name, high ? "high" : "low");
++			return EPERM;
++		}
++		return 0;
++	}
++	lck_mtx_lock(&spmi_lock);
++	if (spmi(which, 0x04, false, &type) || type != 0x10) {
++		SAY("%s: type %#x, not a GPIO: not written\n", allowed[which].name, type);
++		err = ENXIO;
++	} else {
++		if (!(allowed[which].sid == 2 && allowed[which].peripheral == 0xca)) {
++			v = 0x01;       /* power-source 1 (the DT gives none for PM7250B GPIO11: its VIN is left as found) */
++			err |= spmi(which, 0x41, true, &v);
++		}
++		v = high ? 0x80 : 0x00;
++		err |= spmi(which, 0x44, true, &v);
++		v = 0x01;
++		err |= spmi(which, 0x40, true, &v);
++		v = 0x80;
++		err |= spmi(which, 0x46, true, &v);
++	}
++	lck_mtx_unlock(&spmi_lock);
++	SAY("%s driven %s -> %s\n", allowed[which].name, high ? "HIGH" : "low", err ? "FAILED" : "ok");
++	return err ? EIO : 0;
++}
++
++/* ---- the amplifiers' registers (32-bit addresses and values, big-endian, on SE9) --------------------------- */
++
++#define AMP_L                   0x40
++#define AMP_R                   0x41
++
++#define CS_DEVID                0x00000000u
++#define CS_REVID                0x00000004u
++#define CS_OTPID                0x00000010u
++#define CS_TEST_KEY_CTL         0x00000040u
++#define CS_OTP_MEM0             0x00000400u
++#define CS_PWR_CTRL1            0x00002014u
++#define CS_PWR_CTRL2            0x00002018u
++#define CS_PWR_CTRL3            0x0000201cu
++#define CS_AMP_OUT_MUTE         0x00002024u
++#define CS_PLL_CLK_CTRL         0x00002c04u
++#define CS_GLOBAL_CLK_CTRL      0x00002c0cu
++#define CS_TST_FS_MON0          0x00002d10u
++#define CS_BSTCVRT_PEAK_CUR     0x00003808u
++#define CS_BSTCVRT_COEFF        0x00003810u
++#define CS_BSTCVRT_SLOPE_LBST   0x00003814u
++#define CS_SP_ENABLES           0x00004800u
++#define CS_SP_RATE_CTRL         0x00004804u
++#define CS_SP_FORMAT            0x00004808u
++#define CS_SP_HIZ_CTRL          0x0000480cu
++#define CS_SP_FRAME_RX_SLOT     0x00004820u
++#define CS_SP_RX_WL             0x00004840u
++#define CS_DAC_PCM1_SRC         0x00004c00u
++#define CS_AMP_DIG_VOL_CTRL     0x00006000u
++#define CS_NG_CFG               0x00006808u
++#define CS_AMP_GAIN_CTRL        0x00006c04u
++#define CS_IRQ1_STATUS1         0x00010010u
++#define CS_IRQ1_STATUS3         0x00010018u
++#define CS_IRQ1_STATUS4         0x0001001cu
++#define CS_IRQ1_MASK1           0x00010110u
++#define CS_DSP1_CCM_CORE_CTRL   0x02bc1000u
++
++#define CS_CHIP_ID              0x35a40u
++#define CS_CHIP_ID_R            0x35b40u
++#define CS_OTP_BOOT_DONE        0x02u
++#define CS_OTP_BOOT_ERR         0x80000000u
++#define CS_PDN_DONE             0x00800000u
++#define CS_INT1_MASK_DEFAULT    0x7ffcee3fu
++#define CS_ERRORS               (0x80000000u | 0x00020000u | 0x0100u | 0x80u | 0x40u)  /* amp short, temp, bst short/UVP/OVP */
++#define CS_TEMP_WARN            0x8000u
++#define CS_VOL_MUTE             0x4cfu
++#define CS_VOL_MAX_BELOW        816u            /* 1/8 dB: -102 dB is the quietest code */
++#define CS_PCM_GAIN_ANDROID     17u             /* mixer "AMP PCM Gain" 17 */
++
++static struct amp {
++	uint8_t addr;
++	const char *name;
++	unsigned slot, reset_gpio;              /* reset_gpio: index into allowed[] */
++	bool present, prepared, on;
++	uint32_t revid, otpid, pwr2;
++} amps[2] = {
++	{ AMP_L, "0x40 (left, bottom)", 0, 0, false, false, false, 0, 0, 0 },
++	{ AMP_R, "0x41 (right, top)", 1, 1, false, false, false, 0, 0, 0 },
++};
++static uint32_t below_now = CS_VOL_MAX_BELOW + 1;
++static bool gave_up, warned_temp;
++
++static int
++cs_read(struct amp *a, uint32_t reg, uint32_t *val)
++{
++	uint8_t tx[4] = { (uint8_t)(reg >> 24), (uint8_t)(reg >> 16), (uint8_t)(reg >> 8), (uint8_t)reg }, rx[4] = { 0 };
++	int err = sweet_se9_xfer(a->addr, tx, 4, rx, 4);
++
++	if (err == 0) {
++		*val = (uint32_t)rx[0] << 24 | (uint32_t)rx[1] << 16 | (uint32_t)rx[2] << 8 | rx[3];
++	}
++	return err;
++}
++
++static int
++cs_write(struct amp *a, uint32_t reg, uint32_t val)
++{
++	uint8_t tx[8] = { (uint8_t)(reg >> 24), (uint8_t)(reg >> 16), (uint8_t)(reg >> 8), (uint8_t)reg,
++		          (uint8_t)(val >> 24), (uint8_t)(val >> 16), (uint8_t)(val >> 8), (uint8_t)val };
++	int err = sweet_se9_xfer(a->addr, tx, 8, NULL, 0);
++
++	if (err) {
++		SAY("%s: write %#x <- %#x FAILED (%d)\n", a->name, reg, val, err);
++	}
++	return err;
++}
++
++static int
++cs_bits(struct amp *a, uint32_t reg, uint32_t mask, uint32_t val)
++{
++	uint32_t old = 0;
++	int err = cs_read(a, reg, &old);
++
++	return err ? err : cs_write(a, reg, (old & ~mask) | (val & mask));
++}
++
++static int
++cs_unlock(struct amp *a, bool unlock)
++{
++	int err = cs_write(a, CS_TEST_KEY_CTL, unlock ? 0x55 : 0xcc);
++
++	return err ? err : cs_write(a, CS_TEST_KEY_CTL, unlock ? 0xaa : 0x33);
++}
++
++/* cs35l41.c's errata patches: B0 and B2 are the same; A0 has three more */
++static int
++cs_errata(struct amp *a)
++{
++	static const uint32_t common[][2] = {
++		{ 0x00004100, 0 }, { 0x00004310, 0 }, { 0x00004400, 0 }, { 0x0000381c, 0x51 }, { 0x02bc20e0, 0 }, { 0x02bc2020, 0 },
++	};
++	int err = cs_write(a, CS_TEST_KEY_CTL, 0x5555) || cs_write(a, CS_TEST_KEY_CTL, 0xaaaa);
++
++	if (a->revid == 0xa0) {
++		err = err || cs_write(a, 0x00003854, 0x05180240) || cs_write(a, 0x00007418, 0x9091a1c8) ||
++		    cs_write(a, 0x00003014, 0x0200ee0e) || cs_write(a, 0x00000054, 0x00000004) || cs_write(a, 0x00010318, 0) ||
++		    cs_write(a, 0x00010b18, 0);
++	}
++	for (unsigned i = 0; i < sizeof(common) / sizeof(common[0]) && !err; i++) {
++		err = cs_write(a, common[i][0], common[i][1]);
++	}
++	return err || cs_write(a, CS_TEST_KEY_CTL, 0xcccc) || cs_write(a, CS_TEST_KEY_CTL, 0x3333);
++}
++
++/* cs35l41-tables.c otp_map_1 / otp_map_2 (they differ only in element 98: map 2 has VMON_POL 0x4000 bit 11) */
++static const struct {
++	uint32_t reg;
++	uint8_t shift, size;
++} otp_map[] = {
++	{ 0x2030, 0, 4 }, { 0x2030, 7, 1 }, { 0x208c, 24, 6 }, { 0x2090, 14, 4 }, { 0x2090, 10, 4 }, { 0x300c, 11, 4 },
++	{ 0x394c, 23, 2 }, { 0x3950, 0, 7 }, { 0x3950, 8, 7 }, { 0x3950, 16, 8 }, { 0x3950, 24, 8 }, { 0x3954, 0, 7 },
++	{ 0x3954, 8, 7 }, { 0x3954, 16, 8 }, { 0x3954, 24, 8 }, { 0x3958, 0, 7 }, { 0x3958, 8, 7 }, { 0x3958, 16, 8 },
++	{ 0x3958, 24, 8 }, { 0x395c, 0, 7 }, { 0x395c, 8, 7 }, { 0x395c, 16, 8 }, { 0x395c, 24, 8 }, { 0x416c, 0, 8 },
++	{ 0x4160, 0, 7 }, { 0x416c, 8, 8 }, { 0x4160, 16, 10 }, { 0x416c, 16, 12 }, { 0x416c, 28, 1 }, { 0x4170, 0, 6 },
++	{ 0x4170, 6, 1 }, { 0x4170, 8, 6 }, { 0x4170, 14, 1 }, { 0x4170, 16, 9 }, { 0x4360, 0, 5 }, { 0x4360, 6, 9 },
++	{ 0x4448, 0, 8 }, { 0x4448, 8, 8 }, { 0x4448, 16, 8 }, { 0x4448, 24, 8 }, { 0x444c, 0, 3 }, { 0x6e30, 0, 5 },
++	{ 0x6e30, 8, 5 }, { 0x6e30, 16, 5 }, { 0x6e30, 24, 5 }, { 0x6e34, 0, 5 }, { 0x6e34, 8, 5 }, { 0x6e34, 16, 5 },
++	{ 0x6e34, 24, 5 }, { 0x6e38, 0, 5 }, { 0x6e38, 8, 5 }, { 0x6e38, 16, 5 }, { 0x6e38, 24, 5 }, { 0x6e3c, 0, 5 },
++	{ 0x6e3c, 8, 5 }, { 0x6e3c, 16, 5 }, { 0x6e3c, 24, 5 }, { 0x6e40, 0, 5 }, { 0x6e40, 8, 5 }, { 0x6e40, 16, 5 },
++	{ 0x6e40, 24, 5 }, { 0x6e44, 0, 5 }, { 0x6e48, 0, 10 }, { 0x6e48, 10, 10 }, { 0x6e48, 20, 10 }, { 0x6e4c, 0, 10 },
++	{ 0x6e4c, 10, 10 }, { 0x6e4c, 20, 10 }, { 0x6e50, 0, 10 }, { 0x6e50, 10, 10 }, { 0x6e50, 20, 10 }, { 0x6e54, 0, 10 },
++	{ 0x6e54, 10, 10 }, { 0x6e54, 20, 10 }, { 0x6e58, 0, 10 }, { 0x6e58, 10, 10 }, { 0x6e58, 20, 10 }, { 0x6e5c, 0, 10 },
++	{ 0x6e5c, 10, 10 }, { 0x6e5c, 20, 10 }, { 0x6e60, 0, 10 }, { 0x6e60, 10, 10 }, { 0x6e60, 20, 10 }, { 0x6e64, 0, 10 },
++	{ 0x7418, 7, 5 }, { 0x741c, 0, 5 }, { 0x741c, 11, 4 }, { 0x741c, 19, 4 }, { 0x7434, 17, 1 }, { 0x7434, 18, 7 },
++	{ 0x7068, 0, 9 }, { 0x410c, 7, 1 }, { 0x400c, 0, 7 }, { 0x0000, 0, 1 }, { 0x17040, 0, 8 }, { 0x17040, 8, 8 },
++	{ 0x17040, 16, 8 }, { 0x17040, 24, 8 }, { 0x17044, 0, 24 },
++};
++#define OTP_ELEMENT_98          98
++
++static uint32_t
++genmask(unsigned high, unsigned low)
++{
++	return (high >= 31 ? 0xffffffffu : ((1u << (high + 1)) - 1)) & ~((1u << low) - 1);
++}
++
++/* cs35l41_otp_unpack(): the trims from OTP into their registers */
++static int
++cs_otp(struct amp *a)
++{
++	uint32_t mem[32], id = 0;
++	unsigned bit = 16, word = 2, written = 0;
++	int err;
++
++	if ((err = cs_read(a, CS_OTPID, &id)) != 0) {
++		return err;
++	}
++	if (id != 1 && id != 2 && id != 6 && id != 8) {
++		SAY("%s: OTP map %u unknown: no trims\n", a->name, id);
++		return ENODEV;
++	}
++	a->otpid = id;
++	for (unsigned i = 0; i < 32; i++) {
++		if ((err = cs_read(a, CS_OTP_MEM0 + 4 * i, &mem[i])) != 0) {
++			return err;
++		}
++	}
++	if ((err = cs_unlock(a, true)) != 0) {
++		return err;
++	}
++	for (unsigned i = 0; i < sizeof(otp_map) / sizeof(otp_map[0]) && !err; i++) {
++		uint32_t reg = otp_map[i].reg, val, size = otp_map[i].size, shift = otp_map[i].shift;
++
++		if (i == OTP_ELEMENT_98 && (id == 2 || id == 6)) {
++			reg = 0x4000;
++			shift = 11;
++		}
++		if (bit + size - 1 >= 32) {
++			val = (mem[word] & genmask(31, bit)) >> bit;
++			word++;
++			val |= (mem[word] & genmask(bit + size - 33, 0)) << (32 - bit);
++			bit += size - 32;
++		} else {
++			val = (mem[word] & genmask(bit + size - 1, bit)) >> bit;
++			bit += size;
++		}
++		if (bit == 32) {
++			bit = 0;
++			word++;
++		}
++		if (reg != 0) {
++			err = cs_bits(a, reg, genmask(shift + size - 1, shift), val << shift);
++			written++;
++		}
++	}
++	err = err || cs_unlock(a, false);
++	SAY("%s: OTP map %u: %u trims written%s\n", a->name, id, written, err ? ", WITH ERRORS" : "");
++	return err;
++}
++
++static bool
++probe(struct amp *a)
++{
++	uint32_t devid = 0, st = 0;
++	int err;
++	unsigned ms;
++
++	err = cs_read(a, CS_DEVID, &devid);
++	if (err) {
++		SAY("%s: NO ANSWER on SE9 (%d%s)\n", a->name, err, err == ENXIO ? ": NACK, or the SE9 bus is not up (sweethaptic=1)" : "");
++		return false;
++	}
++	(void)cs_read(a, CS_REVID, &a->revid);
++	for (ms = 0; ms < 100; ms++) {
++		if (cs_read(a, CS_IRQ1_STATUS4, &st) == 0 && (st & CS_OTP_BOOT_DONE)) {
++			break;
++		}
++		sleep_ms(1);
++	}
++	(void)cs_read(a, CS_IRQ1_STATUS3, &st);
++	SAY("%s: DEVID %#x REVID %#x, OTP boot %s%s\n", a->name, devid, a->revid, ms < 100 ? "done" : "NOT DONE",
++	    (st & CS_OTP_BOOT_ERR) ? ", OTP BOOT ERROR" : "");
++	if ((devid != CS_CHIP_ID && devid != CS_CHIP_ID_R) || ms >= 100 || (st & CS_OTP_BOOT_ERR)) {
++		return false;
++	}
++	a->present = true;
++	return true;
++}
++
++/* Everything but power: the amplifier configured, muted, its output stage off. */
++static bool
++configure(struct amp *a)
++{
++	uint32_t pwr2 = 0;
++	int err;
++
++	err = cs_write(a, CS_IRQ1_MASK1, CS_INT1_MASK_DEFAULT) || cs_errata(a) || cs_otp(a) ||
++	    cs_write(a, CS_DSP1_CCM_CORE_CTRL, 0);
++	/* boost: 1.0 uH (LBST 0), 15 uF (range 0): K1 0x24, K2 0x24, slope 0x75; peak (3700 - 1600) / 50 + 0x10 */
++	err = err || cs_bits(a, CS_BSTCVRT_COEFF, 0xffff, 0x24 | 0x24 << 8) || cs_bits(a, CS_BSTCVRT_SLOPE_LBST, 0xff03, 0x75 << 8 | 0) ||
++	    cs_bits(a, CS_BSTCVRT_PEAK_CUR, 0x7f, (3700 - 1600) / 50 + 0x10);
++	err = err || cs_bits(a, CS_SP_HIZ_CTRL, 0x3, 3) || cs_bits(a, CS_NG_CFG, 0x3f00, 0x3f << 8);
++	/* DAI: DSP_A (ASP_FMT 0), SCLK and LRCLK slave (MSTR 0), no inversion; RX width 32, word length 24; 48 kHz */
++	err = err || cs_bits(a, CS_SP_FORMAT, 0x0700 | 0x10 | 0x01 | 0x40 | 0x04 | 0xff000000u, 32u << 24) ||
++	    cs_bits(a, CS_SP_RX_WL, 0x3f, 24) || cs_bits(a, CS_GLOBAL_CLK_CTRL, 0x1f, 0x03);
++	/* the slots (mixer: ASPRX1/ASPRX2 Slot Position 0 for L, 1 for R), PCM source ASP RX1 (bypass) */
++	err = err || cs_bits(a, CS_SP_FRAME_RX_SLOT, 0x3f3f, a->slot | a->slot << 8) || cs_bits(a, CS_DAC_PCM1_SRC, 0x7f, 0x08);
++	/* SCLK 6.144 MHz as the PLL reference (cs35l41_component_set_sysclk with cfg 0x28) */
++	err = err || cs_bits(a, CS_SP_RATE_CTRL, 0x3f, 0x28) || cs_bits(a, CS_PLL_CLK_CTRL, 0x0800, 0x0800) ||
++	    cs_bits(a, CS_PLL_CLK_CTRL, 0x07e0, 0x28 << 5) || cs_bits(a, CS_PLL_CLK_CTRL, 0x10, 0) ||
++	    cs_bits(a, CS_PLL_CLK_CTRL, 0x07, 0) || cs_bits(a, CS_PLL_CLK_CTRL, 0x0800, 0) || cs_bits(a, CS_PLL_CLK_CTRL, 0x10, 0x10);
++	/* the FS monitor for SCLK > 6 MHz (cs35l41_dai_set_sysclk): fs1 16, fs2 36 */
++	err = err || cs_unlock(a, true) || cs_write(a, CS_TST_FS_MON0, 16 | 36u << 12) || cs_unlock(a, false);
++	/* gain 17 as Android, digital volume muted, output muted, DRE on, the ASP's RX1 on */
++	err = err || cs_bits(a, CS_AMP_GAIN_CTRL, 0x1f << 5, CS_PCM_GAIN_ANDROID << 5) ||
++	    cs_bits(a, CS_AMP_DIG_VOL_CTRL, 0x7ff << 3, CS_VOL_MUTE << 3) || cs_bits(a, CS_AMP_OUT_MUTE, 0x10, 0x10) ||
++	    cs_bits(a, CS_PWR_CTRL3, 1u << 20 | 1u << 4, 1u << 20 | 1u << 4) || cs_bits(a, CS_SP_ENABLES, 1u << 16, 1u << 16);
++	(void)cs_read(a, CS_PWR_CTRL2, &pwr2);
++	a->pwr2 = pwr2;
++	SAY("%s: %s (PWR_CTRL2 %#x)\n", a->name, err ? "CONFIGURATION FAILED" : "configured: ASP bypass, DSP_A slot, 24/32, PLL from "
++	    "SCLK 6.144 MHz, gain 17, muted", pwr2);
++	a->prepared = !err;
++	return !err;
++}
++
++bool
++sweet_amp_ready(void)
++{
++	return amps[0].prepared || amps[1].prepared;
++}
++
++/* Found, reset (sndgpio=1), configured: powered down and muted. Once. */
++bool
++sweet_amp_prepare(void)
++{
++	static bool tried;
++	bool any = false;
++
++	if (tried) {
++		return sweet_amp_ready();
++	}
++	tried = true;
++	PE_parse_boot_argn("sndgpio", &pmic_writes, sizeof(pmic_writes));
++	if (pmic_writes) {
++		/* the reset pulse cs35l41_probe() makes: low >= 2 ms, then high, 2 ms before the first access */
++		for (unsigned i = 0; i < 2; i++) {
++			(void)sweet_audio_pmic_gpio(allowed[amps[i].reset_gpio].sid, allowed[amps[i].reset_gpio].peripheral, 0);
++		}
++		sleep_ms(3);
++		for (unsigned i = 0; i < 2; i++) {
++			(void)sweet_audio_pmic_gpio(allowed[amps[i].reset_gpio].sid, allowed[amps[i].reset_gpio].peripheral, 1);
++		}
++		sleep_ms(3);
++	}
++	/*
++	 * The SE9 bus is sweet_haptic.c's, brought up by its own thread (8 s after start, then the DRV2624):
++	 * the DSP may be up before it (r26a: amps probed at 67.47 s, SE9 up at 67.67 s), and sweet_se9_xfer()
++	 * says ENXIO both for "bus not up" and for a NACK. So wait, up to 15 s, until either amplifier answers.
++	 */
++	{
++		uint32_t id = 0;
++		unsigned waited;
++
++		for (waited = 0; waited < 15000; waited += 100) {
++			if (cs_read(&amps[0], CS_DEVID, &id) == 0 || cs_read(&amps[1], CS_DEVID, &id) == 0) {
++				break;
++			}
++			sleep_ms(100);
++		}
++		SAY("SE9: %s after %u ms\n", waited < 15000 ? "an amplifier answers" : "NO AMPLIFIER ANSWERS (or the bus never came up)",
++		    waited);
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		struct amp *a = &amps[i];
++
++		if (!probe(a)) {
++			gpio_look(a->reset_gpio);
++			if (!pmic_writes) {
++				SAY("%s: if its reset line above is low or an input, sndgpio=1 lets this kernel drive it high\n", a->name);
++			}
++			continue;
++		}
++		any |= configure(a);
++	}
++	SAY("%s\n", any ? "AMPLIFIERS READY (powered down, muted)" : "NO AMPLIFIER READY");
++	return any;
++}
++
++/* The digital volume: `below' eighths of a dB under Android's level (0 = Android's own); over 816: mute. */
++bool
++sweet_amp_volume(uint32_t below)
++{
++	uint32_t code = below > CS_VOL_MAX_BELOW ? CS_VOL_MUTE : ((0x800u - below) & 0x7ffu);
++	int err = 0;
++
++	for (unsigned i = 0; i < 2; i++) {
++		if (amps[i].prepared) {
++			err |= cs_bits(&amps[i], CS_AMP_DIG_VOL_CTRL, 0x7ff << 3, code << 3);
++		}
++	}
++	below_now = below;
++	return err == 0;
++}
++
++/* Powered up and unmuted at the current volume: only while the TDM clock runs (the PLL locks to SCLK). */
++bool
++sweet_amp_start(void)
++{
++	bool any = false;
++
++	if (gave_up) {
++		return false;
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		struct amp *a = &amps[i];
++		uint32_t s1 = 0, pwr2 = 0;
++		int err;
++
++		if (!a->prepared || a->on) {
++			any |= a->on;
++			continue;
++		}
++		/* "Main AMP" (PWR_CTRL2 AMP_EN), the boost converter (BST_EN 2), then cs35l41_main_amp_event POST_PMU */
++		err = cs_bits(a, CS_PWR_CTRL2, 0x31, 0x21) || cs_unlock(a, true) || cs_write(a, 0x2084, 0x002f1aa0) ||
++		    cs_unlock(a, false) || cs_bits(a, CS_PWR_CTRL1, 1, 1);
++		sleep_ms(2);
++		err = err || cs_bits(a, CS_AMP_OUT_MUTE, 0x10, 0);
++		(void)cs_read(a, CS_IRQ1_STATUS1, &s1);
++		(void)cs_read(a, CS_PWR_CTRL2, &pwr2);
++		SAY("%s: %s (IRQ1_STATUS1 %#x, PWR_CTRL2 %#x)\n", a->name, err ? "START FAILED" : "ON", s1, pwr2);
++		a->on = !err;
++		any |= a->on;
++	}
++	return any;
++}
++
++/* Muted, GLOBAL_EN off, PDN_DONE waited for, the pdn patch: powered down (cs35l41_main_amp_event POST_PMD). */
++void
++sweet_amp_stop(void)
++{
++	for (unsigned i = 0; i < 2; i++) {
++		struct amp *a = &amps[i];
++		uint32_t s1 = 0;
++		unsigned ms;
++
++		if (!a->on) {
++			continue;
++		}
++		(void)cs_bits(a, CS_AMP_OUT_MUTE, 0x10, 0x10);
++		(void)cs_bits(a, CS_PWR_CTRL1, 1, 0);
++		for (ms = 0; ms < 100; ms++) {
++			if (cs_read(a, CS_IRQ1_STATUS1, &s1) == 0 && (s1 & CS_PDN_DONE)) {
++				break;
++			}
++			sleep_ms(1);
++		}
++		(void)cs_write(a, CS_IRQ1_STATUS1, CS_PDN_DONE);
++		(void)(cs_unlock(a, true) || cs_write(a, 0x2084, 0x002f1aa3) || cs_unlock(a, false));
++		(void)cs_bits(a, CS_PWR_CTRL2, 0x01, 0);
++		a->on = false;
++		SAY("%s: off (%s)\n", a->name, ms < 100 ? "PDN_DONE" : "PDN NOT SEEN");
++	}
++}
++
++/* No error reported: true. On an error both are powered down and not started again this boot. */
++bool
++sweet_amp_healthy(void)
++{
++	for (unsigned i = 0; i < 2; i++) {
++		struct amp *a = &amps[i];
++		uint32_t s1 = 0;
++
++		if (!a->on) {
++			continue;
++		}
++		if (cs_read(a, CS_IRQ1_STATUS1, &s1) != 0) {
++			SAY("%s: status not readable: both powered down\n", a->name);
++			goto bad;
++		}
++		if (s1 & CS_ERRORS) {
++			SAY("%s: ERROR (IRQ1_STATUS1 %#x: %s%s%s%s%s): both powered down for this boot\n", a->name, s1,
++			    (s1 & 0x80000000u) ? "amp short " : "", (s1 & 0x00020000u) ? "over-temperature " : "",
++			    (s1 & 0x0100u) ? "boost short " : "", (s1 & 0x80u) ? "boost UVP " : "", (s1 & 0x40u) ? "boost OVP" : "");
++			goto bad;
++		}
++		if ((s1 & CS_TEMP_WARN) && !warned_temp) {
++			warned_temp = true;
++			SAY("%s: temperature warning (IRQ1_STATUS1 %#x)\n", a->name, s1);
++		}
++	}
++	return true;
++bad:
++	gave_up = true;
++	sweet_amp_stop();
++	return false;
++}
++
++void
++sweet_amp_status(void)
++{
++	for (unsigned i = 0; i < 2; i++) {
++		struct amp *a = &amps[i];
++		uint32_t s1 = 0, p1 = 0, p2 = 0, vol = 0;
++
++		if (!a->present) {
++			SAY("%s: not present\n", a->name);
++			continue;
++		}
++		(void)cs_read(a, CS_IRQ1_STATUS1, &s1);
++		(void)cs_read(a, CS_PWR_CTRL1, &p1);
++		(void)cs_read(a, CS_PWR_CTRL2, &p2);
++		(void)cs_read(a, CS_AMP_DIG_VOL_CTRL, &vol);
++		SAY("%s: %s, REVID %#x OTP %u, IRQ1_STATUS1 %#x PWR_CTRL1 %#x PWR_CTRL2 %#x DIG_VOL %#x; level %u.%u dB under "
++		    "Android's%s\n", a->name, a->on ? "ON" : "off", a->revid, a->otpid, s1, p1, p2, vol, below_now / 8,
++		    below_now % 8 * 125 / 100, gave_up ? "; GIVEN UP after an error" : "");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_guard.c b/bsd/dev/sweet_guard.c
+new file mode 100644
+index 0000000..1c296cb
+--- /dev/null
++++ b/bsd/dev/sweet_guard.c
+@@ -0,0 +1,324 @@
++/*
++ * redfin (WS-A, patch 0953): HackiOS's speaker guard (bsd/dev/redwood_guard.c of
++ * github.com/oosexgang/hackios-xnu-kernel, APSL 2.0) unchanged but for its names and this note.
++ * On redfin it sits in front of the two CS35L41 amplifiers (bsd/dev/sweet_cs35l41.c), which run
++ * in ASP bypass (PCM source ASP: no Halo protection firmware), in bsd/dev/sweet_sound.c's feeder;
++ * "Android's level" below means the amplifiers at Android's gain ("AMP PCM Gain" 17, "Digital PCM
++ * Volume" 817 = 0 dB, mixer_paths_noextcodec_snd.xml). HackiOS's description follows.
++ *
++ * The speakers' guard: what the samples go through on their way to the phone's two amplifiers
++ * (bsd/dev/sweet_sound.c's feeder), in place of the protection Android has in the audio DSP.
++ *
++ * Under Android the DSP runs Awinic's algorithm (SKTune, "aw882xx_rx_switch") with each
++ * speaker's calibration: it keeps the cone's excursion and the voice coil's temperature in
++ * bounds, measuring both through the amplifiers' current and voltage feedback. None of that runs
++ * here, and nothing here knows the speakers' parameters (Android's files that can be read have
++ * none: the amplifiers' register profile, the battery tables of its "monitor", and in the device
++ * tree a range of 4 to 9 ohms for the calibrated resistance). So the guard holds what reaches the
++ * speakers to levels that are safe for small phone speakers whatever they are exactly, measured
++ * the only way there is without feedback -- from the samples and the amplifiers' level -- and
++ * kept well under what the speakers can take at Android's level:
++ *
++ *   high-pass  a second-order Butterworth filter at 200 Hz: a phone's speaker gives out next to
++ *              nothing below its resonance (several hundred Hz), and what it is given there only
++ *              moves the cone further and heats the coil
++ *   power      the power that would reach a speaker, averaged three ways -- over 0.2 s (the
++ *              cone and coil at once), 3 s (the voice coil's warming) and 60 s (the magnet and
++ *              the frame) -- and the level turned down so that none of the three averages goes
++ *              over its limit: 3, 6 and 9 dB under the power of a full-scale sine at Android's
++ *              level. Sound of ordinary loudness never comes near them; a sustained full-scale
++ *              tone is turned down at once to the first, after seconds to the second and over a
++ *              minute to the third, and the level comes back up as the averages fall, as a
++ *              speaker cools. The averages go on falling while the amplifiers are off.
++ *   peaks      no sample above 3 dB under full scale at Android's level: a limiter that turns
++ *              the level down at the sample that would go over (so none does) and lets it come
++ *              back with a time constant of 43 ms
++ *   monitor    a further reduction that the amplifiers' watch asks for (sweet_cs35l41.c:
++ *              Android's table for a cold amplifier, and a low battery)
++ *
++ * Before all that, a gain (sound_gain, at most 12 dB): iOS's own processing for the iPhone X's
++ * speaker keeps even a full-scale tone at its top volume 12.6 to 14.3 dB under full scale, so
++ * without it iOS at the top would stay that much under Android at the top. What it lifts over
++ * full scale is held to full scale by the peak limiter (or to its lower limit), never clipped.
++ *
++ * All the limits are in terms of the speakers: a signal at full scale with the amplifiers at
++ * Android's level (the loudest they are ever set to) is 0 dB. With the amplifiers turned down
++ * (sound_below) the same samples are that much quieter at the speakers, and the guard holds them
++ * back only that much later. Everything is integer arithmetic (the kernel's threads do no
++ * floating point); fractions are in Q30 unless said otherwise.
++ *
++ * One caller at a time (the feeder); redwood_guard_attenuation() and redwood_guard_monitor() may
++ * be called from another thread.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <stdbool.h>
++#include <stdint.h>
++#include <sys/redwood_audio.h>
++
++#define ONE                     (1ll << 30)
++#define FULL_SCALE              32768
++
++/* The limits, in eighths of a dB under full scale at Android's level (powers: under a full-scale square wave's) */
++#define PEAK_LIMIT              (3 * 8)
++#define RMS_LIMIT               (6 * 8)         /* a full-scale sine is 3 dB under a square wave: these are 3, 6, 9 dB under it */
++#define FAST_LIMIT              (9 * 8)
++#define SLOW_LIMIT              (12 * 8)
++/* ... and the averages' time constants, in frames (48 kHz) */
++#define RMS_FRAMES              9600            /* 0.2 s */
++#define FAST_FRAMES             144000          /* 3 s */
++#define SLOW_FRAMES             2880000         /* 60 s */
++#define RELEASE_SHIFT           11              /* the peak limiter lets go with a time constant of 2048 frames, 43 ms */
++#define MAX_FRAMES              1024            /* the most frames processed at once (the feeder's period: 960) */
++
++/* 10^(-n/160), n = 0..47, in Q30: an attenuation of n eighths of a dB, as a factor of amplitude */
++static const uint32_t eighths[48] = {
++	1073741824, 1058400094, 1043277569, 1028371116, 1013677647, 999194121, 984917536, 970844937, 956973408, 943300077,
++	929822112, 916536722, 903441154, 890532697, 877808678, 865266461, 852903448, 840717079, 828704830, 816864213,
++	805192776, 793688102, 782347808, 771169545, 760150998, 749289885, 738583957, 728030996, 717628817, 707375265,
++	697268218, 687305580, 677485290, 667805313, 658263644, 648858308, 639587356, 630448869, 621440953, 612561743,
++	603809400, 595182112, 586678091, 578295576, 570032831, 561888146, 553859832, 545946228,
++};
++#define SIX_DB                  538145694       /* 10^(-6/20) in Q30 */
++
++/* the high-pass filter, 200 Hz at 48 kHz, Q = 1/sqrt(2): b0, b1, b2, a1, a2 in Q30 (RBJ's cookbook) */
++static const int64_t hpf_b0 = 1054047540, hpf_b1 = -2108095079, hpf_b2 = 1054047540;
++static const int64_t hpf_a1 = -2107733822, hpf_a2 = 1034714513;
++
++static struct {
++	bool hpf;
++	uint64_t gain;                          /* the gain before everything, Q30 (1 to 4) */
++	volatile uint32_t attenuation;          /* the amplifiers' level under Android's, eighths of a dB; REDWOOD_GUARD_SILENT: off */
++	volatile uint32_t monitor;              /* the monitor's reduction, eighths of a dB */
++	int64_t x1[2], x2[2], y1[2], y2[2];     /* the filter's past, in 1/256 of a sample */
++	uint64_t rms[2], fast[2], slow[2];      /* average powers at each speaker, Q30 of a full-scale square wave at Android's level */
++	uint64_t level;                         /* the power guard's and the monitor's gain at the end of the last block */
++	uint64_t envelope;                      /* the peak limiter's, 1/65536 of a sample */
++	struct redwood_guard_report report;
++} guard = { .hpf = true, .attenuation = REDWOOD_GUARD_SILENT, .gain = ONE, .level = ONE, .report = { .least_gain = ONE, .least_peak_gain = 65536 } };
++
++static int32_t work[2 * MAX_FRAMES];
++
++/* 10^(-n/160) in Q30: n eighths of a dB under, as a factor of amplitude */
++static uint64_t
++amplitude(uint32_t n)
++{
++	uint64_t value = eighths[n % 48];
++
++	for (uint32_t i = 0; i < n / 48 && value != 0; i++) {
++		value = value * SIX_DB >> 30;
++	}
++	return value;
++}
++
++static uint64_t
++isqrt(uint64_t value)
++{
++	uint64_t root = 0, bit = 1ull << 62;
++
++	while (bit > value) {
++		bit >>= 2;
++	}
++	while (bit != 0) {
++		if (value >= root + bit) {
++			value -= root + bit;
++			root = (root >> 1) + bit;
++		} else {
++			root >>= 1;
++		}
++		bit >>= 2;
++	}
++	return root;
++}
++
++/* how much of `limit' a power is, as the square of the gain that would bring it down to it (Q30, at most 1) */
++static uint64_t
++headroom(uint64_t power, uint64_t limit)
++{
++	if (power <= limit) {
++		return ONE;
++	}
++	return (limit << 30) / power;
++}
++
++void
++redwood_guard_configure(bool hpf, uint32_t gain)
++{
++	guard.hpf = hpf;
++	/* 10^(gain/160): one over the attenuation by as much */
++	guard.gain = (1ull << 60) / amplitude(gain > REDWOOD_GUARD_MAX_GAIN ? REDWOOD_GUARD_MAX_GAIN : gain);
++}
++
++void
++redwood_guard_attenuation(uint32_t below)
++{
++	guard.attenuation = below;
++}
++
++void
++redwood_guard_monitor(uint32_t below)
++{
++	guard.monitor = below;
++}
++
++static void
++block(int16_t *frames, uint32_t count)
++{
++	uint32_t attenuation = guard.attenuation;
++	struct redwood_guard_report *r = &guard.report;
++	uint64_t to_speaker = attenuation == REDWOOD_GUARD_SILENT ? 0 : amplitude(2 * attenuation);
++	uint64_t sum[2] = { 0, 0 }, g2 = ONE, g, start = guard.level, ceiling;
++	uint32_t binding = 0;
++
++	/* the high-pass filter, and what comes out of it: its power, per channel */
++	for (uint32_t i = 0; i < 2 * count; i++) {
++		unsigned c = i & 1;
++		int64_t x = (int64_t)frames[i] * (int64_t)guard.gain >> 22, y;    /* (the gain, and 1/256 of a sample) */
++		uint32_t level = frames[i] < 0 ? (uint32_t)-frames[i] : (uint32_t)frames[i];
++
++		if (level > r->peak_in) {
++			r->peak_in = level;
++		}
++		if (guard.hpf) {
++			y = (hpf_b0 * x + hpf_b1 * guard.x1[c] + hpf_b2 * guard.x2[c] - hpf_a1 * guard.y1[c] - hpf_a2 * guard.y2[c]) >> 30;
++			guard.x2[c] = guard.x1[c];
++			guard.x1[c] = x;
++			guard.y2[c] = guard.y1[c];
++			guard.y1[c] = y;
++		} else {
++			y = x;
++		}
++		work[i] = (int32_t)((y + 128) >> 8);
++		sum[c] += (uint64_t)((int64_t)work[i] * work[i]);
++	}
++
++	/* the averages at the speakers, and the gain that keeps all three under their limits */
++	for (unsigned c = 0; c < 2; c++) {
++		/* the block's power, Q30 of full scale (a square wave at 32768), then as it reaches the speaker */
++		uint64_t power = (uint64_t)((unsigned __int128)(sum[c] / count) * to_speaker >> 30), h;
++
++		guard.rms[c] = (uint64_t)((int64_t)guard.rms[c] + ((int64_t)power - (int64_t)guard.rms[c]) * count / RMS_FRAMES);
++		guard.fast[c] = (uint64_t)((int64_t)guard.fast[c] + ((int64_t)power - (int64_t)guard.fast[c]) * count / FAST_FRAMES);
++		guard.slow[c] = (uint64_t)((int64_t)guard.slow[c] + ((int64_t)power - (int64_t)guard.slow[c]) * count / SLOW_FRAMES);
++		if ((h = headroom(guard.rms[c], amplitude(2 * RMS_LIMIT))) < g2) {
++			g2 = h;
++			binding = 1;
++		}
++		if ((h = headroom(guard.fast[c], amplitude(2 * FAST_LIMIT))) < g2) {
++			g2 = h;
++			binding = 2;
++		}
++		if ((h = headroom(guard.slow[c], amplitude(2 * SLOW_LIMIT))) < g2) {
++			g2 = h;
++			binding = 3;
++		}
++	}
++	g = isqrt(g2 << 30) * amplitude(guard.monitor) >> 30;
++	if (g > ONE) {
++		g = ONE;
++	}
++	r->blocks++;
++	if (binding == 1) {
++		r->rms_blocks++;
++	} else if (binding == 2) {
++		r->fast_blocks++;
++	} else if (binding == 3) {
++		r->slow_blocks++;
++	}
++	if (g < r->least_gain) {
++		r->least_gain = g;
++	}
++
++	/* the peaks: no sample over the limit at the speaker (and none over full scale) */
++	ceiling = FULL_SCALE - 1;
++	if (attenuation != REDWOOD_GUARD_SILENT && attenuation < PEAK_LIMIT) {
++		ceiling = (uint64_t)FULL_SCALE * amplitude(PEAK_LIMIT - attenuation) >> 30;
++	}
++	for (uint32_t f = 0; f < count; f++) {
++		/* (the power guard's gain moves from the last block's to this one's across the block) */
++		uint64_t gain = (uint64_t)((int64_t)start + ((int64_t)g - (int64_t)start) * (int64_t)(f + 1) / (int64_t)count);
++		int64_t y[2];
++		uint64_t level, peak_gain = 65536;
++
++		for (unsigned c = 0; c < 2; c++) {
++			y[c] = (int64_t)work[2 * f + c] * (int64_t)gain >> 30;
++		}
++		level = (uint64_t)(y[0] < 0 ? -y[0] : y[0]);
++		if ((uint64_t)(y[1] < 0 ? -y[1] : y[1]) > level) {
++			level = (uint64_t)(y[1] < 0 ? -y[1] : y[1]);
++		}
++		guard.envelope -= guard.envelope >> RELEASE_SHIFT;
++		if (level << 16 > guard.envelope) {
++			guard.envelope = level << 16;
++		}
++		if (guard.envelope > ceiling << 16) {
++			peak_gain = (ceiling << 32) / guard.envelope;
++			r->limited_frames++;
++			if (peak_gain < r->least_peak_gain) {
++				r->least_peak_gain = (uint32_t)peak_gain;
++			}
++		}
++		for (unsigned c = 0; c < 2; c++) {
++			int64_t out = y[c] * (int64_t)peak_gain >> 16;
++			uint32_t magnitude;
++
++			out = out > FULL_SCALE - 1 ? FULL_SCALE - 1 : out < -FULL_SCALE ? -FULL_SCALE : out;
++			frames[2 * f + c] = (int16_t)out;
++			magnitude = (uint32_t)(out < 0 ? -out : out);
++			if (magnitude > r->peak_out) {
++				r->peak_out = magnitude;
++			}
++		}
++	}
++	guard.level = g;
++	r->gain = g;
++	r->rms = guard.rms[0] > guard.rms[1] ? guard.rms[0] : guard.rms[1];
++	r->fast = guard.fast[0] > guard.fast[1] ? guard.fast[0] : guard.fast[1];
++	r->slow = guard.slow[0] > guard.slow[1] ? guard.slow[0] : guard.slow[1];
++}
++
++void
++redwood_guard_process(int16_t *frames, uint32_t count)
++{
++	while (count > 0) {
++		uint32_t n = count < MAX_FRAMES ? count : MAX_FRAMES;
++
++		block(frames, n);
++		frames += 2 * n;
++		count -= n;
++	}
++}
++
++/* What has happened since the last call (and the averages and the gain as they are now). */
++void
++redwood_guard_take_report(struct redwood_guard_report *report)
++{
++	*report = guard.report;
++	guard.report = (struct redwood_guard_report){ .least_gain = ONE, .least_peak_gain = 65536 };
++}
++
++/* 10 log10 of a Q30 ratio, in tenths of a dB (for what is said) */
++int
++redwood_guard_decibels(uint64_t ratio)
++{
++	static const uint16_t fraction[17] = {
++		0, 5732, 11136, 16248, 21098, 25711, 30109, 34312, 38336, 42196, 45904, 49472, 52911, 56229, 59434, 62534, 65535,
++	};
++	int64_t log2;                           /* Q16 */
++	unsigned top = 63;
++
++	if (ratio == 0) {
++		return -999;
++	}
++	while (!(ratio >> top)) {
++		top--;
++	}
++	{
++		/* the 4 bits under the top one choose a segment, the next 12 where in it */
++		uint64_t mantissa = top >= 16 ? ratio >> (top - 16) : ratio << (16 - top);
++		unsigned index = (unsigned)(mantissa >> 12) & 15, within = (unsigned)mantissa & 4095;
++
++		log2 = ((int64_t)top - 30) * 65536 + fraction[index] + (int64_t)(fraction[index + 1] - fraction[index]) * within / 4096;
++	}
++	return (int)(log2 * 30103 / 65536 / 1000);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_sound.c b/bsd/dev/sweet_sound.c
+index dabc617..f4dfecf 100644
+--- a/bsd/dev/sweet_sound.c
++++ b/bsd/dev/sweet_sound.c
+@@ -40,8 +40,16 @@
+  *            sndsecs (default 3) seconds, then everything taken back
+  *   sound=2  ... and the stream: a 1 kHz tone at -30 dBFS for one second into the DSP, the amplifiers
+  *            OFF; the path then stays up feeding silence (poke `a tone MS` plays the tone again)
+- * Boot-args: sndsecs=S (sound=1 hold), sndlpi=0 (leave the LPI pins alone: no clock at the amps).
+- * poke (bsd/dev/sweet_poke.c, letter a): `a status`, `a tone [MS]` (default 1000, at most 5000).
++ *   sound=3  ... and the amplifiers (0953, bsd/dev/sweet_cs35l41.c): probed and configured, powered
++ *            down; HackiOS's speaker guard (bsd/dev/sweet_guard.c) armed at their level first; the tone
++ *            AUDIBLE for a second at sndbelow (default and loudest for sound=3: 20 dB under Android's
++ *            level); the amplifiers run only while something plays and stop after 2 s of silence
++ * Boot-args: sndsecs=S (sound=1 hold), sndlpi=0 (leave the LPI pins alone: no clock at the amps),
++ * sndbelow=E (eighths of a dB under Android's level, sound>=3), sndgpio=1 (sweet_cs35l41.c: let the
++ * kernel drive the amplifiers' PMIC reset lines).
++ * poke (bsd/dev/sweet_poke.c, letter a): `a status`, `a tone [MS]` (default 1000, at most 5000),
++ * `a gain DB` (the amplifiers DB dB under Android's level; sound=3 no louder than 20), `a off` (the
++ * amplifiers off and kept off), `a on` (allowed again).
+  *
+  * Log lines: "SWEET SOUND: ...". What is started is stopped before the DSP is shut down
+  * (redwood_sound_dsp_down() from sweet_adsp.c's redwood_adsp_stop()).
+@@ -75,6 +83,17 @@ static LCK_GRP_DECLARE(sound_lock_group, "sweet-sound");
+ static LCK_MTX_DECLARE(sound_lock, &sound_lock_group);  /* the path being set up or taken down */
+ 
+ static uint32_t level, hold_secs = 3, use_lpi = 1;
++static uint32_t below = 160;            /* the amplifiers' level, eighths of a dB under Android's (sndbelow) */
++static uint32_t below_min = 160;        /* the loudest allowed: sound=3 20 dB under */
++
++/* bsd/dev/sweet_cs35l41.c */
++extern bool sweet_amp_prepare(void);
++extern bool sweet_amp_start(void);
++extern bool sweet_amp_volume(uint32_t below);
++extern bool sweet_amp_healthy(void);
++extern void sweet_amp_stop(void);
++extern bool sweet_amp_ready(void);
++extern void sweet_amp_status(void);
+ 
+ static void
+ sleep_ms(uint32_t ms)
+@@ -790,6 +809,7 @@ static uint32_t tone_at;
+ static volatile uint64_t tone_until_us;          /* the tone plays until then */
+ static volatile bool stopping, feeder_runs;
+ static uint64_t sent_periods, failed_sends, tone_periods, silent_periods;
++static uint32_t guard_periods;
+ 
+ static void
+ period_fill(unsigned period)
+@@ -808,6 +828,11 @@ period_fill(unsigned period)
+ 	} else {
+ 		silent_periods++;
+ 	}
++	if (level >= 3) {
++		/* every period, silence too: its filter and its averages go on (sweet_guard.c) */
++		redwood_guard_process(samples, PERIOD_FRAMES);
++		guard_periods++;
++	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");       /* (write-combining: out to memory before the DSP is told) */
+ }
+ 
+@@ -883,12 +908,117 @@ tone_for(uint32_t ms)
+ 	uint32_t done = written_done;
+ 
+ 	tone_until_us = now_us() + 1000ull * ms;
+-	SAY("tone: 1 kHz at -30 dBFS for %u ms into the DSP (amplifiers off: nothing to hear)\n", ms);
++	SAY("tone: 1 kHz at -30 dBFS for %u ms into the DSP%s\n", ms, level >= 3 && sweet_amp_ready() ?
++	    " (AUDIBLE: the amplifiers follow)" : " (amplifiers off: nothing to hear)");
+ 	sleep_ms(ms + 200);
+ 	SAY("tone over: %u periods came back meanwhile (%u errors, %u underflows): the DSP took %u frames/s\n", written_done - done,
+ 	    write_errors, underflows, (written_done - done) * PERIOD_FRAMES * 1000 / (ms + 200));
+ }
+ 
++/* ---- the amplifiers: on while something plays, off after 2 s of silence ------------------------------------------ */
++
++#define QUIET_BEFORE_OFF_US     2000000ull
++
++static volatile bool amps_on, amps_held_off, amps_given_up, watcher_runs;
++static volatile uint32_t below_wanted;          /* set by poke `a gain`; applied by the watcher */
++static uint32_t amp_starts;
++
++static const char *
++db(char *text, uint32_t eighths)
++{
++	snprintf(text, 16, "%u.%03u", eighths / 8, eighths % 8 * 125);
++	return text;
++}
++
++static void
++guard_say(const char *when)
++{
++	struct redwood_guard_report r;
++
++	redwood_guard_take_report(&r);
++	if (r.blocks == 0) {
++		return;
++	}
++	SAY("guard %s: %u blocks, peaks in %u out %u; held down by the 0.2 s/3 s/60 s averages in %u/%u/%u; %u frames "
++	    "limited; gain now %d/10 dB (least %d/10)\n", when, r.blocks, r.peak_in, r.peak_out, r.rms_blocks, r.fast_blocks,
++	    r.slow_blocks, r.limited_frames, redwood_guard_decibels(r.gain * r.gain >> 30),
++	    redwood_guard_decibels(r.least_gain * r.least_gain >> 30));
++}
++
++static void
++amps_off(const char *why)
++{
++	char t[16];
++
++	if (!amps_on) {
++		return;
++	}
++	(void)sweet_amp_volume(0xffffffffu);
++	sweet_amp_stop();
++	amps_on = false;
++	SAY("amplifiers OFF (%s); they were at %s dB under Android's level\n", why, db(t, below));
++	guard_say("while they were on");
++}
++
++/* sound >= 3, on the sound thread until the run ends */
++static void
++watch(void)
++{
++	uint64_t last_look = 0;
++	char t[16];
++
++	watcher_runs = true;
++	while (!stopping) {
++		uint64_t now = now_us(), until = tone_until_us;
++		bool wanted = now < until + QUIET_BEFORE_OFF_US && until != 0;
++
++		if (below_wanted != below) {
++			below = below_wanted;
++			redwood_guard_attenuation(below);
++			if (amps_on) {
++				(void)sweet_amp_volume(below);
++			}
++			SAY("amplifiers' level: %s dB under Android's\n", db(t, below));
++		}
++		if (wanted && !amps_on && !amps_held_off && !amps_given_up && sweet_amp_ready()) {
++			/* the guard is armed at the level they will play at before they are started */
++			redwood_guard_attenuation(below);
++			guard_say("(silence before)");
++			if (!sweet_amp_start()) {
++				SAY("THE AMPLIFIERS DID NOT START: given up\n");
++				amps_given_up = true;
++				sweet_amp_stop();
++			} else {
++				amps_on = true;
++				amp_starts++;
++				/* faded in from 30 dB further down, 6 dB a step */
++				for (uint32_t extra = 240; extra > 0; extra -= 48) {
++					(void)sweet_amp_volume(below + extra);
++					sleep_ms(8);
++				}
++				(void)sweet_amp_volume(below);
++				last_look = now_us();
++				SAY("amplifiers ON at %s dB under Android's level (start %u)\n", db(t, below), amp_starts);
++			}
++		} else if (amps_on && (!wanted || amps_held_off)) {
++			amps_off(amps_held_off ? "poke a off" : "2 s of silence");
++		} else if (amps_on && now - last_look >= 200000) {
++			last_look = now;
++			if (!sweet_amp_healthy()) {
++				amps_on = false;
++				amps_given_up = true;
++				SAY("an amplifier reported an error: given up for this boot\n");
++			} else if (guard_periods >= 250) {
++				guard_periods = 0;
++				guard_say("(5 s)");
++			}
++		}
++		sleep_ms(10);
++	}
++	amps_off("the run ends");
++	watcher_runs = false;
++}
++
+ /* ---- the whole ------------------------------------------------------------------------------------------------ */
+ 
+ static bool running, path_up, taken_down;
+@@ -898,12 +1028,16 @@ take_down(void)
+ {
+ 	stopping = true;
+ 	thread_wakeup(&feeder_wake);
+-	for (unsigned ms = 0; ms < 2000 && feeder_runs; ms++) {
++	for (unsigned ms = 0; ms < 2000 && (feeder_runs || watcher_runs); ms++) {
+ 		sleep_ms(1);
+ 	}
+ 	lck_mtx_lock(&sound_lock);
+ 	if (running && !taken_down) {
+ 		taken_down = true;
++		if (amps_on) {
++			sweet_amp_stop();
++			amps_on = false;
++		}
+ 		stream_off();
+ 		afe_off();
+ 		pins_off();
+@@ -917,6 +1051,13 @@ take_down(void)
+ 	lck_mtx_unlock(&sound_lock);
+ }
+ 
++static void
++watcher_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	watch();
++	thread_terminate(current_thread());
++}
++
+ static void
+ sound_thread(__unused void *parameter, __unused wait_result_t result)
+ {
+@@ -924,8 +1065,9 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
+ 	thread_t feeder;
+ 
+ 	lck_mtx_lock(&sound_lock);
+-	SAY("sound=%u: %s\n", level, level == 1 ? "votes, LPI pins, QUIN TDM clock/group/port only" :
+-	    "the port and a stream with a -30 dBFS test tone, amplifiers OFF");
++	SAY("sound=%u: %s\n", level, level == 1 ? "votes, LPI pins, QUIN TDM clock/group/port only" : level == 2 ?
++	    "the port and a stream with a -30 dBFS test tone, amplifiers OFF" :
++	    "the port, a stream, the guard and the amplifiers: the test tone AUDIBLE");
+ 	if (!vote(LPASS_HW_MACRO_BLOCK, "LPASS_HW_MACRO") || !vote(LPASS_HW_DCODEC_BLOCK, "LPASS_HW_DCODEC")) {
+ 		SAY("the LPASS votes were not granted\n");
+ 	}
+@@ -956,8 +1098,32 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
+ 	}
+ 	thread_deallocate(feeder);
+ 	path_up = true;
++	if (level >= 3) {
++		char t[16];
++
++		/* the guard first, at the amplifiers' level; then the amplifiers, powered down (sweet_cs35l41.c) */
++		redwood_guard_configure(true, 0);
++		redwood_guard_attenuation(below);
++		below_wanted = below;
++		SAY("guard armed: high-pass 200 Hz, no gain, limits reckoned at %s dB under Android's level\n", db(t, below));
++		if (!sweet_amp_prepare()) {
++			SAY("no amplifier: the tone goes into the DSP unheard\n");
++		}
++	}
+ 	lck_mtx_unlock(&sound_lock);
+ 	SAY("PATH UP: QUIN_TDM_RX_0 0x9040, COPP %u, ASM session 1 running; poke `a tone MS` plays the test tone\n", copp);
++	if (level >= 3) {
++		thread_t watcher;
++
++		tone_until_us = now_us() + 300000ull + 1000000ull;      /* (the amplifiers come up meanwhile) */
++		if (kernel_thread_start(watcher_thread, NULL, &watcher) == KERN_SUCCESS) {
++			thread_deallocate(watcher);
++		}
++		sleep_ms(1500);
++		smmu_faults("after the tone");
++		SAY("sound=%u: LEVEL DONE (the path stays up; the amplifiers follow what plays)\n", level);
++		thread_terminate(current_thread());
++	}
+ 	tone_for(1000);
+ 	smmu_faults("after the tone");
+ 	SAY("sound=%u: LEVEL DONE (the path stays up feeding silence)\n", level);
+@@ -977,11 +1143,13 @@ redwood_sound_dsp_up(void)
+ 	if (!PE_parse_boot_argn("sound", &level, sizeof(level)) || level == 0) {
+ 		return;
+ 	}
+-	if (level > 2) {
+-		SAY("sound=%u: this kernel knows levels 1-2; doing 2\n", level);
+-		level = 2;
++	if (level > 3) {
++		SAY("sound=%u: this kernel knows levels 1-3; doing 3\n", level);
++		level = 3;
+ 	}
+ 	PE_parse_boot_argn("sndsecs", &hold_secs, sizeof(hold_secs));
++	PE_parse_boot_argn("sndbelow", &below, sizeof(below));
++	below = below < below_min ? below_min : below;
+ 	PE_parse_boot_argn("sndlpi", &use_lpi, sizeof(use_lpi));
+ 	running = true;
+ 	if (kernel_thread_start(sound_thread, NULL, &thread) != KERN_SUCCESS) {
+@@ -1057,10 +1225,14 @@ sweet_sound_cmd(const char *s, const char *end)
+ 
+ 	if (len == 0 || is(w, len, "status")) {
+ 		SAY("status: sound=%u path %s, votes %d/%d, pins %s, port %s, stream %s; %llu periods sent, %u done (%u errors), "
+-		    "%u underflows\n", level, path_up ? "UP" : "down", voted[LPASS_HW_MACRO_BLOCK], voted[LPASS_HW_DCODEC_BLOCK],
+-		    pins_taken ? "taken" : "-", port_on ? "on" : "off", stream_runs ? "running" : "-", sent_periods, written_done,
+-		    write_errors, underflows);
++		    "%u underflows; amplifiers %s%s%s, %u starts\n", level, path_up ? "UP" : "down", voted[LPASS_HW_MACRO_BLOCK],
++		    voted[LPASS_HW_DCODEC_BLOCK], pins_taken ? "taken" : "-", port_on ? "on" : "off", stream_runs ? "running" : "-",
++		    sent_periods, written_done, write_errors, underflows, amps_on ? "ON" : "off", amps_held_off ? " (held off)" : "",
++		    amps_given_up ? " (GIVEN UP)" : "", amp_starts);
+ 		smmu_faults("(status)");
++		if (level >= 3) {
++			sweet_amp_status();
++		}
+ 		return 0;
+ 	}
+ 	if (is(w, len, "tone")) {
+@@ -1072,10 +1244,33 @@ sweet_sound_cmd(const char *s, const char *end)
+ 		}
+ 		ms = ms > 5000 ? 5000 : ms;
+ 		tone_until_us = now_us() + 1000ull * ms;
+-		SAY("tone: 1 kHz -30 dBFS for %u ms (amplifiers off)\n", ms);
++		SAY("tone: 1 kHz -30 dBFS for %u ms%s\n", ms, level >= 3 && !amps_held_off && !amps_given_up && sweet_amp_ready() ?
++		    " (AUDIBLE)" : " (amplifiers off)");
++		return 0;
++	}
++	if (is(w, len, "gain")) {
++		uint32_t dbs = number(&s, end, ~0u);
++		char t[16];
++
++		if (dbs == ~0u || level < 3) {
++			SAY("gain: `a gain DB' (DB dB under Android's level) needs sound>=3\n");
++			return -1;
++		}
++		below_wanted = dbs * 8 < below_min ? below_min : dbs * 8 > 816 ? 816 : dbs * 8;
++		SAY("gain: the amplifiers %s dB under Android's level from now on\n", db(t, below_wanted));
++		return 0;
++	}
++	if (is(w, len, "off")) {
++		amps_held_off = true;
++		SAY("off: the amplifiers are stopped and kept off (`a on' allows them again)\n");
++		return 0;
++	}
++	if (is(w, len, "on")) {
++		amps_held_off = false;
++		SAY("on: the amplifiers may run again\n");
+ 		return 0;
+ 	}
+-	SAY("poke a: unknown command (status, tone [MS])\n");
++	SAY("poke a: unknown command (status, tone [MS], gain DB, off, on)\n");
+ 	return -1;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.43.0
+

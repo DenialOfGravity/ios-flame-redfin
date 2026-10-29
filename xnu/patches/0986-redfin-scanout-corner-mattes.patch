@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Tue, 27 Oct 2026 09:00:00 +0100
+Subject: [PATCH] 0986 redfin: direct scanout corner mattes (p scanout corners 0|1)
+
+The corner mattes (fCornerCov) drawn by the CPU into each direct frame's
+own corners after its fence, before the flip: black without a read where
+coverage is 0, read and dimmed where partial. Default off.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b653cae..daac2b6 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2090,6 +2090,9 @@ AppleCLCD::mdpCmd(const char *s, const char *end)
+ static struct {
+ 	volatile bool on;               /* frames go direct (p scanout / boot-arg) */
+ 	bool          noGate;           /* 0985: p scanout gate 0: back pressure in SwapEnd as 0979/0983 */
++	bool          corners;          /* 0986: p scanout corners 1: the corner mattes drawn into each frame */
++	uint64_t      stCornerAbs;
++	uint32_t      stCorners;
+ 	int           gatePid;          /* 0985: who swapped (backboardd): its GPU submits wait for gateSeq on screen */
+ 	volatile uint64_t gateSeq;
+ 	uint64_t      stGateAbs;
+@@ -2397,6 +2400,41 @@ sweet_scan_wait(AppleCLCD *fb, uint32_t id)
+ 	IOLockUnlock(fb->fLock);
+ }
+ 
++/*
++ * 0986: corner mattes in direct mode (p scanout corners 1). The CPU present darkens the panel's rounded corners with
++ * fCornerCov (copyRow); the display engine has no matte, so the drawn frame gets one itself: after its fence (the GPU
++ * is done with it) and before the flip, in the surface's own corners (fCornerExt rows and columns, coverage in panel
++ * pixels: the radius shows 4 % smaller after the 1125 -> 1080 scale). Pixels with no coverage are written black
++ * without a read (the surface is write-combined), partly covered ones are read and dimmed, the rest is not touched:
++ * about 4 x 0.21 x ext^2 writes and 4 x 2 x ext reads. CA does not draw into a frame it has swapped.
++ */
++static void
++sweet_scan_corners(AppleCLCD *fb, SweetSurface *s)
++{
++	uint32_t e = fb->fCornerExt, W = s->width, H = s->height, bpr = s->bytesPerRow;
++	uintptr_t va = s->kernelAddress();
++	if (e == 0 || fb->fCornerCov == NULL || va == 0 || 2 * e >= W || 2 * e >= H) {
++		return;
++	}
++	uint64_t t0 = mach_absolute_time();
++	for (uint32_t i = 0; i < 2 * e; i++) {
++		uint32_t y = i < e ? i : H - 1 - (i - e);
++		const uint8_t *cov = fb->fCornerCov + (size_t)(i < e ? i : i - e) * e;
++		volatile uint32_t *row = (volatile uint32_t *)(va + (uint64_t)y * bpr);
++		for (uint32_t x = 0; x < e; x++) {
++			uint32_t c = cov[x];
++			if (c == 255) {
++				break;  /* the rest of this corner row is inside */
++			}
++			row[x] = c == 0 ? 0xff000000u : sweet_display_dim(row[x], c);
++			row[W - 1 - x] = c == 0 ? 0xff000000u : sweet_display_dim(row[W - 1 - x], c);
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	sweet_scan.stCornerAbs += mach_absolute_time() - t0;
++	sweet_scan.stCorners++;
++}
++
+ /* With fLock, from the scanout thread: latch, then the next flip. False: nothing in flight. */
+ static bool
+ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
+@@ -2455,6 +2493,9 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
+ 			}
+ 		}
+ 	}
++	if (sweet_scan.corners) {
++		sweet_scan_corners(fb, s);      /* 0986 */
++	}
+ 	sweet_scan.next = NULL;
+ 	uint64_t sSeq = sweet_scan.nextSeq, sAbs = sweet_scan.nextAbs;    /* 0979: a newer frame may come while entering */
+ 	uint32_t sSwap = sweet_scan.nextSwap;
+@@ -2539,9 +2580,14 @@ sweet_scan_stats_locked(uint64_t now)
+ 	{
+ 		uint64_t gw = 0;    /* 0985 */
+ 		absolutetime_to_nanoseconds(sweet_scan.stGateAbs, &gw);
+-		IOLog("SWEET SCANOUT: 5s gate: submits %u waited %u (avg %llu us) timeout %u%s\n", sweet_scan.stGate,
+-		    sweet_scan.stGateWait, sweet_scan.stGateWait ? gw / 1000 / sweet_scan.stGateWait : 0, sweet_scan.stGateTimeout,
+-		    sweet_scan.noGate ? " (off: SwapEnd back pressure)" : "");
++		uint64_t cw = 0;    /* 0986 */
++		absolutetime_to_nanoseconds(sweet_scan.stCornerAbs, &cw);
++		IOLog("SWEET SCANOUT: 5s gate: submits %u waited %u (avg %llu us) timeout %u%s | corners %u (avg %llu us)\n",
++		    sweet_scan.stGate, sweet_scan.stGateWait, sweet_scan.stGateWait ? gw / 1000 / sweet_scan.stGateWait : 0,
++		    sweet_scan.stGateTimeout, sweet_scan.noGate ? " (off: SwapEnd back pressure)" : "", sweet_scan.stCorners,
++		    sweet_scan.stCorners ? cw / 1000 / sweet_scan.stCorners : 0);
++		sweet_scan.stCornerAbs = 0;
++		sweet_scan.stCorners = 0;
+ 		sweet_scan.stGateAbs = 0;
+ 		sweet_scan.stGate = sweet_scan.stGateWait = sweet_scan.stGateTimeout = 0;
+ 	}	sweet_scan.stFenceAbs = sweet_scan.stLatchAbs = sweet_scan.stLatchMax = 0;
+@@ -2619,6 +2665,8 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+  *   p hz 60|90 [tc] the panel's rate now (DCS 0x53), ticks and SyncRate with it; tc: tear-check line clock too
+  *   p mdp ...       0948: display-engine dump and scanout tests (above)
+  *   p scanout 0|1   0976: the direct scanout off / on (needs boot-arg sweetscanout=1|2); no argument: the state
++ *   p scanout gate 0|1     0985: GPU-submit gate (default on) or SwapEnd back pressure
++ *   p scanout corners 0|1  0986: corner mattes drawn into each direct frame (default off)
+  */
+ void
+ AppleCLCD::fbCmd(const char *s, const char *end)
+@@ -2741,7 +2789,18 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+ 		while (q < end && *q == ' ') {
+ 			q++;
+ 		}
+-		if (end - q >= 4 && !strncmp(q, "gate", 4)) {
++		if (end - q >= 7 && !strncmp(q, "corners", 7)) {
++			/* 0986: p scanout corners 0|1 */
++			const char *v = q + 7;
++			while (v < end && *v == ' ') {
++				v++;
++			}
++			IOLockLock(fLock);
++			sweet_scan.corners = v < end && *v == '1';
++			IOLockUnlock(fLock);
++			IOLog("SWEET SCANOUT: corners %s (radius %u, %u rows)\n", sweet_scan.corners ? "on" : "off", fCornerRadius,
++			    fCornerExt);
++		} else if (end - q >= 4 && !strncmp(q, "gate", 4)) {
+ 			/* 0985: p scanout gate 0|1 */
+ 			const char *v = q + 4;
+ 			while (v < end && *v == ' ') {
+-- 
+2.43.0
+

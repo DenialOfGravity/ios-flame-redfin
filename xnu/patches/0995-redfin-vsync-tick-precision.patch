@@ -1,0 +1,347 @@
+From c43605e0e70335117959986f5527c652f3b41ef1 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Wed, 28 Oct 2026 11:38:11 +0100
+Subject: [PATCH] 0995 redfin: vsync tick precision (no timer slop, calibration
+ keeps its tick, lead, measured period), IOMFBDisplayRefresh for CA's
+ heartbeat
+
+---
+ iokit/IOKit/IOTimerEventSource.h      |   1 +
+ iokit/Kernel/IOTimerEventSource.cpp   |   4 +
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 182 +++++++++++++++++++++++++-
+ iokit/Kernel/arm/SweetTrace.h         |   3 +-
+ 4 files changed, 184 insertions(+), 6 deletions(-)
+
+diff --git a/iokit/IOKit/IOTimerEventSource.h b/iokit/IOKit/IOTimerEventSource.h
+index 4b907bb..6eb13e0 100644
+--- a/iokit/IOKit/IOTimerEventSource.h
++++ b/iokit/IOKit/IOTimerEventSource.h
+@@ -94,6 +94,7 @@ enum{
+ enum{
+ 	kIOTimeOptionsWithLeeway = 0x00000020,
+ 	kIOTimeOptionsContinuous = 0x00000100,
++	kIOTimeOptionsSweetCritical = 0x00010000,       /* redfin 0995: no timer coalescing slop (SYS_CRITICAL) */
+ };
+ 
+ /*!
+diff --git a/iokit/Kernel/IOTimerEventSource.cpp b/iokit/Kernel/IOTimerEventSource.cpp
+index 0ee1fe9..71c48a5 100644
+--- a/iokit/Kernel/IOTimerEventSource.cpp
++++ b/iokit/Kernel/IOTimerEventSource.cpp
+@@ -559,6 +559,10 @@ IOTimerEventSource::wakeAtTime(uint32_t options, AbsoluteTime inAbstime, Absolut
+ 		if (kIOTimeOptionsContinuous & options) {
+ 			tcoptions |= THREAD_CALL_CONTINUOUS;
+ 		}
++		if (kIOTimeOptionsSweetCritical & options) {
++			/* redfin 0995: a kernel thread's timer otherwise gets min(delay >> 3, 1 ms) of coalescing slop */
++			tcoptions |= THREAD_CALL_DELAY_SYS_CRITICAL;
++		}
+ 
+ 		if (reserved) {
+ 			if (kPassive & flags) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d1e9304..f60e148 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -108,12 +108,16 @@ enum {
+  *   0x4  (0944) present at SwapEnd (2 frames queued, SwapEnd held when full), vsync ticks phased to the TE
+  *        (0946: or, the TE counter reading 0 on redfin, to INTF1's frame counter)
+  *   0x8  (0946) the CPU scales the frame onto the panel (no GPU ring), into the back buffer with sweetfbflip=1
++ *   0x10 (0995) sweetvsync |= 3, 0x20 (0995) sweetfb_refresh=1 unless given (boot only; the r45 cmdline is 583 of
++ *        591 characters, so no room for new boot-arg names)
+  * sweetfb_hz=90: the panel at 90 Hz (DCS 0x53 0x38) and 11.1 ms ticks; anything else is 60 Hz.
+  */
+ #define SWEET_FBX_MODES         0x1
+ #define SWEET_FBX_NOCLEAN       0x2
+ #define SWEET_FBX_SWAPQ         0x4
+ #define SWEET_FBX_CPUPRESENT    0x8
++#define SWEET_FBX_VSYNC         0x10    /* 0995: = sweetvsync 3 (ticks without timer slop, calibration keeps its tick) */
++#define SWEET_FBX_REFRESH       0x20    /* 0995: = sweetfb_refresh=1 (IOMFBDisplayRefresh from the measured period) */
+ static uint32_t sweet_fbx;
+ 
+ /*
+@@ -154,6 +158,32 @@ static uint32_t sweet_pace_min = 8000;
+  *        ids and times, printed as SWEET SWAPTRACE lines once full; p swapdone trace arms it again
+  */
+ static uint32_t sweet_swapdone;
++
++/*
++ * 0995 (ws-u-pace3): boot-args sweetvsync=MASK sweetvsync_lead=US, poke p vsync [MASK [LEAD_US]] (0 = as 0994).
++ * From the 2026-10-28 page-swipe traces (sweet-trace.py --pace): the ticks came 0.7-1.5 ms after the panel edge
++ * (INTF1 frame counter) instead of 0.5, and 17-20 ticks per 8 s were lost, one at almost every 33rd tick.
++ *   0x1  the tick timer without timer coalescing (THREAD_CALL_DELAY_SYS_CRITICAL through IOTimerEventSource's
++ *        kIOTimeOptionsSweetCritical): a kernel thread's 11 ms timer gets min(delay >> 3, 1 ms) of slop
++ *        (arm timer_coalesce_kt_shift 3, kt_ns_max 1 ms)
++ *   0x2  0946's calibration cannot lose a tick: the calibration tick is put 0.3 ms before the predicted edge and polls
++ *        until the counter moves; with the slop it ran after the edge most times and then polled a whole period for
++ *        the next one (that edge got no tick). Now a calibration tick that finds its edge gone by goes out as a
++ *        normal tick, the next calibration comes 8 ticks later and earlier (margin +250 us, at most 2 ms; -50 us
++ *        after a good one, at least 300 us)
++ *   0x4  notifications carry the measured panel period (INTF frame counter, 11.143 ms at "90 Hz") instead of 11.111
++ *   LEAD (default 500 us): ticks this long after the predicted edge (the 0946 phase)
++ * sweetfb_refresh=1|NS (0995), p vsync refresh [NS]: publish IOMFBDisplayRefresh { displayMinRefreshInterval =
++ * the period in 2^-32 s }, which CA takes for its heartbeat (the app CADisplayLinks' clock) when CA_HEARTBEAT_RATE is
++ * not set (redfin-90fps-sensors-plan, 2026-10-28 13:30): 1 = the measured period (republished when it moves by more
++ * than 0.01 %), NS > 1000 = that period in ns (11142700 for this panel). With CA_HEARTBEAT_RATE=90 the app ticks run
++ * at 11.111 ms and drift 2.85 ms/s against the panel (a full period every 3.9 s).
++ */
++static uint32_t sweet_vsync, sweet_vsync_lead = 500, sweet_fb_refresh;
++static uint32_t sweet_vsync_cal_ok, sweet_vsync_cal_late, sweet_vsync_cal_lost;
++#define SWEET_VSYNC_CRIT        0x1
++#define SWEET_VSYNC_CAL         0x2
++#define SWEET_VSYNC_PERIOD      0x4
+ #define SWEET_SWAPDONE_TICK     0x1
+ #define SWEET_SWAPDONE_TRACE    0x2
+ #define SWEET_ST_N              256
+@@ -304,6 +334,10 @@ public:
+ 	uint64_t      fFcEdge, fFcPeriod;     /* INTF1 frame counter: last edge seen, measured period */
+ 	uint32_t      fFcFrame, fFcTicks, fFcMiss;
+ 	bool          fFcCal, fFcDead;
++	uint32_t      fFcEarlyUs;             /* 0995: the calibration tick's margin before the edge */
++	uint64_t      fRefreshNs;             /* 0995: the period published as IOMFBDisplayRefresh */
++	void          publishRefresh(uint64_t ns);
++	void          vsyncCmd(const char *s, const char *end);
+ 	bool          presentCPU(const uint8_t *rec);
+ 	uintptr_t     cpuBuffer(uint64_t pa);
+ 	uintptr_t     cpuSource(SweetSurface *s);       /* 0978 */
+@@ -766,6 +800,23 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetpace", &sweet_pace, sizeof(sweet_pace));      /* 0977 */
+ 	PE_parse_boot_argn("sweetpace_min", &sweet_pace_min, sizeof(sweet_pace_min));      /* 0983 */
+ 	PE_parse_boot_argn("sweetswapdone", &sweet_swapdone, sizeof(sweet_swapdone));      /* 0987 */
++	PE_parse_boot_argn("sweetvsync", &sweet_vsync, sizeof(sweet_vsync));      /* 0995 */
++	PE_parse_boot_argn("sweetvsync_lead", &sweet_vsync_lead, sizeof(sweet_vsync_lead));
++	PE_parse_boot_argn("sweetfb_refresh", &sweet_fb_refresh, sizeof(sweet_fb_refresh));
++	if (sweet_fbx & SWEET_FBX_VSYNC) {
++		sweet_vsync |= SWEET_VSYNC_CRIT | SWEET_VSYNC_CAL;     /* 0995: sweetfbx 0x10 (the cmdline is nearly full) */
++	}
++	if ((sweet_fbx & SWEET_FBX_REFRESH) && sweet_fb_refresh == 0) {
++		sweet_fb_refresh = 1;                                   /* 0995: sweetfbx 0x20 */
++	}
++	fFcEarlyUs = 300;
++	if (sweet_vsync_lead > 5000) {
++		sweet_vsync_lead = 5000;
++	}
++	if (sweet_vsync || sweet_vsync_lead != 500) {
++		IOLog("SWEET FB: vsync %#x lead %u us (0995: 1 no timer slop, 2 calibration keeps its tick, 4 measured period)\n",
++		    sweet_vsync, sweet_vsync_lead);
++	}
+ 	if (sweet_swapdone) {
+ 		IOLog("SWEET FB: swapdone %#x (0987: 1 tick at swap done, 2 trace)\n", sweet_swapdone);
+ 	}
+@@ -835,6 +886,10 @@ AppleCLCD::start(IOService *provider)
+ 	if (sweet_fbx & SWEET_FBX_MODES) {
+ 		publishModes();
+ 	}
++	if (sweet_fb_refresh != 0) {
++		/* 0995: a fixed period now, or (1) the nominal one until the frame counter has measured the panel */
++		publishRefresh(sweet_fb_refresh > 1000 ? sweet_fb_refresh : (fHz == 90 ? 11111111ULL : SWEET_FB_VSYNC_US * 1000ULL));
++	}
+ 	sweet_fb_instance = this;
+ 	sweet_surface_scan_reserve();   /* 0979: the scanout slots' memory before userland (sweetscanout) */
+ 	if (sweet_surface_scan_mode() == 1) {
+@@ -871,7 +926,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (sweet_fbx & SWEET_FBX_SWAPQ) {
+ 		fb->phaseTick(now);	/* 0944: the next tick just after a TE */
+ 	}
+-	sender->wakeAtTime(fb->fNextVsync);
++	if (sweet_vsync & SWEET_VSYNC_CRIT) {
++		sender->wakeAtTime(kIOTimeOptionsSweetCritical, fb->fNextVsync, 0);    /* 0995: no coalescing slop */
++	} else {
++		sender->wakeAtTime(fb->fNextVsync);
++	}
+ 	sweet_gpu_flip_poll();	/* 0905: a finished frame in the back buffer goes on screen at this vsync */
+ 	sweet_gpu_present_poll();	/* 0943: blit->fence latency */
+ 	fb->statLine(now);		/* 0943: every 5 s, the frame statistics */
+@@ -908,7 +967,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			send = false;
+ 		}
+ 	}
+-	SWEET_TRACE(SWT_VSYNC, count, send, mode, fb->fPowerOff ? 0 : sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT));     /* 0994 */
++	SWEET_TRACE(SWT_VSYNC, count, send, mode | (sweet_vsync << 8),     /* 0994; 0995: sweetvsync in bits 8+ */
++	    fb->fPowerOff ? 0 : sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT));
+ 	if (send) {
+ 		fb->sendVsync(count, now);
+ 	}
+@@ -970,7 +1030,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ void
+ AppleCLCD::sendVsync(uint64_t count, uint64_t now)
+ {
+-	uint64_t period = fVsyncAbs;
++	uint64_t period = (sweet_vsync & SWEET_VSYNC_PERIOD) && fFcPeriod != 0 ? fFcPeriod : fVsyncAbs;     /* 0995 */
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -1545,6 +1605,88 @@ AppleCLCD::publishModes(void)
+ 	OSSafeReleaseNULL(color);
+ }
+ 
++/*
++ * 0995: IOMFBDisplayRefresh { displayMinRefreshInterval } in 2^-32 s (2^32 / 90 = 47721859): CA's heartbeat when the
++ * render server's environment has no CA_HEARTBEAT_RATE (the order found in QuartzCore: env, this property, 1/60).
++ */
++void
++AppleCLCD::publishRefresh(uint64_t ns)
++{
++	if (ns < 1000000 || ns > 100000000) {
++		return;
++	}
++	OSDictionary *d = OSDictionary::withCapacity(1);
++	if (d == NULL) {
++		return;
++	}
++	uint64_t v = ((ns << 32) + 500000000ULL) / 1000000000ULL;
++	sweet_fb_set_number(d, "displayMinRefreshInterval", v);
++	setProperty("IOMFBDisplayRefresh", d);
++	d->release();
++	fRefreshNs = ns;
++	IOLog("SWEET FB: IOMFBDisplayRefresh displayMinRefreshInterval %llu (period %llu ns, %llu.%03llu Hz)\n", v, ns,
++	    1000000000000ULL / ns / 1000, 1000000000000ULL / ns % 1000);
++}
++
++/*
++ * 0995: p vsync [MASK [LEAD_US]] | p vsync refresh [NS]: the tick options (see sweet_vsync); no argument: the state and
++ * the calibration counts since the last p vsync (ok, late = would have lost a tick, lost = did lose one).
++ */
++void
++AppleCLCD::vsyncCmd(const char *q, const char *end)
++{
++	while (q < end && *q == ' ') {
++		q++;
++	}
++	if (end - q >= 7 && !strncmp(q, "refresh", 7)) {
++		q += 7;
++		while (q < end && *q == ' ') {
++			q++;
++		}
++		uint64_t ns = 0;
++		while (q < end && *q >= '0' && *q <= '9') {
++			ns = ns * 10 + (uint64_t)(*q++ - '0');
++		}
++		if (ns == 0 && fFcPeriod != 0) {
++			absolutetime_to_nanoseconds(fFcPeriod, &ns);
++		}
++		publishRefresh(ns);
++		return;
++	}
++	bool set = false;
++	uint32_t v = 0, lead = 0;
++	bool haveLead = false;
++	if (q < end && *q >= '0' && *q <= '9') {
++		set = true;
++		while (q < end && *q >= '0' && *q <= '9') {
++			v = v * 10 + (uint32_t)(*q++ - '0');
++		}
++		while (q < end && *q == ' ') {
++			q++;
++		}
++		while (q < end && *q >= '0' && *q <= '9') {
++			haveLead = true;
++			lead = lead * 10 + (uint32_t)(*q++ - '0');
++		}
++	}
++	IOLockLock(fLock);
++	if (set) {
++		sweet_vsync = v;
++		if (haveLead) {
++			sweet_vsync_lead = lead > 5000 ? 5000 : lead;
++		}
++		fFcEarlyUs = 300;
++	}
++	uint32_t ok = sweet_vsync_cal_ok, late = sweet_vsync_cal_late, lost = sweet_vsync_cal_lost;
++	sweet_vsync_cal_ok = sweet_vsync_cal_late = sweet_vsync_cal_lost = 0;
++	uint64_t pns = 0;
++	absolutetime_to_nanoseconds(fFcPeriod, &pns);
++	IOLockUnlock(fLock);
++	IOLog("SWEET FB: vsync now %#x lead %u us (1 no timer slop, 2 calibration keeps its tick, 4 measured period); "
++	    "calibrations since last: ok %u late %u lost %u, margin %u us; panel period %llu ns; refresh published %llu ns\n",
++	    sweet_vsync, sweet_vsync_lead, ok, late, lost, fFcEarlyUs, pns, fRefreshNs);
++}
++
+ /*
+  * The S6E3HC2's refresh rate: DCS short write 0x53 0x28 = 60 Hz, 0x53 0x38 = 90 Hz, same DSI clock and porches
+  * (dsi-panel-s6e3hc2-dvt-dsc-1080p-cmd.dtsi, android-msm-redbull-4.19). Autorefresh starts one frame per TE, so
+@@ -2965,6 +3107,7 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+  *   p scanout gate 0|1|2   0985: SwapEnd back pressure (0), the swapper's GPU submits wait (1, default), 0989: the
+  *                          CP waits for the latch (2; boot-arg sweetscangate)
+  *   p scanout corners 0|1  0986: corner mattes drawn into each direct frame (default off)
++ *   p vsync [MASK [LEAD_US]] | p vsync refresh [NS]   0995: tick timer options, IOMFBDisplayRefresh (above)
+  */
+ extern "C" void sweet_gpu_stats_flush(void);     /* 0991 */
+ extern "C" void sweet_prof_cmd(const char *s, const char *end);   /* 0991 */
+@@ -3113,6 +3256,10 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+ 		mdpCmd(s + 3, end);     /* 0948 */
+ 		return;
+ 	}
++	if (end - s >= 5 && !strncmp(s, "vsync", 5)) {
++		vsyncCmd(s + 5, end);   /* 0995 */
++		return;
++	}
+ 	if (end - s >= 4 && !strncmp(s, "pace", 4)) {
+ 		/* 0977: p pace N (0 = as before, 1 = ticks held for the SwapEnd of a frame in flight); 0983: p pace N [MIN_US] */
+ 		const char *q = s + 4;
+@@ -3513,8 +3660,19 @@ AppleCLCD::phaseFrameCount(uint64_t now)
+ 		return;
+ 	}
+ 	uint64_t lead, early, period = fFcPeriod ? fFcPeriod : fVsyncAbs;
+-	nanoseconds_to_absolutetime(500000, &lead);
+-	nanoseconds_to_absolutetime(300000, &early);
++	bool cal = (sweet_vsync & SWEET_VSYNC_CAL) != 0;
++	nanoseconds_to_absolutetime((uint64_t)sweet_vsync_lead * 1000, &lead);     /* 0995: default 500 us */
++	nanoseconds_to_absolutetime((uint64_t)(cal ? fFcEarlyUs : 300) * 1000, &early);
++	if (fFcCal && fFcEdge != 0 && cal) {
++		/* 0995: the edge this calibration tick was put before (the nearest predicted one) already went by? */
++		uint32_t want = fFcFrame + (uint32_t)((now - fFcEdge + period / 2) / period);
++		if ((int32_t)(sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT) - want) >= 0) {
++			fFcCal = false;         /* no poll for the next edge: this tick goes out now, as a normal one */
++			fFcTicks = 24;          /* calibrate again in 8 ticks, with a larger margin */
++			fFcEarlyUs = fFcEarlyUs + 250 > 2000 ? 2000 : fFcEarlyUs + 250;
++			sweet_vsync_cal_late++;
++		}
++	}
+ 	if (fFcEdge == 0 || fFcCal) {
+ 		uint32_t f0 = sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT), f = f0;
+ 		uint64_t t = now, limit = now + period * 3 / 2;
+@@ -3533,12 +3691,26 @@ AppleCLCD::phaseFrameCount(uint64_t now)
+ 			return;
+ 		}
+ 		fFcMiss = 0;
++		if (fFcEdge != 0 && t - now > period / 2) {
++			sweet_vsync_cal_lost++;         /* 0995: polled past an edge that had gone by: that edge got no tick */
++		} else if (cal) {
++			sweet_vsync_cal_ok++;
++			fFcEarlyUs = fFcEarlyUs >= 350 ? fFcEarlyUs - 50 : 300;
++		}
+ 		uint32_t frames = f - fFcFrame;
+ 		if (fFcEdge != 0 && frames >= 1 && frames < 4096) {
+ 			uint64_t p = (t - fFcEdge) / frames;
+ 			if (p > fVsyncAbs * 3 / 4 && p < fVsyncAbs * 5 / 4) {
+ 				fFcPeriod = p;
+ 				period = p;
++				if (sweet_fb_refresh == 1) {
++					/* 0995: the measured period as CA's heartbeat source, when it moved by more than 0.01 % */
++					uint64_t ns;
++					absolutetime_to_nanoseconds(p, &ns);
++					if (fRefreshNs == 0 || (ns > fRefreshNs ? ns - fRefreshNs : fRefreshNs - ns) * 10000 > fRefreshNs) {
++						publishRefresh(ns);
++					}
++				}
+ 			}
+ 		}
+ 		if (fTeLogs < 3) {
+diff --git a/iokit/Kernel/arm/SweetTrace.h b/iokit/Kernel/arm/SweetTrace.h
+index 42a9ff2..9da84fe 100644
+--- a/iokit/Kernel/arm/SweetTrace.h
++++ b/iokit/Kernel/arm/SweetTrace.h
+@@ -5,7 +5,8 @@
+  * and a branch while no trace runs (the arguments are evaluated inside the branch). No boot-arg.
+  *
+  * Code  Name          Args (a1, a2, a3, a4)
+- * 0x01  VSYNC         vsync timer tick: count, sent (1) or held (0), sweetpace mode, INTF1 frame counter
++ * 0x01  VSYNC         vsync timer tick: count, sent (1) or held (0), sweetpace mode | sweetvsync << 8 (0995),
++ *                     INTF1 frame counter
+  * 0x02  VSYNC_SEND    vsync (type 5) notification out: count, clients that take it, timestamp sent, period
+  * 0x03  NOTIFY        IOMFB async notification: type, client pid, IOReturn of the send (non-zero: dropped), 0
+  * 0x04  IOMFB_SEL     IOMFB externalMethod, START: selector, scalar[0], scalar[1], structIn size;
+-- 
+2.43.0
+

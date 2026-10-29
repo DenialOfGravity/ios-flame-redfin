@@ -1,0 +1,42 @@
+From 5608ab76cb5800d1fad24fdac7fd9752efcdbcb1 Mon Sep 17 00:00:00 2001
+From: WS-P <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 00:42:28 +0100
+Subject: [PATCH] redfin: USB ud_thread polls every 10 ms when quiet
+ (sweetudpoll=1: 1 ms)
+
+The DWC3 event poller ran at 1 kHz forever; after 200 polls without an
+event (and no TX in flight) it now sleeps 10 ms, back to 1 ms on the next
+event.
+---
+ bsd/dev/sweet_usb.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index f4054e1..a2bbb4e 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -844,8 +844,12 @@ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	uint32_t ticks = 0;
++	/* redfin (0969): poll every 1 ms while events flow, every 10 ms after 200 quiet polls; sweetudpoll=1: always 1 ms */
++	uint32_t quiet = 0, fast = 0;
++	PE_parse_boot_argn("sweetudpoll", &fast, sizeof(fast));
+ 	for (;;) {
+ 		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
++		quiet = count ? 0 : quiet < 200 ? quiet + 1 : quiet;
+ 		if (count) {
+ 			ud_sync(UD_EVT, UD_EVT_SIZE);
+ 			for (uint32_t done = 0; done < count; done += 4) {
+@@ -878,7 +882,7 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 				    usb_rd(ud_smmu_cb, 0x68), usb_rd(ud_smmu_cb, 0x6c));
+ 			}
+ 		}
+-		ud_sleep_ms(1);
++		ud_sleep_ms((fast == 1 || quiet < 200 || ud.tx_busy) ? 1 : 10);
+ 	}
+ }
+ 
+-- 
+2.43.0
+

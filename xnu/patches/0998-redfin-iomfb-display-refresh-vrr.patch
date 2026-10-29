@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Wed, 28 Oct 2026 18:00:00 +0100
+Subject: [PATCH] 0998 redfin: IOMFBDisplayRefresh as a variable-refresh display
+ (min/max/step + MachTime), sweetfbx 0x80, p vsync vrr
+
+The A15 DCP firmware (IOMobileFramebuffer::setDisplayRefreshProperties,
+iOS 16.7.2) publishes IOMFBDisplayRefresh with displayMinRefreshInterval,
+displayMaxRefreshInterval and displayRefreshStep, each also as
+...MachTime. 0995 published only the minimum (a fixed-rate panel).
+sweetfbx 0x80 (boot) or poke "p vsync vrr N [STEP_NS]" adds max = N
+periods and step (default one period); N 0 = as 0995. Default off.
+Experiment for UIKit's settle animations at 30 Hz on the 90 Hz heartbeat.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC2ddaTfHZkv9c7LhRi
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7d9111d..e07cb3d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -110,6 +110,8 @@ enum {
+  *   0x8  (0946) the CPU scales the frame onto the panel (no GPU ring), into the back buffer with sweetfbflip=1
+  *   0x10 (0995) sweetvsync |= 3, 0x20 (0995) sweetfb_refresh=1 unless given (boot only; the r45 cmdline is 583 of
+  *        591 characters, so no room for new boot-arg names)
++ *   0x80 (0998) sweetfb_refresh=1 unless given, and IOMFBDisplayRefresh as a variable-refresh display (DCP's
++ *        full key set: min/max interval and step, each with its MachTime twin): max = 3 periods, step = 1 period
+  * sweetfb_hz=90: the panel at 90 Hz (DCS 0x53 0x38) and 11.1 ms ticks; anything else is 60 Hz.
+  */
+ #define SWEET_FBX_MODES         0x1
+@@ -119,6 +121,7 @@ enum {
+ #define SWEET_FBX_VSYNC         0x10    /* 0995: = sweetvsync 3 (ticks without timer slop, calibration keeps its tick) */
+ #define SWEET_FBX_REFRESH       0x20    /* 0995: = sweetfb_refresh=1 (IOMFBDisplayRefresh from the measured period) */
+ #define SWEET_FBX_TRIBUF        0x40    /* 0996: = p scanout tribuf 1 at boot (SwapWait polls answer Busy, gate by depth) */
++#define SWEET_FBX_VRR           0x80    /* 0998: IOMFBDisplayRefresh with max interval and step (p vsync vrr N [STEP_NS]) */
+ static uint32_t sweet_fbx;
+ 
+ /*
+@@ -181,6 +184,17 @@ static uint32_t sweet_swapdone;
+  * at 11.111 ms and drift 2.85 ms/s against the panel (a full period every 3.9 s).
+  */
+ static uint32_t sweet_vsync, sweet_vsync_lead = 500, sweet_fb_refresh;
++/*
++ * 0998 (ws-u-fps): IOMFBDisplayRefresh as the A15 DCP firmware publishes it (IOMobileFramebuffer::
++ * setDisplayRefreshProperties(), iphone14d6xdcp, iOS 16.7.2): displayMinRefreshInterval, displayMaxRefreshInterval,
++ * displayRefreshStep, each in 2^-32 s and as ...MachTime (mach absolute time units). 0995 published only the minimum,
++ * i.e. a fixed-rate panel. sweet_fb_vrr = N (2..16, 0 = off): max = N periods, step = sweet_fb_vrr_step_ns or one
++ * period. Aim: UIKit's settle animations (inProcessAnimationManager) run at 30 Hz on the 90 Hz heartbeat (every
++ * 3rd tick), presumably a 60 fps request quantised onto 90/n; a display CA treats as variable-rate may quantise it
++ * to 90 or 45 instead. Boot: sweetfbx 0x80 (= N 3); poke p vsync vrr N [STEP_NS], then restart backboardd (CA reads
++ * the property when it opens the display).
++ */
++static uint32_t sweet_fb_vrr, sweet_fb_vrr_step_ns;
+ static uint32_t sweet_vsync_cal_ok, sweet_vsync_cal_late, sweet_vsync_cal_lost;
+ #define SWEET_VSYNC_CRIT        0x1
+ #define SWEET_VSYNC_CAL         0x2
+@@ -808,6 +822,12 @@ AppleCLCD::start(IOService *provider)
+ 	if (sweet_fbx & SWEET_FBX_VSYNC) {
+ 		sweet_vsync |= SWEET_VSYNC_CRIT | SWEET_VSYNC_CAL;     /* 0995: sweetfbx 0x10 (the cmdline is nearly full) */
+ 	}
++	if (sweet_fbx & SWEET_FBX_VRR) {
++		sweet_fb_vrr = 3;                                       /* 0998: sweetfbx 0x80 */
++		if (sweet_fb_refresh == 0) {
++			sweet_fb_refresh = 1;
++		}
++	}
+ 	if ((sweet_fbx & SWEET_FBX_REFRESH) && sweet_fb_refresh == 0) {
+ 		sweet_fb_refresh = 1;                                   /* 0995: sweetfbx 0x20 */
+ 	}
+@@ -1617,22 +1637,40 @@ AppleCLCD::publishRefresh(uint64_t ns)
+ 	if (ns < 1000000 || ns > 100000000) {
+ 		return;
+ 	}
+-	OSDictionary *d = OSDictionary::withCapacity(1);
++	OSDictionary *d = OSDictionary::withCapacity(6);
+ 	if (d == NULL) {
+ 		return;
+ 	}
+ 	uint64_t v = ((ns << 32) + 500000000ULL) / 1000000000ULL;
++	uint64_t abs = 0;
+ 	sweet_fb_set_number(d, "displayMinRefreshInterval", v);
++	uint64_t maxNs = 0, stepNs = 0;
++	if (sweet_fb_vrr >= 2 && sweet_fb_vrr <= 16) {
++		/* 0998: the DCP's full set, so that CA sees a variable-rate display (see sweet_fb_vrr) */
++		maxNs = ns * sweet_fb_vrr;
++		stepNs = sweet_fb_vrr_step_ns >= 1000000 && sweet_fb_vrr_step_ns <= ns ? sweet_fb_vrr_step_ns : ns;
++		nanoseconds_to_absolutetime(ns, &abs);
++		sweet_fb_set_number(d, "displayMinRefreshIntervalMachTime", abs);
++		sweet_fb_set_number(d, "displayMaxRefreshInterval", ((maxNs << 32) + 500000000ULL) / 1000000000ULL);
++		nanoseconds_to_absolutetime(maxNs, &abs);
++		sweet_fb_set_number(d, "displayMaxRefreshIntervalMachTime", abs);
++		sweet_fb_set_number(d, "displayRefreshStep", ((stepNs << 32) + 500000000ULL) / 1000000000ULL);
++		nanoseconds_to_absolutetime(stepNs, &abs);
++		sweet_fb_set_number(d, "displayRefreshStepMachTime", abs);
++	}
+ 	setProperty("IOMFBDisplayRefresh", d);
+ 	d->release();
+ 	fRefreshNs = ns;
+-	IOLog("SWEET FB: IOMFBDisplayRefresh displayMinRefreshInterval %llu (period %llu ns, %llu.%03llu Hz)\n", v, ns,
+-	    1000000000000ULL / ns / 1000, 1000000000000ULL / ns % 1000);
++	IOLog("SWEET FB: IOMFBDisplayRefresh displayMinRefreshInterval %llu (period %llu ns, %llu.%03llu Hz)"
++	    " max %llu ns step %llu ns (0998 vrr %u)\n", v, ns, 1000000000000ULL / ns / 1000, 1000000000000ULL / ns % 1000,
++	    maxNs, stepNs, sweet_fb_vrr);
+ }
+ 
+ /*
+  * 0995: p vsync [MASK [LEAD_US]] | p vsync refresh [NS]: the tick options (see sweet_vsync); no argument: the state and
+  * the calibration counts since the last p vsync (ok, late = would have lost a tick, lost = did lose one).
++ * 0998: p vsync vrr N [STEP_NS]: IOMFBDisplayRefresh with max = N periods and the step (0 = one period); N 0 = only
++ * the minimum again. Republished at once with the last published (else the measured) period.
+  */
+ void
+ AppleCLCD::vsyncCmd(const char *q, const char *end)
+@@ -1655,6 +1693,33 @@ AppleCLCD::vsyncCmd(const char *q, const char *end)
+ 		publishRefresh(ns);
+ 		return;
+ 	}
++	if (end - q >= 3 && !strncmp(q, "vrr", 3)) {
++		q += 3;
++		uint32_t n = 0, step = 0;
++		while (q < end && *q == ' ') {
++			q++;
++		}
++		while (q < end && *q >= '0' && *q <= '9') {
++			n = n * 10 + (uint32_t)(*q++ - '0');
++		}
++		while (q < end && *q == ' ') {
++			q++;
++		}
++		while (q < end && *q >= '0' && *q <= '9') {
++			step = step * 10 + (uint32_t)(*q++ - '0');
++		}
++		sweet_fb_vrr = n >= 2 && n <= 16 ? n : 0;
++		sweet_fb_vrr_step_ns = step;
++		uint64_t ns = fRefreshNs;
++		if (ns == 0 && fFcPeriod != 0) {
++			absolutetime_to_nanoseconds(fFcPeriod, &ns);
++		}
++		if (ns == 0) {
++			ns = fHz == 90 ? 11111111ULL : SWEET_FB_VSYNC_US * 1000ULL;
++		}
++		publishRefresh(ns);
++		return;
++	}
+ 	bool set = false;
+ 	uint32_t v = 0, lead = 0;
+ 	bool haveLead = false;
+@@ -3196,6 +3261,7 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+  *   p scanout corners 0|1  0986: corner mattes drawn into each direct frame (default off)
+  *   p scanout tribuf 0|1   0996: SwapWait polls (0x80000000) answer Busy until latched; gate by chain depth (off)
+  *   p vsync [MASK [LEAD_US]] | p vsync refresh [NS]   0995: tick timer options, IOMFBDisplayRefresh (above)
++ *   p vsync vrr N [STEP_NS]                         0998: IOMFBDisplayRefresh max = N periods, step (above)
+  */
+ extern "C" void sweet_gpu_stats_flush(void);     /* 0991 */
+ extern "C" void sweet_prof_cmd(const char *s, const char *end);   /* 0991 */
+-- 
+2.43.0
+

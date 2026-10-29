@@ -1,0 +1,392 @@
+From b86f262c13895e499a576adef6180a579efee1d6 Mon Sep 17 00:00:00 2001
+From: WS-D <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 00:38:49 +0100
+Subject: [PATCH 3/3] 0956 redfin: /dev/redwood-qrtr ports on the ADSP's QRTR,
+ kern.sweet_adsp_services
+
+qol-plan.md 3.1: each open of /dev/redwood-qrtr (a devfs clone) is one QRTR
+port of ours on node 1 (0x5000 + n, n < 16); write() {node, port, data} sends
+one datagram to the DSP, read() returns one ({node, port, data}, blocking
+unless O_NONBLOCK, 64 KiB queued at most per port, select() works), ioctl
+QRTR_LOOKUP fills node/port from the services the DSP has announced (0/0:
+none yet), close() sends DEL_CLIENT. qrtr_input() routes datagrams to the
+ports instead of dropping them. sysctl kern.sweet_adsp_services lists the
+DSP's services as "svc:inst@node:port,...". Poke f 2 also lists open ports.
+---
+ bsd/dev/sweet_adsp.c | 325 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 325 insertions(+)
+
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+index 5335505..2a8495b 100644
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -122,6 +122,7 @@
+ #include <miscfs/devfs/devfs.h>
+ #include <vm/pmap.h>
+ #include <arm/caches_internal.h>
++#include <sys/sysctl.h>                 /* (0956: kern.sweet_adsp_services) */
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -2716,6 +2717,8 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
+ 	}
+ }
+ 
++static bool qrtr_deliver(const struct qrtr_header *header, const uint8_t *data, uint32_t length);   /* 0956 */
++
+ static void
+ qrtr_input(const uint8_t *data, uint32_t length)
+ {
+@@ -2770,6 +2773,9 @@ qrtr_input(const uint8_t *data, uint32_t length)
+ 		pdm_input(&header, data + at, header.size);     /* 0951 */
+ 		return;
+ 	}
++	if (qrtr_deliver(&header, data + at, header.size)) {
++		return;                         /* 0956: a port of /dev/redwood-qrtr */
++	}
+ 	printf("adsp: qrtr: a datagram of %u bytes from node %u port %u to our port %u: nobody here listens there\n", header.size,
+ 	    header.from_node, header.from_port, header.to_port);
+ }
+@@ -3759,6 +3765,318 @@ ssr_input(const uint8_t *data, uint32_t length)
+ 	printf("SWEET FASTRPC: glink_ssr: %u bytes: %#x %#x %#x %#x\n", length, w[0], w[1], w[2], w[3]);
+ }
+ 
++/* ---- /dev/redwood-qrtr (0956): QRTR ports of ours on node 1, for userland's QMI clients ---------------- */
++
++/*
++ * What Linux's AF_QIPCRTR sockets give its QMI clients (libssc's sensors client among them), for
++ * the DSP only, as qol-plan.md 3.1 fixes it:
++ *   open()   one port of ours (0x5000 + n, n < 16), a clone of /dev/redwood-qrtr per open
++ *   write()  struct { u32 node; u32 port; u8 data[]; }: one datagram to the DSP's node and port
++ *   read()   struct { u32 node; u32 port; u8 data[]; }: one datagram (blocks; O_NONBLOCK: EAGAIN),
++ *            cut to the reader's buffer; at most 64 KiB wait per port, more is dropped (and counted)
++ *   ioctl QRTR_LOOKUP {service, instance, node, port}: the DSP's server of the service (instance 0:
++ *            any; the instance is the announcement's word >> 8, its low byte being the version),
++ *            node 0 port 0 when it has not told of one (yet)
++ *   close()  a DEL_CLIENT to the DSP, so its services forget the port
++ * sysctl kern.sweet_adsp_services: "svc:inst@node:port,..." of every service the DSP has told of.
++ */
++struct qrtr_lookup {
++	uint32_t service, instance, node, port;
++};
++#define QRTR_LOOKUP             _IOWR('q', 1, struct qrtr_lookup)
++#define QRTR_PORTS              16
++#define QRTR_PORT_BASE          0x5000u
++#define QRTR_QUEUE_MAX          (64u << 10)
++#define QRTR_WRITE_MAX          0x4000u
++
++struct qrtr_datagram {
++	struct qrtr_datagram *next;
++	uint32_t node, port, length;
++	uint8_t data[];
++};
++static LCK_MTX_DECLARE(qport_lock, &adsp_lock_group);
++static struct {
++	uint32_t claimed;                       /* (taken by the clone function, under devfs's lock: atomically) */
++	bool open;
++	pid_t pid;
++	struct qrtr_datagram *first, *last;
++	uint32_t queued, received, sent, dropped;
++	struct selinfo select;
++} qport[QRTR_PORTS];
++static int qport_major = -1;
++
++/* A datagram from the DSP to a port of ours: queued for its reader. From the link's thread. */
++static bool
++qrtr_deliver(const struct qrtr_header *header, const uint8_t *data, uint32_t length)
++{
++	unsigned n = header->to_port - QRTR_PORT_BASE;
++	struct qrtr_datagram *datagram;
++	bool dropped = false;
++
++	if (header->to_port < QRTR_PORT_BASE || n >= QRTR_PORTS) {
++		return false;
++	}
++	datagram = kalloc_data(sizeof(*datagram) + length, Z_WAITOK);
++	lck_mtx_lock(&qport_lock);
++	if (!qport[n].open || datagram == NULL || qport[n].queued + length > QRTR_QUEUE_MAX) {
++		dropped = true;
++		qport[n].dropped++;
++	} else {
++		datagram->next = NULL;
++		datagram->node = header->from_node;
++		datagram->port = header->from_port;
++		datagram->length = length;
++		memcpy(datagram->data, data, length);
++		if (qport[n].last != NULL) {
++			qport[n].last->next = datagram;
++		} else {
++			qport[n].first = datagram;
++		}
++		qport[n].last = datagram;
++		qport[n].queued += length;
++		qport[n].received++;
++		wakeup(&qport[n]);
++		selwakeup(&qport[n].select);
++		datagram = NULL;
++	}
++	lck_mtx_unlock(&qport_lock);
++	if (datagram != NULL) {
++		kfree_data(datagram, sizeof(*datagram) + length);
++	}
++	if (dropped && qport[n].dropped <= 8) {
++		printf("SWEET QRTR: %u bytes from node %u port %u to our port %#x: %s, dropped\n", length, header->from_node,
++		    header->from_port, header->to_port, qport[n].open ? "ITS QUEUE IS FULL" : "the port is not open");
++	}
++	return true;
++}
++
++static int
++qport_clone(__unused dev_t dev, int action)
++{
++	if (action == DEVFS_CLONE_ALLOC) {
++		for (int n = 0; n < QRTR_PORTS; n++) {
++			if (os_atomic_cmpxchg(&qport[n].claimed, 0u, 1u, acq_rel)) {
++				return n;
++			}
++		}
++		return -1;
++	}
++	return -1;
++}
++
++static int
++qport_open(dev_t dev, __unused int flags, __unused int devtype, proc_t p)
++{
++	unsigned n = (unsigned)minor(dev);
++
++	if (n >= QRTR_PORTS || !qport[n].claimed) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&qport_lock);
++	qport[n].open = true;
++	qport[n].pid = proc_pid(p);
++	qport[n].first = qport[n].last = NULL;
++	qport[n].queued = qport[n].received = qport[n].sent = qport[n].dropped = 0;
++	lck_mtx_unlock(&qport_lock);
++	printf("SWEET QRTR: port %#x opened by pid %d\n", QRTR_PORT_BASE + n, proc_pid(p));
++	return 0;
++}
++
++static int
++qport_close(dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	unsigned n = (unsigned)minor(dev);
++	struct qrtr_datagram *datagram, *next;
++	struct qrtr_control bye = { .command = QRTR_DEL_CLIENT, .words = { QRTR_US, QRTR_PORT_BASE + n } };
++
++	if (n >= QRTR_PORTS) {
++		return 0;
++	}
++	lck_mtx_lock(&qport_lock);
++	qport[n].open = false;
++	datagram = qport[n].first;
++	qport[n].first = qport[n].last = NULL;
++	qport[n].queued = 0;
++	selthreadclear(&qport[n].select);
++	lck_mtx_unlock(&qport_lock);
++	for (; datagram != NULL; datagram = next) {
++		next = datagram->next;
++		kfree_data(datagram, sizeof(*datagram) + datagram->length);
++	}
++	if (glink.channel[CHANNEL_QRTR].open && qrtr_peer != 0) {
++		qrtr_out_packet(QRTR_DEL_CLIENT, QRTR_CONTROL, qrtr_peer, QRTR_CONTROL, &bye, sizeof(bye));
++	}
++	printf("SWEET QRTR: port %#x closed (pid %d): %u datagrams sent, %u received, %u dropped\n", QRTR_PORT_BASE + n,
++	    qport[n].pid, qport[n].sent, qport[n].received, qport[n].dropped);
++	os_atomic_store(&qport[n].claimed, 0u, release);
++	return 0;
++}
++
++static int
++qport_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	unsigned n = (unsigned)minor(dev);
++	uint32_t address[2], length;
++	uint8_t *data;
++	int error;
++
++	if (n >= QRTR_PORTS || uio_resid(uio) < (user_ssize_t)sizeof(address) ||
++	    uio_resid(uio) > (user_ssize_t)(sizeof(address) + QRTR_WRITE_MAX)) {
++		return EINVAL;
++	}
++	length = (uint32_t)uio_resid(uio) - (uint32_t)sizeof(address);
++	if ((error = uiomove((caddr_t)address, sizeof(address), uio)) != 0) {
++		return error;
++	}
++	if (!glink.channel[CHANNEL_QRTR].open || qrtr_peer == 0) {
++		return ENOTCONN;
++	}
++	if (address[0] != qrtr_peer) {
++		return EHOSTUNREACH;
++	}
++	if (length == 0) {
++		return EINVAL;
++	}
++	data = kalloc_data(length, Z_WAITOK);
++	if (data == NULL) {
++		return ENOMEM;
++	}
++	error = uiomove((caddr_t)data, (int)length, uio);
++	if (error == 0) {
++		error = qrtr_out_packet(QRTR_DATA, QRTR_PORT_BASE + n, address[0], address[1], data, length);
++	}
++	kfree_data(data, length);
++	if (error == 0) {
++		qport[n].sent++;
++	}
++	return error;
++}
++
++static int
++qport_read(dev_t dev, struct uio *uio, int ioflag)
++{
++	unsigned n = (unsigned)minor(dev);
++	struct qrtr_datagram *datagram;
++	uint32_t address[2];
++	int error = 0;
++
++	if (n >= QRTR_PORTS || uio_resid(uio) < (user_ssize_t)sizeof(address)) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&qport_lock);
++	while ((datagram = qport[n].first) == NULL) {
++		if (ioflag & IO_NDELAY) {
++			lck_mtx_unlock(&qport_lock);
++			return EWOULDBLOCK;
++		}
++		error = msleep(&qport[n], &qport_lock, PCATCH | PZERO, "qrtr", NULL);
++		if (error != 0) {
++			lck_mtx_unlock(&qport_lock);
++			return error;
++		}
++	}
++	qport[n].first = datagram->next;
++	qport[n].last = qport[n].first == NULL ? NULL : qport[n].last;
++	qport[n].queued -= datagram->length;
++	lck_mtx_unlock(&qport_lock);
++	address[0] = datagram->node;
++	address[1] = datagram->port;
++	error = uiomove((caddr_t)address, sizeof(address), uio);
++	if (error == 0) {
++		error = uiomove((caddr_t)datagram->data, (int)MIN((user_ssize_t)datagram->length, uio_resid(uio)), uio);
++	}
++	kfree_data(datagram, sizeof(*datagram) + datagram->length);
++	return error;
++}
++
++static int
++qport_select(dev_t dev, int which, void *wql, proc_t p)
++{
++	unsigned n = (unsigned)minor(dev);
++	int ready = 1;
++
++	if (which == FREAD && n < QRTR_PORTS) {
++		lck_mtx_lock(&qport_lock);
++		ready = qport[n].first != NULL;
++		if (!ready) {
++			selrecord(p, &qport[n].select, wql);
++		}
++		lck_mtx_unlock(&qport_lock);
++	}
++	return ready;
++}
++
++static int
++qport_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused proc_t p)
++{
++	struct qrtr_lookup *lookup = (struct qrtr_lookup *)data;
++
++	if (cmd != QRTR_LOOKUP) {
++		return ENOTTY;
++	}
++	lookup->node = lookup->port = 0;
++	for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
++		if (qrtr_servers[i].there && qrtr_servers[i].service == lookup->service &&
++		    (lookup->instance == 0 || (qrtr_servers[i].instance >> 8) == lookup->instance)) {
++			lookup->instance = qrtr_servers[i].instance >> 8;
++			lookup->node = qrtr_servers[i].node;
++			lookup->port = qrtr_servers[i].port;
++			break;
++		}
++	}
++	return 0;
++}
++
++static const struct cdevsw qport_cdevsw = {
++	.d_open       = qport_open,
++	.d_close      = qport_close,
++	.d_read       = qport_read,
++	.d_write      = qport_write,
++	.d_ioctl      = qport_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = qport_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++static void
++qport_init(void)
++{
++	qport_major = cdevsw_add(-1, &qport_cdevsw);
++	if (qport_major < 0) {
++		printf("SWEET QRTR: cdevsw_add failed (%d)\n", qport_major);
++		return;
++	}
++	void *node = devfs_make_node_clone(makedev(qport_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, qport_clone,
++	    "redwood-qrtr");
++	printf("SWEET QRTR: /dev/redwood-qrtr %s (major %d, ports %#x-%#x)\n", node ? "ready" : "FAILED", qport_major,
++	    QRTR_PORT_BASE, QRTR_PORT_BASE + QRTR_PORTS - 1);
++}
++
++static int
++sysctl_sweet_adsp_services SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char text[64 * 28];
++	int at = 0;
++
++	text[0] = 0;
++	for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]) && at < (int)sizeof(text) - 28; i++) {
++		if (qrtr_servers[i].there) {
++			at += snprintf(text + at, sizeof(text) - (size_t)at, "%s%u:%u@%u:%u", at ? "," : "", qrtr_servers[i].service,
++			    qrtr_servers[i].instance >> 8, qrtr_servers[i].node, qrtr_servers[i].port);
++		}
++	}
++	return SYSCTL_OUT(req, text, strlen(text) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_adsp_services, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_adsp_services, "A", "SWEET ADSP: QRTR services the DSP has told of, svc:inst@node:port");
++
+ /* poke f N [A]: see NOTES.md (0950, 0951, 0956) */
+ int sweet_adsp_poke(unsigned what, uint64_t a, uint64_t b);
+ int
+@@ -3795,6 +4113,12 @@ sweet_adsp_poke(unsigned what, __unused uint64_t a, __unused uint64_t b)
+ 				    qrtr_servers[i].node, qrtr_servers[i].port);
+ 			}
+ 		}
++		for (unsigned n = 0; n < QRTR_PORTS; n++) {     /* 0956 */
++			if (qport[n].open) {
++				printf("SWEET QRTR: our port %#x (pid %d): %u sent, %u received, %u dropped, %u bytes waiting\n",
++				    QRTR_PORT_BASE + n, qport[n].pid, qport[n].sent, qport[n].received, qport[n].dropped, qport[n].queued);
++			}
++		}
+ 		return 0;
+ 	case 3:
+ 		return fastrpc_smmu_identity((uint32_t)a);
+@@ -4190,6 +4514,7 @@ redwood_adsp_init(void)
+ 	PE_parse_boot_argn("adsp_sleep", &adsp_sleep, sizeof(adsp_sleep));    /* 0950: Android's SMP2P entries */
+ 	PE_parse_boot_argn("adsp_qlog", &adsp_qlog, sizeof(adsp_qlog));       /* 0950: IPCRTR datagrams logged */
+ 	fastrpc_init();                         /* 0950: /dev/redwood-fastrpc (adsp_fastrpc=0: not) */
++	qport_init();                           /* 0956: /dev/redwood-qrtr */
+ 	PE_parse_boot_argn("adsp_pdm", &pdm_on, sizeof(pdm_on));       /* 0951: pd-mapper (adsp_pdm=0: not) */
+ 	if (last_step == 0) {
+ 		/* all of it, on a thread of its own, and left up */
+-- 
+2.43.0
+

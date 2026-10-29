@@ -215,3 +215,138 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   (4 x, 2-16 ms), refusals log both prepare() results.
 - 0942 the `present:` line per 300-frame window: window ms and presents/s, per-frame clean/blit, put off / flips / late in
   the window, mode (single buffer / flip) and `sweetgpufreq`, totals in brackets.
+- 0943 `SWEET FB: 5s: swaps N shown N dropped N | le11 a le18 b le26 c le35 d gt35 e | p50 X.X p95 Y.Y ms | blitq Q us fence F us | hz H` (always); `sweetfbx=` 0x1 TimingElements/SyncRate + GetBlock(0x40) + sel 77, 0x2 no dcache clean unless the surface's seed moved; `sweetfb_hz=90` = DCS 0x53 0x38 + 11.1 ms ticks; poke `p fc`, `p hz 60|90 [tc]`.
+- 0944 `sweetfbx` 0x4 (off by default, needs the present thread): present at SwapEnd (2-deep queue, SwapEnd held <= 50 ms when full, put-off presents retried every 1 ms, landed 0905 flips flushed at once) and vsync ticks phased 0.5 ms after INTF1's TE (tear-check frame/line counters; `SWEET FB: tick phased:` x3, free-running if the counter stops).
+- 0946 `sweetfbx` 0x8 (off by default): CPU present on the present thread (fit-scale nearest sample, 1125x2436 -> 1080x2339, corner mattes, source clean+invalidate; back buffer + flip with `sweetfbflip=1`), no wait behind the GPU ring; 0944 phasing falls back to INTF1 frame counter 0x0ac when the TE counter reads 0; stats line + `| vis V us cpu C us` (SwapEnd -> panel-visible, CPU copy); present thread bound to CPU6 while 0x8 (`sweetfbcpu=N`); poke `p fbx HEX` sets 0x2/0x4/0x8 live.
+- 0945 touch stats (always): `SWEET SECTS: 5s: events N (moves M, batched B) rate R/s | dt p50/p95/max ms | gaps>20ms G | irq->dispatch p50/p95 us | wake p50/p95 us | per drain avg A max B (C us max) | x X` (sample time = attention IRQ) and `SWEET HID: real|swipe: moves N dt p5/p50/p95/max ms | gaps>20ms G | dispatch avg/max us` (HID timestamps iOS gets; 5 s or at lift after >= 10 moves). `sectouchx=` 0x1 HID timestamp = IRQ time + one move per finger per drain, 0x2 READ_ALL_EVENT for >= 3 queued, 0x4 read-only probe of 0x30/0x34, 0x8 touch thread priority 92.
+- 0947 fit within 2 px takes the whole panel (row 2339 no longer flickers; GPU blit and CPU present); once fitted, swaps with no layer / the panel's own surface / not fittable keep the last frame instead of the crop copy (which flipped back to buffer 0: the CPU-present tearing). `SWEET FB: swap N (layers ..) kept the fitted frame` / `not fitted` x4.
+- 0949 CPU present waits for the GPU fence submitted at the frame's SwapEnd (100 us sleeps, <= 50 ms) before reading it (it read half-rendered frames: black regions with a stepped edge); stats line + `gpuwait W us late L`.
+- 0977 vsync pacing (`sweetpace=1`, poke `p pace 0|1`; default 0 = as before): while frames flow, a 90 Hz tick that finds CA still drawing (no SwapEnd since the last notification) is held and sent at that frame's SwapEnd, so CA (CA_FORCE_TIMER=1, starts frames only on type-5 notifications) is not quantised to 2-3 ticks per frame; a held tick no SwapEnd takes lapses to the next tick. Line `SWEET FB: pace 5s: held H at-swap A (U us before the next tick) lapsed L`.
+- 0950 ADSP FastRPC (WS-D): sweet_adsp.c answers `fastrpcglink-apps-dsp` (64 x 0x64 intents) and `glink_ssr`;
+  `/dev/redwood-fastrpc` (0600, one opener) carries 40-byte messages / 16-32-byte answers for phone/fastrpc/fastrpcd;
+  ioctls FASTRPC_SMMU_IDENTITY (SID 0x1403-5 -> apps SMMU bank with translation off, logged `SWEET FASTRPC: SMMU:`)
+  and FASTRPC_ALLOC (RAM < 4 GiB from the GPU pool, zeroed, 32 buffers kept; `SWEET FASTRPC: N bytes for the DSP at PA
+  (GPU pool ...)`); `adsp=2` starts the DSP on the first open of the device (fastrpcd up first); `adsp_sleep=1` Android's other APPS SMP2P
+  entries ("sleepstate" = 1, "rdbg" = 0); `adsp_qlog=1` IPCRTR datagrams/intents logged (`SWEET QLOG:`); `adsp_fastrpc=0` old way, `=2` log every message; poke `f 0` status, `f 1` DSP
+  words + last words, `f 2` QRTR services/ports, `f 3 SID` identity, `f 5` SMMU faults (`f 9` help).
+- 0951 pd-mapper (QMI 0x40, port 0x4001) in the ADSP's kernel QRTR: msm/adsp/{root,sensor,audio}_pd + avs/audio,
+  instance 74; announced after the DSP's HELLO and to its lookups; PD failure reports logged (`SWEET PDMAP:`);
+  `adsp_pdm=0` off; poke `f 4` announces again.
+- 0956 `/dev/redwood-qrtr` (qol-plan 3.1): one QRTR port (0x5000+n) per open, {node, port, data} datagrams, ioctl
+  QRTR_LOOKUP, DEL_CLIENT on close; sysctl `kern.sweet_adsp_services` ("svc:inst@node:port,...").
+- 0952 speakers' path through the ADSP (`bsd/dev/sweet_sound.c`, HackiOS redwood_sound.c's APR layouts): `sound=1` LPASS
+  core votes (AFE 0x100f4 blocks 3/4), LPI gpio6-9 func2, QUIN TDM clock 0x208 6.144 MHz + port 0x9040 (4 x 32-bit slots,
+  mask 0x3; no group, as Android); `sound=2` + SMMU stream 0x1401 identity bank, ADM/ASM session 1, -30 dBFS tone with the
+  amps off, path left up; `sndsecs` `sndlpi=0`; poke `a status|tone [MS]`. Default off.
+- 0953 the two CS35L41 amps (`sweet_cs35l41.c`, SE9 via sweet_se9_xfer, ASP bypass, OTP trims, gain 17) + HackiOS guard
+  (`sweet_guard.c`): `sound=3` tone audible at <= -20 dB vs Android, amps only while playing (off after 2 s);
+  `sndbelow`, `sndgpio=1` (PMIC GPIO resets: PM8150L GPIO11 left, PM7250B GPIO11 right; allow-listed SPMI writes);
+  poke `a gain DB|off|on`.
+- 0954 `/dev/redwood-audio` -> ring -> ASM (`sound=4`): `redwood_audio_set_sink()`/`redwood_audio_volume()` in
+  sweet_audio.c, iOS volume added to `sndbelow`, `sndgain` (guard gain, default 12 dB), amps gated after 2 s of silence.
+- 0955 microphones (`sweet_mic.c`, `mic=1`): ALC5513 (rt5514, plain TDM mode) on SE7 0x57, reset TLMM 91, PRI TDM TLMM
+  49-52, AFE 0x9001 (8 x 32, mask 1), ADM record + ASM session 2 reads, `/dev/redwood-mic` per the plug-in ABI;
+  `micgain`; poke `a mic SECS` -> `SWEET MIC: files read /dev/pmem PA LEN`.
+- 0960 TSENS temperatures (bsd/dev/sweet_thermal.c, read only): `SWEET THERMAL:` every 5 s (silver = hottest A55,
+  gold = sensors 9/11, prime = 10/12, cpuss, gpu, ddr, camera, npu, aoss), sysctl `kern.sweet_temp_*` (deci-degC);
+  once at 20 s the PM7250B charger/QG/SDAM registers (`SWEET BATTERY: boot regs ...` + decoded FCC/FV/JEITA/WD line);
+  SPMI read allow-list + 0x15/0x16/0xb1. `sweettherm=0` off.
+- 0961 cpufreq readback: tables parsed the Linux way (`~` skip, `*` boost rows), the old boot selection kept for
+  `flamecpufreq=0/1/N`; `SWEET CPUFREQ: busy ...` every 5 s (per-CPU busy % from recount idle time via
+  sched_prim.c `sweet_cpu_idle_abs()`, perf-state readback, cycle-counter MHz, LMh ceiling); command server
+  `w stat|freq DOM IDX|table|gov|chg` (sweet_poke.c hands "w WORD" to sweet_power_cmd; "w ADDR VAL" unchanged).
+- 0962 `sweetbig=2`: foreground threads try CPU6 (gold) first, CPU7 (prime) only while CPU6 is busy (1 = old order,
+  default). tools/mkadt.py: redfin clock values (1804.8/2208/2400 MHz); cluster-type stays 0 (no AMP in this kernel).
+- 0963 DVFS governor, `flamecpufreq=2` (default 1 = pinned max as before): 30 ms per-domain tick, util = busiest CPU of
+  the domain, target = cur * util / 80 % (x2 at >= 95 %), lowest valid row above it; up at once, down after 3 ticks;
+  silver floor 1.1 GHz; perf-state writes only. `w gov 0|1 [MS]`; `w freq` takes a domain out until `w gov 1`.
+- 0964 thermal caps (sweet_thermal.c, 1 s sampling): hot = max(gold, prime, cpuss, camera); level 1 > 75 C (gold/prime
+  <= 1.8 GHz), 2 > 85 C (gold/prime 1.2, silver 1.5 GHz, GPU level 2), 3 > 100 C (gold/prime lowest row, silver 1.0 GHz,
+  GPU 1), each released 10 C lower, logged once per change. `sweettcap` bit 0 CPU (default 1), bit 1 GPU (runtime GMU
+  HFI perf vote via sweet_gpu_level_cap()/a6_perf_vote(), off by default), 0 = log only. `w cap N|auto`, `w gpu N`.
+- 0965 PSCI idle, `sweetidle=1` (default off): CPUs 1-7 call PSCI CPU_SUSPEND 0x40000003 (lpm "pc"; never the
+  notify-rpm cluster states) instead of WFI when the next timer is beyond 1774/2207 us; resume via resume_idle_cpu ->
+  arm_init_idle_cpu + sweet_idle_resume() (GIC ICC regs, timer re-arm). Broadcast wake = arm,armv7-timer-mem frame 0
+  (0x17c21000, SPI 8 on CPU0) armed at the earliest sleeper deadline minus exit latency, IPIs the sleepers. Probes
+  PSCI_FEATURES first; a PSCI error turns it off. `SWEET IDLE:` at boot; counters in the `SWEET CPUFREQ:` line.
+- 0966 battery: 4000 mAh, 5 s poll, SOC seeded from QG SDAM 0xb147 (if 0xb146 valid and within 15 % of the voltage
+  estimate) then coulomb-counted from QG LAST_ADC_I with a 0.2 %/poll pull to the voltage estimate at |I| < 100 mA;
+  1 %/poll slew; IsCharging = I > +50 mA; Temperature from the JEITA zone (0x100d). `SWEET BATTERY: SOC seeded ...`.
+- 0967 SPMI write path (sweet_spmi_write): APID channel EXT_WRITEL (Linux pmic-arb v5), owner EE 0 checked, only SID 2
+  0x1061/0x1070/0x1341/0x1342/0x1365/0x1366/0x1370, read back + `SWEET CHG: write ...`; nothing unless `sweetchg=1`.
+  `w chg wr ADDR VAL`.
+- 0968 charger policy (bsd/dev/sweet_charger.c, every 5 s after the 20 s register dump): DCP/CDP/Rp1.5 -> 1500 mA,
+  Rp3.0 -> 2000 mA ICL in HC mode (0x1370, 0x1366.0=1, 0x1342.0=0, 0x1365.4=1), FCC 2000 mA (1000 when JEITA soft or
+  SMB die over bound), FV lowered to 4.45 V only if higher; SDP/float left to the hardware; dry run unless `sweetchg=1`;
+  `sweetchgpol=0` off; <= 200 writes/boot. `w chg` (decoded state), `w chg apsd`, `w chg pol 0|1`.
+- 0969 USB `ud_thread`: 10 ms polls after 200 quiet 1 ms polls (no event, no TX in flight), 1 ms again on the next event;
+  `sweetudpoll=1` = always 1 ms.
+- 0970 big-core governor + boost (default off): `sweetgov=XXYY` (e.g. 4060) gold/prime up >= XX % busy, top >= YY %, down one step/tick after 100 ms hold under XX-10 %; touch (SweetHID down/move) and SwapEnds < 50 ms apart hold >= `sweetboost=MHZ` (1800) for `sweetboostms=MS` (200); 0964 caps stay the ceiling; `SWEET GOV: 5s: boosts N capped N | gold MHz:ms .. | prime ..`; poke `w boost 0|1` (needs the governor, `w gov 1` / flamecpufreq=2).
+- 0971 sensor HID services `SweetHIDAccel/Gyro/ALS/Prox/Compass/Pressure/Orientation` (SweetHID.cpp; usage pairs 0xff00/3,
+  9, 4, 8, 0xa from IOHIDFamily-1035.70.7's AppleHIDUsageTables.h, filled in; pressure 0x20/0x31, orientation 0x20/0x8a
+  with DeviceOrientationUsage 0x64 + UIDeviceOrientation, which locationd's CLOrientationNotifier matches/accepts):
+  every open, user client (pid), copyEvent type and setProperties key/value logged `SWEET MOTION:`, ReportInterval kept;
+  `sweetmotion=MASK` (default 0x77 = all but prox, which crash-looped backboardd; 0x7f all;
+  0x100 = Transport "SPU"; 0x200 = neutral copyEvent answers on every service; ALS and prox always give one);
+  user-space property reads logged.
+- 0972 `/dev/redwood-motion` (sensd's samples, qol-plan §3.3; read() = status, ioctl MOTION_GET_WANT) and `poke m`
+  (`m fake accel|gyro|als|prox|compass|pressure|orient [V..]`, `m rot N`, `m stop|secs|status|log|knob|knobs`):
+  bsd/dev/sweet_motion.c.
+- 0978 CPU present maps the source surface copyback-cacheable (kernelAddress() is write-combined = uncached for non-IOBMD surfaces: 41 ms vs 4.3 ms copies on r36a); last 4 maps kept.
+- 0980 Bluetooth probe logging (`sweetbtlog=1`, off by default): every kernel-control `CTLIOCGINFO` name, every failing
+  open() of /dev bt*/uart*/cu.*/*bluetooth* nodes (`SWEET BTLOG:`, 300 each), and the sweetiolog IOKit trace (`IOK name:`,
+  1000 lines) on bluetoothd, BlueTool, wirelessproxd, bluetoothuserd, BTLEServer.
+- 0981 /dev/btuart (`btuart=1`, no node by default): WCN3998 HCI UART on QUP0 SE5 (0x894000, SPI 606 via 0911) for
+  phone/bt/btd: GENI FIFO mode, RTS/CTS, 16 KiB RX ring, baud/flow/drain/flush/timeout/stats ioctls; ENXIO without
+  XBL-loaded UART firmware; `btuartos=16|32`; poke `b 0` state, `b 1` HCI version, `b 2` QCA EDL version.
+- (no patch) `phone/fastrpc/fastrpcd` (WS-D, GPL-3.0+, hexagonrpcd port): attaches to the ADSP sensors PD over
+  `/dev/redwood-fastrpc` (buffers FASTRPC_ALLOC + /dev/pmem, Android adsprpc layout, session 3) and serves its
+  apps_std file calls from `/private/var/local/hexagon` (tools/redfin-install-hexagon-wsl.sh); launchd job
+  `org.iosonpixel.fastrpcd`, log `/var/local/fastrpcd.log`, exit 3 when the DSP goes; `-v`, `--mmap-method 2|4`.
+- 0957 poke `a gain N` (or `-N`): N dB under Android's level; hard cap 6 dB under (ASP bypass, no protection firmware)
+  for sound=3 and 4, also for `sndbelow`.
+- 0958 CS35L41 lazy re-probe: an amp that missed the boot probe (r29b 0x40 NO ANSWER) is reset+probed+configured again at the next ON (watcher thread, >= 10 s apart, <= 20/boot); `poke a probe` forces it; boot failure logs the SE9 state; log labels 0x40 = top, 0x41 = bottom (routing unchanged)
+- 0982 stand-in Bluetooth nubs + AppleOLYHAL (`sweetbtnub` bitmask: 1 "bluetooth", 2 "marconi-bt", 4 AppleOLYHAL;
+  off by default): SweetBTNub services for bluetoothd's IONameMatch notifications carrying the D22 bluetooth-node
+  properties (transport-encoding 3, 3 Mbaud, vendor/product/profiles/coex, compatible "bluetooth,n88"); AppleOLYHAL
+  is an empty IOService for BlueTool's IOProviderClass match. Property reads logged found/MISSING, user-client
+  requests refused + logged, setProperties keys logged (`SWEET BTNUB:`).
+- 1010 (was ws-q-bt's 0983) Bluetooth bridge (`btbridge=1`, no nodes by default): /dev/cu.bluetooth + /dev/uart.bluetooth (one H4 pipe
+  bluetoothd opens) <-> /dev/btbridge (btd --bridge) + dummy /dev/btwake. Two 16 KiB rings, blocking/O_NONBLOCK/
+  select; btd forwards standard HCI to the WCN3998 and fakes/logs vendor 0xFC__ commands (`SWEET BTBR:`, btd `BTD BRIDGE:`).
+- 0973 AppleARMBacklight publishes the panel's nits for CoreBrightness (MinNits/MaxNits/MaxNitsPanel,
+- 0984 vsync pacing modes, `p pace N [MIN_US]` / `sweetpace=N sweetpace_min=US` (N & 7: 0 as before, 1 0977 hold, 2 extra tick at each SwapEnd, 3 tick at max(SwapEnd, last + MIN), 4 quiet with a 100 ms watchdog for a CA on its own clock; +16 early ticks only while the 0944 swap queue is empty; MIN 8000 us). Line `SWEET FB: pace 5s: held .. at-swap .. lapsed .. | early E skipped S gated G dog D | pace N min M`.
+- 0987 swap-complete ticks + swap trace, `p swapdone [MASK|trace]` / `sweetswapdone=MASK` (1: a type-5 tick when a frame's present is done: blit fence landed, CPU copy done, scanout latched, at least sweetpace_min after the last tick; 2: the next 256 IOMFB/submit events with thread ids as `SWEET SWAPTRACE` lines). CA only ever enables notification type 5 and learns swap completion from SwapWait, so there is no other swap-complete channel. Default 0.
+- 0988 `sweetgputs=1`: a submit's end stamp by CP_EVENT_WRITE RB_DONE_TS | TIMESTAMP and its start = max(own stamp, previous end): accurate 5 s `GPU busy` without the 0157 WFI (CP_REG_TO_MEM stamps time the CP, not the GPU). Default 0.
+- 0992 sampling profiler for one process, `p prof start NAME|PID [HZ [SECS [DEPTH [WAITHZ]]]]` (8 MiB buffer read over /dev/pmem by tools-claude/sweet-prof.py), plus `p disp` and `p phase`.
+- 0994 kdebug frame-trace events, class DBG_DRIVERS subclass 0xF5 (0x06F5xxxx; codes in iokit/Kernel/arm/SweetTrace.h): vsync tick/notification/notify result, IOMFB external methods START/END, swap path, present, shown, swap done, scanout queue/flip/latch/back pressure, GPU submit/gate/fence stamps/waits/clock calibration, SweetAccelerator v2 methods, touch. Only while kdebug is enabled (phone/tools/sweettrace, tools-claude/sweet-trace.py); no boot-arg.
+- 0995 vsync tick precision, all off by default (boot-arg sweetvsync=MASK sweetvsync_lead=US, poke `p vsync [MASK [LEAD_US]]`): 1 the tick timer without kernel timer-coalescing slop (IOTimerEventSource kIOTimeOptionsSweetCritical -> THREAD_CALL_DELAY_SYS_CRITICAL; ticks came 0.7-1.5 ms after the edge, not 0.5), 2 0946's calibration keeps its tick (17-20 ticks per 8 s were lost: the calibration tick ran after its edge and polled a whole period), 4 notifications carry the measured period; LEAD = tick after the edge (default 500 us). sweetfb_refresh=1|NS / `p vsync refresh [NS]`: IOMFBDisplayRefresh.displayMinRefreshInterval (2^-32 s), CA's heartbeat source without CA_HEARTBEAT_RATE. Boot shortcut (the cmdline has 8 characters left): sweetfbx 0x10 = sweetvsync 3, 0x20 = sweetfb_refresh=1. Analysis: `sweet-trace.py --pace`.
+- 0996 direct scanout tribuf, off by default (poke `p scanout tribuf 0|1`, boot sweetfbx 0x40): SwapWait calls with 0x80000000 in scalar 1 (CA's can_update_ poll) answer kIOReturnBusy while the swap is queued/flipping, 0 once it or a later one is latched, dropped or late (100 ms cap); at chain depth 3 the swapper's submits wait for K-1 on screen, not K. Aim: CA keeps K-1's surface until K is latched and takes a 3rd one (needs CA's swap ring of 3; with a ring of 2 CA would wait instead). 5 s line `SCANOUT 5s tribuf` (polls busy/done/stale, gate at K-1, short = depth below the gate's, chain).
+- 0997 file server (TCP 2223) socket timeouts: SO_RCVTIMEO/SO_SNDTIMEO 15 s per accepted connection (one server thread with blocking calls: a quiet peer wedged it, later connects sat in the backlog -> "timeout at the header read" on r41a/r46a while ssh/pokes/log worked); `p fs` logs its state (state, request, connections, timeouts, last err, bytes), `p fs reset` shuts the current connection down.
+- 0998 IOMFBDisplayRefresh as a variable-refresh display, off by default (boot sweetfbx 0x80 = vrr 3 + sweetfb_refresh=1; poke `p vsync vrr N [STEP_NS]`, then restart backboardd): adds displayMaxRefreshInterval = N periods and displayRefreshStep (default one period), each with a ...MachTime twin, to 0995's displayMinRefreshInterval, the key set the A15 DCP firmware publishes (IOMobileFramebuffer::setDisplayRefreshProperties, iOS 16.7.2). Experiment: UIKit's settle animations run at 30 Hz on the 90 Hz heartbeat. Result (r53a, 2026-10-28): no effect; iOS 16.7 QuartzCore reads only displayMinRefreshInterval (no max/step strings), dead lead.
+- 0999 boot sweetfbx 0x100 (default off): 0912's UI-process insertion (SpringBoard, /Applications, containers) also takes /var/local/lib/SweetFPS.dylib (phone/fps, built from phone/haptics/build.sh) when present, colon-joined with SweetHaptics under sweetui=1, plus SWEET_FPS=2 unless set: CADisplayLink requests in [46, 90) fps become 90. Why: QuartzCore maps fps to a heartbeat frame interval n = round(1 / (heartbeat_period * fps)) (0x1882e5038), so UIKit's 60 fps settle animations / scroll deceleration get interval 2 on the 90 Hz heartbeat (45 Hz, 1-or-3-vsync jitter in traces).
+  HardwareAccessibleMin/MaxNits, user-accessible-max-nits, digital-dimming-min-nits, brightness-nits(-cap),
+  DisplayPanel/ProductLuminanceMin/Mid/Max: 2..500, integer nits; 500 nits <-> level 1023): `sweetnits=0` off.
+  `tools/mkadt.py --backlight` (opt-in) also copies D22AP's /backlight node with max-nit-value/LmaxProduct = 500.
+- 1011 (was ws-q-bt's 0990) Sandbox op 4 (container path of a pid) answered: `bsd/kern/redfin_sandbox_container.c` returns the target's
+  `CFFIXED_USER_HOME=` from the strings exec left at the top of its user stack (as sysctl_procargsx reads them), so
+  PlugInKit's `-[PKService checkEnvironment:]` stops killing every .appex ("plugin has invalid sandbox or container:
+  error 2 path ?"; 0050/0924 answered ENOENT). No variable = ENOENT as before; `sweetcontainer=0` = always ENOENT.
+  Logs `SWEET SANDBOX: container <caller>[pid] asks for <target>[pid]: "<path>"` / `none (no CFFIXED_USER_HOME,
+  argslen N)` / `error N`, once per pid, 300 lines at most. Code: HackiOS `kern_minimac.c`
+  `minisandbox_container_path` (APSL 2.0) via ios-topaz 0936 (same code, topaz's 0149 weak hook not needed: 0050 calls it
+  directly), plus bounds checks and the log. If a pid logs `none`, pkd/RunningBoard did not set CFFIXED_USER_HOME.
+- 1012 = Yofuness/ios-flame sunfish 0188 (apple80211 auto-join diagnostics: log caps, 60 s summary, scan elements, set 383 dump).
+- 1013 = sunfish 0193: COUNTRY_CODE (51) get/set kept in the kernel, set 383 taken (`sweetwifiacc=0` refuses both, as before).
+- 1014 Wi-Fi signal for wifid: wland's FW_RSSI (joined network's signal every 2-10 s) feeds RSSI/CURRENT_NETWORK; NOISE 17
+  (-95), RATE 8, PHY_MODE 14, MCS 57 answered; while joined a timer posts the signal (`sweetwifilqm=` / sysctl
+  `kern.sweet_wifi_lqm`: 1 LINK_QUALITY 17, 2 RSSI_CHANGED 39, 4 LINK_CHANGED again, 8 snr/noise in LINK_CHANGED;
+  default 9; `kern.sweet_wifi_rssi` last told); a link wland made by itself posts SSID/BSSID/LINK (`sweetwifilink=0` off).
+  `SWEET WIFI: signal` lines. wland (same branch): re-auth when the AP kicks a stale association (reason 8, the
+  first auto-join after a reboot), 2 retries of a failed wifid join, uptime-stamped wland.log.
+- 1015 kernel control `com.apple.uart.bluetooth` on the BT bridge (with `btbridge=1`; `btbridge=3` nodes only): iOS 16
+  bluetoothd/BlueTool use a PF_SYSTEM control, not a tty (ios-asteroids docs/BT_IOS_TRANSPORT.md). Client bytes -> h2b
+  (btd), btd's -> the socket; termios get/set kept and logged (`SWEET BTBR: kernel control ...`). Needs bluetoothd's
+  `BT_HCI_TRANSPORT=H4BC:POSIX:com.apple.uart.bluetooth,3000000` (tools-claude/bt-launchd.py --transport). Userland:
+  phone/bt/bluetool.c (BlueTool stand-in: every request result 0 after btd is up; `--bluetool`), btd bridge HCI compat
+  (vendor answers carry the sub-opcode, Unknown Command / LE Command Disallowed -> success; `--bridge-raw` off).

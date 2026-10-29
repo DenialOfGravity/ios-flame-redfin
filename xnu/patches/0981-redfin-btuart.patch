@@ -1,0 +1,995 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WS-B <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 00:49:22 +0100
+Subject: [PATCH 2/2] 0981 redfin: /dev/btuart, the WCN3998 Bluetooth UART
+ (btuart=1)
+
+New bsd/dev/sweet_geniuart.c: QUPv3 wrapper 0 SE5 (0x894000,
+msm-geni-serial-hs in the stock DT) as a character device for
+phone/bt/btd, with its interrupt (GIC SPI 606 = INTID 638, level,
+through 0911's sweet_spi_attach). FIFO mode after Linux
+qcom_geni_serial.c: 8N1, RTS/CTS (RFR watermark depth - 2), RX
+watermark + stale timeout into a 16 KiB ring, TX watermark refills;
+clocks from gcc-lito.c (vote 0x52008 bits 6-9 + 15, RCG 0x17600 rows
+or the DFS level), pins GPIO 38-41 function qup05 (EAST tile). The SE
+must hold XBL-loaded UART firmware (GENI_FW_REVISION_RO protocol 2),
+else open() fails with ENXIO. ioctls: baud, flow control (off = CTS
+ignored + RTS held, for the WCN399x power pulses), drain, flush, read
+timeout, stats (phone/bt/btuart.h). Exclusive open; interrupt masked
+while closed. read() also drains the FIFO itself, so a missing
+interrupt only costs latency.
+Boot-args: btuart=1 makes the node (default: no node, SE5 untouched),
+btuartos=16|32 overrides the UART oversampling (default from the QUP
+version as Linux). poke "b 0" state, "b 1" HCI Read_Local_Version,
+"b 2" QCA EDL version request (device closed, chip powered by btd).
+No rails are voted here: btd does that through /dev/pmem.
+---
+ bsd/conf/files           |   1 +
+ bsd/dev/sweet_geniuart.c | 898 +++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_poke.c     |   8 +-
+ bsd/dev/sweet_ufs.c      |   2 +
+ 4 files changed, 908 insertions(+), 1 deletion(-)
+ create mode 100644 bsd/dev/sweet_geniuart.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index aaa3844..384ac70 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -131,6 +131,7 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_charger.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_geniuart.c		standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+ bsd/dev/redwood_apple80211.c	standard
+diff --git a/bsd/dev/sweet_geniuart.c b/bsd/dev/sweet_geniuart.c
+new file mode 100644
+index 0000000..6c1bb88
+--- /dev/null
++++ b/bsd/dev/sweet_geniuart.c
+@@ -0,0 +1,898 @@
++/*
++ * redfin (Pixel 5) 0981: /dev/btuart, the WCN3998 Bluetooth HCI UART: QUPv3 wrapper 0 SE5 (0x894000,
++ * "qcom,msm-geni-serial-hs" in the stock DT), 4-wire (GPIO 38 CTS, 39 RTS, 40 TX, 41 RX, function qup05),
++ * interrupt GIC SPI 606 = INTID 638 (level). A byte pipe for phone/bt/btd, which does the rails, the
++ * WCN399x power pulses, the firmware download and HCI itself; here only the UART, so btd stops polling
++ * the FIFOs through /dev/pmem.
++ *
++ * Register sequence after Linux qcom_geni_serial.c / qcom-geni-se.c (FIFO mode), clocks from gcc-lito.c
++ * (gcc_qupv3_wrap0_s5_clk_src 0x17600, branch 0x175fc, vote 0x52008 bits 6-9 + 15), pins from
++ * pinctrl-lito.c (EAST tile). The SE must already hold UART firmware (XBL loads it): GENI_FW_REVISION_RO
++ * protocol 2, else open() fails with ENXIO.
++ *
++ *   open    exclusive; clocks, pins, GENI at 115200 8N1 with RTS/CTS, RX started, SPI 606 unmasked
++ *   read    bytes from a 16 KiB ring filled by the interrupt (and by read itself, so a missing interrupt
++ *           only costs latency); waits up to the read timeout (default 100 ms), then EAGAIN
++ *   write   every byte into the TX FIFO (TX watermark interrupt refills); ETIMEDOUT if no progress in 1 s
++ *           (CTS held "not ready")
++ *   ioctl   BTUART_SET_BAUD, _SET_FLOW, _DRAIN, _FLUSH, _TIMEOUT, _STATS, _SET_OS (phone/bt/btuart.h)
++ *   close   SPI 606 masked at the GIC and at the SE; RX keeps filling the FIFO (RFR then stops the chip)
++ * RX flow control is the SE's own: RTS drops when the RX FIFO reaches depth - 2 words; when the ring is
++ * full the interrupt stops draining the FIFO until read makes room.
++ *
++ * Boot-args: btuart=1 makes the node (default: none, nothing touched); btuartos=16|32 forces the UART
++ * oversampling (default 16 if the QUP version is >= 2.5, else 32, as Linux). poke "b 0" prints the state,
++ * "b 1" sends HCI Read_Local_Version, "b 2" the QCA EDL version request (with the device closed, after btd
++ * powered the chip) and prints what comes back.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/ioccom.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
++extern void sweet_spi_mask(uint32_t intid, bool masked);
++void sweet_geniuart_init(void);
++int sweet_geniuart_cmd(unsigned what);
++
++/* phone/bt/btuart.h (keep in step) */
++struct btuart_stats {
++	uint32_t fw_revision;
++	uint32_t qup_version;
++	uint32_t baud, flow, oversampling, src_hz, divider;
++	uint32_t irqs, rx_overruns, rx_parity_break, ring_full, tx_timeouts;
++	uint64_t rx_bytes, tx_bytes;
++};
++#define BTUART_SET_BAUD _IOW('B', 1, uint32_t)
++#define BTUART_SET_FLOW _IOW('B', 2, uint32_t)
++#define BTUART_DRAIN    _IOW('B', 3, uint32_t)
++#define BTUART_FLUSH    _IO('B', 4)
++#define BTUART_TIMEOUT  _IOW('B', 5, uint32_t)
++#define BTUART_STATS    _IOR('B', 6, struct btuart_stats)
++#define BTUART_SET_OS   _IOW('B', 7, uint32_t)
++
++#define GU_SE_PA        0x00894000u     /* qcom,qup_uart@894000 */
++#define GU_WRAP_PA      0x008c0000u     /* qcom,qupv3_0_geni_se@8c0000: QUP_HW_VER at +4 */
++#define GU_VOTE_PA      0x00152000u     /* GCC + 0x52000: APCS_CLOCK_BRANCH_ENA_VOTE_1 at +8 */
++#define GU_GCC17_PA     0x00117000u     /* GCC + 0x17000: wrap0 AHB branches, SE5 branch + RCG */
++#define GU_TLMM_PA      0x0f926000u     /* TLMM EAST (0xf900000) + GPIO 38 * 0x1000 */
++#define GU_INTID        638u            /* GIC SPI 606 */
++#define GU_VOTE_BITS    ((1u << 6) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 15))
++#define GU_RCG          0x600u          /* in the GCC17 page: 0x17600 */
++#define GU_CBCR_S5      0x5fcu
++#define GU_RING         16384u
++
++/* SE registers */
++#define FORCE_DEFAULT   0x020u
++#define OUTPUT_CTRL     0x024u
++#define CGC_CTRL        0x028u
++#define GENI_STATUS     0x040u
++#define M_CLK_CFG       0x048u
++#define S_CLK_CFG       0x04cu
++#define IF_DISABLE_RO   0x064u
++#define FW_REVISION     0x068u
++#define CLK_SEL         0x07cu
++#define UART_LOOPBACK   0x22cu
++#define BYTE_GRAN       0x254u
++#define DMA_MODE_EN     0x258u
++#define TX_TRANS_CFG    0x25cu
++#define TX_PACK0        0x260u
++#define TX_PACK1        0x264u
++#define TX_WORD_LEN     0x268u
++#define TX_STOP_LEN     0x26cu
++#define TX_TRANS_LEN    0x270u
++#define RX_TRANS_CFG    0x280u
++#define RX_PACK0        0x284u
++#define RX_PACK1        0x288u
++#define RX_WORD_LEN     0x28cu
++#define RX_STALE_CNT    0x294u
++#define TX_PARITY       0x2a4u
++#define RX_PARITY       0x2a8u
++#define MANUAL_RFR      0x2acu
++#define M_CMD0          0x600u
++#define M_CMD_CTRL      0x604u
++#define M_IRQ_STATUS    0x610u
++#define M_IRQ_EN        0x614u
++#define M_IRQ_CLEAR     0x618u
++#define S_CMD0          0x630u
++#define S_CMD_CTRL      0x634u
++#define S_IRQ_STATUS    0x640u
++#define S_IRQ_EN        0x644u
++#define S_IRQ_CLEAR     0x648u
++#define TX_FIFO         0x700u
++#define RX_FIFO         0x780u
++#define TX_FIFO_STATUS  0x800u
++#define RX_FIFO_STATUS  0x804u
++#define TX_WM           0x80cu
++#define RX_WM           0x810u
++#define RX_RFR_WM       0x814u
++#define GENI_IOS        0x908u
++#define DMA_TX_IRQ_STAT 0xc40u
++#define DMA_TX_IRQ_CLR  0xc44u
++#define DMA_RX_IRQ_STAT 0xd40u
++#define DMA_RX_IRQ_CLR  0xd44u
++#define GSI_EVENT_EN    0xe18u
++#define SE_IRQ_EN       0xe1cu
++#define HW_PARAM_0      0xe24u
++#define HW_PARAM_1      0xe28u
++#define DMA_GEN_CFG     0xe30u
++
++#define M_ACTIVE        (1u << 0)
++#define S_ACTIVE        (1u << 12)
++#define CMD_DONE        (1u << 0)
++#define CMD_CANCEL      (1u << 4)
++#define CMD_ABORT       (1u << 5)
++#define S_RX_WR_ERR     (1u << 25)
++#define S_RX_WM_IRQ     (1u << 26)
++#define S_RX_LAST_IRQ   (1u << 27)
++#define S_GP_IRQS       (0xfu << 9)
++#define M_TX_WM_IRQ     (1u << 30)
++#define M_COMMON_EN     (0x7eu | (1u << 22) | (1u << 23) | (1u << 24) | (1u << 25) | (1u << 28) | (1u << 29))
++#define S_COMMON_EN     (0x3eu | (0x1fu << 9) | (1u << 24) | (1u << 25))
++#define S_RX_EN         (S_RX_WM_IRQ | S_RX_LAST_IRQ)
++#define CTS_MASK        (1u << 1)
++#define RFR_NOT_READY   ((1u << 31) | (1u << 1))
++#define UART_START      (1u << 27)
++#define PACK0           0x0004380eu     /* 8-bit words, 4 per FIFO entry, LSB first */
++#define PACK1           0x000c3e0eu
++#define SE_IRQ_GENI     0xcu            /* SE_IRQ_EN: GENI M + S (no DMA) */
++
++/* gcc-lito.c ftbl_gcc_qupv3_wrap0_s0_clk_src (phone/bt/geniclk.h has the same table) */
++static const struct {
++	uint32_t rate;
++	uint8_t src, hid;
++	uint16_t m, n;
++} gu_rows[] = {
++	{ 7372800, 6, 1, 384, 15625 }, { 14745600, 6, 1, 768, 15625 }, { 19200000, 0, 1, 0, 0 },
++	{ 29491200, 6, 1, 1536, 15625 }, { 32000000, 6, 1, 8, 75 }, { 48000000, 6, 1, 4, 25 },
++	{ 50000000, 6, 11, 0, 0 }, { 64000000, 6, 1, 16, 75 }, { 75000000, 6, 7, 0, 0 },
++	{ 80000000, 6, 1, 4, 15 }, { 96000000, 6, 1, 8, 25 }, { 100000000, 1, 11, 0, 0 },
++	{ 102400000, 6, 1, 128, 375 }, { 112000000, 6, 1, 28, 75 }, { 117964800, 6, 1, 6144, 15625 },
++	{ 120000000, 6, 4, 0, 0 }, { 128000000, 1, 1, 16, 75 },
++};
++
++static LCK_GRP_DECLARE(gu_grp, "sweet-geniuart");
++static LCK_SPIN_DECLARE(gu_spin, &gu_grp);
++static LCK_MTX_DECLARE(gu_mtx, &gu_grp);
++
++static struct {
++	vm_offset_t se, wrap, vote, gcc, tlmm[4];
++	bool mapped, hw_ok, irq_attached, open, rx_masked;
++	unsigned depth, os;
++	uint32_t timeout_ms;
++	uint32_t ring_head, ring_tail;
++	struct btuart_stats st;
++	int rx_chan, tx_chan;
++	uint32_t spurious;
++} gu;
++static uint8_t gu_ring[GU_RING];
++
++static uint32_t
++gu_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++gu_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++#define SE_RD(o)        gu_rd(gu.se, (o))
++#define SE_WR(o, v)     gu_wr(gu.se, (o), (v))
++
++static boolean_t
++gu_lock(void)
++{
++	boolean_t s = ml_set_interrupts_enabled(FALSE);
++	lck_spin_lock(&gu_spin);
++	return s;
++}
++
++static void
++gu_unlock(boolean_t s)
++{
++	lck_spin_unlock(&gu_spin);
++	(void)ml_set_interrupts_enabled(s);
++}
++
++/* sleep up to us on chan; true if interrupted by a signal */
++static bool
++gu_sleep(void *chan, unsigned us, bool interruptible)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
++	(void)assert_wait_deadline(chan, interruptible ? THREAD_INTERRUPTIBLE : THREAD_UNINT, deadline);
++	return thread_block(THREAD_CONTINUE_NULL) == THREAD_INTERRUPTED;
++}
++
++static bool
++gu_wait_se(uint32_t off, uint32_t mask, bool set, unsigned us)
++{
++	for (unsigned i = 0; i <= us; i += 10) {
++		if (!!(SE_RD(off) & mask) == set) {
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++static bool
++gu_map(void)
++{
++	if (gu.mapped) {
++		return true;
++	}
++	gu.se = ml_io_map(GU_SE_PA, 0x1000);
++	gu.wrap = ml_io_map(GU_WRAP_PA, 0x1000);
++	gu.vote = ml_io_map(GU_VOTE_PA, 0x1000);
++	gu.gcc = ml_io_map(GU_GCC17_PA, 0x1000);
++	for (unsigned i = 0; i < 4; i++) {
++		gu.tlmm[i] = ml_io_map(GU_TLMM_PA + 0x1000u * i, 0x1000);
++	}
++	gu.mapped = gu.se && gu.wrap && gu.vote && gu.gcc && gu.tlmm[0] && gu.tlmm[1] && gu.tlmm[2] && gu.tlmm[3];
++	if (!gu.mapped) {
++		printf("SWEET BTUART: ml_io_map failed\n");
++	}
++	return gu.mapped;
++}
++
++static bool
++gu_clocks(void)
++{
++	gu_wr(gu.vote, 0x8, gu_rd(gu.vote, 0x8) | GU_VOTE_BITS);
++	static const uint32_t br[] = { 0x004, 0x008, GU_CBCR_S5 };      /* m_ahb, s_ahb, s5 */
++	for (unsigned i = 0; i < 3; i++) {
++		uint32_t c = 0;
++		bool ok = false;
++		for (unsigned t = 0; t < 500 && !ok; t++) {
++			c = gu_rd(gu.gcc, br[i]);
++			ok = (c & 2u) || !(c & (1u << 31));     /* hardware-gated: reads halted while idle */
++			if (!ok) {
++				delay(10);
++			}
++		}
++		if (!ok) {
++			printf("SWEET BTUART: GCC branch 0x17%03x halted (%#x); not touching SE5\n", br[i], c);
++			return false;
++		}
++	}
++	return true;
++}
++
++/* source clock for baud * oversampling: a table row (RCG programmed) or a DFS level (CLK_SEL) */
++static bool
++gu_fits(uint32_t rate, uint32_t want, uint32_t *div)
++{
++	if (!want || rate + want / 50 < want) {
++		return false;
++	}
++	uint32_t d = (rate + want / 2) / want;
++	if (d < 1 || d > 4095) {
++		return false;
++	}
++	uint32_t got = rate / d, tol = want / 50;
++	if (got + tol < want || got > want + tol) {
++		return false;
++	}
++	*div = d;
++	return true;
++}
++
++static uint32_t
++gu_dfs_rate(uint32_t cfg, uint32_t m, uint32_t nreg)
++{
++	unsigned src = (cfg >> 8) & 7, hid = cfg & 0x1f;
++	uint64_t parent = src == 0 ? 19200000u : src == 1 ? 600000000u : src == 6 ? 300000000u : 0;
++	uint64_t rate = hid ? parent * 2 / (hid + 1) : parent;
++	if (((cfg >> 12) & 3) == 2) {
++		uint32_t n = ((~nreg) & 0xffffu) + (m & 0xffffu);
++		if (n) {
++			rate = rate * (m & 0xffffu) / n;
++		}
++	}
++	return (uint32_t)rate;
++}
++
++static int
++gu_set_clock(uint32_t baud)
++{
++	uint32_t want = baud * gu.os, div = 0, rate = 0;
++	if (gu_rd(gu.gcc, GU_RCG + 0x14) & 1u) {
++		int best = -1;
++		uint32_t bd = 0;
++		for (unsigned l = 0; l < 8; l++) {
++			uint32_t r = gu_dfs_rate(gu_rd(gu.gcc, GU_RCG + 0x1c + 4 * l), gu_rd(gu.gcc, GU_RCG + 0x5c + 4 * l),
++			    gu_rd(gu.gcc, GU_RCG + 0x9c + 4 * l)), d;
++			if (r && gu_fits(r, want, &d) && (best < 0 || r < rate)) {
++				best = (int)l;
++				rate = r;
++				bd = d;
++			}
++		}
++		if (best < 0) {
++			return EINVAL;
++		}
++		SE_WR(CLK_SEL, (uint32_t)best);
++		div = bd;
++	} else {
++		unsigned i;
++		for (i = 0; i < sizeof(gu_rows) / sizeof(gu_rows[0]); i++) {
++			if (gu_fits(gu_rows[i].rate, want, &div)) {
++				break;
++			}
++		}
++		if (i == sizeof(gu_rows) / sizeof(gu_rows[0])) {
++			return EINVAL;
++		}
++		rate = gu_rows[i].rate;
++		if (gu_rows[i].n) {
++			gu_wr(gu.gcc, GU_RCG + 0x8, gu_rows[i].m);
++			gu_wr(gu.gcc, GU_RCG + 0xc, ~(uint32_t)(gu_rows[i].n - gu_rows[i].m) & 0xffffu);
++			gu_wr(gu.gcc, GU_RCG + 0x10, ~(uint32_t)gu_rows[i].n & 0xffffu);
++		}
++		uint32_t cfg = gu_rd(gu.gcc, GU_RCG + 4) & ~(0x371fu | (1u << 20));
++		cfg |= gu_rows[i].hid | (uint32_t)gu_rows[i].src << 8 | (gu_rows[i].n ? 2u << 12 : 0);
++		gu_wr(gu.gcc, GU_RCG + 4, cfg);
++		gu_wr(gu.gcc, GU_RCG, gu_rd(gu.gcc, GU_RCG) | 1u);
++		for (unsigned t = 0; t < 500 && (gu_rd(gu.gcc, GU_RCG) & 1u); t++) {
++			delay(10);
++		}
++		SE_WR(CLK_SEL, 0);
++	}
++	SE_WR(M_CLK_CFG, div << 4 | 1u);
++	SE_WR(S_CLK_CFG, div << 4 | 1u);
++	gu.st.baud = baud;
++	gu.st.src_hz = rate;
++	gu.st.divider = div;
++	return 0;
++}
++
++/* RX FIFO -> ring; with gu_spin held. Stops (and masks the RX interrupts) when the ring is full. */
++static unsigned
++gu_drain_locked(void)
++{
++	unsigned got = 0;
++	for (;;) {
++		uint32_t s = SE_RD(RX_FIFO_STATUS), wc = s & 0x1ffffffu;
++		if (!wc) {
++			break;
++		}
++		if (GU_RING - (gu.ring_head - gu.ring_tail) < 4) {
++			if (!gu.rx_masked) {
++				gu.st.ring_full++;
++				SE_WR(S_IRQ_EN, SE_RD(S_IRQ_EN) & ~S_RX_EN);
++				gu.rx_masked = true;
++			}
++			break;
++		}
++		uint32_t w = SE_RD(RX_FIFO);
++		unsigned nb = (wc == 1 && (s >> 31) && ((s >> 28) & 7)) ? (s >> 28) & 7 : 4;
++		for (unsigned i = 0; i < nb; i++) {
++			gu_ring[gu.ring_head++ % GU_RING] = (uint8_t)(w >> (8 * i));
++		}
++		got += nb;
++	}
++	gu.st.rx_bytes += got;
++	return got;
++}
++
++static void
++gu_isr(__unused void *arg)
++{
++	lck_spin_lock(&gu_spin);
++	gu.st.irqs++;
++	uint32_t m = SE_RD(M_IRQ_STATUS), s = SE_RD(S_IRQ_STATUS);
++	uint32_t dt = SE_RD(DMA_TX_IRQ_STAT), dr = SE_RD(DMA_RX_IRQ_STAT);
++	SE_WR(M_IRQ_CLEAR, m);
++	SE_WR(S_IRQ_CLEAR, s);
++	if (dt | dr) {
++		SE_WR(DMA_TX_IRQ_CLR, dt);
++		SE_WR(DMA_RX_IRQ_CLR, dr);
++	}
++	if (s & S_RX_WR_ERR) {
++		gu.st.rx_overruns++;
++	}
++	if (s & S_GP_IRQS) {
++		gu.st.rx_parity_break++;
++	}
++	unsigned got = gu_drain_locked();
++	bool tx = (m & (M_TX_WM_IRQ | CMD_DONE)) != 0;
++	if (m & M_TX_WM_IRQ) {
++		SE_WR(M_IRQ_EN, SE_RD(M_IRQ_EN) & ~M_TX_WM_IRQ);        /* level: the writer re-arms it */
++	}
++	if (!m && !s && !dt && !dr && !got && ++gu.spurious > 100000) {
++		sweet_spi_mask(GU_INTID, true);                         /* storm with nothing to show: polling only */
++		gu.irq_attached = false;
++	}
++	lck_spin_unlock(&gu_spin);
++	if (got) {
++		thread_wakeup(&gu.rx_chan);
++	}
++	if (tx) {
++		thread_wakeup(&gu.tx_chan);
++	}
++}
++
++static void
++gu_stop_rx(void)
++{
++	if (SE_RD(GENI_STATUS) & S_ACTIVE) {
++		SE_WR(S_CMD_CTRL, 1u << 2);
++		if (!gu_wait_se(S_IRQ_STATUS, CMD_CANCEL, true, 2000)) {
++			SE_WR(S_CMD_CTRL, 1u << 1);
++			(void)gu_wait_se(S_CMD_CTRL, 1u << 1, false, 2000);
++			SE_WR(FORCE_DEFAULT, 1);
++		}
++	}
++	boolean_t st = gu_lock();
++	(void)gu_drain_locked();
++	SE_WR(S_IRQ_CLEAR, 0xffffffffu);
++	gu_unlock(st);
++}
++
++static void
++gu_cancel_tx(void)
++{
++	SE_WR(M_CMD_CTRL, 1u << 2);
++	if (!gu_wait_se(M_IRQ_STATUS, CMD_CANCEL, true, 2000)) {
++		SE_WR(M_CMD_CTRL, 1u << 1);
++		(void)gu_wait_se(M_IRQ_STATUS, CMD_ABORT, true, 2000);
++	}
++	SE_WR(M_IRQ_CLEAR, 0xffffffffu);
++}
++
++static void
++gu_set_flow(bool on)
++{
++	uint32_t t = SE_RD(TX_TRANS_CFG);
++	SE_WR(TX_TRANS_CFG, on ? (t & ~CTS_MASK) : (t | CTS_MASK));
++	SE_WR(MANUAL_RFR, on ? 0 : RFR_NOT_READY);
++	gu.st.flow = on;
++}
++
++/* everything up to a running RX command at 115200 with flow control; false = leave SE5 alone */
++static bool
++gu_hw_init(void)
++{
++	if (!gu_map() || !gu_clocks()) {
++		return false;
++	}
++	uint32_t fw = SE_RD(FW_REVISION), ifd = SE_RD(IF_DISABLE_RO), p0 = SE_RD(HW_PARAM_0), p1 = SE_RD(HW_PARAM_1);
++	uint32_t hw = gu_rd(gu.wrap, 0x4), status = SE_RD(GENI_STATUS);
++	gu.st.fw_revision = fw;
++	gu.st.qup_version = hw;
++	printf("SWEET BTUART: SE5 fw %#x (protocol %u), FIFO interface %s, QUP %#x, status %#x, TX %u x %u, RX %u x %u\n",
++	    fw, (fw >> 8) & 0xffu, (ifd & 1u) ? "disabled" : "enabled", hw, status, (p0 >> 16) & 0x3fu, (p0 >> 24) & 0x3fu,
++	    (p1 >> 16) & 0x3fu, (p1 >> 24) & 0x3fu);
++	if (((fw >> 8) & 0xffu) != 2u) {
++		printf("SWEET BTUART: SE5 has no UART firmware (XBL did not load it): stopping\n");
++		return false;
++	}
++	if ((ifd & 1u) || ((p0 >> 24) & 0x3fu) != 32u || ((p1 >> 24) & 0x3fu) != 32u || ((p0 >> 16) & 0x3fu) < 4u) {
++		printf("SWEET BTUART: unusable FIFO setup: stopping\n");
++		return false;
++	}
++	gu.depth = (p0 >> 16) & 0x3fu;
++	uint32_t os = 0;
++	if (!PE_parse_boot_argn("btuartos", &os, sizeof(os)) || (os != 16 && os != 32)) {
++		os = (hw >= 0x20050000u && hw != 0xffffffffu) ? 16 : 32;
++	}
++	gu.os = os;
++	gu.st.oversampling = os;
++	/* pins: [1:0] pull (CTS none, RTS down, TX up, RX none as the DT), [5:2] function 1 = qup05, 2 mA */
++	static const uint32_t pull[4] = { 0, 1, 3, 0 };
++	for (unsigned i = 0; i < 4; i++) {
++		gu_wr(gu.tlmm[i], 0, (gu_rd(gu.tlmm[i], 0) & ~0x3ffu) | (1u << 2) | pull[i]);
++	}
++	if (status & (M_ACTIVE | S_ACTIVE)) {
++		gu_cancel_tx();
++		gu_stop_rx();
++	}
++	SE_WR(SE_IRQ_EN, 0);
++	SE_WR(RX_STALE_CNT, 10 * 16);
++	SE_WR(TX_PACK0, PACK0);
++	SE_WR(TX_PACK1, PACK1);
++	SE_WR(RX_PACK0, PACK0);
++	SE_WR(RX_PACK1, PACK1);
++	SE_WR(BYTE_GRAN, 0);
++	SE_WR(GSI_EVENT_EN, 0);
++	SE_WR(M_IRQ_CLEAR, 0xffffffffu);
++	SE_WR(S_IRQ_CLEAR, 0xffffffffu);
++	SE_WR(DMA_TX_IRQ_CLR, 0xffffffffu);
++	SE_WR(DMA_RX_IRQ_CLR, 0xffffffffu);
++	SE_WR(CGC_CTRL, SE_RD(CGC_CTRL) | 0x7fu);
++	SE_WR(DMA_GEN_CFG, SE_RD(DMA_GEN_CFG) | 0xfu);
++	SE_WR(OUTPUT_CTRL, 0x7f);
++	SE_WR(FORCE_DEFAULT, 1);
++	SE_WR(DMA_MODE_EN, SE_RD(DMA_MODE_EN) & ~1u);
++	SE_WR(RX_WM, gu.depth / 2);
++	SE_WR(RX_RFR_WM, ((p1 >> 16) & 0x3fu) - 2);
++	SE_WR(M_IRQ_EN, M_COMMON_EN | CMD_DONE);
++	SE_WR(S_IRQ_EN, S_COMMON_EN | S_RX_EN);
++	SE_WR(TX_WM, 0);
++	SE_WR(UART_LOOPBACK, 0);
++	SE_WR(TX_TRANS_CFG, 0);
++	SE_WR(TX_PARITY, 0);
++	SE_WR(RX_TRANS_CFG, 0);
++	SE_WR(RX_PARITY, 0);
++	SE_WR(TX_WORD_LEN, 8);
++	SE_WR(RX_WORD_LEN, 8);
++	SE_WR(TX_STOP_LEN, 0);
++	gu_set_flow(true);
++	if (gu_set_clock(115200)) {
++		printf("SWEET BTUART: no clock for 115200 x %u\n", os);
++		return false;
++	}
++	SE_WR(S_CMD0, UART_START);
++	boolean_t st = gu_lock();
++	gu.ring_head = gu.ring_tail = 0;
++	gu.rx_masked = false;
++	gu_unlock(st);
++	printf("SWEET BTUART: SE5 at 115200 Bd (%u Hz / %u, oversampling %u), RTS/CTS, FIFO %u words\n",
++	    gu.st.src_hz, gu.st.divider, os, gu.depth);
++	return true;
++}
++
++static void
++gu_irq_on(bool on)
++{
++	boolean_t st = gu_lock();
++	SE_WR(SE_IRQ_EN, on ? SE_IRQ_GENI : 0);
++	gu_unlock(st);
++	if (on && !gu.irq_attached) {
++		gu.irq_attached = sweet_spi_attach(GU_INTID, false, gu_isr, NULL);
++		if (!gu.irq_attached) {
++			printf("SWEET BTUART: SPI %u not attached: polling only\n", GU_INTID - 32);
++		}
++	} else if (gu.irq_attached) {
++		sweet_spi_mask(GU_INTID, !on);
++	}
++}
++
++/* bytes out of the ring, waiting up to ms (0 = forever) unless nonblocking; EAGAIN when none */
++static int
++gu_take(uint8_t *buf, unsigned cap, unsigned *n, unsigned ms, bool nonblock)
++{
++	uint64_t end = 0;
++	if (ms) {
++		clock_interval_to_deadline(ms, NSEC_PER_MSEC, &end);
++	}
++	for (;;) {
++		boolean_t st = gu_lock();
++		(void)gu_drain_locked();        /* also the interrupt's job; here so a lost one costs only latency */
++		unsigned avail = gu.ring_head - gu.ring_tail, k = avail < cap ? avail : cap;
++		for (unsigned i = 0; i < k; i++) {
++			buf[i] = gu_ring[gu.ring_tail++ % GU_RING];
++		}
++		if (k && gu.rx_masked && GU_RING - (gu.ring_head - gu.ring_tail) >= GU_RING / 2) {
++			SE_WR(S_IRQ_EN, SE_RD(S_IRQ_EN) | S_RX_EN);
++			gu.rx_masked = false;
++		}
++		gu_unlock(st);
++		if (k) {
++			*n = k;
++			return 0;
++		}
++		if (nonblock || (ms && mach_absolute_time() >= end)) {
++			return EAGAIN;
++		}
++		if (gu_sleep(&gu.rx_chan, 2000, true)) {
++			return EINTR;
++		}
++	}
++}
++
++/* n bytes as one UART_START_TX command; returns once all are in the FIFO */
++static int
++gu_tx(const uint8_t *b, unsigned n)
++{
++	for (unsigned t = 0; SE_RD(GENI_STATUS) & M_ACTIVE; t++) {
++		if (t > 1000) {
++			gu.st.tx_timeouts++;
++			gu_cancel_tx();
++			break;
++		}
++		(void)gu_sleep(&gu.tx_chan, 1000, false);
++	}
++	boolean_t st = gu_lock();
++	SE_WR(M_IRQ_CLEAR, CMD_DONE | M_TX_WM_IRQ);
++	SE_WR(TX_TRANS_LEN, n);
++	SE_WR(M_CMD0, UART_START);
++	gu_unlock(st);
++	unsigned off = 0, idle = 0;
++	while (off < n) {
++		st = gu_lock();
++		uint32_t wc = SE_RD(TX_FIFO_STATUS) & 0x0fffffffu;
++		unsigned space = wc < gu.depth ? gu.depth - wc : 0, before = off;
++		while (space-- && off < n) {
++			uint32_t w = 0;
++			for (unsigned i = 0; i < 4 && off < n; i++) {
++				w |= (uint32_t)b[off++] << (8 * i);
++			}
++			SE_WR(TX_FIFO, w);
++		}
++		if (off < n) {
++			SE_WR(TX_WM, gu.depth / 2);
++			SE_WR(M_IRQ_CLEAR, M_TX_WM_IRQ);
++			SE_WR(M_IRQ_EN, SE_RD(M_IRQ_EN) | M_TX_WM_IRQ);
++		}
++		gu_unlock(st);
++		if (off < n) {
++			idle = off == before ? idle + 1 : 0;
++			if (idle > 500) {       /* ~1 s without FIFO space: CTS held */
++				gu.st.tx_timeouts++;
++				gu_cancel_tx();
++				return ETIMEDOUT;
++			}
++			(void)gu_sleep(&gu.tx_chan, 2000, false);
++		}
++	}
++	gu.st.tx_bytes += n;
++	return 0;
++}
++
++static int
++gu_drain_tx(unsigned ms)
++{
++	for (unsigned t = 0; t <= ms; t++) {
++		if (!(SE_RD(GENI_STATUS) & M_ACTIVE) && !(SE_RD(TX_FIFO_STATUS) & 0x0fffffffu)) {
++			return 0;
++		}
++		(void)gu_sleep(&gu.tx_chan, 1000, false);
++	}
++	return ETIMEDOUT;
++}
++
++static int
++gu_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	lck_mtx_lock(&gu_mtx);
++	if (gu.open) {
++		lck_mtx_unlock(&gu_mtx);
++		return EBUSY;
++	}
++	gu.hw_ok = gu_hw_init();
++	if (!gu.hw_ok) {
++		lck_mtx_unlock(&gu_mtx);
++		return ENXIO;
++	}
++	gu_irq_on(true);
++	gu.open = true;
++	gu.timeout_ms = 100;
++	lck_mtx_unlock(&gu_mtx);
++	return 0;
++}
++
++static int
++gu_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	lck_mtx_lock(&gu_mtx);
++	if (gu.hw_ok) {
++		gu_irq_on(false);
++	}
++	gu.open = false;
++	printf("SWEET BTUART: closed: %u Bd, %u irqs, rx %llu tx %llu bytes, overruns %u, parity/break %u, ring full %u, "
++	    "tx timeouts %u\n", gu.st.baud, gu.st.irqs, gu.st.rx_bytes, gu.st.tx_bytes, gu.st.rx_overruns,
++	    gu.st.rx_parity_break, gu.st.ring_full, gu.st.tx_timeouts);
++	lck_mtx_unlock(&gu_mtx);
++	return 0;
++}
++
++static int
++gu_read(__unused dev_t dev, struct uio *uio, int ioflag)
++{
++	uint8_t buf[1024];
++	unsigned n = 0, cap = (unsigned)MIN(uio_resid(uio), (user_ssize_t)sizeof(buf));
++	if (!cap) {
++		return 0;
++	}
++	int e = gu_take(buf, cap, &n, gu.timeout_ms, (ioflag & IO_NDELAY) != 0);
++	return e ? e : uiomove((caddr_t)buf, (int)n, uio);
++}
++
++static int
++gu_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	uint8_t buf[256];
++	int e = 0;
++	lck_mtx_lock(&gu_mtx);
++	while (!e && uio_resid(uio) > 0) {
++		int n = (int)MIN(uio_resid(uio), (user_ssize_t)sizeof(buf));
++		e = uiomove((caddr_t)buf, n, uio);
++		if (!e) {
++			e = gu_tx(buf, (unsigned)n);
++		}
++	}
++	lck_mtx_unlock(&gu_mtx);
++	return e;
++}
++
++static int
++gu_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc_t p)
++{
++	int e = 0;
++	lck_mtx_lock(&gu_mtx);
++	switch (cmd) {
++	case BTUART_SET_BAUD: {
++		uint32_t b = *(uint32_t *)data;
++		(void)gu_drain_tx(100);
++		gu_stop_rx();
++		e = gu_set_clock(b);
++		SE_WR(S_CMD0, UART_START);
++		if (e) {
++			printf("SWEET BTUART: no clock for %u Bd x %u\n", b, gu.os);
++		}
++		break;
++	}
++	case BTUART_SET_OS: {
++		uint32_t os = *(uint32_t *)data;
++		if (os != 16 && os != 32) {
++			e = EINVAL;
++			break;
++		}
++		(void)gu_drain_tx(100);
++		gu_stop_rx();
++		gu.os = os;
++		gu.st.oversampling = os;
++		e = gu_set_clock(gu.st.baud);
++		SE_WR(S_CMD0, UART_START);
++		break;
++	}
++	case BTUART_SET_FLOW:
++		gu_set_flow(*(uint32_t *)data != 0);
++		break;
++	case BTUART_DRAIN:
++		e = gu_drain_tx(*(uint32_t *)data);
++		break;
++	case BTUART_FLUSH: {
++		boolean_t st = gu_lock();
++		(void)gu_drain_locked();
++		gu.ring_tail = gu.ring_head;
++		if (gu.rx_masked) {
++			SE_WR(S_IRQ_EN, SE_RD(S_IRQ_EN) | S_RX_EN);
++			gu.rx_masked = false;
++		}
++		gu_unlock(st);
++		break;
++	}
++	case BTUART_TIMEOUT:
++		gu.timeout_ms = *(uint32_t *)data;
++		break;
++	case BTUART_STATS:
++		*(struct btuart_stats *)data = gu.st;
++		break;
++	default:
++		e = ENOTTY;
++	}
++	lck_mtx_unlock(&gu_mtx);
++	return e;
++}
++
++static const struct cdevsw gu_cdevsw = {
++	.d_open       = gu_open,
++	.d_close      = gu_close,
++	.d_read       = gu_read,
++	.d_write      = gu_write,
++	.d_ioctl      = gu_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++static bool gu_enabled;
++
++/* poke "b N": 0 state, 1 HCI Read_Local_Version, 2 QCA EDL version request (device closed) */
++int
++sweet_geniuart_cmd(unsigned what)
++{
++	if (!gu_enabled) {
++		printf("SWEET BTUART: off (boot-arg btuart=1)\n");
++		return ENODEV;
++	}
++	lck_mtx_lock(&gu_mtx);
++	if (what == 0) {
++		if (gu.mapped && gu.hw_ok) {
++			printf("SWEET BTUART: %s, fw %#x, %u Bd, flow %u, status %#x, IOS %#x (CTS %s), M irq %#x S irq %#x, "
++			    "TX fifo %u RX fifo %#x, ring %u, irqs %u, rx %llu tx %llu, overruns %u, parity/break %u, ring full %u, "
++			    "tx timeouts %u\n", gu.open ? "open" : "closed", gu.st.fw_revision, gu.st.baud, gu.st.flow,
++			    SE_RD(GENI_STATUS), SE_RD(GENI_IOS), (SE_RD(GENI_IOS) & 2u) ? "not ready" : "ready",
++			    SE_RD(M_IRQ_STATUS), SE_RD(S_IRQ_STATUS), SE_RD(TX_FIFO_STATUS) & 0x0fffffffu, SE_RD(RX_FIFO_STATUS),
++			    gu.ring_head - gu.ring_tail, gu.st.irqs, gu.st.rx_bytes, gu.st.tx_bytes, gu.st.rx_overruns,
++			    gu.st.rx_parity_break, gu.st.ring_full, gu.st.tx_timeouts);
++		} else {
++			printf("SWEET BTUART: not opened yet\n");
++		}
++		lck_mtx_unlock(&gu_mtx);
++		return 0;
++	}
++	if (gu.open) {
++		lck_mtx_unlock(&gu_mtx);
++		printf("SWEET BTUART: busy (btd has it open)\n");
++		return EBUSY;
++	}
++	static const uint8_t rlv[4] = { 0x01, 0x01, 0x10, 0x00 }, edl[5] = { 0x01, 0x00, 0xfc, 0x01, 0x19 };
++	const uint8_t *cmd = what == 1 ? rlv : edl;
++	unsigned len = what == 1 ? sizeof(rlv) : sizeof(edl);
++	if (what > 2) {
++		lck_mtx_unlock(&gu_mtx);
++		return EINVAL;
++	}
++	if (!gu.hw_ok) {
++		gu.hw_ok = gu_hw_init();
++	}
++	if (!gu.hw_ok) {
++		lck_mtx_unlock(&gu_mtx);
++		return ENXIO;
++	}
++	gu_irq_on(true);
++	boolean_t st = gu_lock();
++	gu.ring_tail = gu.ring_head;
++	gu_unlock(st);
++	int e = gu_tx(cmd, len);
++	uint8_t buf[64];
++	unsigned n = 0, total = 0;
++	char line[3 * 64 + 1];
++	line[0] = 0;
++	uint64_t end;
++	clock_interval_to_deadline(300, NSEC_PER_MSEC, &end);
++	while (!e && total < sizeof(buf) && mach_absolute_time() < end) {
++		if (gu_take(buf + total, (unsigned)sizeof(buf) - total, &n, 20, false) == 0) {
++			total += n;
++		}
++	}
++	for (unsigned i = 0; i < total; i++) {
++		snprintf(line + 3 * i, sizeof(line) - 3 * i, "%02x ", buf[i]);
++	}
++	gu_irq_on(false);
++	printf("SWEET BTUART: b %u: sent %u bytes at %u Bd (%d), got %u in 300 ms: %s(irqs %u)\n", what, len,
++	    gu.st.baud, e, total, line, gu.st.irqs);
++	lck_mtx_unlock(&gu_mtx);
++	return e ? e : (int)total;
++}
++
++void
++sweet_geniuart_init(void)
++{
++	uint32_t on = 0;
++	PE_parse_boot_argn("btuart", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	int major = cdevsw_add(-1, &gu_cdevsw);
++	if (major < 0) {
++		printf("SWEET BTUART: cdevsw_add failed (%d)\n", major);
++		return;
++	}
++	void *node = devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "btuart");
++	gu_enabled = node != NULL;
++	printf("SWEET BTUART: /dev/btuart %s (major %d); SE5 untouched until opened\n", node ? "ready" : "failed", major);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_poke.c b/bsd/dev/sweet_poke.c
+index db1dc24..384836b 100644
+--- a/bsd/dev/sweet_poke.c
++++ b/bsd/dev/sweet_poke.c
+@@ -171,7 +171,7 @@ poke_line(const char *s, const char *end, unsigned lineno)
+ 		return;
+ 	}
+ 	volatile uint32_t *r = NULL;
+-	if (op != '@' && op != 's' && op != 'v' && op != 't' && op != 'c') {
++	if (op != '@' && op != 's' && op != 'v' && op != 't' && op != 'c' && op != 'b') {
+ 		if (!ha || (a & 3) || !(r = poke_reg(a))) {
+ 			printf("POKE: line %u: bad address\n", lineno);
+ 			return;
+@@ -211,6 +211,12 @@ poke_line(const char *s, const char *end, unsigned lineno)
+ 		printf("POKE: c %llu -> %d\n", a, sweet_cam_cmd_args((unsigned)a, b, c, d));
+ 		break;
+ 	}
++	case 'b': {
++		/* redfin (0981): b 0 /dev/btuart state; b 1 HCI Read_Local_Version, b 2 QCA EDL version (sweet_geniuart.c) */
++		extern int sweet_geniuart_cmd(unsigned what);
++		printf("POKE: b %llu -> %d\n", a, sweet_geniuart_cmd((unsigned)a));
++		break;
++	}
+ 	case 'r': {
+ 		uint64_t n = hb ? b : 1;
+ 		for (uint64_t i = 0; i < n && i < 256; i += 4) {
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index fc2e671..dccfe52 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -60,6 +60,7 @@ extern void sweet_torch_init(void);
+ extern void sweet_cam_init(void);
+ extern void sweet_audio_init(void);
+ extern void redwood_adsp_init(void);
++extern void sweet_geniuart_init(void);
+ extern void sweet_cpufreq_init(void);
+ extern void sweet_pmem_init(void);
+ extern void flame_wlan_init(void);
+@@ -683,6 +684,7 @@ sweet_ufs_init(void)
+ 	sweet_cam_init();	/* redfin camera sensors (sweetcam=1/2): bsd/dev/sweet_cam.c */
+ 	sweet_audio_init();	/* /dev/redwood-audio, /dev/redwood-haptic: bsd/dev/sweet_audio.c */
+ 	redwood_adsp_init();	/* the audio DSP (adsp=1): bsd/dev/sweet_adsp.c */
++	sweet_geniuart_init();	/* /dev/btuart, the Bluetooth UART (btuart=1): bsd/dev/sweet_geniuart.c */
+ 	sweet_usb_probe();
+ 	return 0;
+ }

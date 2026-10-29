@@ -1,0 +1,219 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Tue, 27 Oct 2026 02:30:00 +0100
+Subject: [PATCH] 0977 redfin: vsync tick held for the SwapEnd of a frame in flight (sweetpace, p pace N)
+
+backboardd runs CA on our vsync notifications (CA_FORCE_TIMER=1: sel 72
+type 5 on/off). A frame that takes longer than a tick (render thread
+~12-14 ms vs 11.1 ms at 90 Hz) leaves the next tick unused: CA's render
+thread then idles in its run loop until the tick after, so frames take
+2 ticks (22.2 ms) or 3. sweetpace=1 / p pace 1: while frames flow, a
+tick that finds no SwapEnd since the last notification is held and sent
+at the SwapEnd that ends the frame (timestamp = then); a held tick that
+no SwapEnd takes lapses to the next tick. 5 s line SWEET FB: pace 5s.
+Default 0: as before.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 24a55d2..9ed47e0 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -113,6 +113,17 @@ enum {
+ #define SWEET_FBX_CPUPRESENT    0x8
+ static uint32_t sweet_fbx;
+ 
++/*
++ * 0977: boot-arg sweetpace=MASK, poke p pace N (default 0 = as before):
++ *   0x1  CA (CA_FORCE_TIMER=1) starts a frame only on a vsync notification. When drawing a frame takes longer than
++ *        a tick (encode ~10-14 ms vs 11.1 ms at 90 Hz) the tick in between finds CA busy and is not used, so every
++ *        frame took two ticks (22.2 ms) or three. With this bit, while frames flow (a SwapEnd within 3 ticks), a
++ *        tick that comes before the SwapEnd of the frame its predecessor started is held, and sent at that SwapEnd
++ *        (timestamp = then, period as usual): CA starts its next frame at once. A held tick no SwapEnd took goes at
++ *        the next tick (that one, fresh), so CA never waits longer than today.
++ */
++static uint32_t sweet_pace;
++
+ /* INTF1 (DSI0) and its tear check, offsets from the MDP (as shim/sde.c): the TE frame counter is INT_COUNT >> 16 */
+ #define SWEET_INTF1             0x6b800u
+ #define INTF_FRAME_COUNT        0x0ac
+@@ -236,6 +247,14 @@ public:
+ 	uint32_t      fTeFrame, fTeStale, fTeLogs;
+ 	void          phaseTick(uint64_t now);
+ 	bool          queueSwap(const uint8_t *rec, uint64_t now);
++	/* 0977 (sweetpace & 1): a tick that comes while CA is still drawing goes at that frame's SwapEnd (fLock) */
++	bool          fPaceSwapped;           /* a SwapEnd since the last vsync notification */
++	bool          fPaceOwed;              /* a tick held for the SwapEnd of the frame in flight */
++	uint64_t      fPaceOwedCount;
++	uint32_t      fPaceHeld, fPaceAtSwap, fPaceLapsed;
++	uint64_t      fPaceAheadAbs;          /* at-swap ticks: sum of (next tick - delivery) */
++	bool          vsyncOn(void);
++	void          sendVsync(uint64_t count, uint64_t now);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -661,6 +680,10 @@ AppleCLCD::start(IOService *provider)
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	/* 0943: sweetfb_hz=90 also runs the panel and the ticks at 90 Hz (the DCS command goes out below) */
+ 	PE_parse_boot_argn("sweetfbx", &sweet_fbx, sizeof(sweet_fbx));
++	PE_parse_boot_argn("sweetpace", &sweet_pace, sizeof(sweet_pace));      /* 0977 */
++	if (sweet_pace) {
++		IOLog("SWEET FB: pace %#x (ticks held for the SwapEnd of a frame in flight)\n", sweet_pace);
++	}
+ 	fHz = hz == 90 ? 90 : 60;
+ 	fDsiLock = IOLockAlloc();
+ 	fVsync->setTimeoutUS(fHz == 90 ? 11111 : SWEET_FB_VSYNC_US);
+@@ -761,18 +784,23 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	 * the vsync's host time and a2 + a3 the next one (a3 = the refresh period, also CA's CVTimeStamp
+ 	 * videoRefreshPeriod). a3 was 0: CA saw every frame's deadline as already past.
+ 	 */
+-	uint64_t period = fb->fVsyncAbs;
+-	uint64_t values[6] = {
+-		(uint32_t)count, (uint32_t)(count >> 32),
+-		(uint32_t)now, (uint32_t)(now >> 32),
+-		(uint32_t)period, (uint32_t)(period >> 32),
+-	};
+-
+ 	IOLockLock(fb->fLock);
+-	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
+-		IOMobileFramebufferUserClient *client =
+-		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+-		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
++	bool send = true;
++	if ((sweet_pace & 1) && !fb->fPowerOff) {
++		/* 0977: CA still drawing the frame the last tick started (no SwapEnd since), frames flowing: hold this one */
++		bool flowing = fb->fStLastSwap != 0 && now - fb->fStLastSwap < 3 * fb->fVsyncAbs;
++		if (fb->fPaceOwed) {
++			fb->fPaceOwed = false;  /* no SwapEnd took it: this tick goes, as it would have */
++			fb->fPaceLapsed++;
++		} else if (flowing && !fb->fPaceSwapped && fb->vsyncOn()) {
++			fb->fPaceOwed = true;
++			fb->fPaceOwedCount = count;
++			fb->fPaceHeld++;
++			send = false;
++		}
++	}
++	if (send) {
++		fb->sendVsync(count, now);
+ 	}
+ 	if (fb->fPowerOff) {
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+@@ -826,6 +854,39 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ }
+ 
++/* 0977: with the fLock. The vsync notification to every client that has it on (values as 0121). */
++void
++AppleCLCD::sendVsync(uint64_t count, uint64_t now)
++{
++	uint64_t period = fVsyncAbs;
++	uint64_t values[6] = {
++		(uint32_t)count, (uint32_t)(count >> 32),
++		(uint32_t)now, (uint32_t)(now >> 32),
++		(uint32_t)period, (uint32_t)(period >> 32),
++	};
++
++	fPaceSwapped = false;
++	for (unsigned int i = 0; i < fClients->getCount(); i++) {
++		IOMobileFramebufferUserClient *client =
++		    (IOMobileFramebufferUserClient *)fClients->getObject(i);
++		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
++	}
++}
++
++/* 0977: with the fLock. Does any client take vsync notifications now (CA turns them on while it animates)? */
++bool
++AppleCLCD::vsyncOn(void)
++{
++	for (unsigned int i = 0; i < fClients->getCount(); i++) {
++		IOMobileFramebufferUserClient *client =
++		    (IOMobileFramebufferUserClient *)fClients->getObject(i);
++		if (client->fFunc[SWEET_FB_NOTIFY_VSYNC] != 0 && client->fPort != MACH_PORT_NULL) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ void
+ AppleCLCD::presentLoop(void *arg)
+ {
+@@ -995,6 +1056,18 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	fStLastSwap = now;
+ 	fStSwaps++;
+ 	fStDropped += fDirty;
++	if (sweet_pace & 1) {
++		/* 0977: the frame in flight is done: a tick held for it goes now */
++		fPaceSwapped = true;
++		if (fPaceOwed && !fPowerOff) {
++			fPaceOwed = false;
++			fPaceAtSwap++;
++			if (fNextVsync > now) {
++				fPaceAheadAbs += fNextVsync - now;
++			}
++			sendVsync(fPaceOwedCount, now);
++		}
++	}
+ 	if (sweet_scan_live()) {
+ 		/* 0976: a frame on a scanout-slot surface goes to the display engine itself */
+ 		IOLockUnlock(fLock);
+@@ -1091,6 +1164,11 @@ AppleCLCD::statLine(uint64_t now)
+ 	fStWaitN = fStWaitLate = 0;
+ 	absolutetime_to_nanoseconds(fStBlitqAbs, &blitq);
+ 	blitq = fStBlitqN ? blitq / 1000 / fStBlitqN : 0;
++	uint32_t pHeld = fPaceHeld, pAt = fPaceAtSwap, pLapsed = fPaceLapsed;   /* 0977 */
++	uint64_t pAhead = 0;
++	absolutetime_to_nanoseconds(fPaceAheadAbs, &pAhead);
++	fPaceHeld = fPaceAtSwap = fPaceLapsed = 0;
++	fPaceAheadAbs = 0;
+ 	fStWin = now;
+ 	fStSwaps = fStShown = fStDropped = fStBlitqN = fStHistN = 0;
+ 	fStBlitqAbs = 0;
+@@ -1112,6 +1190,11 @@ AppleCLCD::statLine(uint64_t now)
+ 	IOLog("SWEET FB: 5s: swaps %u shown %u dropped %u | le11 %u le18 %u le26 %u le35 %u gt35 %u | "
+ 	    "p50 %u.%u p95 %u.%u ms | blitq %llu us fence %llu us | hz %u | vis %llu us cpu %llu us gpuwait %llu us late %llu\n", swaps, shown,
+ 	    dropped, b[0], b[1], b[2], b[3], b[4], p50 / 10, p50 % 10, p95 / 10, p95 % 10, blitq, fence, fHz, vis, cpu, gw, gwLate);
++	if (sweet_pace) {
++		/* 0977: ticks held for a SwapEnd, sent at one (and how much before the next tick), lapsed to the next tick */
++		IOLog("SWEET FB: pace 5s: held %u at-swap %u (%llu us before the next tick) lapsed %u | pace %#x\n", pHeld, pAt,
++		    pAt ? pAhead / 1000 / pAt : 0, pLapsed, sweet_pace);
++	}
+ }
+ 
+ /* sweetfbx & 2: has the CPU locked the surface for writing (IOSurface seed bumped) since its last present? */
+@@ -2354,6 +2437,28 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+ 		mdpCmd(s + 3, end);     /* 0948 */
+ 		return;
+ 	}
++	if (end - s >= 4 && !strncmp(s, "pace", 4)) {
++		/* 0977: p pace N (0 = as before, 1 = ticks held for the SwapEnd of a frame in flight) */
++		const char *q = s + 4;
++		uint32_t v = 0;
++		while (q < end && *q == ' ') {
++			q++;
++		}
++		while (q < end && *q >= '0' && *q <= '9') {
++			v = v * 10 + (uint32_t)(*q++ - '0');
++		}
++		IOLockLock(fLock);
++		sweet_pace = v;
++		bool owed = fPaceOwed;
++		fPaceOwed = false;
++		fPaceSwapped = false;
++		if (owed) {
++			sendVsync(fPaceOwedCount, mach_absolute_time());       /* nothing stays held */
++		}
++		IOLockUnlock(fLock);
++		IOLog("SWEET FB: pace now %#x\n", sweet_pace);
++		return;
++	}
+ 	if (end - s >= 7 && !strncmp(s, "scanout", 7)) {
+ 		/* 0976: p scanout 0|1 */
+ 		const char *q = s + 7;
+@@ -2367,7 +2472,7 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+ 		}
+ 		return;
+ 	}
+-	IOLog("SWEET FB: poke p: fc | hz 60|90 [tc] | fbx HEX | mdp dump|smmu|test|scale|ca|restore | scanout 0|1\n");
++	IOLog("SWEET FB: poke p: fc | hz 60|90 [tc] | fbx HEX | mdp dump|smmu|test|scale|ca|restore | scanout 0|1 | pace N\n");
+ }
+ 
+ extern "C" void sweet_fb_cmd(const char *s, const char *end);

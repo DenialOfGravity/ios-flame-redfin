@@ -1,0 +1,231 @@
+From 627749553ba2467cad5bf254e665433b599cdc2c Mon Sep 17 00:00:00 2001
+From: WS-P <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 00:40:52 +0100
+Subject: [PATCH] redfin: SPMI charger write path (sweetchg=1, allow-list,
+ read-back)
+
+sweet_spmi_write(): APID channel EXT_WRITEL as Linux spmi-pmic-arb v5,
+owner EE 0 checked, only SID 2 0x1061/0x1070/0x1341/0x1342/0x1365/0x1366/
+0x1370, every write read back and logged; off unless sweetchg=1.
+w chg wr ADDR VAL for a single test write.
+---
+ bsd/dev/sweet_spmi.c    | 108 ++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_spmi.h    |   7 +++
+ bsd/dev/sweet_thermal.c |  32 ++++++++++++
+ 3 files changed, 147 insertions(+)
+
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 0aea73c..9243e51 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -6,12 +6,24 @@
+  * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
+  * Also the PM8150 RTC (peripheral 0x60) for the time of day (SweetPlatformExpert.cpp).
+  * redfin: the battery blocks are on PM7250B (SID 2), the RTC stays on SID 0.
++ *
++ * redfin (0967): the one exception to "read only": sweet_spmi_write(), off unless
++ * boot-arg sweetchg=1, and then only for the SMB5 charger registers in
++ * sp_write_ok[] (FCC 0x1061, FV 0x1070, CMD_APSD 0x1341, CMD_ICL_OVERRIDE
++ * 0x1342, USBIN_LOAD_CFG 0x1365, USBIN_ICL_OPTIONS 0x1366,
++ * USBIN_CURRENT_LIMIT_CFG 0x1370). Linux spmi-pmic-arb.c v5: the APID's
++ * channel at chnls 0x0c600000 + 0x10000 * APID, WDATA0 +0x10, CMD +0x00 =
++ * EXT_WRITEL (opcode 0) << 27 | addr[7:0] << 4 | byte count - 1, STATUS +0x08
++ * (bit 0 done, 1 failure, 2 denied, 3 dropped); the APID must be owned by EE 0
++ * (cnfg 0x0c40a000 + 0x700 + 4 * APID, bits 2:0). Every write is read back
++ * through the observer and logged ("SWEET CHG: write ...").
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
+ #include <IOKit/IOLocks.h>
++#include <pexpert/pexpert.h>
+ #include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -20,6 +32,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ #define SP_OBS_PA  0x0e600000u
+ #define SP_CFG_PA  0x0c40a000u
+ #define SP_NO_APID 0xffffu
++#define SP_CHNL_PA 0x0c600000u
+ 
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
+ static IOLock *sp_lock;
+@@ -129,4 +142,99 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++/* ---- 0967: the charger write path ---- */
++static const uint16_t sp_write_ok[] = { 0x1061, 0x1070, 0x1341, 0x1342, 0x1365, 0x1366, 0x1370 };
++static int sp_wr_enabled = -1;
++static struct {
++	uint16_t apid;
++	vm_offset_t va;
++} sp_chnl[4];
++
++int
++sweet_spmi_write_enabled(void)
++{
++	if (sp_wr_enabled < 0) {
++		unsigned v = 0;
++		PE_parse_boot_argn("sweetchg", &v, sizeof(v));
++		sp_wr_enabled = v == 1;
++		printf("SWEET CHG: SPMI charger writes %s (sweetchg=%u)\n", sp_wr_enabled ? "ENABLED" : "off", v);
++	}
++	return sp_wr_enabled;
++}
++
++static vm_offset_t
++sp_chnl_va(uint16_t apid)
++{
++	for (unsigned i = 0; i < sizeof(sp_chnl) / sizeof(sp_chnl[0]); ++i) {
++		if (sp_chnl[i].va && sp_chnl[i].apid == apid) {
++			return sp_chnl[i].va;
++		}
++	}
++	for (unsigned i = 0; i < sizeof(sp_chnl) / sizeof(sp_chnl[0]); ++i) {
++		if (!sp_chnl[i].va) {
++			sp_chnl[i].va = ml_io_map(SP_CHNL_PA + 0x10000u * apid, 0x1000);
++			sp_chnl[i].apid = apid;
++			return sp_chnl[i].va;
++		}
++	}
++	return 0;
++}
++
++int
++sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
++{
++	bool listed = false;
++	for (unsigned i = 0; i < sizeof(sp_write_ok) / sizeof(sp_write_ok[0]); ++i) {
++		listed = listed || addr == sp_write_ok[i];
++	}
++	if (!sweet_spmi_write_enabled() || sid != 2 || !listed) {
++		printf("SWEET CHG: write %u:%04x = %02x refused (%s)\n", sid, addr, val,
++		    sp_wr_enabled ? "not on the allow-list" : "sweetchg=0");
++		return -1;
++	}
++	uint8_t before = 0, after = 0;
++	if (sweet_spmi_read(sid, addr, &before) != 0) {
++		printf("SWEET CHG: write %u:%04x = %02x refused (cannot read it first)\n", sid, addr, val);
++		return -1;
++	}
++	unsigned peripheral = addr >> 8;
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
++	unsigned owner = apid == SP_NO_APID ? 7 : (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u);
++	vm_offset_t ch = (apid == SP_NO_APID || owner != 0 || sp_poisoned[apid]) ? 0 : sp_chnl_va(apid);
++	if (!ch) {
++		IOLockUnlock(sp_lock);
++		printf("SWEET CHG: write %u:%04x refused: APID %u owner EE %u%s\n", sid, addr, apid, owner,
++		    apid != SP_NO_APID && sp_poisoned[apid] ? " (poisoned)" : "");
++		return -1;
++	}
++	uint32_t status = 0;
++	unsigned t;
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x10u) = val;                       /* WDATA0 */
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x00u) = ((addr & 0xffu) << 4);     /* EXT_WRITEL (0), BC = 0 */
++	__asm__ volatile ("dsb osh" ::: "memory");
++	for (t = 0; t < 1000; ++t) {
++		status = sp_rd(ch, 0x08u);
++		if (status & 1u) {
++			break;
++		}
++		delay(1);
++	}
++	if (!(status & 1u)) {
++		sp_poisoned[apid] = true;
++	}
++	IOLockUnlock(sp_lock);
++	if (!(status & 1u) || (status & 0x0eu)) {
++		printf("SWEET CHG: write %u:%04x = %02x FAILED: status %x after %u us%s\n", sid, addr, val, status, t,
++		    (status & 1u) ? "" : " (APID disabled)");
++		return -1;
++	}
++	int rb = sweet_spmi_read(sid, addr, &after);
++	bool same = rb == 0 && after == val;
++	printf("SWEET CHG: write %u:%04x = %02x (was %02x) -> reads %02x %s\n", sid, addr, val, before, after,
++	    same ? "ok" : "MISMATCH");
++	return same ? 0 : -2;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 45565d1..a04a1c5 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,6 +8,13 @@ extern "C" {
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/*
++ * redfin (0967): one-byte write through this EE's APID channel, ONLY with boot-arg
++ * sweetchg=1 and ONLY to the charger registers on the allow-list (sweet_spmi.c).
++ * Thread context. 0 = written and read back equal, -1 refused/failed, -2 read back differs.
++ */
++int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
++int sweet_spmi_write_enabled(void);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+index ff1dfdf..48b285e 100644
+--- a/bsd/dev/sweet_thermal.c
++++ b/bsd/dev/sweet_thermal.c
+@@ -23,6 +23,7 @@
+  *   w table [DOM]       print the frequency table(s)
+  *   w gov 0|1 [MS]      DVFS governor off/on, tick MS (0963)
+  *   w chg               charger/gauge registers now
++ *   w chg wr ADDR VAL   one allow-listed charger write (hex, sweetchg=1 only; 0967)
+  *   w cap N             force thermal level N (0-3) for a test, "w cap auto" back to the sensors
+  *   w gpu N             GPU level cap N (0 = none) through sweet_gpu_level_cap()
+  *
+@@ -365,6 +366,26 @@ pc_num(const char **p, const char *end, unsigned *out)
+ 	return true;
+ }
+ 
++/* hex with or without 0x */
++static unsigned
++pc_hex(const char *w)
++{
++	unsigned v = 0;
++	if (w[0] == '0' && (w[1] == 'x' || w[1] == 'X')) {
++		w += 2;
++	}
++	for (; *w; w++) {
++		unsigned c = (unsigned char)*w;
++		unsigned d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 :
++		    c >= 'A' && c <= 'F' ? c - 'A' + 10 : 16;
++		if (d > 15) {
++			break;
++		}
++		v = v * 16 + d;
++	}
++	return v;
++}
++
+ /* DOM: 0/1/2 or s(ilver)/g(old)/p(rime) */
+ static bool
+ pc_dom(const char **p, const char *end, unsigned *out)
+@@ -445,6 +466,17 @@ sweet_power_cmd(const char *s, const char *end)
+ 		(void)pc_num(&s, end, &n);
+ 		printf("SWEET POWER: gpu level cap %u -> %d\n", n, sweet_gpu_level_cap(n));
+ 	} else if (pc_is(w, "chg")) {
++		char sub[8];
++		if (pc_word(&s, end, sub, sizeof(sub)) && pc_is(sub, "wr")) {
++			char a[12], v[8];
++			if (!pc_word(&s, end, a, sizeof(a)) || !pc_word(&s, end, v, sizeof(v))) {
++				printf("SWEET POWER: usage: w chg wr ADDR VAL (hex)\n");
++				return;
++			}
++			unsigned addr = pc_hex(a), val = pc_hex(v);
++			printf("SWEET POWER: w chg wr %04x %02x -> %d\n", addr, val, sweet_spmi_write(2, addr, (uint8_t)val));
++			return;
++		}
+ 		sweet_thermal_pmic_dump("now");
+ 	} else {
+ 		printf("SWEET POWER: unknown \"w %s\" (stat, freq, table, gov, cap, gpu, chg)\n", w);
+-- 
+2.43.0
+

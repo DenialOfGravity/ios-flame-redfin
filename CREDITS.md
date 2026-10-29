@@ -18,6 +18,11 @@ what you need to fetch yourself.
   interfaces for this phone. Patch 0915 (`bsd/dev/sweet_adsp.c`, `bsd/sys/redwood_audio.h`) is HackiOS's kernel
   `redwood_adsp.c` and `sys/redwood_audio.h` (<https://github.com/oosexgang/hackios-xnu-kernel>, APSL 2.0) with the
   Pixel 5's numbers; the commit message lists what changed.
+  Patches 0952-0955 (`bsd/dev/sweet_sound.c`, `sweet_mic.c`, `sweet_guard.c`) carry over HackiOS's kernel
+  `redwood_sound.c`/`redwood_mic.c` APR message layouts and its `redwood_guard.c` speaker guard (unchanged but for
+  names), APSL 2.0. The CS35L41, ALC5513 (rt5514) and LPASS register sequences in `sweet_cs35l41.c`/`sweet_mic.c`
+  were written from the redbull kernel's `sound/soc/codecs/cs35l41*.c`, `rt5514.c`, `rl6231.c` and
+  `techpack/audio` (GPL-2.0; LineageOS android_kernel_google_redbull) and the phone's device tree.
 
 - **ios-sweet** (dipa-studio, <https://github.com/dipa-studio/ios-sweet>, MIT): the XNU port to the Redmi
   Note 10 Pro this is forked from. Patches 0001-0081, the shim and most of `tools/` started there.
@@ -26,6 +31,8 @@ what you need to fetch yourself.
   - `phone/wifi/radio.c` is a userland port of its TopazModem radio (its patches 0123-0130).
   - Our patch 0123 contains its 0900 (en0 + Apple80211 for wifid) and 0128 (IOKit quiesce).
   - ios-topaz's CREDITS.md puts the HackiOS-derived kernel parts under the APSL 2.0.
+  - Patch 0990 (`bsd/kern/redfin_sandbox_container.c`, Sandbox container path from CFFIXED_USER_HOME) is its 0936 /
+    HackiOS's `minisandbox_container_path` in `kern_minimac.c` (APSL 2.0), with bounds checks, a kill switch and a log.
 - **HackiOS** (OOSEX GANG, <https://github.com/oosexgang/hackios-xnu-kernel>, APSL 2.0): the origin of the
   Apple80211/wifid code above (`redwood_net`, `redwood_apple80211`, `redwood_sta`, `RedwoodWLAN`,
   `MiniIONetworkStack`), the keystore wrap/unwrap and the 10-bit surface formats in 0123/0124.
@@ -43,6 +50,14 @@ what you need to fetch yourself.
   SMP2P, GLINK, QRTR and remoteproc drivers (GPL-2.0). It also follows Bjorn Andersson's rmtfs, pd-mapper and
   tqftpserv for those protocols. The FTS touch driver (patch 0085) was written from Google's `fts_touch`
   module (GPL-2.0) and the phone's device tree.
+- **HexagonRPC** (the Sensor Shell / HexagonRPC contributors, <https://github.com/linux-msm/hexagonrpc>,
+  GPL-3.0-or-later; libhexagonrpc parts LGPL-3.0-or-later): `phone/fastrpc/` (`fastrpcd`, the ADSP sensors PD's
+  file service) is built from hexagonrpcd's listener, localctl, apps_mem, iobuffer and libhexagonrpc marshalling
+  code and interface definitions (each file keeps its header and says what fastrpcd changed). `fastrpcd` is a
+  separate program under the **GPL-3.0-or-later** (`phone/fastrpc/LICENSE.hexagonrpc`); the files written for it
+  (`transport.c`, `apps_std.c`, `fastrpcd.c`, `log.c`, the tests) are under the same licence. Argument layouts and
+  method numbers were checked against Qualcomm's fastrpc (`apps_std_skel.c`, BSD-3-Clause) and Android's
+  `adsprpc.c` (GPL-2.0) -- read, not copied.
 - **blacktop/darwin-xnu-build** (<https://github.com/blacktop/darwin-xnu-build>, MIT): the XNU build.
 - Fetched and built by the user, not in git:
   - Google's factory image, AOSP `mkbootimg` and `avbtool` (Apache 2.0)

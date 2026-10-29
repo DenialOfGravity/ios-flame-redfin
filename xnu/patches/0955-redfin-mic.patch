@@ -1,0 +1,1338 @@
+From d290a673cceb44a3f4d5e1e3ec05d75523d0951a Mon Sep 17 00:00:00 2001
+From: WS-A <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 00:48:41 +0100
+Subject: [PATCH] redfin: microphones (mic=1): ALC5513 on SE7, PRI_TDM_TX
+ 0x9001, ADM record, ASM read, /dev/redwood-mic, poke a mic
+
+---
+ bsd/conf/files        |    1 +
+ bsd/dev/sweet_mic.c   | 1255 +++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_sound.c |   12 +-
+ 3 files changed, 1266 insertions(+), 2 deletions(-)
+ create mode 100644 bsd/dev/sweet_mic.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 9779f28..67dd184 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,6 +117,7 @@ bsd/dev/sweet_audio.c			standard
+ bsd/dev/sweet_sound.c			standard
+ bsd/dev/sweet_cs35l41.c			standard
+ bsd/dev/sweet_guard.c			standard
++bsd/dev/sweet_mic.c			standard
+ bsd/dev/sweet_adsp.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_poke.c			standard
+diff --git a/bsd/dev/sweet_mic.c b/bsd/dev/sweet_mic.c
+new file mode 100644
+index 0000000..b8ef1e3
+--- /dev/null
++++ b/bsd/dev/sweet_mic.c
+@@ -0,0 +1,1255 @@
++/*
++ * redfin (Pixel 5): the microphones through the audio DSP. Patch 0955 (WS-A).
++ *
++ * The three DMICs are on a Realtek ALC5513 (driver rt5514), not on the SoC's codec (lito-redfin-audio.dtsi
++ * disables bolero): control over I2C 0x57 on QUPv3 SE7 (i2c@984000, TLMM gpio6/7 function qup11), reset
++ * TLMM 91 (output-high when active), the mic supply "Audio LDO Mic1" = PM7250B GPIO6 (kona.c's DAPM
++ * supply, audio_ldo1-gpios); audio over PRI_TDM_TX_0 (AFE port 0x9001, group 0x9101) on APPS TLMM 49 sck /
++ * 50 ws / 51 din / 52 dout (function pri_mi2s / pri_mi2s_ws, 8 mA, no pull). The SPI side (hotword DSP
++ * firmware) is not used: Android's driver forces the codec's DSP on while recording (rt5514_hw_params()
++ * sets dsp_enabled 3), which needs firmware over SPI; here the codec runs in its plain I2S/TDM mode, as
++ * the upstream driver does on Chromebooks.
++ *
++ * What is written (sound/soc/codecs/rt5514.c of the redbull kernel; mixer_paths_noextcodec_snd.xml
++ * "handset-mic"; kona.c kona_tdm_snd_hw_params() for PRI_TDM_TX):
++ *   codec   probe: VENDOR_ID2 0x10ec5514, VENDOR_ID1 (0x80: the "P" part, PLL2), the I2C patch and the
++ *           regmap patch; the DAI: DSP_A, NB/NF, TDM 8 slots of 32 bits, TX slot mask 1, 16-bit words;
++ *           the PLL from BCLK 12.288 MHz to 12.288 MHz (rl6231: M bypass, N 4, K 4), sysclk from the PLL,
++ *           pre-divider 0 (256 fs); "Stereo1 DMIC Mux" DMIC1, "Sto1 ADC MIXL DMIC Switch" (DAPM),
++ *           "ADC1 Capture Volume" micgain (default 23 = 0 dB); DAPM's power-up for that path: PLL LDO
++ *           enable, PLL LDO, PLL, "adc stereo1 filter", DMIC clock 12.288 MHz / 8, the ADC muted and
++ *           unmuted 85 ms later (rt5514_dmic_event)
++ *   AFE     PRI TDM IBIT (0x200) at 12.288 MHz, group 0x9101 (port 0x9001, 8 slots x 32, mask 0xff), port
++ *           0x9001: 1 channel of 16 bits in 8 slots, slot mask 1, sync mode 0, source 1, invert 0, delay 1;
++ *           slot offset 0 (mic 1; the 2nd/3rd mics would be offsets 8/12 from Stereo2)
++ *   path    ADM device open v5 for live recording from 0x9001 (no processing, 1 x 16 bits, 48 kHz),
++ *           ASM session 2 opened for reading PCM16 into 8 periods of 20 ms of our memory (the second half
++ *           of bsd/dev/sweet_sound.c's buffers, SMMU stream 0x1401), routed, run, READ_V2 again on each
++ *           READ_DONE (message layouts: HackiOS bsd/dev/redwood_mic.c, APSL 2.0)
++ *
++ * Boot-arg mic=1 (needs adsp=1): /dev/redwood-mic (S16 mono 48 kHz, non-blocking reads, short reads padded
++ * by the plug-in: phone/audio/audio_plugin.c codec_read()); the path is up while the device is open and
++ * taken down 3 s after the last close. Without mic=1: no device, as before. micgain=N (0-63) the ADC gain.
++ * The mic supply is a PMIC GPIO: driven only with sndgpio=1 (bsd/dev/sweet_cs35l41.c's allow-list).
++ * poke `a mic SECS` (1-10): record SECS seconds into GPU-pool memory and print where: the line
++ * "SWEET MIC: files read /dev/pmem PA LEN" is the command to fetch it (S16LE mono 48 kHz, raw).
++ *
++ * Log lines: "SWEET MIC: ...".
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <libkern/libkern.h>
++#include <libkern/OSAtomic.h>
++#include <mach/mach_types.h>
++#include <mach/vm_param.h>
++#include <vm/memory_types.h>
++#include <miscfs/devfs/devfs.h>
++#include <pexpert/pexpert.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/systm.h>
++#include <sys/uio.h>
++#include <sys/redwood_audio.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern kern_return_t thread_terminate(thread_t thread);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa);
++extern int sweet_audio_pmic_gpio(unsigned sid, unsigned peripheral, int high);
++int sweet_mic_cmd(uint32_t seconds);
++void sweet_mic_status(void);
++
++#define SAY(...)                printf("SWEET MIC: " __VA_ARGS__)
++
++static void
++sleep_ms(uint32_t ms)
++{
++	delay_for_interval(ms, NSEC_PER_MSEC);
++}
++
++static uint64_t
++now_us(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++static uint32_t
++mrd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++mwr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static bool
++wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(mrd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* ---- QUPv3 SE7 as an I2C master (sweet_haptic.c's SE9 code with SE7's numbers) ------------------------------------ */
++
++#define SE7_PA                  0x00984000u
++#define GCC_PAGE_18             0x00118000u     /* wrap1 core 0x18004, s_ahb 0x18008, s1 CBCR 0x1813c, RCG 0x18140 */
++#define GCC_PAGE_23             0x00123000u     /* wrap1 0x23138 / 0x23140 */
++#define GCC_PAGE_52             0x00152000u     /* APCS_CLOCK_BRANCH_ENA_VOTE_1 0x52008 */
++#define GCC_VOTE                0x008u
++#define GCC_VOTE_BITS           ((0xfu << 18) | (1u << 23))     /* wrap1 core_2x, core, m_ahb, s_ahb; s1 */
++#define GCC_S1_CBCR             0x13cu
++#define GCC_S1_RCG              0x140u
++#define TLMM_WEST_PA            0x0f500000u
++#define TLMM_SOUTH_PA           0x0f100000u
++#define CODEC_ADDR              0x57
++
++#define SE_STATUS       0x040u
++#define SE_MCLK         0x048u
++#define SE_FW           0x068u
++#define SE_CLK_SEL      0x07cu
++#define SE_DMA          0x258u
++#define SE_TX_LEN       0x26cu
++#define SE_RX_LEN       0x270u
++#define SE_SCL          0x278u
++#define SE_CMD          0x600u
++#define SE_CTRL         0x604u
++#define SE_IRQ          0x610u
++#define SE_IRQ_EN       0x614u
++#define SE_IRQ_CLR      0x618u
++#define SE_TX           0x700u
++#define SE_RX           0x780u
++#define SE_TX_COUNT     0x800u
++#define SE_RX_COUNT     0x804u
++#define SE_TX_WM        0x80cu
++#define SE_HW_TX        0xe24u
++#define SE_HW_RX        0xe28u
++#define SE_RX_WM_IRQ    (1u << 26)
++#define SE_RX_LAST      (1u << 27)
++#define SE_TX_WM_IRQ    (1u << 30)
++#define SE_DONE         (1u << 0)
++#define SE_NACK         (1u << 10)
++#define SE_ERRORS       (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | (1u << 13) | (3u << 24) | (3u << 28))
++#define SE_EVENTS       (SE_DONE | SE_ERRORS | SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ)
++#define SE_PACK0        0x0007f8feu
++#define SE_PACK1        0x000ffefeu
++
++static struct {
++	vm_offset_t se, g18, g23, g52, west6, west49, south91;
++	bool ready, dead;
++	uint32_t irq_last;
++} bus;
++
++static bool
++bus_clocks(void)
++{
++	uint32_t cfg, dfs, sahb;
++	static const struct { vm_offset_t *page; uint32_t off; } branches[] = {
++		{ &bus.g18, 0x004 }, { &bus.g18, 0x008 }, { &bus.g23, 0x138 }, { &bus.g23, 0x140 }, { &bus.g18, GCC_S1_CBCR },
++	};
++
++	mwr(bus.g52, GCC_VOTE, mrd(bus.g52, GCC_VOTE) | GCC_VOTE_BITS);
++	cfg = mrd(bus.g18, GCC_S1_RCG + 4u);
++	dfs = mrd(bus.g18, GCC_S1_RCG + 0x14u);
++	SAY("SE7 clocks: vote %#x rcg %#x cfg %#x dfs %#x\n", mrd(bus.g52, GCC_VOTE), mrd(bus.g18, GCC_S1_RCG), cfg, dfs);
++	if (dfs & 1u) {
++		cfg = mrd(bus.g18, GCC_S1_RCG + 0x1cu);
++		if ((cfg & 0x371fu) != 1u) {
++			SAY("SE7: DFS level 0 %#x is not XO/1\n", cfg);
++			return false;
++		}
++	} else {
++		mwr(bus.g18, GCC_S1_RCG + 4u, (cfg & ~(0x371fu | (1u << 20))) | 1u);     /* XO, divider 1: 19.2 MHz */
++		mwr(bus.g18, GCC_S1_RCG, mrd(bus.g18, GCC_S1_RCG) | 1u);
++		if (!wait_clear(bus.g18, GCC_S1_RCG, 1u)) {
++			SAY("SE7: RCG update timeout\n");
++			return false;
++		}
++	}
++	sahb = mrd(bus.g18, 0x008);
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		if (branches[i].off == 0x008 && branches[i].page == &bus.g18 && (sahb & 2u)) {
++			continue;               /* (s_ahb is hardware clock gated: CLK_OFF reads 1 while idle, 0909) */
++		}
++		if (!wait_clear(*branches[i].page, branches[i].off, 1u << 31)) {
++			SAY("SE7: GCC branch %#x halted (%#x)\n", branches[i].off, mrd(*branches[i].page, branches[i].off));
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool
++bus_init(void)
++{
++	uint32_t fw, tx, rx;
++
++	if (bus.ready) {
++		return true;
++	}
++	if (bus.dead) {
++		return false;
++	}
++	bus.se = ml_io_map(SE7_PA, 0x1000);
++	bus.g18 = ml_io_map(GCC_PAGE_18, 0x1000);
++	bus.g23 = ml_io_map(GCC_PAGE_23, 0x1000);
++	bus.g52 = ml_io_map(GCC_PAGE_52, 0x1000);
++	bus.west6 = ml_io_map(TLMM_WEST_PA + 0x6000u, 0x2000);          /* gpio6, gpio7 */
++	if (!bus.se || !bus.g18 || !bus.g23 || !bus.g52 || !bus.west6 || !bus_clocks()) {
++		bus.dead = true;
++		return false;
++	}
++	/* gpio6/7: function 1 (qup11), no pull, 2 mA */
++	for (unsigned i = 0; i < 2; i++) {
++		mwr(bus.west6, 0x1000u * i, (mrd(bus.west6, 0x1000u * i) & ~0x3ffu) | (1u << 2));
++	}
++	fw = mrd(bus.se, SE_FW);
++	tx = mrd(bus.se, SE_HW_TX);
++	rx = mrd(bus.se, SE_HW_RX);
++	SAY("SE7: fw %#x proto %u status %#x tx %#x rx %#x\n", fw, (fw >> 8) & 0xffu, mrd(bus.se, SE_STATUS), tx, rx);
++	if (((fw >> 8) & 0xffu) != 3u || (mrd(bus.se, 0x64) & 1u) || ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
++	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
++		SAY("SE7 has no I2C firmware with 32-bit FIFOs: the codec cannot be reached\n");
++		bus.dead = true;
++		return false;
++	}
++	if (mrd(bus.se, SE_STATUS) & 0x1001u) {
++		SAY("SE7 busy (another EE?)\n");
++		bus.dead = true;
++		return false;
++	}
++	mwr(bus.se, 0xe18, 0);
++	mwr(bus.se, 0xe1c, 0);
++	mwr(bus.se, 0x644, 0);
++	mwr(bus.se, SE_IRQ_CLR, 0xffffffffu);
++	mwr(bus.se, 0x648, 0xffffffffu);
++	mwr(bus.se, SE_DMA, 0);
++	mwr(bus.se, 0x28, mrd(bus.se, 0x28) | 0x7fu);
++	mwr(bus.se, 0xe30, mrd(bus.se, 0xe30) | 0x0fu);
++	mwr(bus.se, 0x24, 0x7f);
++	mwr(bus.se, 0x20, 1);
++	mwr(bus.se, SE_CLK_SEL, 0);
++	mwr(bus.se, SE_MCLK, (7u << 4) | 1u);
++	mwr(bus.se, SE_SCL, (10u << 20) | (11u << 10) | 26u);         /* 100 kHz from 19.2 MHz */
++	mwr(bus.se, 0x254, 0);
++	mwr(bus.se, 0x260, SE_PACK0);
++	mwr(bus.se, 0x264, SE_PACK1);
++	mwr(bus.se, 0x284, SE_PACK0);
++	mwr(bus.se, 0x288, SE_PACK1);
++	mwr(bus.se, SE_TX_WM, 0);
++	mwr(bus.se, 0x810, 0);
++	mwr(bus.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
++	mwr(bus.se, SE_IRQ_EN, SE_EVENTS);
++	bus.ready = mrd(bus.se, 0x260) == SE_PACK0 && !(mrd(bus.se, SE_TX_COUNT) & 0xfffffffu);
++	SAY("SE7 I2C %s\n", bus.ready ? "ready (100 kHz)" : "NOT READY");
++	bus.dead = !bus.ready;
++	return bus.ready;
++}
++
++static void
++bus_abort(void)
++{
++	mwr(bus.se, SE_CTRL, 2);
++	for (unsigned i = 0; i < 5000 && !(mrd(bus.se, SE_IRQ) & (1u << 5)); ++i) {
++		delay(1);
++	}
++	for (unsigned i = 0; i < 64 && (mrd(bus.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)mrd(bus.se, SE_RX);
++	}
++	mwr(bus.se, SE_IRQ_CLR, 0xffffffffu);
++	if (!wait_clear(bus.se, SE_STATUS, 1u)) {
++		bus.dead = true;
++		SAY("SE7: abort failed; the bus is given up\n");
++	}
++}
++
++/* One FIFO message: TX at most 8 bytes or RX at most 8 bytes (sweet_haptic.c hap_msg_to) */
++static int
++bus_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
++{
++	unsigned sent = 0, got = 0;
++	int err = ETIMEDOUT;
++
++	if (!bus.ready || bus.dead || nt > 8 || nr > 8 || (nt && nr) || (!nt && !nr)) {
++		return EIO;
++	}
++	if (!wait_clear(bus.se, SE_STATUS, 1u)) {
++		bus.dead = true;
++		return EBUSY;
++	}
++	mwr(bus.se, SE_IRQ_CLR, 0xffffffffu);
++	mwr(bus.se, SE_TX_WM, nt ? 1u : 0u);
++	mwr(bus.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
++	mwr(bus.se, SE_CMD, ((nr ? 2u : 1u) << 27) | ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
++	for (unsigned i = 0; i < 20000; ++i) {
++		uint32_t irq = bus.irq_last = mrd(bus.se, SE_IRQ), count;
++
++		if (irq & SE_ERRORS) {
++			err = (irq & SE_NACK) ? ENXIO : EIO;
++			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
++				delay(1);
++				irq = mrd(bus.se, SE_IRQ);
++			}
++			if ((irq & SE_DONE) && !(mrd(bus.se, SE_STATUS) & 1u)) {
++				mwr(bus.se, SE_IRQ_CLR, irq);
++				return err;
++			}
++			break;
++		}
++		if (nt && !sent && (irq & SE_TX_WM_IRQ)) {
++			for (unsigned w = 0; w * 4u < nt; ++w) {
++				uint32_t word = 0;
++
++				for (unsigned j = 0; j < 4 && w * 4u + j < nt; ++j) {
++					word |= (uint32_t)tx[w * 4u + j] << (8u * j);
++				}
++				mwr(bus.se, SE_TX, word);
++			}
++			sent = nt;
++			mwr(bus.se, SE_TX_WM, 0);
++		}
++		count = mrd(bus.se, SE_RX_COUNT) & 0x1ffffffu;
++		if (count > 4) {
++			err = EIO;
++			break;
++		}
++		while (count--) {
++			uint32_t word = mrd(bus.se, SE_RX);
++
++			for (unsigned j = 0; j < 4 && got < nr; ++j) {
++				rx[got++] = (uint8_t)(word >> (8u * j));
++			}
++		}
++		if (irq & SE_DONE) {
++			irq = mrd(bus.se, SE_IRQ);
++			if (irq & SE_ERRORS) {
++				continue;
++			}
++			mwr(bus.se, SE_IRQ_CLR, irq);
++			return got == nr && sent == nt ? 0 : EIO;
++		}
++		mwr(bus.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
++		delay(1);
++	}
++	bus_abort();
++	return err;
++}
++
++/* ---- the codec: 32-bit addresses and values, big-endian ---------------------------------------------------------- */
++
++#define RT_MAP                  0x18000000u     /* RT5514_DSP_MAPPING: the logical registers' window */
++#define RT_I2S_CTRL1            0x2010u
++#define RT_DIG_SOURCE_CTRL      0x20a4u
++#define RT_PLL_SOURCE_CTRL      0x2100u
++#define RT_CLK_CTRL1            0x2104u
++#define RT_CLK_CTRL2            0x2108u
++#define RT_DOWNFILTER0_CTRL1    0x2190u
++#define RT_DOWNFILTER0_CTRL2    0x2194u
++#define RT_DOWNFILTER1_CTRL1    0x21a0u
++#define RT_DOWNFILTER1_CTRL2    0x21a4u
++#define RT_PWR_ANA2             0x2008u
++#define RT_ANA_CTRL_PLL2_1      0x2250u
++#define RT_ANA_CTRL_PLL2_2      0x2254u
++#define RT_ANA_CTRL_PLL1_1      0x2260u
++#define RT_ANA_CTRL_PLL1_2      0x2264u
++#define RT_VENDOR_ID1           0x2ff0u
++#define RT_VENDOR_ID2           0x2ff4u
++#define RT_DEVICE_ID            0x10ec5514u
++#define RT_AD_AD_MUTE           (1u << 7)
++
++static bool codec_found, codec_p;               /* codec_p: VENDOR_ID1 0x80, the rt5514p (PLL2) */
++static uint32_t mic_gain = 23;                   /* "ADC1 Capture Volume" (0.75 dB steps from -17.25 dB) */
++
++static int
++rt_raw_read(uint32_t reg, uint32_t *val)
++{
++	uint8_t tx[4] = { (uint8_t)(reg >> 24), (uint8_t)(reg >> 16), (uint8_t)(reg >> 8), (uint8_t)reg }, rx[4] = { 0 };
++	int err = bus_msg(CODEC_ADDR, tx, 4, NULL, 0, true);
++
++	err = err ? err : bus_msg(CODEC_ADDR, NULL, 0, rx, 4, false);
++	if (!err) {
++		*val = (uint32_t)rx[0] << 24 | (uint32_t)rx[1] << 16 | (uint32_t)rx[2] << 8 | rx[3];
++	}
++	return err;
++}
++
++static int
++rt_raw_write(uint32_t reg, uint32_t val)
++{
++	uint8_t tx[8] = { (uint8_t)(reg >> 24), (uint8_t)(reg >> 16), (uint8_t)(reg >> 8), (uint8_t)reg,
++		          (uint8_t)(val >> 24), (uint8_t)(val >> 16), (uint8_t)(val >> 8), (uint8_t)val };
++	int err = bus_msg(CODEC_ADDR, tx, 8, NULL, 0, false);
++
++	if (err) {
++		SAY("codec write %#x <- %#x FAILED (%d)\n", reg, val, err);
++	}
++	return err;
++}
++
++static int
++rt_bits(uint32_t reg, uint32_t mask, uint32_t val)
++{
++	uint32_t old = 0;
++	int err = rt_raw_read(RT_MAP | reg, &old);
++
++	return err ? err : rt_raw_write(RT_MAP | reg, (old & ~mask) | (val & mask));
++}
++
++static const uint32_t rt5514p_i2c_patch[][2] = {
++	{ 0xfafafafa, 0x00000001 }, { 0x18002000, 0x000010ec }, { 0x18002004, 0x00808f81 }, { 0x18002008, 0x00770000 },
++	{ 0x18002f08, 0x00000006 }, { 0x18002f10, 0x00000000 }, { 0x18002f10, 0x00000001 }, { 0xfafafafa, 0x00000000 },
++	{ 0x18001104, 0x00000007 }, { 0x18001108, 0x00000000 }, { 0x1800110c, 0x00000000 }, { 0x18001100, 0x0000031f },
++	{ 0x18002000, 0x000010ec },
++};
++static const uint32_t rt5514_i2c_patch[][2] = {
++	{ 0x1800101c, 0x00000000 }, { 0x18001100, 0x0000031f }, { 0x18001104, 0x00000007 }, { 0x18001108, 0x00000000 },
++	{ 0x1800110c, 0x00000000 }, { 0x18001110, 0x00000000 }, { 0x18001114, 0x00000001 }, { 0x18001118, 0x00000000 },
++	{ 0x18002f08, 0x00000006 }, { 0x18002f00, 0x00055149 }, { 0x18002f00, 0x0005514b }, { 0x18002f00, 0x00055149 },
++	{ 0xfafafafa, 0x00000001 }, { 0x18002f10, 0x00000001 }, { 0x18002f10, 0x00000000 }, { 0x18002f10, 0x00000001 },
++	{ 0xfafafafa, 0x00000001 }, { 0x18002000, 0x000010ec }, { 0xfafafafa, 0x00000000 }, { 0x18001044, 0x00000000 },
++};
++/* rt5514_patch (logical registers) */
++static const uint32_t rt5514_regs_patch[][2] = {
++	{ 0x2070, 0x00000040 }, { 0x2104, 0x380200c1 }, { 0x20ac, 0x44000eee }, { 0x2200, 0x00028704 }, { 0x2224, 0x00000800 },
++	{ 0x2180, 0x00000003 }, { 0x2190, 0x0002042f }, { 0x2194, 0x0002042f }, { 0x2198, 0x10000342 }, { 0x21a0, 0x0002042f },
++	{ 0x21a4, 0x0002042f }, { 0x21a8, 0x10000342 },
++};
++
++static bool
++gpio91(bool high)
++{
++	if (bus.south91 == 0) {
++		bus.south91 = ml_io_map(TLMM_SOUTH_PA + 0x5b000u, 0x1000);
++	}
++	if (bus.south91 == 0) {
++		return false;
++	}
++	/* GPIO function 0, 2 mA, no pull, output enabled (bit 9); the value in the IO register's bit 1 */
++	mwr(bus.south91, 4, high ? 2u : 0u);
++	mwr(bus.south91, 0, (mrd(bus.south91, 0) & ~0x3ffu) | (1u << 9));
++	return true;
++}
++
++/* Once: the bus, the supply, a reset pulse, the probe, the two patches and the static configuration. */
++static bool
++codec_init(void)
++{
++	uint32_t id2 = 0, id1 = 0;
++	int err;
++
++	if (codec_found) {
++		return true;
++	}
++	if (!bus_init()) {
++		return false;
++	}
++	(void)sweet_audio_pmic_gpio(2, 0xc5, 1);        /* "Audio LDO Mic1" (needs sndgpio=1) */
++	SAY("codec reset: TLMM 91 low, then high\n");
++	if (!gpio91(false)) {
++		return false;
++	}
++	sleep_ms(10);
++	(void)gpio91(true);
++	sleep_ms(20);
++	err = rt_raw_read(RT_MAP | RT_VENDOR_ID2, &id2);
++	if (err || id2 != RT_DEVICE_ID) {
++		err = rt_raw_read(RT_MAP | RT_VENDOR_ID2, &id2);       /* (the driver gives it a second try) */
++	}
++	(void)rt_raw_read(RT_MAP | RT_VENDOR_ID1, &id1);
++	SAY("codec at 0x57: VENDOR_ID2 %#x VENDOR_ID1 %#x (err %d, SE irq %#x)\n", id2, id1, err, bus.irq_last);
++	if (err || id2 != RT_DEVICE_ID) {
++		SAY("NO ALC5513 (rt5514) ANSWERS at 0x57\n");
++		return false;
++	}
++	codec_p = id1 == 0x80;
++	if (codec_p) {
++		for (unsigned i = 0; i < sizeof(rt5514p_i2c_patch) / sizeof(rt5514p_i2c_patch[0]) && !err; i++) {
++			err = rt_raw_write(rt5514p_i2c_patch[i][0], rt5514p_i2c_patch[i][1]);
++		}
++	} else {
++		for (unsigned i = 0; i < sizeof(rt5514_i2c_patch) / sizeof(rt5514_i2c_patch[0]) && !err; i++) {
++			err = rt_raw_write(rt5514_i2c_patch[i][0], rt5514_i2c_patch[i][1]);
++		}
++	}
++	for (unsigned i = 0; i < sizeof(rt5514_regs_patch) / sizeof(rt5514_regs_patch[0]) && !err; i++) {
++		err = rt_raw_write(RT_MAP | rt5514_regs_patch[i][0], rt5514_regs_patch[i][1]);
++	}
++	/* the DAI: DSP_A NB/NF; TDM, 8 slots of 32 bits both ways; 16-bit words */
++	err = err || rt_bits(RT_I2S_CTRL1, (7u << 16) | (1u << 25) | (1u << 26), 2u << 16) ||
++	    rt_bits(RT_I2S_CTRL1, (1u << 28) | (3u << 10) | (3u << 6) | (3u << 8) | (3u << 4) | (1u << 30),
++	    (1u << 28) | (3u << 10) | (3u << 6) | (3u << 8) | (3u << 4)) || rt_bits(RT_I2S_CTRL1, 3u, 0);
++	/* the PLL from BCLK (SCLK) 12.288 -> 12.288 MHz: K 4, N 4, M bypassed; sysclk from the PLL; pre-divider 0 */
++	if (codec_p) {
++		err = err || rt_bits(RT_PLL_SOURCE_CTRL, 7u << 8, 3u << 8) || rt_raw_write(RT_MAP | RT_ANA_CTRL_PLL2_1, 4u << 16 | 4u << 4) ||
++		    rt_bits(RT_ANA_CTRL_PLL2_2, 1u << 2, 1u << 2);
++	} else {
++		err = err || rt_bits(RT_PLL_SOURCE_CTRL, 7u << 12, 3u << 12) || rt_raw_write(RT_MAP | RT_ANA_CTRL_PLL1_1, 4u << 16 | 4u << 4) ||
++		    rt_bits(RT_ANA_CTRL_PLL1_2, 1u << 2, 1u << 2);
++	}
++	err = err || rt_bits(RT_CLK_CTRL2, 3u, 3u) || rt_bits(RT_CLK_CTRL1, 0xfu, 1u) || rt_bits(RT_CLK_CTRL2, (7u << 8) | (7u << 4), 0);
++	/* "Stereo1 DMIC Mux" DMIC1; "ADC1 Capture Volume" mic_gain on both channels; muted until the path runs */
++	err = err || rt_bits(RT_DIG_SOURCE_CTRL, 1u, 0) || rt_bits(RT_DOWNFILTER0_CTRL1, 0x3fu << 1 | RT_AD_AD_MUTE,
++	    mic_gain << 1 | RT_AD_AD_MUTE) || rt_bits(RT_DOWNFILTER0_CTRL2, 0x3fu << 1 | RT_AD_AD_MUTE, mic_gain << 1 | RT_AD_AD_MUTE);
++	SAY("codec (%s) %s: DSP_A TDM 8 x 32, 16-bit words, PLL%u from BCLK 12.288 MHz, DMIC1 -> Stereo1, ADC1 gain %u\n",
++	    codec_p ? "rt5514p" : "rt5514", err ? "CONFIGURATION FAILED" : "configured", codec_p ? 2 : 1, mic_gain);
++	codec_found = !err;
++	return codec_found;
++}
++
++/* DAPM's power-up for DMIC1 -> Sto1 ADC MIXL -> AIF1TX, with BCLK running (the PLL locks to it) */
++static bool
++codec_on(void)
++{
++	int err;
++
++	if (codec_p) {
++		err = rt_bits(RT_ANA_CTRL_PLL2_2, 1u, 1u) || rt_bits(RT_PWR_ANA2, 1u << 20, 1u << 20) ||
++		    rt_bits(RT_PWR_ANA2, 1u << 22, 1u << 22);
++	} else {
++		err = rt_bits(RT_ANA_CTRL_PLL1_2, 1u, 1u) || rt_bits(RT_PWR_ANA2, 1u << 16, 1u << 16) ||
++		    rt_bits(RT_PWR_ANA2, 1u << 18, 1u << 18);
++	}
++	/* "adc stereo1 filter"; "DMIC CLK": 12.288 MHz / 8 (divider index 3, rt5514_calc_dmic_clk with 1.536 MHz) */
++	err = err || rt_bits(RT_CLK_CTRL1, 1u << 23, 1u << 23) || rt_bits(RT_CLK_CTRL1, 7u << 8, 3u << 8);
++	/* rt5514_dmic_event: all four ADC paths muted, unmuted 85 ms later */
++	err = err || rt_bits(RT_DOWNFILTER0_CTRL1, RT_AD_AD_MUTE, RT_AD_AD_MUTE) || rt_bits(RT_DOWNFILTER0_CTRL2, RT_AD_AD_MUTE, RT_AD_AD_MUTE) ||
++	    rt_bits(RT_DOWNFILTER1_CTRL1, RT_AD_AD_MUTE, RT_AD_AD_MUTE) || rt_bits(RT_DOWNFILTER1_CTRL2, RT_AD_AD_MUTE, RT_AD_AD_MUTE);
++	sleep_ms(85);
++	err = err || rt_bits(RT_DOWNFILTER0_CTRL1, RT_AD_AD_MUTE, 0) || rt_bits(RT_DOWNFILTER0_CTRL2, RT_AD_AD_MUTE, 0);
++	SAY("codec %s\n", err ? "POWER-UP FAILED" : "powered: PLL, ADC filter 1, DMIC clock 1.536 MHz, unmuted");
++	return !err;
++}
++
++static void
++codec_off(void)
++{
++	(void)rt_bits(RT_DOWNFILTER0_CTRL1, RT_AD_AD_MUTE, RT_AD_AD_MUTE);
++	(void)rt_bits(RT_DOWNFILTER0_CTRL2, RT_AD_AD_MUTE, RT_AD_AD_MUTE);
++	(void)rt_bits(RT_CLK_CTRL1, 1u << 23, 0);
++	if (codec_p) {
++		(void)rt_bits(RT_PWR_ANA2, (1u << 22) | (1u << 20), 0);
++		(void)rt_bits(RT_ANA_CTRL_PLL2_2, 1u, 0);
++	} else {
++		(void)rt_bits(RT_PWR_ANA2, (1u << 18) | (1u << 16), 0);
++		(void)rt_bits(RT_ANA_CTRL_PLL1_2, 1u, 0);
++	}
++	SAY("codec powered down\n");
++}
++
++/* ---- the PRI TDM pins (APPS TLMM 49-52) --------------------------------------------------------------------------- */
++
++static uint32_t pins_found[4];
++static bool pins_taken;
++
++static void
++pins_on(void)
++{
++	if (bus.west49 == 0) {
++		bus.west49 = ml_io_map(TLMM_WEST_PA + 0x31000u, 0x4000);       /* gpio49..52 */
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		pins_found[i] = mrd(bus.west49, 0x1000u * i);
++		/* function 1 (pri_mi2s / pri_mi2s_ws), 8 mA, no pull */
++		mwr(bus.west49, 0x1000u * i, (pins_found[i] & ~0x3ffu) | (1u << 2) | (3u << 6));
++	}
++	pins_taken = true;
++	SAY("TLMM 49-52 (PRI TDM): were %#x %#x %#x %#x, now %#x\n", pins_found[0], pins_found[1], pins_found[2], pins_found[3],
++	    mrd(bus.west49, 0));
++}
++
++static void
++pins_off(void)
++{
++	if (!pins_taken) {
++		return;
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		mwr(bus.west49, 0x1000u * i, pins_found[i]);
++	}
++	pins_taken = false;
++}
++
++/* ---- APR: AFE PRI_TDM_TX, ADM record path, ASM session 2 --------------------------------------------------------- */
++
++#define APR_SVC_AFE             4
++#define APR_SVC_ASM             7
++#define APR_SVC_ADM             8
++#define APR_BASIC_RSP_RESULT    0x000110e8u
++#define APR_WAIT_MS             1000
++
++#define AFE_PORT_CMD_DEVICE_START               0x000100e5u
++#define AFE_PORT_CMD_DEVICE_STOP                0x000100e6u
++#define AFE_PORT_CMD_SET_PARAM_V2               0x000100efu
++#define AFE_SVC_CMD_SET_PARAM                   0x000100f3u
++#define AFE_MODULE_AUDIO_DEV_INTERFACE          0x0001020cu
++#define AFE_PARAM_ID_TDM_CONFIG                 0x0001029du
++#define AFE_MODULE_TDM                          0x0001028au
++#define AFE_PARAM_ID_PORT_SLOT_MAPPING_CONFIG   0x00010297u
++#define AFE_MODULE_GROUP_DEVICE                 0x00010254u
++#define AFE_PARAM_ID_GROUP_DEVICE_ENABLE        0x00010256u
++#define AFE_PARAM_ID_GROUP_DEVICE_TDM_CONFIG    0x0001029eu
++#define AFE_MODULE_CLOCK_SET                    0x0001028fu
++#define AFE_PARAM_ID_CLOCK_SET                  0x00010290u
++#define ADM_CMD_DEVICE_OPEN_V5                  0x00010326u
++#define ADM_CMDRSP_DEVICE_OPEN_V5               0x00010329u
++#define ADM_CMD_DEVICE_CLOSE_V5                 0x00010327u
++#define ADM_CMD_MATRIX_MAP_ROUTINGS_V5          0x00010325u
++#define ADM_PATH_LIVE_RECORDING                 2
++#define ADM_MATRIX_AUDIO_TX                     1
++#define ADM_TOPOLOGY_NONE                       0x00010312u
++#define ASM_CMD_SHARED_MEM_MAP_REGIONS          0x00010d92u
++#define ASM_CMDRSP_SHARED_MEM_MAP_REGIONS       0x00010d93u
++#define ASM_CMD_SHARED_MEM_UNMAP_REGIONS        0x00010d94u
++#define ASM_STREAM_CMD_OPEN_READ_V3             0x00010db4u
++#define ASM_STREAM_CMD_SET_ENCDEC_PARAM         0x00010c10u
++#define ASM_PARAM_ID_ENCDEC_ENC_CFG_BLK_V2      0x00010da3u
++#define ASM_SESSION_CMD_RUN_V2                  0x00010daau
++#define ASM_DATA_CMD_READ_V2                    0x00010dacu
++#define ASM_DATA_EVENT_READ_DONE_V2             0x00010d9au
++#define ASM_STREAM_CMD_CLOSE                    0x00010bcdu
++#define ASM_TOPOLOGY_NONE                       0x00010c68u
++#define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2      0x00010da5u
++#define ASM_SHMEM_4K_POOL                       3
++
++#define MIC_PORT                0x9001          /* PRI_TDM_TX_0 */
++#define MIC_GROUP               0x9101
++#define PORT_INVALID            0xffff
++#define CLOCK_PRI_TDM_IBIT      0x200
++#define CLOCK_INVERT_COUPLE_NO  4
++#define MIC_RATE                48000
++#define MIC_SLOTS               8               /* no qcom,tdm-max-slots: kona.c's default 8; rt5514 set to 8 x 32 */
++#define MIC_SESSION             2
++#define MIC_STREAM_PORT         (MIC_SESSION << 8 | 1)
++#define READ_TOKEN              0x40000000u     /* | the period */
++#define PCM_CHANNEL_FC          3
++#define MIC_PERIODS             8
++#define MIC_PERIOD_FRAMES       960             /* 20 ms of one 16-bit channel */
++#define MIC_PERIOD_BYTES        (MIC_PERIOD_FRAMES * 2)
++
++struct afe_param {
++	uint32_t module, param;
++	uint16_t size, reserved;
++} __attribute__((packed));
++
++static bool
++cmd(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const void *payload, uint32_t length, uint32_t wanted,
++    struct redwood_apr_answer *answer)
++{
++	struct redwood_apr_answer local;
++
++	if (answer == NULL) {
++		answer = &local;
++	}
++	if (!redwood_adsp_apr(service, port, 0, opcode, payload, length, APR_WAIT_MS, answer)) {
++		SAY("%s (opcode %#x): NO ANSWER\n", what, opcode);
++		return false;
++	}
++	if (answer->opcode == APR_BASIC_RSP_RESULT && answer->words[0] == opcode) {
++		SAY("%s: %s (%u)\n", what, answer->words[1] == 0 ? "done" : "REFUSED", answer->words[1]);
++		return answer->words[1] == 0 && wanted == 0;
++	}
++	if (wanted != 0 && answer->opcode == wanted) {
++		return true;
++	}
++	SAY("%s: unexpected answer %#x: %#x %#x\n", what, answer->opcode, answer->words[0], answer->words[1]);
++	return false;
++}
++
++static bool
++afe_param(const char *what, bool service, uint32_t module, uint32_t param, const void *data, uint16_t size)
++{
++	uint8_t packet[16 + sizeof(struct afe_param) + 64];
++	struct afe_param *p = (struct afe_param *)(packet + 16);
++
++	bzero(packet, sizeof(packet));
++	if (service) {
++		*(uint32_t *)packet = (uint32_t)sizeof(*p) + size;
++	} else {
++		*(uint16_t *)packet = MIC_PORT;
++		*(uint16_t *)(packet + 2) = (uint16_t)(sizeof(*p) + size);
++	}
++	p->module = module;
++	p->param = param;
++	p->size = size;
++	memcpy(packet + 16 + sizeof(*p), data, size);
++	return cmd(what, APR_SVC_AFE, 0, service ? AFE_SVC_CMD_SET_PARAM : AFE_PORT_CMD_SET_PARAM_V2, packet,
++	           16 + (uint32_t)sizeof(*p) + size, 0, NULL);
++}
++
++static bool clock_on, group_on, port_on, mapped, copp_open, stream_open, memory_taken;
++static uint32_t map_handle, copp;
++static uintptr_t mic_memory;
++static uint64_t mic_address;
++static volatile uint32_t read_ready, read_errors, reads_done;
++static volatile uint32_t read_sizes[MIC_PERIODS];
++
++static bool
++mic_events(uint8_t service, __unused uint16_t port, uint32_t opcode, uint32_t token, const uint32_t *payload, uint32_t length)
++{
++	if (service != APR_SVC_ASM || !(token & READ_TOKEN) || (token & 0x3fffffffu) >= MIC_PERIODS) {
++		return false;
++	}
++	if (opcode == ASM_DATA_EVENT_READ_DONE_V2) {
++		if (length < 24 || payload[0] != 0) {
++			OSIncrementAtomic((volatile SInt32 *)&read_errors);
++		}
++		read_sizes[token & 0x3fffffffu] = length >= 24 ? payload[4] : 0;
++		OSIncrementAtomic((volatile SInt32 *)&reads_done);
++		OSBitOrAtomic(1u << (token & 31), &read_ready);
++		return true;
++	}
++	if (opcode == APR_BASIC_RSP_RESULT) {
++		OSIncrementAtomic((volatile SInt32 *)&read_errors);
++		read_sizes[token & 0x3fffffffu] = 0;
++		OSBitOrAtomic(1u << (token & 31), &read_ready);
++		return true;
++	}
++	return false;
++}
++
++static bool
++mic_read(unsigned period)
++{
++	uint64_t a = mic_address + 4096ull * period;
++	uint32_t read[5] = { (uint32_t)a, (uint32_t)(a >> 32), map_handle, MIC_PERIOD_BYTES, period };
++
++	return redwood_adsp_apr(APR_SVC_ASM, MIC_STREAM_PORT, READ_TOKEN | period, ASM_DATA_CMD_READ_V2, read, sizeof(read), 0, NULL);
++}
++
++static bool
++afe_on(void)
++{
++	struct {
++		uint32_t version, id, hz;
++		uint16_t attribute, root;
++		uint32_t enable;
++	} __attribute__((packed)) clock = { 1, CLOCK_PRI_TDM_IBIT, MIC_RATE * 32 * MIC_SLOTS, CLOCK_INVERT_COUPLE_NO, 0, 1 };
++	struct {
++		uint32_t version;
++		uint16_t group, reserved;
++		uint16_t ports[8];
++		uint32_t channels, rate, bits;
++		uint16_t slots, slot_bits;
++		uint32_t slot_mask;
++	} __attribute__((packed)) group = { 1, MIC_GROUP, 0, { MIC_PORT, PORT_INVALID, PORT_INVALID, PORT_INVALID, PORT_INVALID,
++		                                                PORT_INVALID, PORT_INVALID, PORT_INVALID }, MIC_SLOTS, MIC_RATE, 32,
++		                            MIC_SLOTS, 32, 0xff };
++	struct {
++		uint16_t group, enable;
++	} __attribute__((packed)) enable = { MIC_GROUP, 1 };
++	struct {
++		uint32_t version, channels, rate, bits;
++		uint16_t data_format, sync_mode, sync_source, slots, data_out, invert_sync, data_delay, slot_bits;
++		uint32_t slot_mask;
++	} __attribute__((packed)) tdm = { 1, 1, MIC_RATE, 16, 0, 0, 1, MIC_SLOTS, 0, 0, 1, 32, 0x1 };
++	struct {
++		uint32_t version;
++		uint16_t channels, bits;
++		uint32_t align;
++		uint16_t offsets[8];
++	} __attribute__((packed)) mapping = { 1, 1, 16, 0, { 0, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff } };
++	uint16_t start[2] = { MIC_PORT, 0 };
++
++	/* msm_dai_q6_tdm_prepare()'s order: the clock, the group (enabled for PRI_TDM_TX even with one port), the port */
++	clock_on = afe_param("PRI TDM bit clock 0x200 at 12.288 MHz, on", true, AFE_MODULE_CLOCK_SET, AFE_PARAM_ID_CLOCK_SET, &clock,
++	    sizeof(clock));
++	if (!clock_on) {
++		return false;
++	}
++	group_on = afe_param("group 0x9101: port 0x9001, 8 slots x 32, mask 0xff", true, AFE_MODULE_GROUP_DEVICE,
++	    AFE_PARAM_ID_GROUP_DEVICE_TDM_CONFIG, &group, sizeof(group)) &&
++	    afe_param("group 0x9101, on", true, AFE_MODULE_GROUP_DEVICE, AFE_PARAM_ID_GROUP_DEVICE_ENABLE, &enable, sizeof(enable));
++	if (!group_on ||
++	    !afe_param("port 0x9001: 1 ch x 16 bits in 8 x 32, mask 1, sync 0/1, delay 1", false, AFE_MODULE_AUDIO_DEV_INTERFACE,
++	    AFE_PARAM_ID_TDM_CONFIG, &tdm, sizeof(tdm)) ||
++	    !afe_param("port 0x9001 slot mapping: offset 0", false, AFE_MODULE_TDM, AFE_PARAM_ID_PORT_SLOT_MAPPING_CONFIG, &mapping,
++	    sizeof(mapping))) {
++		return false;
++	}
++	port_on = cmd("port 0x9001, started", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL);
++	return port_on;
++}
++
++static bool
++path_on(void)
++{
++	struct {
++		uint16_t pool, regions;
++		uint32_t property, low, high, size;
++	} __attribute__((packed)) map = { ASM_SHMEM_4K_POOL, 1, 0, 0, 0, MIC_PERIODS * 4096 };
++	struct {
++		uint16_t flags, mode, endpoint1, endpoint2;
++		uint32_t topology;
++		uint16_t channels, bits;
++		uint32_t rate;
++		uint8_t map[8];
++	} __attribute__((packed)) open = { 0, ADM_PATH_LIVE_RECORDING, MIC_PORT, 0xffff, ADM_TOPOLOGY_NONE, 1, 16, MIC_RATE,
++		                           { PCM_CHANNEL_FC } };
++	struct {
++		uint32_t mode, endpoint, topology, format;
++		uint16_t bits, reserved;
++	} __attribute__((packed)) reading = { 0, 0, ASM_TOPOLOGY_NONE, ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2, 16, 0 };
++	struct {
++		uint32_t param, size, frames_per_buffer, block_size;
++		uint16_t channels, bits;
++		uint32_t rate;
++		uint16_t is_signed, reserved;
++		uint8_t map[8];
++	} __attribute__((packed)) encoder = { ASM_PARAM_ID_ENCDEC_ENC_CFG_BLK_V2, 28, 0, 20, 1, 16, MIC_RATE, 1, 0, { PCM_CHANNEL_FC } };
++	struct {
++		uint32_t matrix, sessions;
++		uint16_t session, copps;
++		uint16_t copp[2];
++	} __attribute__((packed)) route = { ADM_MATRIX_AUDIO_TX, 1, MIC_SESSION, 1, { 0, 0 } };
++	struct redwood_apr_answer answer;
++	uint32_t bytes = 0;
++
++	if (!redwood_audio_dsp_memory(&mic_memory, &mic_address, &bytes) || bytes < MIC_PERIODS * 4096) {
++		SAY("no memory the DSP can see\n");
++		return false;
++	}
++	memory_taken = true;
++	map.low = (uint32_t)mic_address;
++	map.high = (uint32_t)(mic_address >> 32);
++	redwood_adsp_apr_events_second(mic_events);
++	if (!cmd("ASM: mic periods mapped", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_MAP_REGIONS, &map, sizeof(map),
++	    ASM_CMDRSP_SHARED_MEM_MAP_REGIONS, &answer)) {
++		return false;
++	}
++	mapped = true;
++	map_handle = answer.words[0];
++	SAY("ASM: %u KB at %#llx are the DSP's handle %#x\n", MIC_PERIODS * 4, mic_address, map_handle);
++	if (!cmd("ASM: session 2 opened for reading PCM16, no processing", APR_SVC_ASM, MIC_STREAM_PORT, ASM_STREAM_CMD_OPEN_READ_V3,
++	    &reading, sizeof(reading), 0, NULL)) {
++		return false;
++	}
++	stream_open = true;
++	if (!cmd("ASM: encoder 1 x 16 bits, 48 kHz", APR_SVC_ASM, MIC_STREAM_PORT, ASM_STREAM_CMD_SET_ENCDEC_PARAM, &encoder,
++	    sizeof(encoder), 0, NULL)) {
++		return false;
++	}
++	if (!cmd("ADM: device open v5, live recording from 0x9001, 1 x 16 bits", APR_SVC_ADM, MIC_PORT, ADM_CMD_DEVICE_OPEN_V5, &open,
++	    sizeof(open), ADM_CMDRSP_DEVICE_OPEN_V5, &answer) || answer.words[0] != 0) {
++		SAY("ADM: device open REFUSED (%#x)\n", answer.words[0]);
++		return false;
++	}
++	copp_open = true;
++	copp = answer.words[1] & 0xffff;
++	route.copp[0] = (uint16_t)copp;
++	SAY("ADM: COPP %u open\n", copp);
++	return cmd("ADM: COPP routed to session 2", APR_SVC_ADM, 0, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &route, sizeof(route), 0, NULL);
++}
++
++static void
++dsp_off(void)
++{
++	uint16_t stop[2] = { MIC_PORT, 0 };
++	struct {
++		uint32_t version, id, hz;
++		uint16_t attribute, root;
++		uint32_t enable;
++	} __attribute__((packed)) clock = { 1, CLOCK_PRI_TDM_IBIT, MIC_RATE * 32 * MIC_SLOTS, CLOCK_INVERT_COUPLE_NO, 0, 0 };
++	struct {
++		uint16_t group, enable;
++	} __attribute__((packed)) disable = { MIC_GROUP, 0 };
++
++	if (stream_open) {
++		(void)cmd("ASM: session 2 closed", APR_SVC_ASM, MIC_STREAM_PORT, ASM_STREAM_CMD_CLOSE, NULL, 0, 0, NULL);
++		stream_open = false;
++	}
++	if (copp_open) {
++		(void)cmd("ADM: COPP closed", APR_SVC_ADM, (uint16_t)copp, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, 0, NULL);
++		copp_open = false;
++	}
++	if (port_on) {
++		(void)cmd("port 0x9001, stopped", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
++		port_on = false;
++	}
++	if (group_on) {
++		(void)afe_param("group 0x9101, off", true, AFE_MODULE_GROUP_DEVICE, AFE_PARAM_ID_GROUP_DEVICE_ENABLE, &disable,
++		    sizeof(disable));
++		group_on = false;
++	}
++	if (clock_on) {
++		(void)afe_param("PRI TDM bit clock, off", true, AFE_MODULE_CLOCK_SET, AFE_PARAM_ID_CLOCK_SET, &clock, sizeof(clock));
++		clock_on = false;
++	}
++	if (mapped) {
++		(void)cmd("ASM: mic periods unmapped", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &map_handle, sizeof(map_handle),
++		    0, NULL);
++		mapped = false;
++	}
++	redwood_adsp_apr_events_second(NULL);
++	if (memory_taken) {
++		redwood_audio_dsp_memory_put();
++		memory_taken = false;
++	}
++}
++
++/* ---- the ring, /dev/redwood-mic (HackiOS redwood_mic.c's mic=4 device) --------------------------------------------- */
++
++#define RING_FRAMES             16384           /* 341 ms; a power of two */
++#define RING_KEEP               1920            /* 40 ms: how far behind the DSP a reader is kept */
++#define RING_MOST               4800            /* more than 100 ms waiting: the oldest is skipped */
++
++static int16_t ring[RING_FRAMES];
++static volatile uint64_t ring_written;
++static uint64_t ring_read, ring_skipped, ring_dry;
++static bool ring_primed;
++static volatile uint32_t ios_wants;
++static volatile uint64_t ios_closed_us;
++static volatile bool stopping, record_wanted, running;
++static uint32_t record_secs;
++static int mic_wake;
++static LCK_GRP_DECLARE(mic_lock_group, "sweet-mic");
++static LCK_MTX_DECLARE(read_lock, &mic_lock_group);
++
++static void
++ring_put(const int16_t *samples, uint32_t count)
++{
++	uint64_t at = ring_written;
++
++	for (uint32_t i = 0; i < count; i++) {
++		ring[(at + i) % RING_FRAMES] = samples[i];
++	}
++	__atomic_store_n(&ring_written, at + count, __ATOMIC_RELEASE);
++}
++
++static int
++mic_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	uint64_t written, avail, want;
++	int error = 0;
++
++	if (uio_resid(uio) < 2) {
++		return 0;
++	}
++	lck_mtx_lock(&read_lock);
++	written = __atomic_load_n(&ring_written, __ATOMIC_ACQUIRE);
++	want = (uint64_t)uio_resid(uio) / 2;
++	avail = written - ring_read;
++	if (avail > RING_MOST) {
++		ring_skipped += avail - RING_KEEP;
++		ring_read = written - RING_KEEP;
++		avail = RING_KEEP;
++	}
++	if (!ring_primed) {
++		if (avail < RING_KEEP) {
++			lck_mtx_unlock(&read_lock);
++			return 0;
++		}
++		ring_primed = true;
++	}
++	if (avail < want) {
++		ring_dry++;
++		ring_primed = false;
++	}
++	while (want > 0 && avail > 0 && error == 0) {
++		uint64_t at = ring_read % RING_FRAMES, n = want < avail ? want : avail;
++
++		n = n < RING_FRAMES - at ? n : RING_FRAMES - at;
++		error = uiomove((caddr_t)&ring[at], (int)(n * 2), uio);
++		ring_read += n;
++		want -= n;
++		avail -= n;
++	}
++	lck_mtx_unlock(&read_lock);
++	return error;
++}
++
++static int
++mic_dev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	ios_wants = 1;
++	thread_wakeup(&mic_wake);
++	return 0;
++}
++
++static int
++mic_dev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	ios_wants = 0;
++	ios_closed_us = now_us();
++	return 0;
++}
++
++static const struct cdevsw mic_cdevsw = {
++	.d_open = mic_dev_open, .d_close = mic_dev_close, .d_read = mic_dev_read, .d_write = eno_rdwrt,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_reserved_1 = eno_getc, .d_reserved_2 = eno_putc, .d_type = 0
++};
++
++/* ---- listening ------------------------------------------------------------------------------------------------------ */
++
++static uint64_t rec_pa;                         /* poke `a mic`: GPU-pool memory, fetched with files read /dev/pmem */
++static vm_offset_t rec_va;
++static uint32_t rec_bytes, rec_at;
++static bool path_is_up, path_broken;
++static uint64_t path_ups;
++
++static void
++path_down(void)
++{
++	codec_off();
++	dsp_off();
++	pins_off();
++	path_is_up = false;
++	SAY("mic path down (ring: %llu frames skipped, %llu short reads)\n", ring_skipped, ring_dry);
++}
++
++static bool
++path_up(void)
++{
++	uint32_t run[3] = { 0, 0, 0 };
++
++	if (!codec_init()) {
++		return false;
++	}
++	pins_on();
++	if (!path_on() || !afe_on() || !codec_on()) {
++		path_down();
++		return false;
++	}
++	read_ready = 0;
++	reads_done = read_errors = 0;
++	if (!cmd("ASM: session 2, run", APR_SVC_ASM, MIC_STREAM_PORT, ASM_SESSION_CMD_RUN_V2, run, sizeof(run), 0, NULL)) {
++		path_down();
++		return false;
++	}
++	for (unsigned p = 0; p < MIC_PERIODS; p++) {
++		if (!mic_read(p)) {
++			SAY("a READ could not be sent\n");
++			path_down();
++			return false;
++		}
++	}
++	path_is_up = true;
++	path_ups++;
++	SAY("MIC PATH UP (%llu): PRI_TDM_TX_0 0x9001 -> COPP %u -> ASM session 2, %u reads of 20 ms queued\n", path_ups, copp,
++	    MIC_PERIODS);
++	return true;
++}
++
++/* 20 log10(rms / 32768) in tenths of a dB, roughly (6 dB a halving) */
++static int
++dbfs10(uint64_t squares, uint32_t frames)
++{
++	uint64_t ms = frames ? squares / frames : 0;
++	uint32_t rms = 0, r;
++	int tenths = 0;
++
++	while ((uint64_t)(rms + 1) * (rms + 1) <= ms) {
++		rms++;
++	}
++	if (rms == 0) {
++		return -999;
++	}
++	for (r = rms; r < 16384; r *= 2) {
++		tenths -= 60;
++	}
++	return tenths - (int)((32768 - r) * 60 / 16384);
++}
++
++/* The stream read while it is wanted (iOS has the device open, or 3 s after; or a recording runs). */
++static void
++listen(void)
++{
++	unsigned next = 0;
++	uint32_t frames = 0, peak = 0, seconds = 0, empty = 0;
++	uint64_t squares = 0, began = now_us();
++
++	while (!stopping) {
++		uint64_t now = now_us();
++		bool wanted = ios_wants || now - ios_closed_us < 3000000ull || record_wanted;
++
++		if (!wanted) {
++			break;
++		}
++		if (!(read_ready & (1u << next))) {
++			if (reads_done == 0 && now - began > 1500000ull) {
++				SAY("NO READ HAS COME BACK in 1.5 s: the path is given up until the next open\n");
++				path_broken = true;
++				break;
++			}
++			sleep_ms(4);
++			continue;
++		}
++		OSBitAndAtomic(~(1u << next), &read_ready);
++		{
++			int16_t *samples = (int16_t *)(mic_memory + 4096u * next);
++			uint32_t got = read_sizes[next] / 2;
++
++			got = got > MIC_PERIOD_FRAMES ? MIC_PERIOD_FRAMES : got;
++			empty += got == 0;
++			for (uint32_t i = 0; i < got; i++) {
++				int32_t v = samples[i];
++				uint32_t a = (uint32_t)(v < 0 ? -v : v);
++
++				squares += (uint64_t)((int64_t)v * v);
++				peak = a > peak ? a : peak;
++			}
++			frames += got;
++			ring_put(samples, got);
++			if (record_wanted && rec_va != 0) {
++				uint32_t n = got * 2 < rec_bytes - rec_at ? got * 2 : rec_bytes - rec_at;
++
++				memcpy((void *)(rec_va + rec_at), samples, n);
++				rec_at += n;
++				if (rec_at >= rec_bytes) {
++					__asm__ volatile ("dsb sy" ::: "memory");
++					SAY("recording done: %u s, %u bytes of S16LE mono 48 kHz at PA %#llx\n", record_secs, rec_bytes, rec_pa);
++					SAY("files read /dev/pmem 0x%llx %u\n", rec_pa, rec_bytes);
++					record_wanted = false;
++				}
++			}
++		}
++		(void)mic_read(next);
++		next = (next + 1) % MIC_PERIODS;
++		if (frames >= MIC_RATE) {
++			int d = dbfs10(squares, frames);
++
++			seconds++;
++			if (seconds <= 3 || seconds % 30 == 0) {
++				SAY("second %u: %u frames (%u empty periods), level %d.%d dBFS, peak %u; reads %u, errors %u\n", seconds, frames,
++				    empty, d / 10, (d < 0 ? -d : d) % 10, peak, reads_done, read_errors);
++			}
++			frames = peak = empty = 0;
++			squares = 0;
++		}
++	}
++}
++
++static void
++mic_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	while (!stopping) {
++		if (!ios_wants && !record_wanted) {
++			assert_wait_timeout((event_t)&mic_wake, THREAD_UNINT, 500, NSEC_PER_MSEC);
++			thread_block(THREAD_CONTINUE_NULL);
++			continue;
++		}
++		if (path_broken && !record_wanted) {
++			/* (given up until the reader closes and opens again) */
++			while (ios_wants && !stopping && !record_wanted) {
++				sleep_ms(100);
++			}
++			path_broken = false;
++			continue;
++		}
++		SAY("%s: the mic path comes up\n", record_wanted ? "recording" : "iOS opened /dev/redwood-mic");
++		if (!path_up()) {
++			SAY("THE MIC PATH DID NOT COME UP\n");
++			path_broken = true;
++			record_wanted = false;
++			continue;
++		}
++		listen();
++		path_down();
++		record_wanted = false;
++	}
++	running = false;
++	thread_terminate(current_thread());
++}
++
++int
++sweet_mic_cmd(uint32_t seconds)
++{
++	if (!running) {
++		SAY("mic: needs mic=1 (and adsp=1)\n");
++		return -1;
++	}
++	if (record_wanted) {
++		SAY("mic: a recording is running\n");
++		return -1;
++	}
++	seconds = seconds == 0 ? 3 : seconds > 10 ? 10 : seconds;
++	if (rec_va == 0) {
++		rec_bytes = 10 * MIC_RATE * 2;
++		if (sweet_gpu_pool_alloc(rec_bytes, &rec_pa) != 0 || rec_pa + rec_bytes > 0x100000000ull ||
++		    (rec_va = ml_io_map_unmappable(rec_pa, rec_bytes, VM_WIMG_WCOMB)) == 0) {
++			SAY("mic: no memory for the recording\n");
++			rec_va = 0;
++			return -1;
++		}
++	}
++	record_secs = seconds;
++	rec_bytes = seconds * MIC_RATE * 2;
++	rec_at = 0;
++	record_wanted = true;
++	thread_wakeup(&mic_wake);
++	SAY("mic: recording %u s into PA %#llx (%u bytes)\n", seconds, rec_pa, rec_bytes);
++	return 0;
++}
++
++void
++sweet_mic_status(void)
++{
++	SAY("status: %s, path %s%s, %llu ups; iOS %s; codec %s; reads %u (errors %u); ring %llu written, %llu read\n",
++	    running ? "mic=1" : "off", path_is_up ? "UP" : "down", path_broken ? " (broken)" : "", path_ups,
++	    ios_wants ? "reading" : "-", codec_found ? (codec_p ? "rt5514p" : "rt5514") : "not found", reads_done, read_errors,
++	    ring_written, ring_read);
++}
++
++void
++redwood_mic_dsp_up(void)
++{
++	uint32_t on = 0;
++	int major;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("mic", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	PE_parse_boot_argn("micgain", &mic_gain, sizeof(mic_gain));
++	mic_gain = mic_gain > 63 ? 63 : mic_gain;
++	major = cdevsw_add(-1, &mic_cdevsw);
++	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-mic") == NULL) {
++		SAY("/dev/redwood-mic cannot be made (%d)\n", major);
++		return;
++	}
++	running = true;
++	if (kernel_thread_start(mic_thread, NULL, &thread) != KERN_SUCCESS) {
++		running = false;
++		SAY("no thread\n");
++		return;
++	}
++	thread_deallocate(thread);
++	SAY("mic=1: /dev/redwood-mic ready (major %d); the path comes up while it is open; ADC1 gain %u\n", major, mic_gain);
++}
++
++void
++redwood_mic_dsp_down(void)
++{
++	if (!running) {
++		return;
++	}
++	stopping = true;
++	thread_wakeup(&mic_wake);
++	for (unsigned ms = 0; ms < 3000 && running; ms++) {
++		sleep_ms(1);
++	}
++	if (path_is_up) {
++		path_down();
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_sound.c b/bsd/dev/sweet_sound.c
+index b9f6598..5116bf7 100644
+--- a/bsd/dev/sweet_sound.c
++++ b/bsd/dev/sweet_sound.c
+@@ -54,7 +54,8 @@
+  * sndgpio=1 (sweet_cs35l41.c: let the kernel drive the amplifiers' PMIC reset lines).
+  * poke (bsd/dev/sweet_poke.c, letter a): `a status`, `a tone [MS]` (default 1000, at most 5000),
+  * `a gain DB` (the amplifiers DB dB under Android's level; sound=3 no louder than 20, sound=4 than 0), `a off` (the
+- * amplifiers off and kept off), `a on` (allowed again).
++ * amplifiers off and kept off), `a on` (allowed again), `a mic SECS` (0955, bsd/dev/sweet_mic.c: record SECS
++ * seconds from the microphone, mic=1, and print the `files read /dev/pmem PA LEN` that fetches it).
+  *
+  * Log lines: "SWEET SOUND: ...". What is started is stopped before the DSP is shut down
+  * (redwood_sound_dsp_down() from sweet_adsp.c's redwood_adsp_stop()).
+@@ -100,6 +101,9 @@ extern bool sweet_amp_healthy(void);
+ extern void sweet_amp_stop(void);
+ extern bool sweet_amp_ready(void);
+ extern void sweet_amp_status(void);
++/* bsd/dev/sweet_mic.c */
++extern int sweet_mic_cmd(uint32_t seconds);
++extern void sweet_mic_status(void);
+ 
+ static void
+ sleep_ms(uint32_t ms)
+@@ -1328,6 +1332,7 @@ sweet_sound_cmd(const char *s, const char *end)
+ 		if (level >= 3) {
+ 			sweet_amp_status();
+ 		}
++		sweet_mic_status();
+ 		return 0;
+ 	}
+ 	if (is(w, len, "tone")) {
+@@ -1360,12 +1365,15 @@ sweet_sound_cmd(const char *s, const char *end)
+ 		SAY("off: the amplifiers are stopped and kept off (`a on' allows them again)\n");
+ 		return 0;
+ 	}
++	if (is(w, len, "mic")) {
++		return sweet_mic_cmd(number(&s, end, 3));
++	}
+ 	if (is(w, len, "on")) {
+ 		amps_held_off = false;
+ 		SAY("on: the amplifiers may run again\n");
+ 		return 0;
+ 	}
+-	SAY("poke a: unknown command (status, tone [MS], gain DB, off, on)\n");
++	SAY("poke a: unknown command (status, tone [MS], gain DB, off, on, mic SECS)\n");
+ 	return -1;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.43.0
+

@@ -1,0 +1,390 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Tue, 27 Oct 2026 11:00:00 +0100
+Subject: [PATCH] 0989 redfin: direct scanout gate in the CP (p scanout gate 2), own-fence
+ flips, display off leaves direct mode
+
+p scanout gate 2 (boot-arg sweetscangate=2): the swapper's GPU submits after
+SwapEnd K return at once with a CP_WAIT_REG_MEM (WRITE_GE, memory) on a
+latched-frame word in the scratch page; the scanout thread writes the
+frame on screen at each latch. The word only goes up; every armed wait is
+released (word = newest reference) on a gate change, scanout off, leaving
+the direct geometry, or 50 ms without a latch, so the ring cannot stall.
+Gate 1 (CPU wait, default) cap 30 -> 50 ms. The flip now waits for the
+swapper's own last fence (per-pid), not the latest fence of any client.
+Display off (power key) leaves the direct geometry so the fade shows.
+r39's 'gate 0 deadlock' was a power-key press at 491.4 s (display off), 20 s
+before gate 0.
+---
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index f7242d2..f769fc1 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -1216,13 +1216,32 @@ uint32_t a6_fence_read(const struct a6_gpu *g)
+ 
+ uint32_t a6_submit_ibs_async(struct a6_gpu *g, const uint64_t *iova, const uint32_t *dwords, unsigned nib,
+ 			     unsigned timeout_ms)
++{
++	return a6_submit_ibs_async_wait(g, iova, dwords, nib, timeout_ms, 0, 0);
++}
++
++/*
++ * 0989: the same, with the CP first waiting until the word at GPU address wait_va is >= wait_ref (CP_WAIT_REG_MEM,
++ * memory poll, WRITE_GE; wait_va 0: no wait). Whoever arms it must make sure the word gets there (sweet_gpu_scan_word).
++ */
++uint32_t a6_submit_ibs_async_wait(struct a6_gpu *g, const uint64_t *iova, const uint32_t *dwords, unsigned nib,
++				  unsigned timeout_ms, uint64_t wait_va, uint32_t wait_ref)
+ {
+ 	uint64_t fva = a6_pool_va(A6_OFF_SCRATCH);
+ 	/* GPU time of this submit: CP_ALWAYS_ON_COUNTER before the IBs and once they are idle (a6_submit_time) */
+ 	uint64_t ts = a6_pool_va(A6_OFF_SCRATCH + A6_TS_OFF) + 16ull * ((g->fence + 1) % A6_TS_SLOTS);
+-	uint32_t dw[4 + 4 + 4 * A6_SUBMIT_MAX + 5 + 5 + 2], n = 0;	/* 0988: + the longer end stamp */
++	uint32_t dw[7 + 4 + 4 + 4 * A6_SUBMIT_MAX + 5 + 5 + 2], n = 0;	/* 0988: + the longer end stamp; 0989: + the wait */
+ 	if (nib == 0 || nib > A6_SUBMIT_MAX)
+ 		return 0;
++	if (wait_va != 0) {
++		dw[n++] = a6_pkt7(0x3c, 6);		/* CP_WAIT_REG_MEM */
++		dw[n++] = 5u | 1u << 4;			/* FUNCTION WRITE_GE, POLL memory */
++		dw[n++] = (uint32_t)wait_va;
++		dw[n++] = (uint32_t)(wait_va >> 32);
++		dw[n++] = wait_ref;
++		dw[n++] = 0xffffffffu;			/* MASK */
++		dw[n++] = 16;				/* DELAY_LOOP_CYCLES */
++	}
+ 	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 1);
+ 	dw[n++] = 0x18;				/* PC_CCU_INVALIDATE_DEPTH */
+ 	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 1);
+diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
+index d2be646..710ee3a 100644
+--- a/bsd/dev/sweet_a6xx.h
++++ b/bsd/dev/sweet_a6xx.h
+@@ -125,6 +125,9 @@ uint32_t a6_submit_ib_async(struct a6_gpu *g, uint64_t iova, uint32_t dwords, un
+  * returns the fence, or 0 when the ring has no room within timeout_ms (0 = look once).
+  */
+ #define A6_SUBMIT_MAX	16
++uint32_t a6_submit_ibs_async_wait(struct a6_gpu *g, const uint64_t *iova, const uint32_t *dwords, unsigned n,
++	unsigned timeout_ms, uint64_t wait_va, uint32_t wait_ref);	/* 0989 */
++#define A6_SCAN_WORD_OFF	0x3000ull	/* 0989: in the scratch page: the direct scanout's latched frame */
+ uint32_t a6_submit_ibs_async(struct a6_gpu *g, const uint64_t *iova, const uint32_t *dwords, unsigned n,
+ 			     unsigned timeout_ms);
+ /* Has the fence (from a6_submit_ib_async) landed? (wraparound-safe) */
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 2920e62..f754b2d 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1522,7 +1522,35 @@ sweet_gpu_unmap_at(uint64_t iova, uint64_t len)
+ 	lck_mtx_unlock(&sweet_gpu_lock);
+ }
+ 
+-void sweet_scan_submit_gate(void);     /* 0985: SweetFramebuffer.cpp */
++uint32_t sweet_scan_submit_gate(void);         /* 0985: SweetFramebuffer.cpp; 0989: a GPU-side wait's reference */
++
++/*
++ * 0989: the direct scanout's "latched frame" word (scratch + A6_SCAN_WORD_OFF), which gated submits make the CP wait
++ * for (p scanout gate 2); and each process's last fence (the swapper's frame is done at its own last submit, not at
++ * the latest of anyone's: r39's fence waits included other clients' work queued after it).
++ */
++void sweet_gpu_scan_word(uint32_t v);
++void
++sweet_gpu_scan_word(uint32_t v)
++{
++	if (gpu_ready) {
++		a6_write(a6_pool_pa(&gpu, A6_OFF_SCRATCH + A6_SCAN_WORD_OFF), &v, 4);
++	}
++}
++
++static struct { int pid; uint32_t fence; } pid_fence[8];
++uint32_t sweet_gpu_fence_of(int pid);
++uint32_t
++sweet_gpu_fence_of(int pid)
++{
++	for (unsigned i = 0; i < 8; i++) {
++		if (pid_fence[i].pid == pid) {
++			return pid_fence[i].fence;
++		}
++	}
++	return 0;
++}
++
+ /* Queue up to A6_SUBMIT_MAX IBs: the fence, 0 when the GPU is not usable, or 0 with *busy when the ring is full. */
+ uint32_t
+ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bool *busy)
+@@ -1536,11 +1564,28 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bo
+ 	static uint32_t ring_wait_ms;
+ 	if (!ring_wait_ms && !PE_parse_boot_argn("sweetringwait", &ring_wait_ms, sizeof(ring_wait_ms)))
+ 		ring_wait_ms = 2000;
+-	sweet_scan_submit_gate();       /* 0985: CA's next frame waits for its last one on screen (direct scanout) */
++	/* 0985: CA's next frame waits for its last one on screen (direct scanout): here (gate 1) or in the CP (0989, gate 2) */
++	uint32_t wait_ref = sweet_scan_submit_gate();
++	int pid = proc_selfpid();
+ 	lck_mtx_lock(&sweet_gpu_lock);
+ 	gpu_note_submit_locked();
+-	uint32_t fence = a6_submit_ibs_async(&gpu, iova, dwords, n, ring_wait_ms);
+-	gpu_owner_locked(fence, proc_selfpid());
++	uint32_t fence = a6_submit_ibs_async_wait(&gpu, iova, dwords, n, ring_wait_ms,
++	    wait_ref ? a6_pool_va(A6_OFF_SCRATCH + A6_SCAN_WORD_OFF) : 0, wait_ref);
++	gpu_owner_locked(fence, pid);
++	if (fence != 0) {
++		unsigned slot = 0;      /* 0989: this pid's entry, else the oldest */
++		for (unsigned i = 0; i < 8; i++) {
++			if (pid_fence[i].pid == pid) {
++				slot = i;
++				break;
++			}
++			if ((int32_t)(pid_fence[i].fence - pid_fence[slot].fence) < 0) {
++				slot = i;
++			}
++		}
++		pid_fence[slot].pid = pid;
++		pid_fence[slot].fence = fence;
++	}
+ 	lck_mtx_unlock(&sweet_gpu_lock);
+ 	*busy = fence == 0 && n > 0 && n <= A6_SUBMIT_MAX;
+ 	return fence;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f652eee..74ab102 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -55,6 +55,8 @@ void sweet_gpu_present_landed(uint64_t *sum_abs, uint64_t *n);
+ uint32_t sweet_mdp_rd(uint32_t off);    /* 0943: MDP registers, offset from 0x0ae00000 */
+ void sweet_mdp_wr(uint32_t off, uint32_t v);
+ void sweet_gpu_mdp_own(int on);         /* 0948: p mdp test/scale owns the pipes */
++void sweet_gpu_scan_word(uint32_t v);   /* 0989: the latched-frame word the CP waits on (gate 2) */
++uint32_t sweet_gpu_fence_of(int pid);   /* 0989: a process's last GPU fence */
+ int sweet_gpu_cpu_target(uint64_t *pa);         /* 0946 (sweetfbx & 8) */
+ void sweet_gpu_cpu_flip(void);
+ void sweet_gpu_present_tag(uint64_t swap_abs);
+@@ -1266,7 +1268,9 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	if (sweet_scan_live()) {
+ 		/* 0976: a frame on a scanout-slot surface goes to the display engine itself */
+ 		IOLockUnlock(fLock);
+-		if (sweet_scan_swap(this, rec, now, fence)) {
++		/* 0989: the swapper's own last submit (its frame), not the latest of any client's */
++		uint32_t own = sweet_gpu_fence_of(proc_selfpid());
++		if (sweet_scan_swap(this, rec, now, own != 0 && (int32_t)(fence - own) >= 0 ? own : fence)) {
+ 			return;
+ 		}
+ 		IOLockLock(fLock);
+@@ -2182,7 +2186,12 @@ AppleCLCD::mdpCmd(const char *s, const char *end)
+  */
+ static struct {
+ 	volatile bool on;               /* frames go direct (p scanout / boot-arg) */
+-	bool          noGate;           /* 0985: p scanout gate 0: back pressure in SwapEnd as 0979/0983 */
++	uint32_t      gate;             /* 0985: 1 = the swapper's GPU submits wait on the CPU; 0 = SwapEnd back pressure
++	                                 * (0979/0983); 0989: 2 = the CP waits (CP_WAIT_REG_MEM on the latched-frame word) */
++	uint32_t      word;             /* 0989: the latched-frame word as last written (monotonic) */
++	uint32_t      armedRef;         /* 0989: the highest reference a gated submit was given */
++	uint64_t      armedAbs;         /* ... when that was armed */
++	uint32_t      stGpuWait, stGpuRelease;
+ 	bool          corners;          /* 0986: p scanout corners 1: the corner mattes drawn into each frame */
+ 	uint64_t      stCornerAbs;
+ 	uint32_t      stCorners;
+@@ -2211,6 +2220,29 @@ static struct {
+ 	uint32_t      lastSwap, stWaitNewest;   /* 0983: the newest slot swap's id; SwapWaits on it (not waited) */
+ } sweet_scan;
+ 
++/*
++ * 0989: the latched-frame word (gate 2). Only goes up: the frame on screen, or, to release every wait armed so far
++ * (gate change, scanout off, leaving the direct geometry, a wait past 50 ms), the newest reference given out.
++ */
++static void
++sweet_scan_word_locked(uint32_t v)
++{
++	if ((int32_t)(v - sweet_scan.word) > 0) {
++		sweet_scan.word = v;
++		sweet_gpu_scan_word(v);
++	}
++}
++
++static void
++sweet_scan_release_locked(void)
++{
++	if ((int32_t)(sweet_scan.armedRef - sweet_scan.word) > 0) {
++		sweet_scan.stGpuRelease++;
++	}
++	sweet_scan_word_locked(sweet_scan.armedRef);
++	sweet_scan_word_locked((uint32_t)sweet_scan.shownSeq);
++}
++
+ static bool
+ sweet_scan_live(void)
+ {
+@@ -2296,6 +2328,7 @@ sweet_scan_leave(AppleCLCD *fb, const char *why)
+ 	bool was = sweet_scan.geom;
+ 	sweet_scan.geom = false;
+ 	sweet_scan_drop_all_locked();
++	sweet_scan_release_locked();    /* 0989: no CP wait outlives the direct geometry */
+ 	if (was) {
+ 		sweet_scan.stLeave++;
+ 	}
+@@ -2401,7 +2434,7 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+ 	 */
+ 	uint32_t depth = sweet_scan.depth;
+ 	uint64_t need = seq + 2 > depth ? seq + 2 - depth : 0;
+-	if (!sweet_scan.noGate) {
++	if (!(sweet_scan.gate == 0)) {
+ 		/*
+ 		 * 0985: double buffering without holding CA. SwapEnd K always came before K was on screen (its fence lands
+ 		 * ~5-12 ms later, the latch at the next frame start), so 0983's "SwapEnd K returns once K is on screen" waited
+@@ -2435,21 +2468,39 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+  * SwapEnd K waits until frame K is on screen (30 ms at most). K's own work is in the ring before its SwapEnd (0949),
+  * so this cannot hold up K's fence.
+  */
+-extern "C" void sweet_scan_submit_gate(void);
+-void
++extern "C" uint32_t sweet_scan_submit_gate(void);
++uint32_t
+ sweet_scan_submit_gate(void)
+ {
+ 	AppleCLCD *fb = sweet_fb_instance;
+-	if (!sweet_scan.on || !sweet_scan.geom || sweet_scan.noGate || fb == NULL || proc_selfpid() != sweet_scan.gatePid) {
+-		return;
++	if (!sweet_scan.on || !sweet_scan.geom || sweet_scan.gate == 0 || fb == NULL || proc_selfpid() != sweet_scan.gatePid) {
++		return 0;
+ 	}
+ 	IOLockLock(fb->fLock);
+ 	sweet_scan.stGate++;
++	if (sweet_scan.gate == 2 && sweet_scan.geom) {
++		/* 0989: the CP waits instead of this thread: until the word reaches gateSeq (released after 50 ms) */
++		uint32_t ref = (uint32_t)sweet_scan.gateSeq;
++		if ((int32_t)(ref - sweet_scan.word) > 0) {
++			if ((int32_t)(ref - sweet_scan.armedRef) > 0 || sweet_scan.armedAbs == 0) {
++				sweet_scan.armedAbs = mach_absolute_time();
++			}
++			if ((int32_t)(ref - sweet_scan.armedRef) > 0) {
++				sweet_scan.armedRef = ref;
++			}
++			sweet_scan.stGpuWait++;
++			IOLockWakeup(fb->fLock, &sweet_scan, false);    /* the scanout thread watches the armed wait */
++			IOLockUnlock(fb->fLock);
++			return ref != 0 ? ref : 1;
++		}
++		IOLockUnlock(fb->fLock);
++		return 0;
++	}
+ 	if (sweet_scan.shownSeq < sweet_scan.gateSeq && sweet_scan.geom) {
+ 		uint64_t dl, t0 = mach_absolute_time();
+-		clock_interval_to_deadline(30, kMillisecondScale, &dl);
++		clock_interval_to_deadline(50, kMillisecondScale, &dl);    /* 0989: 30 -> 50 ms */
+ 		sweet_scan.stGateWait++;
+-		while (sweet_scan.on && sweet_scan.geom && !sweet_scan.noGate && sweet_scan.shownSeq < sweet_scan.gateSeq) {
++		while (sweet_scan.on && sweet_scan.geom && sweet_scan.gate == 1 && sweet_scan.shownSeq < sweet_scan.gateSeq) {
+ 			if (IOLockSleepDeadline(fb->fLock, &sweet_scan.shownSeq, dl, THREAD_UNINT) == THREAD_TIMED_OUT) {
+ 				sweet_scan.stGateTimeout++;
+ 				break;
+@@ -2458,6 +2509,7 @@ sweet_scan_submit_gate(void)
+ 		sweet_scan.stGateAbs += mach_absolute_time() - t0;
+ 	}
+ 	IOLockUnlock(fb->fLock);
++	return 0;
+ }
+ 
+ /* SwapWait(id): until swap id (or a later one) is on screen, 50 ms at most. */
+@@ -2548,6 +2600,7 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
+ 		sweet_scan.shown = sweet_scan.flipping;
+ 		sweet_scan.flipping = NULL;
+ 		sweet_scan.shownSeq = sweet_scan.flipSeq;
++		sweet_scan_word_locked((uint32_t)sweet_scan.shownSeq);     /* 0989: the CP's wait goes on */
+ 		sweet_scan.shownSwap = sweet_scan.flipSwap;
+ 		uint64_t l = now - sweet_scan.flipSwapAbs;
+ 		sweet_scan.stLatched++;
+@@ -2620,6 +2673,7 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
+ 		sweet_scan_drop(&sweet_scan.shown);
+ 		sweet_scan.shown = s;
+ 		sweet_scan.shownSeq = sSeq;
++		sweet_scan_word_locked((uint32_t)sweet_scan.shownSeq);
+ 		sweet_scan.shownSwap = sSwap;
+ 		sweet_scan.stFlips++;
+ 		sweet_scan.stLatched++;
+@@ -2676,10 +2730,11 @@ sweet_scan_stats_locked(uint64_t now)
+ 		absolutetime_to_nanoseconds(sweet_scan.stGateAbs, &gw);
+ 		uint64_t cw = 0;    /* 0986 */
+ 		absolutetime_to_nanoseconds(sweet_scan.stCornerAbs, &cw);
+-		IOLog("SWEET SCANOUT: 5s gate: submits %u waited %u (avg %llu us) timeout %u%s | corners %u (avg %llu us)\n",
+-		    sweet_scan.stGate, sweet_scan.stGateWait, sweet_scan.stGateWait ? gw / 1000 / sweet_scan.stGateWait : 0,
+-		    sweet_scan.stGateTimeout, sweet_scan.noGate ? " (off: SwapEnd back pressure)" : "", sweet_scan.stCorners,
+-		    sweet_scan.stCorners ? cw / 1000 / sweet_scan.stCorners : 0);
++		IOLog("SWEET SCANOUT: 5s gate %u: submits %u waited %u (avg %llu us) timeout %u | cp waits %u released %u | "
++		    "corners %u (avg %llu us)\n", sweet_scan.gate, sweet_scan.stGate, sweet_scan.stGateWait,
++		    sweet_scan.stGateWait ? gw / 1000 / sweet_scan.stGateWait : 0, sweet_scan.stGateTimeout, sweet_scan.stGpuWait,
++		    sweet_scan.stGpuRelease, sweet_scan.stCorners, sweet_scan.stCorners ? cw / 1000 / sweet_scan.stCorners : 0);
++		sweet_scan.stGpuWait = sweet_scan.stGpuRelease = 0;
+ 		sweet_scan.stCornerAbs = 0;
+ 		sweet_scan.stCorners = 0;
+ 		sweet_scan.stGateAbs = 0;
+@@ -2703,7 +2758,18 @@ sweet_scan_thread(void *arg)
+ 		if (sweet_scan.on) {
+ 			sweet_scan_stats_locked(now);
+ 		}
+-		if (busy || sweet_scan.flipping != NULL) {
++		bool armed = (int32_t)(sweet_scan.armedRef - sweet_scan.word) > 0;
++		if (armed) {
++			/* 0989: a CP wait not released by a latch within 50 ms is released here (the ring must not stall) */
++			uint64_t ns;
++			absolutetime_to_nanoseconds(now - sweet_scan.armedAbs, &ns);
++			if (ns > 50 * NSEC_PER_MSEC || !sweet_scan.on || !sweet_scan.geom || sweet_scan.gate != 2) {
++				sweet_scan.stGateTimeout++;
++				sweet_scan_release_locked();
++				armed = false;
++			}
++		}
++		if (busy || sweet_scan.flipping != NULL || armed) {
+ 			uint64_t dl;
+ 			clock_interval_to_deadline(1, kMillisecondScale, &dl);
+ 			IOLockSleepDeadline(fb->fLock, &sweet_scan, dl, THREAD_UNINT);
+@@ -2724,6 +2790,9 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+ 		return;
+ 	}
+ 	if (on && !sweet_scan.thread) {
++		uint32_t g = 1;         /* 0989: boot-arg sweetscangate=0|1|2 (default 1, the CPU gate) */
++		PE_parse_boot_argn("sweetscangate", &g, sizeof(g));
++		sweet_scan.gate = g <= 2 ? g : 1;
+ 		sweet_scan.thread = IOCreateThread(sweet_scan_thread, fb) != NULL;
+ 		if (!sweet_scan.thread) {
+ 			IOLog("SWEET SCANOUT: no thread: stays off\n");
+@@ -2759,7 +2828,8 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+  *   p hz 60|90 [tc] the panel's rate now (DCS 0x53), ticks and SyncRate with it; tc: tear-check line clock too
+  *   p mdp ...       0948: display-engine dump and scanout tests (above)
+  *   p scanout 0|1   0976: the direct scanout off / on (needs boot-arg sweetscanout=1|2); no argument: the state
+- *   p scanout gate 0|1     0985: GPU-submit gate (default on) or SwapEnd back pressure
++ *   p scanout gate 0|1|2   0985: SwapEnd back pressure (0), the swapper's GPU submits wait (1, default), 0989: the
++ *                          CP waits for the latch (2; boot-arg sweetscangate)
+  *   p scanout corners 0|1  0986: corner mattes drawn into each direct frame (default off)
+  */
+ void
+@@ -2922,16 +2992,19 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+ 			IOLog("SWEET SCANOUT: corners %s (radius %u, %u rows)\n", sweet_scan.corners ? "on" : "off", fCornerRadius,
+ 			    fCornerExt);
+ 		} else if (end - q >= 4 && !strncmp(q, "gate", 4)) {
+-			/* 0985: p scanout gate 0|1 */
++			/* 0985: p scanout gate 0|1; 0989: 2 */
+ 			const char *v = q + 4;
+ 			while (v < end && *v == ' ') {
+ 				v++;
+ 			}
+ 			IOLockLock(fLock);
+-			sweet_scan.noGate = v < end && *v == '0';
++			sweet_scan.gate = v < end && *v >= '0' && *v <= '2' ? (uint32_t)(*v - '0') : 1;
++			sweet_scan_release_locked();    /* 0989: nothing armed survives a change */
+ 			IOLockWakeup(fLock, &sweet_scan.shownSeq, false);
++			IOLockWakeup(fLock, &sweet_scan, false);
+ 			IOLockUnlock(fLock);
+-			IOLog("SWEET SCANOUT: gate %s\n", sweet_scan.noGate ? "off (SwapEnd back pressure)" : "on (GPU submits wait)");
++			IOLog("SWEET SCANOUT: gate %u (%s)\n", sweet_scan.gate, sweet_scan.gate == 0 ? "SwapEnd back pressure" :
++			    sweet_scan.gate == 1 ? "GPU submits wait on the CPU" : "the CP waits for the latch");
+ 		} else if (q < end && (*q == '0' || *q == '1')) {
+ 			sweet_scan_set(this, *q == '1', "p scanout");
+ 		} else {
+@@ -3739,6 +3812,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
++			if (off && sweet_scan_live()) {
++				sweet_scan_leave(fFB, "display off");  /* 0989: the fade goes through the panel buffer */
++			}
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
+-- 
+2.43.0
+

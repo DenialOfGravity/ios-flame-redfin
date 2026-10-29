@@ -2,7 +2,7 @@ name: userland
 
 # iOS 16 arm64 userland for SSH into the phone: dropbear (root-only, pubkey
 # only) and dash. Built with the runner's Xcode iOS SDK, ad hoc signed.
-# Also wland (phone/wifi, sunfish constants) and phone/tools. Install with
+# Also wland (phone/wifi, sunfish constants), fastrpcd (phone/fastrpc, GPL-3.0+) and phone/tools. Install with
 # tools/sunfish-install-ssh.sh over the kernel file server.
 
 on:
@@ -91,11 +91,18 @@ jobs:
           cd repo
           sh phone/wifi/build.sh
           cp phone/wifi/out/wland ../out/
+          sh phone/sensors/test.sh > ../out/sensd-test.log 2>&1 || { echo "::warning::sensd host tests failed"; tail -20 ../out/sensd-test.log; }
+          sh phone/sensors/build.sh && cp phone/sensors/out/sensd ../out/ || echo "::warning::sensd failed"
+          sh phone/bt/build.sh && cp phone/bt/out/btd phone/bt/out/bluetool phone/bt/out/tlv_test.log ../out/
+          sh phone/fastrpc/test.sh > ../out/fastrpcd-test.log 2>&1 || { echo "::warning::fastrpcd host tests failed"; tail -20 ../out/fastrpcd-test.log; }
+          sh phone/fastrpc/build.sh
+          cp phone/fastrpc/out/fastrpcd phone/fastrpc/org.iosonpixel.fastrpcd.plist ../out/
           bash phone/tools/build.sh || echo "::warning::some phone tools failed"
           sh phone/haptics/build.sh && cp phone/haptics/out/SweetHaptics.dylib ../out/ || echo "::warning::SweetHaptics.dylib failed"
+          sh phone/fps/build.sh && cp phone/fps/out/SweetFPS.dylib ../out/ || echo "::warning::SweetFPS.dylib failed"
           # (the build's output goes out with the files: the run's own logs cannot be fetched from Claude's container)
-          sh phone/audio/build.sh > ../out/audio-build.log 2>&1 && cp -R phone/audio/out/RedwoodAudio.driver phone/audio/out/sound_test phone/audio/out/camera_test phone/audio/out/camera_avtest phone/audio/out/mg_test phone/audio/out/vt_test ../out/ || { echo "::warning::RedwoodAudio.driver failed"; tail -40 ../out/audio-build.log; }
-          for t in psx pstack netsvc nettest oslog prefs openapp lsreg memwarn pmem a2s imgdump; do
+          sh phone/audio/build.sh > ../out/audio-build.log 2>&1 && cp -R phone/audio/out/RedwoodAudio.driver phone/audio/out/sound_test phone/audio/out/camera_test phone/audio/out/camera_avtest phone/audio/out/mg_test phone/audio/out/vt_test phone/audio/out/mic_test ../out/ || { echo "::warning::RedwoodAudio.driver failed"; tail -40 ../out/audio-build.log; }
+          for t in psx pstack netsvc nettest oslog prefs openapp lsreg memwarn pmem a2s imgdump autolock; do
             [ -f phone/tools/out/$t ] && cp phone/tools/out/$t ../out/ || true
           done
 
@@ -133,3 +140,5 @@ jobs:
           git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com \
             commit -qm "iOS userland from $GITHUB_REF_NAME ${GITHUB_SHA::12} (run $GITHUB_RUN_ID)"
           git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-userland
+          # Also to builds-userland-<ref>: workstream branches building at the same time must not clobber each other
+          git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-userland:builds-userland-"$GITHUB_REF_NAME"

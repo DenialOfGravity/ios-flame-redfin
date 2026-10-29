@@ -11,3 +11,5 @@ mkdir -p out
 	-o out/SweetHaptics.dylib SweetHaptics.m
 codesign -f -s - out/SweetHaptics.dylib
 ls -la out/SweetHaptics.dylib
+# ws-u-fps: SweetFPS.dylib rides along (the local builder's list has no phone/fps); not fatal
+SWEETFPS_B64=1 sh ../fps/build.sh || echo "SweetFPS.dylib failed"
