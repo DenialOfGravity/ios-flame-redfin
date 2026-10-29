@@ -39,6 +39,7 @@ size_t nmb_device_name(const NmbDevice *, char *out, size_t size);
 uint64_t nmb_device_max_buffer_length(const NmbDevice *);
 // Pipeline makings (count, total us, longest us, waited us, failed), sink messages (info, warning+), shader cache hits/misses/writes.
 bool nmb_device_work_stats(const NmbDevice *, uint64_t out[10]);
+bool nmb_device_sched_counts(const NmbDevice *, uint64_t out[9]);   /* u-t: scheduler WorkCounts (NativeMetalObjects.rs) */
 /* Artifact lookups and driver pipeline records are separate cache layers. */
 struct NmbShaderCacheStats {
     uint64_t hits, misses, rejected, read_failures, writes, write_failures, evictions;
@@ -97,6 +98,19 @@ struct NmbTextureExtras {uint64_t rotation, framebuffer_only;};
 NmbTexture *nmb_texture_new_on_surface_rotated(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row,
                                                bool planar, const struct NmbTextureExtras *extras);
 void nmb_texture_extras(const NmbTexture *, struct NmbTextureExtras *out);
+/* The surface seed + 1 a two-plane YCbCr texture's planes hold now: converted again only when it changes. False for other textures. */
+bool nmb_texture_set_converted_generation(const NmbTexture *, uint64_t generation);
+/* SweetMetal2 (patch 0107, SWEET_SHADOW_SEED=1): the surface seed + 1 (0 = changed another way) a shadowed surface texture is bound at. */
+bool nmb_texture_set_bytes_generation(const NmbTexture *, uint64_t generation);
+/* SweetMetal2: shadow copy counts since start (patch 0104): copies, texel bytes, repacked, YCbCr copies skipped, layouts refused. */
+bool nmb_sweet_shadow_counts(uint64_t out[5]);
+/* SweetMetal2: render encoder step times (patch 0106, env SWEET_DRAWSTAT=1): (ns, count) pairs since start into out[2*capacity];
+   returns the steps written. nmb_sweet_drawstat_name: step index's name (static), or NULL. */
+bool nmb_sweet_drawstat_on(void);
+/* u-combo: bridge 0111's SWEET_M2V_SCRATCH from the next pass on (0 off, 1 on, -1 the env's): the live knobs */
+void nmb_sweet_scratch_live(int32_t value);
+size_t nmb_sweet_drawstat(uint64_t *out, size_t capacity);
+const char *nmb_sweet_drawstat_name(size_t index);
 NmbTexture *nmb_texture_new_linear(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, uint64_t bytes_per_image);
 /* whole: a view of every level and slice as format; else levels and slices are {start, count} and kind the view's texture type. */
 NmbTexture *nmb_texture_new_view(NmbTexture *, uint64_t format, uint64_t kind, const uint64_t levels[2], const uint64_t slices[2], bool whole);
@@ -197,6 +211,7 @@ size_t nmb_command_buffer_error(const NmbCommandBuffer *, char *out, size_t size
 double nmb_command_buffer_gpu_time(const NmbCommandBuffer *, bool end);
 void nmb_rotated_copy_stats(uint64_t out[5]);
 void nmb_rotated_planes_written(void);
+double nmb_command_buffer_kernel_time(const NmbCommandBuffer *, bool end);   /* u-t: scheduler submit begin/end, host clock s */
 
 /* Events: an MTLEvent (shared false) or an MTLSharedEvent within this process. */
 NmbEvent *nmb_event_new(NmbDevice *, bool shared);
