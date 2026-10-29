@@ -1,5 +1,7 @@
 # sweetmon: live monitor and one-button traces for redfin
 
+Full guide: docs/redfin/sweetmon-guide.md
+
 What runs where (design and wire protocol: `docs/redfin/sweetmon.md` on branch ws-z-mon):
 
 | Piece | Where | What it does |

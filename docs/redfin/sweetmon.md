@@ -1,5 +1,7 @@
 # sweetmon: live CPU/GPU/thermal monitoring and one-button traces (branch ws-z-mon, 2026-10-29)
 
+Full guide (how to use it, recipes, files, limits): docs/redfin/sweetmon-guide.md
+
 Goal: see what makes the phone slow and hot, live, on the PC, with as little extra load on the phone as possible;
 start/stop traces from a dashboard button or from Claude (phone agent); no more slow klog/trace pulls.
 
