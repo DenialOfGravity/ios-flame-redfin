@@ -168,7 +168,8 @@ r=$(post /api/speed '{"mb":32}' 120)
 # slow link (usb paced at 4 MB/s): 24 MiB takes ~6 s while the collector keeps pinging and a cmd is sent in between
 post /api/cmd '{"cmd":"ping warm"}' >/dev/null
 ( sleep 1; post /api/cmd '{"cmd":"ping during-speed"}' > "$W/ping-during.json" ) &
-r=$(post /api/speed '{"mb":24}' 120); wait
+PD=$!
+r=$(post /api/speed '{"mb":24}' 120); wait $PD
 [ "$(echo "$r" | j 'd["ok"] and d["bytes"]==24*1048576 and d["pc_s"]>4')" = True ] \
 	&& [ "$(j 'd["ok"] and d["msg"]=="during-speed"' < "$W/ping-during.json")" = True ] \
 	&& ! grep -q 'unsolicited reply' "$W/logs/mon/collector.log" \
