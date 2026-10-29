@@ -331,6 +331,13 @@ static std::string gPrewarmDir;
 static std::mutex gPrewarmLock;
 static std::unordered_map<std::string,bool> gPrewarmSeen;   // recorded lines (the file's and this process's)
 static std::atomic<bool> gPrewarmRunning{false};
+static std::unordered_map<std::string,bool> gPrewarmUsed;   // mode 2: records CA made this process (under gPrewarmLock)
+// G6: 2 = idle priming (SWEET_PREWARM=2), 1 = the prewarm at device creation (default; 0 turns both off through prewarmOn).
+static int prewarmMode() {
+ static int mode=-1;
+ if(mode<0){const char *e=getenv("SWEET_PREWARM");mode=e && atoi(e)==2?2:1;}
+ return mode;
+}
 static bool prewarmOn() {
  static int on=-1;
  if(on<0){const char *e=getenv("SWEET_PREWARM"),*p=getprogname();
@@ -489,15 +496,9 @@ static void prewarmRun(std::vector<std::string> lines) {
 // for backboardd's work too (its own count where the page is missing). Each record CA itself makes this boot is marked used; mode 2
 // primes only the recorded pipelines not used this boot (CA's own makings already did the rest). SWEET_PREWARM_MAX bounds the makings, SWEET_PREWARM_MS the
 // making time (pauses not counted). "native-metal: PR prime: done/total, paused N, ms" when done.
-static std::unordered_map<std::string,bool> gPrewarmUsed;   // mode 2: records CA made this process (under gPrewarmLock)
 struct PrimeBusyPage {uint32_t magic,version;std::atomic<uint64_t> commits;};
 static const uint32_t kPrimeBusyMagic=0x53505242;   // 'SPRB'
 static PrimeBusyPage *gPrimeBusyOut;                // backboardd, mode 2: its commits, published
-static int prewarmMode() {
- static int mode=-1;
- if(mode<0){const char *e=getenv("SWEET_PREWARM");mode=e && atoi(e)==2?2:1;}
- return mode;
-}
 // backboardd's commit count (gCommits: submitted command buffers), published at each completion (a few ms late, no hunk in commit).
 static inline void primeNoteCommit() {if(PrimeBusyPage *p=gPrimeBusyOut)p->commits.store(gCommits.load(std::memory_order_relaxed),std::memory_order_relaxed);}
 static PrimeBusyPage *primeBusyMap(bool write) {
