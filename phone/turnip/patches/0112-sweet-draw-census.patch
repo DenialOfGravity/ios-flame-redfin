@@ -1,0 +1,664 @@
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index e76f169..3cb7362 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -8,6 +8,8 @@
+  */
+ 
+ #include "tu_cmd_buffer.h"
++#include <sys/stat.h>
++#include <unistd.h>
+ 
+ #include "vk_common_entrypoints.h"
+ #include "vk_log.h"
+@@ -592,6 +594,50 @@ tu_emit_cache_flush_renderpass(struct tu_cmd_buffer *cmd_buffer)
+    struct tu_cs *cs = &cmd_buffer->draw_cs;
+    struct tu_cache_state *cache = &cmd_buffer->state.renderpass_cache;
+ 
++   /* sweet 0112: count the cache events this flush puts into the pass (SEQ line), and SWEET_TU_RPFLUSH_GMEM=1|2:
++    * in GMEM (CP_COND_EXEC on the render mode) a flush inside a render pass emits no CCU/UCHE events, only the
++    * WFI (1) or nothing but the bindless invalidate (2); sysmem keeps them all. Turnip records a pass before it
++    * knows its mode, so upstream always emits the sysmem flushes. */
++   {
++      const BITMASK_ENUM(tu_cmd_flush_bits) f = cache->flush_bits;
++      struct tu_render_pass_state *rp = &cmd_buffer->state.rp;
++      if (f & TU_CMD_FLAG_WAIT_FOR_IDLE)
++         rp->sweet_wfi++;
++      if (f & (TU_CMD_FLAG_CCU_CLEAN_COLOR | TU_CMD_FLAG_CCU_CLEAN_DEPTH | TU_CMD_FLAG_CCU_INVALIDATE_COLOR |
++               TU_CMD_FLAG_CCU_INVALIDATE_DEPTH))
++         rp->sweet_ccu_clean++;
++      if (f & (TU_CMD_FLAG_CCU_INVALIDATE_COLOR | TU_CMD_FLAG_CCU_INVALIDATE_DEPTH))
++         rp->sweet_ccu_inv++;
++      if (f & TU_CMD_FLAG_CACHE_CLEAN)
++         rp->sweet_cache_clean++;
++      if (f & TU_CMD_FLAG_CACHE_INVALIDATE)
++         rp->sweet_cache_inv++;
++      static const unsigned sweet_rpflush_gmem = debug_get_num_option("SWEET_TU_RPFLUSH_GMEM", 0);
++      const BITMASK_ENUM(tu_cmd_flush_bits) heavy =
++         TU_CMD_FLAG_CCU_CLEAN_COLOR | TU_CMD_FLAG_CCU_CLEAN_DEPTH | TU_CMD_FLAG_CCU_INVALIDATE_COLOR |
++         TU_CMD_FLAG_CCU_INVALIDATE_DEPTH | TU_CMD_FLAG_CACHE_CLEAN | TU_CMD_FLAG_CACHE_INVALIDATE |
++         TU_CMD_FLAG_WAIT_FOR_IDLE | TU_CMD_FLAG_WAIT_MEM_WRITES;
++      if (sweet_rpflush_gmem && (f & heavy) && !TU_DEBUG(FLUSHALL) && !TU_DEBUG(SYNCDRAW)) {
++         struct tu_cache_state sys = *cache;
++         tu_cond_exec_start(cs, CP_COND_EXEC_0_RENDER_MODE_SYSMEM);
++         tu6_emit_flushes<CHIP>(cmd_buffer, cs, &sys);
++         tu_cond_exec_end(cs);
++         struct tu_cache_state gm = *cache;
++         gm.flush_bits = f & ~heavy;
++         if (sweet_rpflush_gmem == 1 && (f & heavy))
++            gm.flush_bits |= TU_CMD_FLAG_WAIT_FOR_IDLE;
++         if (gm.flush_bits) {
++            tu_cond_exec_start(cs, CP_COND_EXEC_0_RENDER_MODE_GMEM);
++            tu6_emit_flushes<CHIP>(cmd_buffer, cs, &gm);
++            tu_cond_exec_end(cs);
++         }
++         cache->flush_bits = 0;
++         if (f & TU_CMD_FLAG_BLIT_CACHE_CLEAN)
++            cmd_buffer->state.blit_cache_cleaned = true;
++         return;
++      }
++   }
++
+    tu6_emit_flushes<CHIP>(cmd_buffer, cs, cache);
+    if (cmd_buffer->state.renderpass_cache.flush_bits &
+        TU_CMD_FLAG_BLIT_CACHE_CLEAN) {
+@@ -3920,6 +3966,8 @@ struct sweet_pt_meta {
+    uint32_t draws, cb;
+    uint16_t tile_w, tile_h;
+    uint8_t bins_x, bins_y, binning, fetch, pipes, pipe_tiles;
++   /* sweet 0112: the census (tu_render_pass_state's sweet_* counters) */
++   uint16_t c_fetch, c_gorder, c_sorder, c_pipe, c_sets, c_bar, c_wfi, c_ccu, c_ccuinv, c_cclean, c_cinv;
+ };
+ /* per slot in the BO (u64s): [0] begin, [1] after the binning pass (GMEM), [2] end, [3] unused,
+  * [4..19] VSC_CHANNEL_VISIBILITY(0..31) as the binning pass left them */
+@@ -4018,6 +4066,22 @@ sweet_pt_open(struct tu_cmd_buffer *cmd, bool gmem)
+       m.draws = cmd->state.rp.drawcall_count;
+       m.fetch = cmd->state.rp.sysmem_single_prim_mode;
+       m.cb = sweet_pt_cb_serial(cmd);
++      {
++         const struct tu_render_pass_state *rp = &cmd->state.rp;
++#define SWEET_C16(x) ((uint16_t) MIN2((x), 0xffffu))
++         m.c_fetch = SWEET_C16(rp->sweet_fetch_draws);
++         m.c_gorder = SWEET_C16(rp->sweet_gorder_draws);
++         m.c_sorder = SWEET_C16(rp->sweet_sorder_draws);
++         m.c_pipe = SWEET_C16(rp->sweet_pipe_binds);
++         m.c_sets = SWEET_C16(rp->sweet_set_binds);
++         m.c_bar = SWEET_C16(rp->sweet_barriers);
++         m.c_wfi = SWEET_C16(rp->sweet_wfi);
++         m.c_ccu = SWEET_C16(rp->sweet_ccu_clean);
++         m.c_ccuinv = SWEET_C16(rp->sweet_ccu_inv);
++         m.c_cclean = SWEET_C16(rp->sweet_cache_clean);
++         m.c_cinv = SWEET_C16(rp->sweet_cache_inv);
++#undef SWEET_C16
++      }
+       if (cmd->state.tiling && cmd->state.tiling->possible) {
+          const struct tu_vsc_config *vsc = tu_vsc_config(cmd, cmd->state.tiling);
+          m.tile_w = (uint16_t) cmd->state.tiling->tile0.width;
+@@ -4077,6 +4141,335 @@ sweet_pt_stamp(struct tu_cmd_buffer *cmd, int slot, unsigned end)
+    }
+ }
+ 
++/* sweet 0112 (u-gpudraw): the draw census. The fragment shaders the passes' draws use (by tu_shader, at most 128),
++ * their ir3 stats and draws, and with SWEET_TU_DRAWTS=1 each draw's GPU time: an RB_DONE_TS after every draw inside
++ * a render pass, into a ring of 16384 stamps, the time from the draw before it in its recording charged to its
++ * fragment shader. In GMEM a pass's draw_cs runs once per bin and a slot keeps the last bin's stamp, so the times
++ * mean what they say in sysmem (TU_DEBUG=sysmem). Only with SWEET_TIMELINE on, in the device the timeline uses. */
++#define SWEET_FS_N 128u
++#define SWEET_DS_SLOTS 16384u
++struct sweet_fs_ent {
++   const struct tu_shader *fs;
++   uint32_t id, draws, timed;
++   uint64_t ticks, px_all, px_timed;   /* px: each draw's scissor/viewport/render area, summed */
++   uint16_t instrs, sizedw, max_reg, max_half, constlen, tex, ss, sy, sstall, pvt;
++   uint8_t waves, dbl, fetch, gorder, sorder, noearlyz, kill;
++};
++static struct sweet_fs_ent sweet_fs_tab[SWEET_FS_N];
++static uint32_t sweet_fs_n, sweet_fs_ids, sweet_fs_last;
++static uint32_t sweet_cb_serials;
++struct sweet_ds_meta {
++   uint32_t gen, serial, idx, fs, px;
++};
++/* sweet 0112: the passes the last pass report counted (begin, end), for the draw report's time split */
++static struct sweet_pt_win { uint64_t b, e; } sweet_pt_win[SWEET_PT_SLOTS];
++static uint32_t sweet_pt_nwin;
++static struct sweet_ds_meta sweet_ds_meta[SWEET_DS_SLOTS];
++static struct tu_bo *sweet_ds_bo;
++static volatile uint64_t *sweet_ds_ts;
++static uint32_t sweet_ds_next, sweet_ds_gen;
++static int sweet_ds_state = -1;   /* -1 unknown, 0 off, 1 on */
++extern "C" {
++/* tu_descriptor_set.cc: sampled image descriptors written, by layout: linear, tiled, UBWC */
++extern uint64_t sweet_tex_writes[3];
++}
++
++static void
++sweet_draw_census(struct tu_cmd_buffer *cmd)
++{
++   if (sweet_pt_state != 1 || !cmd->state.pass)
++      return;
++   struct tu_render_pass_state *rp = &cmd->state.rp;
++   const struct tu_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
++   if (fs && fs->fs.sweet_reads_input_attachments)
++      rp->sweet_fetch_draws++;
++   if (cmd->state.sweet_gmem_flush)
++      rp->sweet_gorder_draws++;
++   if (cmd->state.pipeline_sysmem_single_prim_mode)
++      rp->sweet_sorder_draws++;
++   cmd->sweet_fs_id = 0;
++   {
++      /* the draw's bound: scissor 0 within viewport 0 within the render area */
++      const struct vk_viewport_state *vp = &cmd->vk.dynamic_graphics_state.vp;
++      const VkRect2D *sc = &vp->scissors[0];
++      const VkViewport *v = &vp->viewports[0];
++      const VkRect2D *ra = &cmd->state.render_areas[0];
++      int64_t x0 = MAX2((int64_t) sc->offset.x, (int64_t) MIN2(v->x, v->x + v->width));
++      int64_t y0 = MAX2((int64_t) sc->offset.y, (int64_t) MIN2(v->y, v->y + v->height));
++      int64_t x1 = MIN2((int64_t) sc->offset.x + sc->extent.width, (int64_t) MAX2(v->x, v->x + v->width));
++      int64_t y1 = MIN2((int64_t) sc->offset.y + sc->extent.height, (int64_t) MAX2(v->y, v->y + v->height));
++      if (ra->extent.width && ra->extent.height) {   /* a secondary has none: scissor in viewport alone */
++         x0 = MAX2(x0, (int64_t) ra->offset.x);
++         y0 = MAX2(y0, (int64_t) ra->offset.y);
++         x1 = MIN2(x1, (int64_t) ra->offset.x + ra->extent.width);
++         y1 = MIN2(y1, (int64_t) ra->offset.y + ra->extent.height);
++      }
++      cmd->sweet_px = (x1 > x0 && y1 > y0) ? (uint32_t) ((x1 - x0) * (y1 - y0)) : 0;
++   }
++   if (!fs || cmd->device != sweet_pt_dev)
++      return;
++   pthread_mutex_lock(&sweet_pt_lock);
++   unsigned i = sweet_fs_last;
++   if (i >= sweet_fs_n || sweet_fs_tab[i].fs != fs) {
++      for (i = 0; i < sweet_fs_n && sweet_fs_tab[i].fs != fs; i++)
++         ;
++      if (i == sweet_fs_n) {
++         if (sweet_fs_n == SWEET_FS_N) {
++            i = 0;   /* full: the entry of fewest draws goes */
++            for (unsigned k = 1; k < SWEET_FS_N; k++)
++               if (sweet_fs_tab[k].draws < sweet_fs_tab[i].draws)
++                  i = k;
++         } else {
++            i = sweet_fs_n++;
++         }
++         struct sweet_fs_ent e = {};
++         e.fs = fs;
++         e.id = ++sweet_fs_ids;
++         const struct ir3_shader_variant *v = fs->variant;
++         if (v) {
++            e.instrs = (uint16_t) v->info.instrs_count;
++            e.sizedw = (uint16_t) v->info.sizedwords;
++            e.max_reg = (uint16_t) (v->info.max_reg + 1);
++            e.max_half = (uint16_t) (v->info.max_half_reg + 1);
++            e.constlen = (uint16_t) v->constlen;
++            e.tex = (uint16_t) v->info.instrs_per_cat[5];
++            e.ss = (uint16_t) v->info.ss;
++            e.sy = (uint16_t) v->info.sy;
++            e.sstall = (uint16_t) v->info.sstall;
++            e.pvt = (uint16_t) MIN2(v->pvtmem_size, 0xffffu);
++            e.waves = (uint8_t) v->info.max_waves;
++            e.dbl = v->info.double_threadsize;
++            e.noearlyz = v->no_earlyz;
++            e.kill = v->has_kill;
++         }
++         e.fetch = fs->fs.sweet_reads_input_attachments;
++         sweet_fs_tab[i] = e;
++         /* SWEET_TU_FS_DUMP=N: the ir3 disassembly of each new fragment shader of at least N instructions (1: all),
++          * with its pipeline's vertex shader, into /var/local/tmp/sweet-fs/<pid>-<id>.txt */
++         static const unsigned sweet_fs_dump = debug_get_num_option("SWEET_TU_FS_DUMP", 0);
++         if (sweet_fs_dump && v && v->bin && e.instrs >= sweet_fs_dump) {
++            char path[128];
++            mkdir("/var/local/tmp/sweet-fs", 0755);
++            snprintf(path, sizeof(path), "/var/local/tmp/sweet-fs/%d-%u.txt", (int) getpid(), e.id);
++            FILE *f = fopen(path, "w");
++            if (f) {
++               fprintf(f, "fs #%u: i%u r%u/%u w%u%s c%u t%u fetch %u blake3 %s\n", e.id, e.instrs, e.max_reg, e.max_half,
++                       e.waves, e.dbl ? "x2" : "", e.constlen, e.tex, e.fetch, v->blake3_str);
++               ir3_shader_disasm((struct ir3_shader_variant *) v, v->bin, f);
++               const struct tu_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
++               if (vs && vs->variant && vs->variant->bin) {
++                  fprintf(f, "\n---- vertex shader (blake3 %s)\n", vs->variant->blake3_str);
++                  ir3_shader_disasm((struct ir3_shader_variant *) vs->variant, vs->variant->bin, f);
++               }
++               fclose(f);
++            }
++         }
++      }
++      sweet_fs_last = i;
++   }
++   struct sweet_fs_ent *e = &sweet_fs_tab[i];
++   e->draws++;
++   e->px_all += cmd->sweet_px;
++   e->gorder |= cmd->state.sweet_gmem_flush;
++   e->sorder |= cmd->state.pipeline_sysmem_single_prim_mode;
++   cmd->sweet_fs_id = e->id;
++   pthread_mutex_unlock(&sweet_pt_lock);
++}
++
++template <chip CHIP>
++static void
++sweet_ds_after_draw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
++{
++   if (sweet_ds_state == 0 || sweet_pt_state != 1 || !cmd->state.pass || cmd->device != sweet_pt_dev)
++      return;
++   pthread_mutex_lock(&sweet_pt_lock);
++   if (sweet_ds_state < 0) {
++      const char *e = getenv("SWEET_TU_DRAWTS");
++      sweet_ds_state = e && *e && strcmp(e, "0") ? 1 : 0;
++      if (sweet_ds_state) {
++         struct tu_bo *bo = NULL;
++         if (tu_bo_init_new(cmd->device, NULL, &bo, SWEET_DS_SLOTS * 8, TU_BO_ALLOC_NO_FLAGS, "sweet draw stamps") ==
++                VK_SUCCESS &&
++             tu_bo_map(cmd->device, bo, NULL) == VK_SUCCESS && bo->map) {
++            memset(bo->map, 0, SWEET_DS_SLOTS * 8);
++            sweet_ds_ts = (volatile uint64_t *) bo->map;
++            sweet_ds_bo = bo;
++         } else {
++            mesa_logw("sweet: draw stamps off (no buffer)");
++            sweet_ds_state = 0;
++         }
++      }
++   }
++   if (sweet_ds_state != 1) {
++      pthread_mutex_unlock(&sweet_pt_lock);
++      return;
++   }
++   const uint32_t slot = sweet_ds_next++ % SWEET_DS_SLOTS;
++   sweet_ds_ts[slot] = 0;
++   sweet_ds_gen = sweet_ds_gen + 1 ? sweet_ds_gen + 1 : 1;
++   sweet_ds_meta[slot] = (struct sweet_ds_meta) { sweet_ds_gen, cmd->sweet_serial, cmd->state.rp.drawcall_count,
++                                                  cmd->sweet_fs_id, cmd->sweet_px };
++   pthread_mutex_unlock(&sweet_pt_lock);
++   const uint64_t iova = sweet_ds_bo->iova + (uint64_t) slot * 8;
++   if (CHIP == A6XX) {
++      tu_cs_emit_pkt7(cs, CP_EVENT_WRITE, 4);
++      tu_cs_emit(cs, CP_EVENT_WRITE_0_EVENT(RB_DONE_TS) | CP_EVENT_WRITE_0_TIMESTAMP);
++      tu_cs_emit_qw(cs, iova);
++      tu_cs_emit(cs, 0x00000000);
++   } else {
++      tu_cs_emit_pkt7(cs, CP_EVENT_WRITE7, 3);
++      tu_cs_emit(cs, CP_EVENT_WRITE7_0(.event = RB_DONE_TS, .write_src = EV_WRITE_ALWAYSON,
++                                       .write_dst = EV_DST_RAM, .write_enabled = true).value);
++      tu_cs_emit_qw(cs, iova);
++   }
++}
++
++/* with sweet_pt_lock held: the GPU time of the passes the last pass report counted, split by the draw stamps in
++ * GPU order: from the pass's begin to its first stamped draw ("first"), from each stamped draw to the next (charged to
++ * the later draw's fragment shader), from the last to the pass's end ("tail"); passes without stamps ("bare") */
++struct sweet_ds_ev { uint64_t t; uint32_t fs, px; };
++static struct sweet_ds_ev sweet_ds_evs[SWEET_DS_SLOTS];
++static uint64_t sweet_split[5];   /* first, draws, tail, bare, all (ticks) */
++static uint32_t sweet_split_passes;
++static int
++sweet_ds_ev_cmp(const void *a, const void *b)
++{
++   const uint64_t x = ((const struct sweet_ds_ev *) a)->t, y = ((const struct sweet_ds_ev *) b)->t;
++   return x < y ? -1 : x > y;
++}
++static int
++sweet_pt_win_cmp(const void *a, const void *b)
++{
++   const uint64_t x = ((const struct sweet_pt_win *) a)->b, y = ((const struct sweet_pt_win *) b)->b;
++   return x < y ? -1 : x > y;
++}
++static void
++sweet_fs_charge(uint32_t fs, uint32_t px, uint64_t t)
++{
++   for (unsigned i = 0; i < sweet_fs_n; i++)
++      if (sweet_fs_tab[i].id == fs) {
++         sweet_fs_tab[i].ticks += t;
++         sweet_fs_tab[i].timed++;
++         sweet_fs_tab[i].px_timed += px;
++         return;
++      }
++}
++static void
++sweet_ds_collect(void)
++{
++   memset(sweet_split, 0, sizeof(sweet_split));
++   sweet_split_passes = 0;
++   if (sweet_ds_state != 1 || !sweet_ds_ts)
++      return;
++   uint32_t n = 0;
++   for (uint32_t s = 0; s < SWEET_DS_SLOTS; s++) {
++      if (!sweet_ds_meta[s].gen || !sweet_ds_ts[s])
++         continue;
++      sweet_ds_evs[n++] = (struct sweet_ds_ev) { sweet_ds_ts[s], sweet_ds_meta[s].fs, sweet_ds_meta[s].px };
++   }
++   qsort(sweet_ds_evs, n, sizeof(sweet_ds_evs[0]), sweet_ds_ev_cmp);
++   qsort(sweet_pt_win, sweet_pt_nwin, sizeof(sweet_pt_win[0]), sweet_pt_win_cmp);
++   uint32_t k = 0;
++   for (uint32_t w = 0; w < sweet_pt_nwin; w++) {
++      const uint64_t b = sweet_pt_win[w].b, e = sweet_pt_win[w].e;
++      while (k < n && sweet_ds_evs[k].t < b)
++         k++;
++      sweet_split[4] += e - b;
++      sweet_split_passes++;
++      uint64_t prev = b;
++      bool any = false;
++      for (; k < n && sweet_ds_evs[k].t <= e; k++) {
++         const uint64_t d = sweet_ds_evs[k].t - prev;
++         sweet_split[any ? 1 : 0] += d;
++         sweet_fs_charge(sweet_ds_evs[k].fs, sweet_ds_evs[k].px, d);
++         prev = sweet_ds_evs[k].t;
++         any = true;
++      }
++      sweet_split[any ? 2 : 3] += e - prev;
++   }
++   /* every stamp read now; stamps of passes reported later are lost (the ring holds about 3 s) */
++   for (uint32_t s = 0; s < SWEET_DS_SLOTS; s++)
++      sweet_ds_meta[s].gen = 0;
++}
++
++/* with sweet_pt_lock held: the window's 10 fragment shaders of most GPU time (SWEET_TU_DRAWTS) or most draws, with
++ * their stats; then every entry starts over. " | fs N shaders D draws: #id T.Tms/n U.Uus i<instrs> r<full>/<half>
++ * w<waves>[x2] c<constlen> t<tex> ss/sy<..> [F fetch][O gmem order][s sysmem order][P pvtmem][Z no early-z][K kill];" */
++static size_t
++sweet_fs_report(char *out, size_t size)
++{
++   sweet_ds_collect();
++   size_t at = 0;
++   uint32_t draws = 0, used = 0;
++   for (unsigned i = 0; i < sweet_fs_n; i++) {
++      draws += sweet_fs_tab[i].draws;
++      used += sweet_fs_tab[i].draws > 0;
++   }
++   at += snprintf(out + at, size > at ? size - at : 0, "fs %u shaders %u draws:", used, draws);
++   if (sweet_ds_state == 1)
++      at += snprintf(out + at, size > at ? size - at : 0, " split %u passes %.1fms = first %.1f + draws %.1f + tail %.1f + bare %.1f;",
++                     sweet_split_passes, sweet_split[4] / 19200.0, sweet_split[0] / 19200.0, sweet_split[1] / 19200.0,
++                     sweet_split[2] / 19200.0, sweet_split[3] / 19200.0);
++   bool shown[SWEET_FS_N] = {};
++   for (unsigned r = 0; r < 10; r++) {
++      int best = -1;
++      for (unsigned i = 0; i < sweet_fs_n; i++) {
++         if (shown[i] || !sweet_fs_tab[i].draws)
++            continue;
++         if (best < 0 || (sweet_ds_state == 1 ? sweet_fs_tab[i].ticks > sweet_fs_tab[best].ticks
++                                              : sweet_fs_tab[i].draws > sweet_fs_tab[best].draws))
++            best = (int) i;
++      }
++      if (best < 0)
++         break;
++      shown[best] = true;
++      const struct sweet_fs_ent *e = &sweet_fs_tab[best];
++      at += snprintf(out + at, size > at ? size - at : 0, " #%u", e->id);
++      if (sweet_ds_state == 1)
++         at += snprintf(out + at, size > at ? size - at : 0, " %.2fms/%u %.1fus", e->ticks / 19200.0, e->timed,
++                        e->timed ? e->ticks / 19.2 / e->timed : 0.0);
++      at += snprintf(out + at, size > at ? size - at : 0, " a%.0fk", e->draws ? e->px_all / 1000.0 / e->draws : 0.0);
++      if (sweet_ds_state == 1 && e->px_timed)
++         at += snprintf(out + at, size > at ? size - at : 0, " %.1fns/px", e->ticks / 19.2e-3 / (double) e->px_timed);
++      at += snprintf(out + at, size > at ? size - at : 0, " d%u i%u r%u/%u w%u%s c%u t%u ss%u sy%u st%u%s%s%s%s%s%s;",
++                     e->draws, e->instrs, e->max_reg, e->max_half, e->waves, e->dbl ? "x2" : "", e->constlen, e->tex,
++                     e->ss, e->sy, e->sstall, e->fetch ? " F" : "", e->gorder ? " O" : "", e->sorder ? " s" : "",
++                     e->pvt ? " P" : "", e->noearlyz ? " Z" : "", e->kill ? " K" : "");
++   }
++   for (unsigned i = 0; i < sweet_fs_n; i++) {
++      sweet_fs_tab[i].draws = 0;
++      sweet_fs_tab[i].timed = 0;
++      sweet_fs_tab[i].ticks = 0;
++      sweet_fs_tab[i].px_all = sweet_fs_tab[i].px_timed = 0;
++      sweet_fs_tab[i].gorder = sweet_fs_tab[i].sorder = 0;
++   }
++   static uint64_t last_tex[3];
++   uint64_t now_tex[3];
++   for (unsigned i = 0; i < 3; i++)
++      now_tex[i] = p_atomic_read(&sweet_tex_writes[i]);
++   at += snprintf(out + at, size > at ? size - at : 0, " | tex writes lin %llu tiled %llu ubwc %llu",
++                  (unsigned long long) (now_tex[0] - last_tex[0]), (unsigned long long) (now_tex[1] - last_tex[1]),
++                  (unsigned long long) (now_tex[2] - last_tex[2]));
++   memcpy(last_tex, now_tex, sizeof(last_tex));
++   return at;
++}
++
++/* sweet 0112: the "T tu-draw" line (SweetMetal2 dlsyms it), with SWEET_TIMELINE on; empty otherwise */
++extern "C" __attribute__((visibility("default"))) size_t sweet_tu_draw_report(char *out, size_t size);
++extern "C" __attribute__((visibility("default"))) size_t
++sweet_tu_draw_report(char *out, size_t size)
++{
++   if (!out || size == 0)
++      return 0;
++   out[0] = 0;
++   if (sweet_pt_state != 1)
++      return 0;
++   pthread_mutex_lock(&sweet_pt_lock);
++   size_t at = sweet_fs_report(out, size);
++   pthread_mutex_unlock(&sweet_pt_lock);
++   return at < size ? at : size - 1;
++}
++
+ /* "passes N M.Mms (gmem a sysmem b) top: WxH FMT L/S gmem|sysmem T.Tms/n ... | tu waits cpu n (x ms) gpu n of s submits" */
+ /* "passes N M.Mms (gmem a sysmem b fetch f) top: WxH FMT L/S gmem|sysmem T.Tms xn [d D b V/B TWxTH bin B.BB] ...
+  *  [| seq T.Tms: ...] | tu submits ..."
+@@ -4089,7 +4482,9 @@ static struct sweet_pt_done {
+    uint32_t gen, cb, ticks, vis, draws, w, h;
+    uint16_t bins;
+    uint8_t load, store, gmem, fetch;
+-} sweet_pt_done[SWEET_PT_SLOTS];   /* only the reporting thread (one, every 5 s) uses it */
++   const struct sweet_pt_meta *m;   /* sweet 0112: the census (a copy in sweet_pt_done_meta) */
++} sweet_pt_done[SWEET_PT_SLOTS];
++static struct sweet_pt_meta sweet_pt_done_meta[SWEET_PT_SLOTS];   /* only the reporting thread (one, every 5 s) uses it */
+ 
+ static uint32_t
+ sweet_pt_visible(const struct sweet_pt_meta *m, uint32_t slot)
+@@ -4127,6 +4522,7 @@ sweet_tu_pass_report(char *out, size_t size, unsigned top)
+    uint64_t all_ticks = 0;
+    uint32_t passes = 0, gmem_passes = 0, fetch_passes = 0;
+    pthread_mutex_lock(&sweet_pt_lock);
++   sweet_pt_nwin = 0;   /* sweet 0112 */
+    if (sweet_pt_ts) {
+       for (uint32_t slot = 0; slot < SWEET_PT_SLOTS; slot++) {
+          struct sweet_pt_meta *m = &sweet_pt_meta[slot];
+@@ -4141,6 +4537,8 @@ sweet_tu_pass_report(char *out, size_t size, unsigned top)
+          const uint64_t t = e - b;
+          if (t > 19200000ull)
+             continue;   /* over a second: not one pass's time */
++         if (sweet_pt_nwin < SWEET_PT_SLOTS)
++            sweet_pt_win[sweet_pt_nwin++] = (struct sweet_pt_win) { b, e };
+          passes++;
+          gmem_passes += m->gmem;
+          fetch_passes += m->fetch;
+@@ -4148,8 +4546,11 @@ sweet_tu_pass_report(char *out, size_t size, unsigned top)
+          const uint32_t bins = (uint32_t) m->bins_x * m->bins_y;
+          const bool binned = m->gmem && m->binning && mid >= b && mid <= e;
+          const uint32_t vis = binned ? sweet_pt_visible(m, slot) : bins;
+-         sweet_pt_done[ndone++] = (struct sweet_pt_done) { gen, m->cb, (uint32_t) t, binned ? vis : ~0u, m->draws, m->w, m->h,
+-                                                           (uint16_t) bins, m->load, m->store, m->gmem, m->fetch };
++         sweet_pt_done_meta[ndone] = *m;
++         sweet_pt_done[ndone] = (struct sweet_pt_done) { gen, m->cb, (uint32_t) t, binned ? vis : ~0u, m->draws, m->w, m->h,
++                                                         (uint16_t) bins, m->load, m->store, m->gmem, m->fetch,
++                                                         &sweet_pt_done_meta[ndone] };
++         ndone++;
+          unsigned k = 0;
+          for (; k < nkeys; k++)
+             if (keys[k].w == m->w && keys[k].h == m->h && keys[k].format == m->format && keys[k].gmem == m->gmem &&
+@@ -4251,7 +4652,12 @@ sweet_tu_pass_report(char *out, size_t size, unsigned top)
+             SWEET_PUT(" %.2f %ux%u %c/%c%c", d->ticks * ms_per_tick, d->w, d->h, d->load, d->store, d->gmem ? 'g' : 's');
+             if (d->vis != ~0u)
+                SWEET_PUT(" b%u/%u", d->vis, (unsigned) d->bins);
+-            SWEET_PUT(" d%u%s;", d->draws, d->fetch ? "f" : "");
++            SWEET_PUT(" d%u%s", d->draws, d->fetch ? "f" : "");
++            /* sweet 0112: F fetching draws, O GMEM / sysmem per-overlap-flushing draws, P pipeline binds, S set
++             * binds, B barriers, W WFIs, C CCU clean/invalidate, U UCHE clean/invalidate (recorded in the pass) */
++            const struct sweet_pt_meta *c = d->m;
++            SWEET_PUT(" F%u O%u/%u P%u S%u B%u W%u C%u/%u U%u/%u;", c->c_fetch, c->c_gorder, c->c_sorder, c->c_pipe,
++                      c->c_sets, c->c_bar, c->c_wfi, c->c_ccu, c->c_ccuinv, c->c_cclean, c->c_cinv);
+          }
+          if (small)
+             SWEET_PUT(" +%u more %.2fms", small, small_ticks * ms_per_tick);
+@@ -4808,6 +5214,7 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+    if (result != VK_SUCCESS)
+       return result;
+    sweet_pt_cb_begin(cmd_buffer);
++   cmd_buffer->sweet_serial = p_atomic_inc_return(&sweet_cb_serials);   /* sweet 0112 */
+ 
+    /* setup initial configuration into command buffer */
+    if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
+@@ -5150,6 +5557,9 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
+    struct tu_descriptor_state *descriptors_state =
+       tu_get_descriptors_state(cmd, bind_point);
+ 
++   if (cmd->state.pass && bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS)
++      cmd->state.rp.sweet_set_binds++;   /* sweet 0112 */
++
+    descriptors_state->max_sets_bound =
+       MAX2(descriptors_state->max_sets_bound,
+            info->firstSet + info->descriptorSetCount);
+@@ -5933,6 +6343,9 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
+    cmd->state.load_state = pipeline->load_state;
+    cmd->state.prim_order_gmem = pipeline->prim_order.state_gmem;
+    cmd->state.pipeline_sysmem_single_prim_mode = pipeline->prim_order.sysmem_single_prim_mode;
++   cmd->state.sweet_gmem_flush = pipeline->prim_order.sweet_gmem_flush;   /* sweet 0112 */
++   if (cmd->state.pass)
++      cmd->state.rp.sweet_pipe_binds++;
+    cmd->state.pipeline_has_tess = pipeline->active_stages & VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
+    cmd->state.pipeline_disable_gmem = gfx_pipeline->feedback_loop_may_involve_textures;
+ 
+@@ -6587,6 +7000,18 @@ tu_render_pass_state_merge(struct tu_render_pass_state *dst,
+ 
+    dst->drawcall_bandwidth_per_sample_sum +=
+       src->drawcall_bandwidth_per_sample_sum;
++   /* sweet 0112 */
++   dst->sweet_fetch_draws += src->sweet_fetch_draws;
++   dst->sweet_gorder_draws += src->sweet_gorder_draws;
++   dst->sweet_sorder_draws += src->sweet_sorder_draws;
++   dst->sweet_pipe_binds += src->sweet_pipe_binds;
++   dst->sweet_set_binds += src->sweet_set_binds;
++   dst->sweet_barriers += src->sweet_barriers;
++   dst->sweet_wfi += src->sweet_wfi;
++   dst->sweet_ccu_clean += src->sweet_ccu_clean;
++   dst->sweet_ccu_inv += src->sweet_ccu_inv;
++   dst->sweet_cache_clean += src->sweet_cache_clean;
++   dst->sweet_cache_inv += src->sweet_cache_inv;
+    if (!dst->lrz_disable_reason && src->lrz_disable_reason) {
+       dst->lrz_disable_reason = src->lrz_disable_reason;
+       dst->lrz_disabled_at_draw =
+@@ -8772,6 +9197,7 @@ tu6_draw_common_body(struct tu_cmd_buffer *cmd,
+ 
+    /* Fill draw stats for autotuner */
+    rp->drawcall_count++;
++   sweet_draw_census(cmd);   /* sweet 0112 */
+ 
+    rp->drawcall_bandwidth_per_sample_sum +=
+       cmd->state.bandwidth.color_bandwidth_per_sample;
+@@ -9241,6 +9667,7 @@ tu_CmdDraw(VkCommandBuffer commandBuffer,
+    tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX));
+    tu_cs_emit(cs, instanceCount);
+    tu_cs_emit(cs, vertexCount);
++   sweet_ds_after_draw<CHIP>(cmd, cs);   /* sweet 0112 */
+ 
+    trace_end_draw(&cmd->rp_trace, cs);
+ }
+@@ -9319,6 +9746,7 @@ tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+    tu_cs_emit(cs, firstIndex);
+    tu_cs_emit_qw(cs, cmd->state.index_va);
+    tu_cs_emit(cs, cmd->state.max_index_count);
++   sweet_ds_after_draw<CHIP>(cmd, cs);   /* sweet 0112 */
+ 
+    trace_end_draw(&cmd->rp_trace, cs);
+ }
+@@ -10440,6 +10868,8 @@ tu_barrier(struct tu_cmd_buffer *cmd,
+ 
+    struct tu_cache_state *cache =
+       cmd->state.pass  ? &cmd->state.renderpass_cache : &cmd->state.cache;
++   if (cmd->state.pass)
++      cmd->state.rp.sweet_barriers++;   /* sweet 0112 */
+ 
+    /* a750 has a HW bug where writing a UBWC compressed image with a compute
+     * shader followed by reading it as a texture (or readonly image) requires
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
+index 17bebeb..1a90a7c 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.h
++++ b/src/freedreno/vulkan/tu_cmd_buffer.h
+@@ -359,6 +359,12 @@ struct tu_render_pass_state
+ 
+    const char *gmem_disable_reason;
+    const char *cb_disable_reason;
++
++   /* sweet 0112: the pass's draw census (summed from its secondaries, recorded, not executed): draws whose fragment
++    * shader reads an input attachment, draws that flush per overlap in GMEM / in sysmem, pipeline and descriptor set
++    * binds, pipeline barriers inside it, and the cache events its renderpass cache flushes put into draw_cs */
++   uint32_t sweet_fetch_draws, sweet_gorder_draws, sweet_sorder_draws, sweet_pipe_binds, sweet_set_binds;
++   uint32_t sweet_barriers, sweet_wfi, sweet_ccu_clean, sweet_ccu_inv, sweet_cache_clean, sweet_cache_inv;
+ };
+ 
+ /* These are the states of the suspend/resume state machine. In addition to
+@@ -585,6 +591,7 @@ struct tu_cmd_state
+    bool stencil_written_on_depth_fail;
+    bool stencil_written_based_on_depth_test;
+    bool pipeline_sysmem_single_prim_mode;
++   bool sweet_gmem_flush;   /* sweet 0112: the bound pipeline flushes per overlap in GMEM */
+    bool pipeline_has_tess;
+    bool pipeline_disable_gmem;
+    bool raster_order_attachment_access;
+@@ -659,6 +666,10 @@ struct tu_cmd_buffer
+ {
+    struct vk_command_buffer vk;
+ 
++   uint32_t sweet_serial;   /* sweet 0112: which recording (tu_BeginCommandBuffer numbers them) */
++   uint32_t sweet_fs_id;    /* sweet 0112: the census id of the last draw's fragment shader */
++   uint32_t sweet_px;       /* sweet 0112: the last draw's bound (scissor in viewport in render area), pixels */
++
+    struct tu_device *device;
+ 
+    struct u_trace_iterator trace_renderpass_start;
+diff --git a/src/freedreno/vulkan/tu_descriptor_set.cc b/src/freedreno/vulkan/tu_descriptor_set.cc
+index 2ff6826..2b851d9 100644
+--- a/src/freedreno/vulkan/tu_descriptor_set.cc
++++ b/src/freedreno/vulkan/tu_descriptor_set.cc
+@@ -20,6 +20,7 @@
+ #include "tu_descriptor_set.h"
+ 
+ #include "util/mesa-blake3.h"
++#include "util/u_atomic.h"
+ #include "util/format/u_format.h"
+ #include "vk_acceleration_structure.h"
+ #include "vk_descriptors.h"
+@@ -1192,6 +1193,10 @@ write_ubo_descriptor(uint32_t *dst, const VkDescriptorBufferInfo *buffer_info)
+    write_ubo_descriptor_addr(dst, &addr);
+ }
+ 
++extern "C" {
++uint64_t sweet_tex_writes[3];   /* sweet 0112: linear, tiled, UBWC */
++}
++
+ static void
+ write_image_descriptor(uint32_t *dst,
+                        VkDescriptorType descriptor_type,
+@@ -1208,6 +1213,12 @@ write_image_descriptor(uint32_t *dst,
+       memcpy(dst, iview->view.storage_descriptor, sizeof(iview->view.storage_descriptor));
+    } else {
+       memcpy(dst, iview->view.descriptor, sizeof(iview->view.descriptor));
++      /* sweet 0112: sampled image descriptors by layout (TEX_CONST_0 TILE_MODE, TEX_CONST_3 FLAG), for the SEQ line */
++      if (descriptor_type != VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) {
++         const uint32_t *d = iview->view.descriptor;
++         const unsigned k = (d[3] & (1u << 28)) ? 2 : (d[0] & 0x3) ? 1 : 0;
++         p_atomic_inc(&sweet_tex_writes[k]);
++      }
+    }
+ }
+ 
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index f138065..61980c2 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -4464,6 +4464,7 @@ tu_pipeline_builder_parse_rasterization_order(
+ 
+    struct tu_cs cs;
+ 
++   pipeline->prim_order.sweet_gmem_flush = gmem_prim_mode != NO_FLUSH;
+    pipeline->prim_order.state_gmem = tu_cs_draw_state(&pipeline->cs, &cs, 2);
+    tu_cs_emit_regs(&cs, GRAS_SC_CNTL(CHIP,
+       .single_prim_mode = gmem_prim_mode,
+diff --git a/src/freedreno/vulkan/tu_pipeline.h b/src/freedreno/vulkan/tu_pipeline.h
+index 791a4fc..eb48ee8 100644
+--- a/src/freedreno/vulkan/tu_pipeline.h
++++ b/src/freedreno/vulkan/tu_pipeline.h
+@@ -210,6 +210,7 @@ struct tu_pipeline
+    struct {
+       /* If the pipeline sets SINGLE_PRIM_MODE for sysmem. */
+       bool sysmem_single_prim_mode;
++      bool sweet_gmem_flush;   /* sweet 0112: GMEM single-prim mode other than NO_FLUSH */
+       struct tu_draw_state state_gmem;
+    } prim_order;
+ 

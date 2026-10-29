@@ -1,0 +1,189 @@
+ios-redfin bridge patch 0161: SWEET_M2V_CONTRACT=1 -- let the device fuse what AIR's fast-math flags allow.
+Base: metal2vulkan 720ef1ce + ios-redfin bridge patches 0001-0111, 0120, 0130-0137, 0160.
+Where NoContraction comes from (offline translation of fixed_frag_lph_cph, Turnip-like profile):
+  - colour-write rounding (lower/arith/color_write.rs round_scaled_product etc.): an exact Dekker split, 36 of the
+    ~38 NoContraction ops per fragment module; present wherever SWEET_M2V_COLOR_WRITES is not `device` (the phone
+    runs `fetch`, so every non-fetch shader keeps it). NOT touched here: contracting it breaks the rounding;
+    SWEET_M2V_COLOR_WRITES=device (0109) is the switch that removes it.
+  - narrow::converted's `x + -0.0` barrier before each f32->f16 rounding (0160 removes it under SWEET_FP16).
+  - lower/arith/mod.rs contraction(fmf): upstream leaves an AIR fadd/fsub/fmul undecorated only with BOTH
+    `contract` and `reassoc`, and forces NoContraction on additions Metal's measured rule keeps apart from a
+    `contract` multiply (contract::Plan::kept), and on SWEET_FP16=native's 16-bit + - * (ops::f16_binary).
+Rule under the knob: an AIR float operation carrying `contract` (LLVM `fast` includes it; CA's *_lph code is
+all `fast`) is emitted undecorated, including kept-apart additions and the 16-bit half ops. An operation
+without `contract` (precise AIR, no fast flags) keeps NoContraction, as do the translator's own exact
+sequences (colour-write rounding, fma/division routines, libm). Undecorated, Mesa may also apply its other
+inexact algebra, which `fast` allows. Default off; knob value in every cache key (sweet_key_tag).
+
+diff --git a/crates/metal2vulkan/src/env_vars.rs b/crates/metal2vulkan/src/env_vars.rs
+index d5b88bf1..00644e28 100644
+--- a/crates/metal2vulkan/src/env_vars.rs
++++ b/crates/metal2vulkan/src/env_vars.rs
+@@ -52,6 +52,16 @@ pub const REGISTRY: &[EnvVar] = &[
+                  MetalHalfConversion and MetalHalfFma) and the rounding of other `half` results \
+                  has no `NoContraction` barrier. Changes the SPIR-V (and every cache key)",
+     },
++    EnvVar {
++        name: "SWEET_M2V_CONTRACT",
++        default: "unset (an operation stays undecorated only with both `contract` and `reassoc`)",
++        effect: "sweet 0161: `1`: an AIR float operation carrying `contract` (or `fast`) is \
++                 left undecorated, so the device may fuse it (Turnip's mad), where upstream asks \
++                 for `reassoc` too and keeps apart the additions Metal keeps apart; the 16-bit \
++                 `half` `+ - *` of SWEET_FP16=native is then undecorated too. The translator's \
++                 own exact sequences keep `NoContraction`. Changes the SPIR-V (and every cache \
++                 key)",
++    },
+     EnvVar {
+         name: "METAL2VULKAN_LOG_PIPELINES",
+         default: "unset (off)",
+@@ -135,6 +145,13 @@ pub fn sweet_fp16() -> SweetFp16 {
+     })
+ }
+ 
++/// sweet 0161: `SWEET_M2V_CONTRACT=1`: contraction wherever the AIR operation carries
++/// `contract` (`lower::arith::contraction`). Read once per process; part of every cache key.
++pub fn sweet_contract() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("SWEET_M2V_CONTRACT").is_ok_and(|v| v == "1"))
++}
++
+ /// sweet: the bytes the sweet knobs that change compiled modules add to every cache key (the
+ /// compile layer's keys, the runtime's shader cache build); empty with every knob off, so the
+ /// keys are then upstream's.
+@@ -148,6 +165,9 @@ pub fn sweet_key_tag() -> &'static [u8] {
+         if sweet_color_writes_fetch() {
+             t.extend_from_slice(b"sweet-color-writes-fetch\0");
+         }
++        if sweet_contract() {
++            t.extend_from_slice(b"sweet-contract\0");
++        }
+         match sweet_fp16() {
+             SweetFp16::Off => {}
+             SweetFp16::Wide => t.extend_from_slice(b"sweet-fp16-wide\0"),
+diff --git a/crates/metal2vulkan/src/lower/arith/mod.rs b/crates/metal2vulkan/src/lower/arith/mod.rs
+index 54f371d8..493d2225 100644
+--- a/crates/metal2vulkan/src/lower/arith/mod.rs
++++ b/crates/metal2vulkan/src/lower/arith/mod.rs
+@@ -199,6 +199,8 @@ pub enum ArithStrategy {
+     F16 {
+         op: AirBin,
+         form: Form,
++        /// sweet 0161: `Allowed` only under `SWEET_M2V_CONTRACT=1` and the AIR's `contract`.
++        contract: Contraction,
+     },
+     /// `fneg` on floats of `form`: the sign bit flipped on the bits where `bits`
+     /// ([`math::sign_on_bits`]: `float`), else the device's `OpFNegate`.
+@@ -1367,8 +1369,18 @@ fn lanes_of(cx: &SelectCx<'_>, v: Value) -> Result<u32, Error> {
+ /// separately, `contract` and `reassoc`, so only an operation that carries both stays undecorated;
+ /// any other is `NoContraction`, which keeps the rounding of each operation, one of the values its
+ /// flags allow.
++///
++/// sweet 0161: under `SWEET_M2V_CONTRACT=1` `contract` alone (LLVM's `fast` includes it) leaves
++/// the operation undecorated: the flag lets a compiler fuse a multiply into the addition using it,
++/// which is what Turnip's `mad` needs. Undecorated, Mesa also treats the operation as inexact for
++/// its other algebraic rules, a relaxation past `contract` alone (CA's `*_lph` code is all `fast`,
++/// which allows it); that is why it is a knob. An operation without `contract` (precise AIR) keeps
++/// `NoContraction`, and so do the translator's own exact sequences (colour-write rounding, the
++/// fused multiply-add and division routines, the narrow conversions' barrier).
+ fn contraction(fmf: FastMath) -> Contraction {
+-    if fmf.contains(FastMath::CONTRACT.union(FastMath::REASSOC)) {
++    if crate::env_vars::sweet_contract() && fmf.contains(FastMath::CONTRACT) {
++        Contraction::Allowed
++    } else if fmf.contains(FastMath::CONTRACT.union(FastMath::REASSOC)) {
+         Contraction::Allowed
+     } else {
+         Contraction::Forbidden
+@@ -2076,7 +2088,13 @@ fn select_in(
+                     fp_env(cx, *fmf, f);
+                     // An addition Metal keeps apart from its `contract` multiply operand is
+                     // never fused by the device either.
+-                    let contract = if cx.families.arith.contract.kept.contains(&at) {
++                    // sweet 0161: under SWEET_M2V_CONTRACT=1 an addition that carries `contract`
++                    // may be fused by the device even where Metal keeps it apart: its flags allow
++                    // either value.
++                    let kept = cx.families.arith.contract.kept.contains(&at)
++                        && !(crate::env_vars::sweet_contract()
++                            && fmf.contains(FastMath::CONTRACT));
++                    let contract = if kept {
+                         Contraction::Forbidden
+                     } else {
+                         contraction(*fmf)
+@@ -2112,7 +2130,15 @@ fn select_in(
+                         // The device's own `half` arithmetic, measured to be Metal's in the forms
+                         // that keep it apart, which the AIR's flags allow whatever they are.
+                         cx.families.arith.f16_arith = true;
+-                        let s = S::F16 { op: *op, form: f };
++                        // sweet 0161: the instruction undecorated where the flags allow it.
++                        let s = S::F16 {
++                            op: *op,
++                            form: f,
++                            contract: match crate::env_vars::sweet_contract() {
++                                true => contraction(*fmf),
++                                false => Contraction::Forbidden,
++                            },
++                        };
+                         with_nan(cx, at, s, nan::binary_answer(*op, fmt), f)
+                     } else {
+                         let s = S::Float {
+@@ -3717,9 +3743,9 @@ fn value(
+             let (p, q) = (a(cx, 0)?, a(cx, 1)?);
+             ops::float_binary(fb, *op, *form, *contract, p, q)?
+         }
+-        S::F16 { op, form } => {
++        S::F16 { op, form, contract } => {
+             let (p, q) = (a(cx, 0)?, a(cx, 1)?);
+-            ops::f16_binary(fb, *op, form.lanes, p, q)?
++            ops::f16_binary_with(fb, *op, form.lanes, p, q, *contract)?
+         }
+         S::FastDivide { routine, .. } => {
+             let (p, q) = (a(cx, 0)?, a(cx, 1)?);
+diff --git a/crates/metal2vulkan/src/lower/arith/ops.rs b/crates/metal2vulkan/src/lower/arith/ops.rs
+index 3fae3b89..bc8c06c0 100644
+--- a/crates/metal2vulkan/src/lower/arith/ops.rs
++++ b/crates/metal2vulkan/src/lower/arith/ops.rs
+@@ -285,12 +285,28 @@ pub fn f16_binary_words(f: Form) -> u32 {
+ /// (EV `CRT2-ha2-m4`); a `NoContraction` `OpFMul`, which SPIRV-Cross writes as `fma(l, r, 0)`,
+ /// answers `+0` for a `-0` product (EVs `CRT-ha-m3`, `CRT-ha-m4`). Keeping each operation apart is
+ /// one of the values the flags allow, the one the widened lowering gives.
++#[cfg_attr(not(test), allow(dead_code))]
+ pub fn f16_binary(
+     fb: &mut FunctionBuilder<'_>,
+     op: AirBin,
+     lanes: u8,
+     a: Value,
+     b: Value,
++) -> BResult<Value> {
++    f16_binary_with(fb, op, lanes, a, b, Contraction::Forbidden)
++}
++
++/// sweet 0161: [`f16_binary`] with contraction `contract`: `Allowed` (SWEET_M2V_CONTRACT=1 and the
++/// AIR's `contract`) emits the 16-bit `OpFAdd`, `OpFSub` or `OpFMul` undecorated, which the device
++/// may fuse (the kept-apart forms only keep Metal's compiler from folding the narrowings, which a
++/// Mesa driver does not do); `Forbidden` is [`f16_binary`]'s forms.
++pub fn f16_binary_with(
++    fb: &mut FunctionBuilder<'_>,
++    op: AirBin,
++    lanes: u8,
++    a: Value,
++    b: Value,
++    contract: Contraction,
+ ) -> BResult<Value> {
+     let float_ty = |fb: &mut FunctionBuilder<'_>, width: u8| -> BResult<TypeId> {
+         let e = fb.module().ty(Type::Float { width })?;
+@@ -302,6 +318,16 @@ pub fn f16_binary(
+     let (h, w) = (float_ty(fb, 16)?, float_ty(fb, 32)?);
+     let x = fb.convert(ConvOp::FConvert, a, h)?;
+     let y = fb.convert(ConvOp::FConvert, b, h)?;
++    if contract == Contraction::Allowed {
++        let o = match op {
++            AirBin::FAdd => BinOp::FAdd,
++            AirBin::FSub => BinOp::FSub,
++            AirBin::FMul => BinOp::FMul,
++            _ => return Err(BuildError::Type(TypeRule::ScalarWidth)),
++        };
++        let r = fb.binary(o, x, y)?;
++        return fb.convert(ConvOp::FConvert, r, w);
++    }
+     let r = match op {
+         AirBin::FAdd => fb.binary_no_contraction(BinOp::FAdd, x, y)?,
+         AirBin::FSub => fb.binary_no_contraction(BinOp::FSub, x, y)?,

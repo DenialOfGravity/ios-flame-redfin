@@ -1,0 +1,93 @@
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 3cb7362..173b62e 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -19,6 +19,9 @@
+ #include "common/freedreno_gpu_event.h"
+ #include "common/freedreno_lrz.h"
+ #include "common/freedreno_vrs.h"
++extern "C" {
++#include "common/disasm.h"
++}
+ #include "tu_autotune.h"
+ #include "tu_buffer.h"
+ #include "tu_clear_blit.h"
+@@ -4154,6 +4157,7 @@ struct sweet_fs_ent {
+    uint64_t ticks, px_all, px_timed;   /* px: each draw's scissor/viewport/render area, summed */
+    uint16_t instrs, sizedw, max_reg, max_half, constlen, tex, ss, sy, sstall, pvt;
+    uint8_t waves, dbl, fetch, gorder, sorder, noearlyz, kill;
++   uint8_t cbkey;   /* sweet 0114: attachment 0's blend enable (bit 4) and write mask (bits 0-3) */
+ };
+ static struct sweet_fs_ent sweet_fs_tab[SWEET_FS_N];
+ static uint32_t sweet_fs_n, sweet_fs_ids, sweet_fs_last;
+@@ -4174,6 +4178,22 @@ extern "C" {
+ extern uint64_t sweet_tex_writes[3];
+ }
+ 
++
++/* sweet 0114: SWEET_TU_FS_DUMP's disassembly. A compiled variant no longer holds its ir3 (ir3 frees it after assembly
++ * unless shader debugging keeps it), and ir3_shader_disasm() reads it (the r47 crash: SIGSEGV at 0x18): without the ir
++ * only the binary is disassembled. */
++static void
++sweet_variant_disasm(const struct ir3_shader_variant *v, FILE *f)
++{
++   if (v->ir) {
++      ir3_shader_disasm((struct ir3_shader_variant *) v, v->bin, f);
++      return;
++   }
++   fprintf(f, "; %u instrs, %u dwords, %u full regs, %u half regs, constlen %u (binary only: no ir kept)\n",
++           v->info.instrs_count, v->info.sizedwords, v->info.max_reg + 1, v->info.max_half_reg + 1, v->constlen);
++   disasm_a3xx(v->bin, v->info.sizedwords, 0, f, v->compiler->gen * 100);
++}
++
+ static void
+ sweet_draw_census(struct tu_cmd_buffer *cmd)
+ {
+@@ -4210,8 +4230,13 @@ sweet_draw_census(struct tu_cmd_buffer *cmd)
+       return;
+    pthread_mutex_lock(&sweet_pt_lock);
+    unsigned i = sweet_fs_last;
+-   if (i >= sweet_fs_n || sweet_fs_tab[i].fs != fs) {
+-      for (i = 0; i < sweet_fs_n && sweet_fs_tab[i].fs != fs; i++)
++   /* sweet 0114: one entry per fragment shader AND attachment 0's blend/write mask: identical shader binaries of
++    * pipelines that blend differently (Turnip shares the tu_shader) are no longer merged into one entry. */
++   const struct vk_color_blend_state *sweet_cb = &cmd->vk.dynamic_graphics_state.cb;
++   const uint8_t cbkey = sweet_cb->attachment_count ?
++      (uint8_t) ((sweet_cb->attachments[0].blend_enable ? 16 : 0) | (sweet_cb->attachments[0].write_mask & 15)) : 0;
++   if (i >= sweet_fs_n || sweet_fs_tab[i].fs != fs || sweet_fs_tab[i].cbkey != cbkey) {
++      for (i = 0; i < sweet_fs_n && (sweet_fs_tab[i].fs != fs || sweet_fs_tab[i].cbkey != cbkey); i++)
+          ;
+       if (i == sweet_fs_n) {
+          if (sweet_fs_n == SWEET_FS_N) {
+@@ -4224,6 +4249,7 @@ sweet_draw_census(struct tu_cmd_buffer *cmd)
+          }
+          struct sweet_fs_ent e = {};
+          e.fs = fs;
++         e.cbkey = cbkey;
+          e.id = ++sweet_fs_ids;
+          const struct ir3_shader_variant *v = fs->variant;
+          if (v) {
+@@ -4255,11 +4281,11 @@ sweet_draw_census(struct tu_cmd_buffer *cmd)
+             if (f) {
+                fprintf(f, "fs #%u: i%u r%u/%u w%u%s c%u t%u fetch %u blake3 %s\n", e.id, e.instrs, e.max_reg, e.max_half,
+                        e.waves, e.dbl ? "x2" : "", e.constlen, e.tex, e.fetch, v->blake3_str);
+-               ir3_shader_disasm((struct ir3_shader_variant *) v, v->bin, f);
++               sweet_variant_disasm(v, f);
+                const struct tu_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+                if (vs && vs->variant && vs->variant->bin) {
+                   fprintf(f, "\n---- vertex shader (blake3 %s)\n", vs->variant->blake3_str);
+-                  ir3_shader_disasm((struct ir3_shader_variant *) vs->variant, vs->variant->bin, f);
++                  sweet_variant_disasm(vs->variant, f);
+                }
+                fclose(f);
+             }
+@@ -4428,7 +4454,8 @@ sweet_fs_report(char *out, size_t size)
+       if (sweet_ds_state == 1)
+          at += snprintf(out + at, size > at ? size - at : 0, " %.2fms/%u %.1fus", e->ticks / 19200.0, e->timed,
+                         e->timed ? e->ticks / 19.2 / e->timed : 0.0);
+-      at += snprintf(out + at, size > at ? size - at : 0, " a%.0fk", e->draws ? e->px_all / 1000.0 / e->draws : 0.0);
++      at += snprintf(out + at, size > at ? size - at : 0, " a%.0fk cb%s%x", e->draws ? e->px_all / 1000.0 / e->draws : 0.0,
++                     (e->cbkey & 16) ? "B" : "", e->cbkey & 15);
+       if (sweet_ds_state == 1 && e->px_timed)
+          at += snprintf(out + at, size > at ? size - at : 0, " %.1fns/px", e->ticks / 19.2e-3 / (double) e->px_timed);
+       at += snprintf(out + at, size > at ? size - at : 0, " d%u i%u r%u/%u w%u%s c%u t%u ss%u sy%u st%u%s%s%s%s%s%s;",

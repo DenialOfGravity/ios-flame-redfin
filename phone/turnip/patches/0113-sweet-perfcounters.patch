@@ -1,0 +1,662 @@
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 3cb7362..114e593 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -29,6 +29,7 @@
+ #include "tu_subsampled_image.h"
+ #include "tu_tile_config.h"
+ #include "tu_tracepoints.h"
++#include "perfcntrs/freedreno_perfcntr.h"   /* sweet 0113 */
+ 
+ /* sweet 0110 (u-tr): SWEET_TU_CPUPROF counters (tu_cs.h) */
+ extern "C" {
+@@ -4470,6 +4471,554 @@ sweet_tu_draw_report(char *out, size_t size)
+    return at < size ? at : size - 1;
+ }
+ 
++/* sweet 0113 (u-perfctr): the Adreno's hardware performance counters per render pass and, with SWEET_TU_PERFCTR_DRAW=1,
++ * per draw. SWEET_TU_PERFCTR=<preset> (busy alu wave mem rop tex ras; 1 = busy) picks up to 8 countables from Mesa's
++ * a6xx tables (perfcntrs/, a6xx_perfcntrs.xml); SWEET_TU_PERFCTR_SWEEP=1 moves to the next preset at every report
++ * (every 5 s in backboardd). Only with SWEET_TIMELINE on, in the device the pass timeline uses; off (the default) it costs
++ * one branch per command buffer, pass and draw. Each countable gets the highest free counter of its group (Mesa and the
++ * kernel keep CP and SP counter 0: CP_ALWAYS_COUNT, programmed by sweet_a6xx at CP init); every preset's first countable
++ * is CP_ALWAYS_COUNT (GPU core clocks), the reference for the cycle counters' percentages.
++ * Per pass (the primary's cs, outside the tile loop): WFI, the select registers (pkt4), WFI, the counters (CP_REG_TO_MEM)
++ * before the pass's begin stamp; WFI, the counters, a done mark after its end stamp. Per draw (draw_cs, not in the
++ * binning pass): WFI + counters before the draw packet, WFI + counters after it and acc += after - before
++ * (CP_MEM_TO_MEM), so GMEM bins add up; each draw then runs alone (measurement mode). The CPU never reads a counter:
++ * sweet_tu_perf_report() sums the samples the GPU finished since its last call by pass kind and fragment shader
++ * (the ids of T tu-draw). */
++#define SWEET_PF_N 8u
++#define SWEET_PF_DS 8192u       /* per-draw slots: acc[8], before[8], after[8], done */
++#define SWEET_PF_DQ 25u
++#define SWEET_PF_PQ 17u         /* per-pass slots (as the pass timeline's): before[8], after[8], done */
++enum sweet_pf_unit { PF_CYC, PF_CNT, PF_BEAT };
++struct sweet_pf_cnt {
++   const char *group, *countable, *label;
++   enum sweet_pf_unit kind;
++};
++struct sweet_pf_preset {
++   const char *name;
++   struct sweet_pf_cnt c[SWEET_PF_N];
++};
++#define PF_CLK { "CP", "PERF_CP_ALWAYS_COUNT", "clk", PF_CNT }
++static const struct sweet_pf_preset sweet_pf_presets[] = {
++   { "busy", { PF_CLK, { "CP", "PERF_CP_BUSY_CYCLES", "cp", PF_CYC }, { "SP", "PERF_SP_BUSY_CYCLES", "sp", PF_CYC },
++               { "TP", "PERF_TP_BUSY_CYCLES", "tp", PF_CYC }, { "RB", "PERF_RB_BUSY_CYCLES", "rb", PF_CYC },
++               { "UCHE", "PERF_UCHE_BUSY_CYCLES", "uche", PF_CYC }, { "CCU", "PERF_CCU_BUSY_CYCLES", "ccu", PF_CYC },
++               { "RAS", "PERF_RAS_BUSY_CYCLES", "ras", PF_CYC } } },
++   { "alu", { PF_CLK, { "SP", "PERF_SP_BUSY_CYCLES", "sp", PF_CYC }, { "SP", "PERF_SP_ALU_WORKING_CYCLES", "alu", PF_CYC },
++              { "SP", "PERF_SP_EFU_WORKING_CYCLES", "efu", PF_CYC }, { "SP", "PERF_SP_NON_EXECUTION_CYCLES", "nonex", PF_CYC },
++              { "SP", "PERF_SP_FS_STAGE_FULL_ALU_INSTRUCTIONS", "full", PF_CNT },
++              { "SP", "PERF_SP_FS_STAGE_HALF_ALU_INSTRUCTIONS", "half", PF_CNT },
++              { "HLSQ", "PERF_HLSQ_QUADS", "quads", PF_CNT } } },
++   { "wave", { PF_CLK, { "SP", "PERF_SP_BUSY_CYCLES", "sp", PF_CYC }, { "SP", "PERF_SP_WAVE_CONTEXT_CYCLES", "wctx", PF_CNT },
++               { "SP", "PERF_SP_WAVE_NOP_CYCLES", "wnop", PF_CNT }, { "SP", "PERF_SP_WAVE_IDLE_CYCLES", "widle", PF_CNT },
++               { "SP", "PERF_SP_WAVE_SHORT_SYNC_CYCLES", "wss", PF_CNT },
++               { "SP", "PERF_SP_WAVE_LONG_SYNC_CYCLES", "wsy", PF_CNT },
++               { "SP", "PERF_SP_FS_STAGE_EFU_INSTRUCTIONS", "efui", PF_CNT } } },
++   { "mem", { PF_CLK, { "CMP", "PERF_CMPDECMP_VBIF_READ_DATA", "rd", PF_BEAT },
++              { "CMP", "PERF_CMPDECMP_VBIF_WRITE_DATA", "wr", PF_BEAT },
++              { "CMP", "PERF_CMPDECMP_VBIF_READ_DATA_CCU", "rdccu", PF_BEAT },
++              { "CMP", "PERF_CMPDECMP_VBIF_WRITE_DATA_CCU", "wrccu", PF_BEAT },
++              { "UCHE", "PERF_UCHE_VBIF_READ_BEATS_TP", "rdtp", PF_BEAT },
++              { "RB", "PERF_RB_STALL_CYCLES_CCU", "rbstall", PF_CYC },
++              { "UCHE", "PERF_UCHE_STALL_CYCLES_ARBITER", "uchestall", PF_CYC } } },
++   { "rop", { PF_CLK, { "RB", "PERF_RB_BUSY_CYCLES", "rb", PF_CYC }, { "RB", "PERF_RB_TOTAL_PASS", "pass", PF_CNT },
++              { "RB", "PERF_RB_C_READ", "cread", PF_CNT }, { "RB", "PERF_RB_C_WRITE", "cwrite", PF_CNT },
++              { "RB", "PERF_RB_STARVE_CYCLES_SP", "starvesp", PF_CYC },
++              { "RB", "PERF_RB_BLENDER_WORKING_CYCLES", "blend", PF_CYC },
++              { "RB", "PERF_RB_STALL_CYCLES_CCU", "stallccu", PF_CYC } } },
++   { "tex", { PF_CLK, { "TP", "PERF_TP_BUSY_CYCLES", "tp", PF_CYC }, { "TP", "PERF_TP_L1_CACHELINE_REQUESTS", "l1req", PF_CNT },
++              { "TP", "PERF_TP_L1_CACHELINE_MISSES", "l1miss", PF_CNT }, { "TP", "PERF_TP_OUTPUT_PIXELS", "texels", PF_CNT },
++              { "TP", "PERF_TP_STALL_CYCLES_UCHE", "tpstall", PF_CYC }, { "SP", "PERF_SP_STALL_CYCLES_TP", "spstalltp", PF_CYC },
++              { "SP", "PERF_SP_FS_STAGE_TEX_INSTRUCTIONS", "texi", PF_CNT } } },
++   { "ras", { PF_CLK, { "TSE", "PERF_TSE_INPUT_PRIM", "prims", PF_CNT }, { "TSE", "PERF_TSE_OUTPUT_VISIBLE_PRIM", "vis", PF_CNT },
++              { "RAS", "PERF_RAS_8X4_TILES", "t8x4", PF_CNT }, { "RAS", "PERF_RAS_FULLY_COVERED_8X4_TILES", "full8x4", PF_CNT },
++              { "LRZ", "PERF_LRZ_TOTAL_PIXEL", "lrzpx", PF_CNT }, { "LRZ", "PERF_LRZ_VISIBLE_PIXEL_AFTER_LRZ", "lrzvis", PF_CNT },
++              { "HLSQ", "PERF_HLSQ_QUADS", "quads", PF_CNT } } },
++};
++#undef PF_CLK
++#define SWEET_PF_PRESETS ((unsigned) ARRAY_SIZE(sweet_pf_presets))
++struct sweet_pf_reg {
++   uint32_t sel, lo, selector;
++   bool ok;
++};
++static struct sweet_pf_reg sweet_pf_regs[SWEET_PF_PRESETS][SWEET_PF_N];
++static int sweet_pf_state = -1;   /* -1 unknown, 0 off, 1 on */
++static bool sweet_pf_draws, sweet_pf_sweep, sweet_pf_resolved;
++static volatile unsigned sweet_pf_cur;
++static struct tu_bo *sweet_pf_pbo, *sweet_pf_dbo;
++static volatile uint64_t *sweet_pf_pv, *sweet_pf_dv;
++/* a pass slot's samples (the timeline's report clears its own meta, so the pass is copied here) */
++struct sweet_pf_pmeta {
++   uint32_t gen, w, h, draws;
++   uint8_t preset, gmem;   /* preset + 1, 0: none */
++};
++static struct sweet_pf_pmeta sweet_pf_pmeta[SWEET_PT_SLOTS];
++static uint32_t sweet_pf_pgen, sweet_pf_lost;
++struct sweet_pf_dmeta {
++   uint32_t gen, fs, px;
++   uint8_t preset;
++};
++static struct sweet_pf_dmeta sweet_pf_dmeta[SWEET_PF_DS];
++static uint32_t sweet_pf_dnext, sweet_pf_dgen;
++
++/* the preset a command buffer samples with (latched by tu_BeginCommandBuffer); the env read once */
++static unsigned
++sweet_pf_latch(void)
++{
++   if (sweet_pf_state < 0) {
++      pthread_mutex_lock(&sweet_pt_lock);
++      if (sweet_pf_state < 0) {
++         const char *e = getenv("SWEET_TU_PERFCTR");
++         int on = e && *e && strcmp(e, "0") ? 1 : 0;
++         unsigned p = 0;
++         for (unsigned i = 0; on && i < SWEET_PF_PRESETS; i++)
++            if (!strcmp(e, sweet_pf_presets[i].name))
++               p = i;
++         sweet_pf_cur = p;
++         sweet_pf_draws = debug_get_num_option("SWEET_TU_PERFCTR_DRAW", 0) != 0;
++         sweet_pf_sweep = debug_get_num_option("SWEET_TU_PERFCTR_SWEEP", 0) != 0;
++         if (sweet_pf_sweep)
++            on = 1;
++         if (on)
++            mesa_logi("sweet: perf counters on, preset %s%s%s", sweet_pf_presets[p].name, sweet_pf_draws ? ", per draw" : "",
++                      sweet_pf_sweep ? ", sweep" : "");
++         sweet_pf_state = on;
++      }
++      pthread_mutex_unlock(&sweet_pt_lock);
++   }
++   return sweet_pf_cur;
++}
++
++/* with sweet_pt_lock held: the counters of every preset (once), and the pass samples' buffer */
++static bool
++sweet_pf_setup(struct tu_device *dev)
++{
++   if (!sweet_pf_resolved) {
++      sweet_pf_resolved = true;
++      unsigned ngroups = 0;
++      const struct fd_perfcntr_group *groups = fd_perfcntrs(&dev->physical_device->dev_id, &ngroups);
++      for (unsigned p = 0; p < SWEET_PF_PRESETS; p++) {
++         unsigned used[32] = {};
++         for (unsigned i = 0; i < SWEET_PF_N; i++) {
++            const struct sweet_pf_cnt *c = &sweet_pf_presets[p].c[i];
++            struct sweet_pf_reg *r = &sweet_pf_regs[p][i];
++            unsigned g = 0;
++            for (; groups && g < ngroups && strcmp(groups[g].name, c->group); g++)
++               ;
++            const struct fd_perfcntr_countable *k =
++               groups && g < ngroups && g < 32 ? fd_perfcntrs_countable(&groups[g], c->countable) : NULL;
++            if (!k || used[g] >= groups[g].num_counters) {
++               mesa_logw("sweet: perf counters: no %s %s", c->group, c->countable);
++               continue;
++            }
++            const struct fd_perfcntr_counter *ctr = &groups[g].counters[groups[g].num_counters - 1 - used[g]++];
++            *r = (struct sweet_pf_reg) { ctr->select_reg, ctr->counter_reg_lo, k->selector, true };
++         }
++      }
++   }
++   if (!sweet_pf_pbo) {
++      struct tu_bo *bo = NULL;
++      if (tu_bo_init_new(dev, NULL, &bo, SWEET_PT_SLOTS * SWEET_PF_PQ * 8, TU_BO_ALLOC_NO_FLAGS, "sweet perf passes") ==
++             VK_SUCCESS &&
++          tu_bo_map(dev, bo, NULL) == VK_SUCCESS && bo->map) {
++         memset(bo->map, 0, SWEET_PT_SLOTS * SWEET_PF_PQ * 8);
++         sweet_pf_pv = (volatile uint64_t *) bo->map;
++         sweet_pf_pbo = bo;
++      } else {
++         mesa_logw("sweet: perf counters off (no buffer)");
++         sweet_pf_state = 0;
++         return false;
++      }
++   }
++   return true;
++}
++
++/* tu_cmd_render: the pass's slot (the timeline's) samples with the command buffer's preset */
++static int
++sweet_pf_open(struct tu_cmd_buffer *cmd, int slot)
++{
++   if (slot < 0 || sweet_pf_state != 1)
++      return slot;
++   pthread_mutex_lock(&sweet_pt_lock);
++   if (sweet_pf_setup(cmd->device)) {
++      for (unsigned i = 0; i < SWEET_PF_PQ; i++)
++         sweet_pf_pv[SWEET_PF_PQ * slot + i] = 0;
++      if (sweet_pf_pmeta[slot].preset)
++         sweet_pf_lost++;   /* never reported: the ring went round in a report's time */
++      const struct sweet_pt_meta *m = &sweet_pt_meta[slot];
++      sweet_pf_pgen = sweet_pf_pgen + 1 ? sweet_pf_pgen + 1 : 1;
++      sweet_pf_pmeta[slot] = (struct sweet_pf_pmeta) { sweet_pf_pgen, m->w, m->h, m->draws,
++                                                       (uint8_t) (cmd->sweet_pf_preset + 1), m->gmem };
++   }
++   pthread_mutex_unlock(&sweet_pt_lock);
++   return slot;
++}
++
++template <chip CHIP>
++static void
++sweet_pf_sample(struct tu_cs *cs, unsigned preset, uint64_t iova)
++{
++   for (unsigned i = 0; i < SWEET_PF_N; i++) {
++      const struct sweet_pf_reg *r = &sweet_pf_regs[preset][i];
++      if (!r->ok)
++         continue;
++      tu_cs_emit_pkt7(cs, CP_REG_TO_MEM, 3);
++      tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(r->lo) | CP_REG_TO_MEM_0_64B);
++      tu_cs_emit_qw(cs, iova + i * 8);
++   }
++}
++
++/* around a pass, in the primary's cs: end 0 before its begin stamp (selects + before), 1 after its end stamp */
++template <chip CHIP>
++static void
++sweet_pf_pass(struct tu_cmd_buffer *cmd, int slot, unsigned end)
++{
++   if (CHIP != A6XX || slot < 0 || sweet_pf_state != 1 || !sweet_pf_pbo || !sweet_pf_pmeta[slot].preset)
++      return;
++   const unsigned p = sweet_pf_pmeta[slot].preset - 1;
++   struct tu_cs *cs = &cmd->cs;
++   const uint64_t base = sweet_pf_pbo->iova + (uint64_t) SWEET_PF_PQ * slot * 8;
++   tu_cs_emit_wfi(cs);
++   if (!end) {
++      for (unsigned i = 0; i < SWEET_PF_N; i++) {
++         const struct sweet_pf_reg *r = &sweet_pf_regs[p][i];
++         if (!r->ok)
++            continue;
++         tu_cs_emit_pkt4(cs, r->sel, 1);
++         tu_cs_emit(cs, r->selector);
++      }
++      tu_cs_emit_wfi(cs);
++      sweet_pf_sample<CHIP>(cs, p, base);
++   } else {
++      sweet_pf_sample<CHIP>(cs, p, base + SWEET_PF_N * 8);
++      tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 4);
++      tu_cs_emit_qw(cs, base + 2 * SWEET_PF_N * 8);
++      tu_cs_emit_qw(cs, sweet_pf_pmeta[slot].gen);
++   }
++}
++
++/* per draw (SWEET_TU_PERFCTR_DRAW=1): the slot, -1 for none; the counters before the draw packet */
++template <chip CHIP>
++static int
++sweet_pf_before_draw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
++{
++   if (CHIP != A6XX || sweet_pf_state != 1 || !sweet_pf_draws || sweet_pt_state != 1 || !cmd->state.pass ||
++       cmd->device != sweet_pt_dev)
++      return -1;
++   pthread_mutex_lock(&sweet_pt_lock);
++   if (!sweet_pf_dbo) {
++      struct tu_bo *bo = NULL;
++      if (sweet_pf_setup(cmd->device) &&
++          tu_bo_init_new(cmd->device, NULL, &bo, SWEET_PF_DS * SWEET_PF_DQ * 8, TU_BO_ALLOC_NO_FLAGS,
++                         "sweet perf draws") == VK_SUCCESS &&
++          tu_bo_map(cmd->device, bo, NULL) == VK_SUCCESS && bo->map) {
++         memset(bo->map, 0, SWEET_PF_DS * SWEET_PF_DQ * 8);
++         sweet_pf_dv = (volatile uint64_t *) bo->map;
++         sweet_pf_dbo = bo;
++      } else {
++         mesa_logw("sweet: perf counters per draw off (no buffer)");
++         sweet_pf_draws = false;
++         pthread_mutex_unlock(&sweet_pt_lock);
++         return -1;
++      }
++   }
++   const uint32_t slot = sweet_pf_dnext++ % SWEET_PF_DS;
++   for (unsigned i = 0; i < SWEET_PF_DQ; i++)
++      sweet_pf_dv[SWEET_PF_DQ * slot + i] = 0;
++   sweet_pf_dgen = sweet_pf_dgen + 1 ? sweet_pf_dgen + 1 : 1;
++   sweet_pf_dmeta[slot] = (struct sweet_pf_dmeta) { sweet_pf_dgen, cmd->sweet_fs_id, cmd->sweet_px,
++                                                    (uint8_t) cmd->sweet_pf_preset };
++   pthread_mutex_unlock(&sweet_pt_lock);
++   const uint64_t base = sweet_pf_dbo->iova + (uint64_t) SWEET_PF_DQ * slot * 8;
++   /* not in the binning pass: its VS-only run of the draw is not the draw's work */
++   tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(RENDER_MODE) | CP_COND_REG_EXEC_0_GMEM | CP_COND_REG_EXEC_0_SYSMEM);
++   tu_cs_emit_wfi(cs);
++   sweet_pf_sample<CHIP>(cs, cmd->sweet_pf_preset, base + SWEET_PF_N * 8);
++   tu_cond_exec_end(cs);
++   return (int) slot;
++}
++
++template <chip CHIP>
++static void
++sweet_pf_after_draw(struct tu_cmd_buffer *cmd, struct tu_cs *cs, int slot)
++{
++   if (CHIP != A6XX || slot < 0)
++      return;
++   const uint64_t base = sweet_pf_dbo->iova + (uint64_t) SWEET_PF_DQ * slot * 8;
++   const unsigned p = cmd->sweet_pf_preset;
++   tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(RENDER_MODE) | CP_COND_REG_EXEC_0_GMEM | CP_COND_REG_EXEC_0_SYSMEM);
++   tu_cs_emit_wfi(cs);
++   sweet_pf_sample<CHIP>(cs, p, base + 2 * SWEET_PF_N * 8);
++   for (unsigned i = 0; i < SWEET_PF_N; i++) {
++      if (!sweet_pf_regs[p][i].ok)
++         continue;
++      /* acc (dst) = acc (srcA) + after (srcB) - before (srcC) */
++      tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 9);
++      tu_cs_emit(cs, CP_MEM_TO_MEM_0_WAIT_FOR_MEM_WRITES | CP_MEM_TO_MEM_0_DOUBLE | CP_MEM_TO_MEM_0_NEG_C);
++      tu_cs_emit_qw(cs, base + i * 8);
++      tu_cs_emit_qw(cs, base + i * 8);
++      tu_cs_emit_qw(cs, base + (2 * SWEET_PF_N + i) * 8);
++      tu_cs_emit_qw(cs, base + (SWEET_PF_N + i) * 8);
++   }
++   tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 4);
++   tu_cs_emit_qw(cs, base + 3 * SWEET_PF_N * 8);
++   tu_cs_emit_qw(cs, sweet_pf_dmeta[slot].gen);
++   tu_cond_exec_end(cs);
++}
++
++/* the report's sums: per preset, all passes, pass kinds (WxH, GMEM/sysmem), fragment shaders (per draw) */
++struct sweet_pf_sum {
++   uint32_t n, draws, gmem;
++   uint64_t ticks, px, v[SWEET_PF_N];
++};
++struct sweet_pf_kind {
++   uint8_t preset, gmem;
++   uint32_t w, h;
++   struct sweet_pf_sum s;
++};
++struct sweet_pf_fs {
++   uint8_t preset;
++   uint32_t fs;
++   struct sweet_pf_sum s;
++};
++#define SWEET_PF_KINDS 32u
++#define SWEET_PF_FSN 64u
++static struct sweet_pf_sum sweet_pf_all[SWEET_PF_PRESETS];
++static struct sweet_pf_kind sweet_pf_kinds[SWEET_PF_KINDS];
++static struct sweet_pf_fs sweet_pf_fss[SWEET_PF_FSN];
++static unsigned sweet_pf_nkinds, sweet_pf_nfs;
++
++/* with sweet_pt_lock held: every sample the GPU finished, summed, and its slot freed */
++static void
++sweet_pf_collect(void)
++{
++   memset(sweet_pf_all, 0, sizeof(sweet_pf_all));
++   sweet_pf_nkinds = sweet_pf_nfs = 0;
++   for (uint32_t slot = 0; sweet_pf_pv && sweet_pt_ts && slot < SWEET_PT_SLOTS; slot++) {
++      struct sweet_pf_pmeta *m = &sweet_pf_pmeta[slot];
++      const volatile uint64_t *q = &sweet_pf_pv[SWEET_PF_PQ * slot];
++      if (!m->preset || q[2 * SWEET_PF_N] != m->gen)
++         continue;   /* none, or not run yet */
++      const unsigned p = m->preset - 1;
++      m->preset = 0;
++      const uint64_t b = sweet_pt_ts[SWEET_PT_Q * slot], e = sweet_pt_ts[SWEET_PT_Q * slot + 2];
++      struct sweet_pf_sum d = {};
++      d.n = 1;
++      d.draws = m->draws;
++      d.gmem = m->gmem;
++      d.ticks = e > b && e - b < 19200000ull ? e - b : 0;
++      d.px = (uint64_t) m->w * m->h;
++      for (unsigned i = 0; i < SWEET_PF_N; i++)
++         d.v[i] = q[SWEET_PF_N + i] - q[i];
++      unsigned k = 0;
++      for (; k < sweet_pf_nkinds; k++)
++         if (sweet_pf_kinds[k].preset == p && sweet_pf_kinds[k].gmem == m->gmem && sweet_pf_kinds[k].w == m->w &&
++             sweet_pf_kinds[k].h == m->h)
++            break;
++      if (k == sweet_pf_nkinds && k < SWEET_PF_KINDS) {
++         sweet_pf_kinds[k] = (struct sweet_pf_kind) { (uint8_t) p, m->gmem, m->w, m->h, {} };
++         sweet_pf_nkinds++;
++      }
++      struct sweet_pf_sum *dst[2] = { &sweet_pf_all[p], k < sweet_pf_nkinds ? &sweet_pf_kinds[k].s : NULL };
++      for (unsigned j = 0; j < 2; j++) {
++         if (!dst[j])
++            continue;
++         dst[j]->n += d.n;
++         dst[j]->draws += d.draws;
++         dst[j]->gmem += d.gmem;
++         dst[j]->ticks += d.ticks;
++         dst[j]->px += d.px;
++         for (unsigned i = 0; i < SWEET_PF_N; i++)
++            dst[j]->v[i] += d.v[i];
++      }
++   }
++   for (uint32_t slot = 0; sweet_pf_dv && slot < SWEET_PF_DS; slot++) {
++      const struct sweet_pf_dmeta *dm = &sweet_pf_dmeta[slot];
++      const volatile uint64_t *q = &sweet_pf_dv[SWEET_PF_DQ * slot];
++      if (!dm->gen || q[3 * SWEET_PF_N] != dm->gen)
++         continue;
++      unsigned k = 0;
++      for (; k < sweet_pf_nfs; k++)
++         if (sweet_pf_fss[k].preset == dm->preset && sweet_pf_fss[k].fs == dm->fs)
++            break;
++      if (k == sweet_pf_nfs) {
++         if (k == SWEET_PF_FSN)
++            continue;
++         sweet_pf_fss[k] = (struct sweet_pf_fs) { dm->preset, dm->fs, {} };
++         sweet_pf_nfs++;
++      }
++      struct sweet_pf_sum *s = &sweet_pf_fss[k].s;
++      s->n++;
++      s->px += dm->px;
++      for (unsigned i = 0; i < SWEET_PF_N; i++)
++         s->v[i] += q[i];
++      sweet_pf_dmeta[slot].gen = 0;
++   }
++}
++
++/* "12.3M" */
++static const char *
++sweet_pf_si(char *buf, size_t size, double v)
++{
++   const char *u = "";
++   if (v >= 1e9) { v /= 1e9; u = "G"; }
++   else if (v >= 1e6) { v /= 1e6; u = "M"; }
++   else if (v >= 1e3) { v /= 1e3; u = "k"; }
++   snprintf(buf, size, v >= 100 || !*u ? "%.0f%s" : "%.1f%s", v, u);
++   return buf;
++}
++
++/* one sum: " clk 9.8M 587MHz sp 92% full 12.3M ... [derived]" (counts per draw when per_draw, else totals) */
++static size_t
++sweet_pf_put_sum(char *out, size_t size, unsigned p, const struct sweet_pf_sum *s, double per, bool clock)
++{
++#define PF_PUT(...) at += snprintf(out + at, size > at ? size - at : 0, __VA_ARGS__)
++   size_t at = 0;
++   char b[32];
++   const struct sweet_pf_preset *ps = &sweet_pf_presets[p];
++   const double cyc = (double) s->v[0];
++   for (unsigned i = 0; i < SWEET_PF_N; i++) {
++      const struct sweet_pf_cnt *c = &ps->c[i];
++      if (!sweet_pf_regs[p][i].ok)
++         continue;
++      const double v = (double) s->v[i];
++      if (i == 0) {
++         PF_PUT(" %s %s", c->label, sweet_pf_si(b, sizeof(b), v / per));
++         if (clock && s->ticks)
++            PF_PUT(" %.0fMHz", v / (s->ticks / 19.2));
++      } else if (c->kind == PF_CYC) {
++         PF_PUT(" %s %.0f%%", c->label, cyc > 0 ? 100.0 * v / cyc : 0.0);
++      } else if (c->kind == PF_BEAT) {
++         PF_PUT(" %s %.2fMB", c->label, v * 32 / 1e6 / per);
++      } else {
++         PF_PUT(" %s %s", c->label, sweet_pf_si(b, sizeof(b), v / per));
++      }
++   }
++   /* the preset's ratios, by label */
++   double val[SWEET_PF_N] = {};
++   auto get = [&](const char *label) -> double {
++      for (unsigned i = 0; i < SWEET_PF_N; i++)
++         if (sweet_pf_regs[p][i].ok && !strcmp(ps->c[i].label, label))
++            return val[i];
++      return -1;
++   };
++   for (unsigned i = 0; i < SWEET_PF_N; i++)
++      val[i] = (double) s->v[i];
++   const double px = s->px ? (double) s->px : -1;
++   if (!strcmp(ps->name, "alu")) {
++      const double lanes = get("quads") * 4, sp = get("sp"), full = get("full"), half = get("half");
++      if (lanes > 0)
++         PF_PUT(" -> full/px %.1f half/px %.1f", full / lanes, half / lanes);
++      if (sp > 0)
++         PF_PUT(" alu/sp %.0f%% instr/spclk %.1f", 100.0 * get("alu") / sp, (full + half) / sp);
++   } else if (!strcmp(ps->name, "wave")) {
++      const double sp = get("sp"), w = get("wctx");
++      if (sp > 0 && w > 0)
++         PF_PUT(" -> waves %.1f nop %.0f%% idle %.0f%% ss %.0f%% sy %.0f%%", w / sp, 100 * get("wnop") / w,
++                100 * get("widle") / w, 100 * get("wss") / w, 100 * get("wsy") / w);
++   } else if (!strcmp(ps->name, "mem")) {
++      const double bytes = (get("rd") + get("wr")) * 32;
++      if (cyc > 0)
++         PF_PUT(" -> B/clk %.1f", bytes / cyc);
++      if (px > 0)
++         PF_PUT(" B/px %.1f", bytes / px);
++   } else if (!strcmp(ps->name, "rop")) {
++      if (cyc > 0)
++         PF_PUT(" -> px/clk %.2f", get("pass") / cyc);
++      if (get("rb") > 0)
++         PF_PUT(" px/rbclk %.2f", get("pass") / get("rb"));
++   } else if (!strcmp(ps->name, "tex")) {
++      if (get("l1req") > 0)
++         PF_PUT(" -> l1miss %.1f%%", 100 * get("l1miss") / get("l1req"));
++      if (px > 0)
++         PF_PUT(" texels/px %.2f", get("texels") / px);
++   } else if (!strcmp(ps->name, "ras")) {
++      if (get("lrzpx") > 0)
++         PF_PUT(" -> lrzkill %.0f%%", 100 * (1 - get("lrzvis") / get("lrzpx")));
++      if (get("t8x4") > 0)
++         PF_PUT(" full8x4 %.0f%% quads/px %.2f", 100 * get("full8x4") / get("t8x4"), px > 0 ? get("quads") / px : 0.0);
++   }
++#undef PF_PUT
++   return at;
++}
++
++/* sweet 0113: "T tu-perf 5s" lines (SweetMetal2 dlsyms it): part 0 sums what the GPU finished since the last call and
++ * prints the passes, parts 1 and 2 the fragment shaders of most clocks (per draw: ranks 0-3, 4-7), part 3 and on
++ * nothing (0). With SWEET_TU_PERFCTR_SWEEP the
++ * preset moves on at part 0. */
++extern "C" __attribute__((visibility("default"))) size_t sweet_tu_perf_report(char *out, size_t size, unsigned part);
++extern "C" __attribute__((visibility("default"))) size_t
++sweet_tu_perf_report(char *out, size_t size, unsigned part)
++{
++   if (!out || size == 0)
++      return 0;
++   out[0] = 0;
++   if (sweet_pf_state != 1 || sweet_pt_state != 1 || part > 2)
++      return 0;
++   size_t at = 0;
++#define PF_PUT(...) at += snprintf(out + at, size > at ? size - at : 0, __VA_ARGS__)
++   pthread_mutex_lock(&sweet_pt_lock);
++   if (part == 0) {
++      sweet_pf_collect();
++      for (unsigned p = 0; p < SWEET_PF_PRESETS; p++) {
++         const struct sweet_pf_sum *s = &sweet_pf_all[p];
++         if (!s->n)
++            continue;
++         PF_PUT("%spreset %s: %u passes (gmem %u) %u draws %.1fms |", at ? " || " : "", sweet_pf_presets[p].name, s->n,
++                s->gmem, s->draws, s->ticks / 19200.0);
++         at += sweet_pf_put_sum(out + at, size > at ? size - at : 0, p, s, 1.0, true);
++         /* the 3 pass kinds of most clocks: per pass */
++         bool shown[SWEET_PF_KINDS] = {};
++         for (unsigned r = 0; r < 3; r++) {
++            int best = -1;
++            for (unsigned k = 0; k < sweet_pf_nkinds; k++)
++               if (!shown[k] && sweet_pf_kinds[k].preset == p &&
++                   (best < 0 || sweet_pf_kinds[k].s.v[0] > sweet_pf_kinds[best].s.v[0]))
++                  best = (int) k;
++            if (best < 0)
++               break;
++            shown[best] = true;
++            const struct sweet_pf_kind *k = &sweet_pf_kinds[best];
++            PF_PUT(" | %ux%u %c x%u d%.1f %.2fms/pass:", k->w, k->h, k->gmem ? 'g' : 's', k->s.n,
++                   (double) k->s.draws / k->s.n, k->s.ticks / 19200.0 / k->s.n);
++            at += sweet_pf_put_sum(out + at, size > at ? size - at : 0, p, &k->s, (double) k->s.n, true);
++         }
++      }
++      if (sweet_pf_lost)
++         PF_PUT(" | lost %u", sweet_pf_lost);
++      sweet_pf_lost = 0;
++      if (!at && sweet_pf_sweep)
++         PF_PUT("preset %s: no passes", sweet_pf_presets[sweet_pf_cur].name);
++      if (sweet_pf_sweep)
++         sweet_pf_cur = (sweet_pf_cur + 1) % SWEET_PF_PRESETS;
++   } else if (sweet_pf_nfs) {
++      /* the fragment shaders of most clocks (per draw, the ids of T tu-draw): per draw */
++      bool shown[SWEET_PF_FSN] = {};
++      for (unsigned r = 0; r < 4 * part; r++) {
++         int best = -1;
++         for (unsigned k = 0; k < sweet_pf_nfs; k++)
++            if (!shown[k] && (best < 0 || sweet_pf_fss[k].s.v[0] > sweet_pf_fss[best].s.v[0]))
++               best = (int) k;
++         if (best < 0)
++            break;
++         shown[best] = true;
++         if (r < 4 * (part - 1))
++            continue;   /* part 1: ranks 0-3, part 2: 4-7 */
++         const struct sweet_pf_fs *f = &sweet_pf_fss[best];
++         unsigned instrs = 0;
++         for (unsigned i = 0; i < sweet_fs_n; i++)
++            if (sweet_fs_tab[i].id == f->fs)
++               instrs = sweet_fs_tab[i].instrs;
++         PF_PUT("%s#%u %s i%u d%u a%.0fk:", at ? " " : "", f->fs, sweet_pf_presets[f->preset].name, instrs, f->s.n,
++                f->s.n ? f->s.px / 1000.0 / f->s.n : 0.0);
++         at += sweet_pf_put_sum(out + at, size > at ? size - at : 0, f->preset, &f->s, f->s.n ? (double) f->s.n : 1.0, false);
++         PF_PUT(";");
++      }
++   }
++   pthread_mutex_unlock(&sweet_pt_lock);
++#undef PF_PUT
++   return at < size ? at : size - 1;
++}
++
+ /* "passes N M.Mms (gmem a sysmem b) top: WxH FMT L/S gmem|sysmem T.Tms/n ... | tu waits cpu n (x ms) gpu n of s submits" */
+ /* "passes N M.Mms (gmem a sysmem b fetch f) top: WxH FMT L/S gmem|sysmem T.Tms xn [d D b V/B TWxTH bin B.BB] ...
+  *  [| seq T.Tms: ...] | tu submits ..."
+@@ -4749,6 +5298,7 @@ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
+    tu6_emit_tile_store_cs<CHIP>(cmd, &cmd->tile_store_cs);
+    tu_cs_end(&cmd->tile_store_cs);
+ 
++   sweet_pf_pass<CHIP>(cmd, sweet_slot, 0);   /* sweet 0113 */
+    sweet_pt_stamp<CHIP>(cmd, sweet_slot, 0);
+    tu6_tile_render_begin<CHIP>(cmd, &cmd->cs, rp_ctx, fdm_offsets);
+    sweet_pt_binned<CHIP>(cmd, sweet_slot);
+@@ -4806,6 +5356,7 @@ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
+ 
+    tu6_tile_render_end<CHIP>(cmd, &cmd->cs, rp_ctx);
+    sweet_pt_stamp<CHIP>(cmd, sweet_slot, 2);
++   sweet_pf_pass<CHIP>(cmd, sweet_slot, 1);   /* sweet 0113 */
+ 
+    /* Outside of renderpasses we assume all draw states are disabled. We do
+     * this outside the draw CS for the normal case where 3d gmem stores aren't
+@@ -4850,6 +5401,7 @@ tu_cmd_render_sysmem(struct tu_cmd_buffer *cmd,
+ 
+    tu_trace_start_render_pass(cmd);
+ 
++   sweet_pf_pass<CHIP>(cmd, sweet_slot, 0);   /* sweet 0113 */
+    sweet_pt_stamp<CHIP>(cmd, sweet_slot, 0);
+    tu6_sysmem_render_begin<CHIP>(cmd, &cmd->cs, rp_ctx);
+ 
+@@ -4861,6 +5413,7 @@ tu_cmd_render_sysmem(struct tu_cmd_buffer *cmd,
+ 
+    tu6_sysmem_render_end<CHIP>(cmd, &cmd->cs, rp_ctx);
+    sweet_pt_stamp<CHIP>(cmd, sweet_slot, 2);
++   sweet_pf_pass<CHIP>(cmd, sweet_slot, 1);   /* sweet 0113 */
+ 
+    /* Outside of renderpasses we assume all draw states are disabled. */
+    tu_disable_draw_states(cmd, &cmd->cs);
+@@ -4883,9 +5436,10 @@ tu_cmd_render(struct tu_cmd_buffer *cmd_buffer,
+ 
+    tu_autotune::rp_ctx_t rp_ctx = NULL;
+    if (use_sysmem_rendering(cmd_buffer, &rp_ctx, rp_key))
+-      tu_cmd_render_sysmem<CHIP>(cmd_buffer, rp_ctx, sweet_pt_open(cmd_buffer, false));
++      tu_cmd_render_sysmem<CHIP>(cmd_buffer, rp_ctx, sweet_pf_open(cmd_buffer, sweet_pt_open(cmd_buffer, false)));
+    else
+-      tu_cmd_render_tiles<CHIP>(cmd_buffer, rp_ctx, fdm_offsets, sweet_pt_open(cmd_buffer, true));
++      tu_cmd_render_tiles<CHIP>(cmd_buffer, rp_ctx, fdm_offsets,
++                                sweet_pf_open(cmd_buffer, sweet_pt_open(cmd_buffer, true)));   /* sweet 0113 */
+ }
+ 
+ static void tu_reset_render_pass(struct tu_cmd_buffer *cmd_buffer)
+@@ -5215,6 +5769,7 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+       return result;
+    sweet_pt_cb_begin(cmd_buffer);
+    cmd_buffer->sweet_serial = p_atomic_inc_return(&sweet_cb_serials);   /* sweet 0112 */
++   cmd_buffer->sweet_pf_preset = sweet_pf_state != 0 ? sweet_pf_latch() : 0;   /* sweet 0113 */
+ 
+    /* setup initial configuration into command buffer */
+    if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
+@@ -9662,11 +10217,13 @@ tu_CmdDraw(VkCommandBuffer commandBuffer,
+    tu6_emit_vs_params(cmd, 0, firstVertex, firstInstance);
+ 
+    tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);
++   const int sweet_pf = sweet_pf_before_draw<CHIP>(cmd, cs);   /* sweet 0113 */
+ 
+    tu_cs_emit_pkt7(cs, CP_DRAW_INDX_OFFSET, 3);
+    tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX));
+    tu_cs_emit(cs, instanceCount);
+    tu_cs_emit(cs, vertexCount);
++   sweet_pf_after_draw<CHIP>(cmd, cs, sweet_pf);   /* sweet 0113 */
+    sweet_ds_after_draw<CHIP>(cmd, cs);   /* sweet 0112 */
+ 
+    trace_end_draw(&cmd->rp_trace, cs);
+@@ -9738,6 +10295,7 @@ tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+    tu6_emit_vs_params(cmd, 0, vertexOffset, firstInstance);
+ 
+    tu6_draw_common<CHIP>(cmd, cs, true, indexCount);
++   const int sweet_pf = sweet_pf_before_draw<CHIP>(cmd, cs);   /* sweet 0113 */
+ 
+    tu_cs_emit_pkt7(cs, CP_DRAW_INDX_OFFSET, 7);
+    tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_DMA));
+@@ -9746,6 +10304,7 @@ tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+    tu_cs_emit(cs, firstIndex);
+    tu_cs_emit_qw(cs, cmd->state.index_va);
+    tu_cs_emit(cs, cmd->state.max_index_count);
++   sweet_pf_after_draw<CHIP>(cmd, cs, sweet_pf);   /* sweet 0113 */
+    sweet_ds_after_draw<CHIP>(cmd, cs);   /* sweet 0112 */
+ 
+    trace_end_draw(&cmd->rp_trace, cs);
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
+index 1a90a7c..e0e4757 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.h
++++ b/src/freedreno/vulkan/tu_cmd_buffer.h
+@@ -669,6 +669,7 @@ struct tu_cmd_buffer
+    uint32_t sweet_serial;   /* sweet 0112: which recording (tu_BeginCommandBuffer numbers them) */
+    uint32_t sweet_fs_id;    /* sweet 0112: the census id of the last draw's fragment shader */
+    uint32_t sweet_px;       /* sweet 0112: the last draw's bound (scissor in viewport in render area), pixels */
++   uint32_t sweet_pf_preset;   /* sweet 0113: the perf counter preset this recording samples with */
+ 
+    struct tu_device *device;
+ 

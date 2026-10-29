@@ -16,6 +16,8 @@ rm -rf "$B" && mkdir -p "$B"
 	grep -v "was built for newer 'iOS' version" || true
 [ -f "$B/SweetMetal2" ] || exit 1
 rm -rf out/SweetMetal2.dSYM; mv "$B/SweetMetal2.dSYM" out/ 2>/dev/null || dsymutil "$B/SweetMetal2" -o out/SweetMetal2.dSYM 2>/dev/null || true
+# unstripped copy (all local symbols) for tools-claude/sweet-prof.py --macho-dir .../syms
+rm -rf out/syms && mkdir -p out/syms && cp "$B/SweetMetal2" out/syms/SweetMetal2
 strip -x "$B/SweetMetal2"
 cp Info.plist "$B/Info.plist"
 cp "$TURNIP" "$B/libvulkan_freedreno.dylib"

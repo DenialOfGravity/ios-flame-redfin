@@ -1,0 +1,225 @@
+diff --git a/crates/metal2vulkan-runtime/src/linear_attachment.rs b/crates/metal2vulkan-runtime/src/linear_attachment.rs
+index 56508e92..e1221cc7 100644
+--- a/crates/metal2vulkan-runtime/src/linear_attachment.rs
++++ b/crates/metal2vulkan-runtime/src/linear_attachment.rs
+@@ -135,6 +135,13 @@ impl Coverage {
+             false => self.colors.get(index).copied().flatten(),
+         }
+     }
++
++    /// ios-on-pixel (bridge 0111): whether no draw of the pass writes color `index`: every draw's
++    /// pixels bounded (no execution, tile dispatch or rate map), and none of them with a write
++    /// mask (or a zeroing variant) on that color.
++    pub(super) fn sweet_unwritten(&self, index: usize) -> bool {
++        !self.unbounded && self.colors.get(index).copied().flatten().is_none()
++    }
+ }
+ 
+ /// What a draw writes of each color, by color index: `Some(reads)` where it writes the color,
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index a52061a8..8228873e 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -3649,6 +3649,40 @@ impl RenderCommandEncoder {
+                 depth_stencil: None,
+                 ..layout.clone()
+             });
++        // ios-on-pixel (bridge 0111, `SWEET_M2V_SCRATCH=1`): the memoryless colors no draw of the
++        // pass writes or reads leave every instance's subpass, after the clears ahead of the pass
++        // above (none for them) and before the pass objects below, which begin those instances
++        // and whose framebuffers a tiler sizes its bins by (`sweet_scratch_free`).
++        let simple = executions.is_empty()
++            && pending.is_empty()
++            && dispatches.is_empty()
++            && imageblock.is_none();
++        // ios-on-pixel (ws-u-combo): looked at only with SWEET_M2V_SCRATCH or SWEET_DRAWSTAT on
++        // (every pass as before with both off).
++        // The knob is read once per pass (it may change live, `sweet_drawstat::set_scratch_live`).
++        let trim = crate::sweet_drawstat::scratch_trim();
++        let scratch_free = match trim || crate::sweet_drawstat::on() {
++            true => sweet_scratch_free(&layout, &instances, &coverage, &inputs_read, &extended, simple),
++            false => Vec::new(),
++        };
++        if !scratch_free.is_empty() && trim {
++            for instance in instances.iter_mut() {
++                let mut storage = instance.shape.storage.clone();
++                storage.extend(scratch_free.iter().copied());
++                storage.sort_unstable();
++                storage.dedup();
++                instance.shape = instance.shape.with_storage(storage);
++            }
++            crate::sweet_drawstat::count(crate::sweet_drawstat::C_SCR_TRIMMED);
++            let cleared = scratch_free.iter().any(|&index| {
++                layout.colors[index as usize]
++                    .as_ref()
++                    .is_some_and(|color| color.load == LoadAction::Clear)
++            });
++            if cleared {
++                crate::sweet_drawstat::count(crate::sweet_drawstat::C_SCR_CLEARED);
++            }
++        }
+         crate::sweet_drawstat::lap(crate::sweet_drawstat::E_PLAN);
+         let mut objects = Vec::with_capacity(count);
+         for (index, instance) in instances.iter().enumerate() {
+@@ -8368,6 +8402,92 @@ fn cleared_off_codes(descriptor: &RenderPassDescriptor) -> BTreeSet<u32> {
+         .collect()
+ }
+ 
++/// ios-on-pixel (bridge 0111): the color indices of `layout`'s memoryless attachments that the
++/// pass's subpass may leave out (`VK_ATTACHMENT_UNUSED`, as the interlock's storage colors are,
++/// `render_target::create`): no draw of the pass writes one (`coverage`, every draw's pixels
++/// bounded) or reads one as an input attachment (`inputs_read`), nor took a view of it (its
++/// extended-range shadow, an instance's storage form or reformatting view, sample planes); the pass
++/// is `simple` (no execution of render commands, pending pipeline, tile dispatch or imageblock),
++/// no instance routes its colors or renders views, the attachment resolves nowhere, and another
++/// attachment stays in the subpass. Metal neither loads nor stores a memoryless texture (its
++/// validation stops `Load` and `Store`), so what the pass's clear would have left there is read by
++/// nothing: the pass is the same without it. The pipelines and the instances' secondary command
++/// buffers keep the compatible pass that has it: a driver that runs them in the subpass without
++/// it writes nothing there (Turnip: the color's MRT format `NONE`, `tu6_emit_mrt`), and its
++/// pipelines write it with an empty mask anyway. Counted (`SWEET_DRAWSTAT`) whether or not
++/// `SWEET_M2V_SCRATCH` leaves them out; not called with both off.
++fn sweet_scratch_free(
++    layout: &PassLayout,
++    instances: &[Instance],
++    coverage: &linear_attachment::Coverage,
++    inputs_read: &BTreeSet<u32>,
++    extended: &ExtendedShadows,
++    simple: bool,
++) -> Vec<u32> {
++    use crate::sweet_drawstat::{
++        count, C_SCR_FREE, C_SCR_OTHER, C_SCR_PASSES, C_SCR_READ, C_SCR_WRITTEN,
++    };
++    let memoryless: Vec<u32> = (0..layout.colors.len())
++        .filter(|&index| layout.colors[index].as_ref().is_some_and(|c| c.memoryless))
++        .map(|index| index as u32)
++        .collect();
++    if memoryless.is_empty() {
++        return Vec::new();
++    }
++    count(C_SCR_PASSES);
++    let shapes_plain = instances.iter().all(|instance| {
++        instance.shape.locations.is_empty() && instance.views == ViewSetup::default()
++    });
++    let mut free = Vec::new();
++    let (mut written, mut read, mut other) = (false, false, !simple || !shapes_plain);
++    for &index in &memoryless {
++        let Some(color) = layout.colors[index as usize].as_ref() else {
++            continue;
++        };
++        if !coverage.sweet_unwritten(index as usize) {
++            written = true;
++            continue;
++        }
++        if inputs_read.contains(&index) {
++            read = true;
++            continue;
++        }
++        let viewed = extended.made(index)
++            || instances.iter().any(|instance| {
++                instance.shape.storage.contains(&index)
++                    || instance.reformats.iter().any(|r| r.index == index as usize)
++            });
++        let resolves = color.resolve.is_some() || color.copied_resolve.is_some();
++        if viewed || resolves || color.planes.is_some() || !simple || !shapes_plain {
++            other = true;
++            continue;
++        }
++        free.push(index);
++    }
++    // Another attachment stays in every instance's subpass.
++    let stays = instances.iter().all(|instance| {
++        instance.shape.depth_stencil.is_some()
++            || layout.colors.iter().enumerate().any(|(index, color)| {
++                let index = index as u32;
++                color.is_some()
++                    && !free.contains(&index)
++                    && !instance.shape.storage.contains(&index)
++            })
++    });
++    if !stays {
++        free.clear();
++        other = true;
++    }
++    match free.is_empty() {
++        false => count(C_SCR_FREE),
++        true if written => count(C_SCR_WRITTEN),
++        true if read => count(C_SCR_READ),
++        true if other => count(C_SCR_OTHER),
++        true => {}
++    }
++    free
++}
++
+ /// The layout of an instance of `shape` in a pass of `layout`: `bare`, the layout without the
+ /// pass's hidden depth and stencil, for an instance before they arrived (its shape has no
+ /// depth/stencil attachment), else `layout`.
+diff --git a/crates/metal2vulkan-runtime/src/sweet_drawstat.rs b/crates/metal2vulkan-runtime/src/sweet_drawstat.rs
+index d7dc4261..59729d82 100644
+--- a/crates/metal2vulkan-runtime/src/sweet_drawstat.rs
++++ b/crates/metal2vulkan-runtime/src/sweet_drawstat.rs
+@@ -72,7 +72,20 @@ pub const C_SEED_SKIPS: usize = 46;
+ // (a state call since, or a new instance), and entries dropped for room (`fast_kept`).
+ pub const C_FAST_MISS_GEN: usize = 47;
+ pub const C_FAST_EVICTS: usize = 48;
+-pub const STEPS: usize = 49;
++// 0111 counts (`render.rs` `sweet_scratch_free`): passes with a memoryless color attachment, those
++// whose draws neither write nor read one (the ones `SWEET_M2V_SCRATCH=1` leaves out of the subpass),
++// the passes it did leave one out of, those of them whose load action was `Clear`, and why the
++// others kept it (a draw wrote it; a draw fetched it; anything else: an execution, a tile dispatch,
++// an imageblock, a pending pipeline, a routed or multiview subpass, a resolve, sample planes, no
++// other attachment).
++pub const C_SCR_PASSES: usize = 49;
++pub const C_SCR_FREE: usize = 50;
++pub const C_SCR_TRIMMED: usize = 51;
++pub const C_SCR_CLEARED: usize = 52;
++pub const C_SCR_WRITTEN: usize = 53;
++pub const C_SCR_READ: usize = 54;
++pub const C_SCR_OTHER: usize = 55;
++pub const STEPS: usize = 56;
+ 
+ /// Each step's short name, in the order of the constants above.
+ pub const NAMES: [&str; STEPS] = [
+@@ -82,6 +95,8 @@ pub const NAMES: [&str; STEPS] = [
+     "e.steps", "e.tail", "e.core", "END", "OPEN", "#rp", "#fb", "#set", "#set-reused",
+     "#held", "#writes", "e.p2.plan", "e.p2.shadows", "e.p2.uses", "e.p2.endsec", "#rp-hit",
+     "#fb-hit", "#fast-hit", "#fast-miss", "#seed-skip", "#fast-miss-gen", "#fast-evict",
++    "#scr-pass", "#scr-free", "#scr-trim", "#scr-trim-clear", "#scr-kept-w", "#scr-kept-r",
++    "#scr-kept-x",
+ ];
+ 
+ static NS: [AtomicU64; STEPS] = [const { AtomicU64::new(0) }; STEPS];
+@@ -135,6 +150,33 @@ pub fn fast_draw() -> bool {
+     *ON.get_or_init(|| flag("SWEET_FASTDRAW", true))
+ }
+ 
++/// ios-on-pixel (bridge 0111): whether a memoryless color attachment that no draw of its pass
++/// writes or reads is left out of the pass's subpass (`VK_ATTACHMENT_UNUSED`, its description
++/// kept, so its framebuffer and every pipeline's compatible pass are as before) in the passes
++/// `end_encoding` begins (env `SWEET_M2V_SCRATCH`, off unless set and not `0`). A tiler then keeps
++/// it out of tile memory (Turnip: half the bytes per pixel of CoreAnimation's two-color passes,
++/// twice the pixels per bin) and neither clears nor loads it. Metal keeps nothing of a memoryless
++/// texture past its pass, so a color no draw touches holds nothing anyone reads. The frontend's
++/// live knobs (`/var/local/mtl2-live`) override the env through `set_scratch_live`: the choice is
++/// made per pass (a trimmed pass and its framebuffer are other kept objects than the full ones,
++/// `render_target` keys them by their attachments and subpass), so it may change between passes.
++#[inline]
++pub fn scratch_trim() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    match SCRATCH_LIVE.load(Ordering::Relaxed) {
++        live if live >= 0 => live != 0,
++        _ => *ON.get_or_init(|| flag("SWEET_M2V_SCRATCH", false)),
++    }
++}
++
++static SCRATCH_LIVE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
++
++/// ios-on-pixel (bridge 0111): `scratch_trim`'s live value from the next pass on: 0 off, 1 on,
++/// negative = the env's again.
++pub fn set_scratch_live(value: i8) {
++    SCRATCH_LIVE.store(value.max(-1), Ordering::Relaxed);
++}
++
+ /// Whether a surface texture's shadow skips its copy in while its image holds the bytes of the
+ /// surface's seed the frontend gave (env `SWEET_SHADOW_SEED`, off unless set and not `0`).
+ #[inline]

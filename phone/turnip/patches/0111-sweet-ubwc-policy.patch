@@ -1,0 +1,190 @@
+sweet 0111 (u-ub): SWEET_UBWC policy and a UBWC census
+
+Turnip compresses (UBWC) every optimal-tiled image that ubwc_possible() and its mutable-format checks allow; nothing
+in our patches turned that off (0102's "no UBWC on these targets" is about the IOSurface framebuffers, which
+metal2vulkan makes LINEAR over imported pages). SWEET_UBWC makes the choice explicit:
+  unset  Turnip's own rules (as before 0111)
+  0      no UBWC on any image (the A/B baseline; TU_DEBUG=noubwc for images alone)
+  1      UBWC only on private device images: optimal tiling, no explicit layout / DRM modifier, no host-transfer
+         usage, no external-memory handle, no sparse/alias flag, and a render-target/sampled/input usage
+IOSurface-backed and CPU-visible images (linear, explicit layout, host transfer) are never compressed under any value.
+sweet_tu_ubwc_report() (exported) gives the census since its last call: images made by outcome (ubwc / tiled without
+ubwc / linear) and their MB, why a tiled image of >= 64K px went without (storage, mutable, host transfer, policy,
+other), and the first 12 large shapes (w x h, VkFormat, usage, flags, outcome). SweetMetal2 logs it as
+"native-metal: T tu-ubwc:" after the "T 5s" line.
+
+diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
+index b763c35..5a12073 100644
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -12,7 +12,9 @@
+ #include "drm-uapi/drm_fourcc.h"
+ 
+ #include "util/format/u_format.h"
++#include "util/u_atomic.h"
+ #include "util/u_debug.h"
++#include <pthread.h>
+ #include "vk_android.h"
+ #include "vk_debug_utils.h"
+ #include "vk_util.h"
+@@ -511,6 +513,136 @@ format_list_ubwc_possible(struct tu_device *dev,
+    return true;
+ }
+ 
++/* sweet 0111 (u-ub): SWEET_UBWC, read once: unset (-1) = Turnip's own rules, as before 0111 (every optimal image that
++ * ubwc_possible() and the mutable-format checks allow is compressed); 0 = no UBWC on any image (TU_DEBUG=noubwc for
++ * images alone); 1 = UBWC only on a private device image (sweet_ubwc_private): what the display, the kernel blit, the
++ * CPU or another process reads (IOSurfaces: linear images over imported pages, explicit layouts, DRM modifiers,
++ * host-transfer images) never is. sweet_tu_ubwc_report() gives the census since its last call for the frontend's
++ * "native-metal: T tu-ubwc:" line. */
++static int
++sweet_ubwc_policy(void)
++{
++   static int policy = -2;
++   if (policy == -2)
++      policy = (int) debug_get_num_option("SWEET_UBWC", -1);
++   return policy;
++}
++
++static bool
++sweet_ubwc_private(const VkImageCreateInfo *info, uint64_t modifier,
++                   const VkSubresourceLayout *plane_layouts)
++{
++   if (info->tiling != VK_IMAGE_TILING_OPTIMAL || plane_layouts ||
++       modifier != DRM_FORMAT_MOD_INVALID)
++      return false;
++   if (info->usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT)
++      return false;
++   if (info->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_ALIAS_BIT))
++      return false;
++   const VkExternalMemoryImageCreateInfo *external =
++      vk_find_struct_const(info->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
++   if (external && external->handleTypes)
++      return false;
++   /* render targets and sampled images; a transfer-only (staging) image stays as it is made */
++   return (info->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
++                          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
++                          VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)) != 0;
++}
++
++/* census: images made, by outcome (0 ubwc, 1 tiled without ubwc, 2 linear), their bytes, and why a tiled image of
++ * >= 64K px went without (0 storage, 1 mutable, 2 host transfer, 3 policy, 4 other); and the first large shapes */
++enum { SWEET_UB_UBWC, SWEET_UB_TILED, SWEET_UB_LINEAR, SWEET_UB_KINDS };
++enum { SWEET_UBR_STORAGE, SWEET_UBR_MUTABLE, SWEET_UBR_HOST, SWEET_UBR_POLICY, SWEET_UBR_OTHER, SWEET_UBR_COUNT };
++static uint64_t sweet_ub_n[SWEET_UB_KINDS], sweet_ub_bytes[SWEET_UB_KINDS], sweet_ub_why[SWEET_UBR_COUNT];
++static uint64_t sweet_ub_total[SWEET_UB_KINDS];
++#define SWEET_UB_SHAPES 12
++static struct {
++   uint32_t w, h, format, usage, flags, kind;
++} sweet_ub_shapes[SWEET_UB_SHAPES];
++static uint32_t sweet_ub_shape_count, sweet_ub_shape_logged;
++static pthread_mutex_t sweet_ub_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static void
++sweet_ubwc_note(const struct tu_image *image, const VkImageCreateInfo *info, bool policy_refused)
++{
++   const struct fdl_layout *layout = &image->layout[0];
++   const unsigned kind = layout->ubwc ? SWEET_UB_UBWC :
++                         layout->tile_mode != TILE6_LINEAR ? SWEET_UB_TILED : SWEET_UB_LINEAR;
++   p_atomic_inc(&sweet_ub_n[kind]);
++   p_atomic_inc(&sweet_ub_total[kind]);
++   p_atomic_add(&sweet_ub_bytes[kind], image->total_size);
++   const uint64_t px = (uint64_t) image->vk.extent.width * image->vk.extent.height;
++   if (px < 65536)
++      return;
++   if (kind == SWEET_UB_TILED) {
++      const unsigned why = policy_refused ? SWEET_UBR_POLICY :
++                           (info->usage & VK_IMAGE_USAGE_STORAGE_BIT) ? SWEET_UBR_STORAGE :
++                           (info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) ? SWEET_UBR_MUTABLE :
++                           (info->usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) ? SWEET_UBR_HOST : SWEET_UBR_OTHER;
++      p_atomic_inc(&sweet_ub_why[why]);
++   }
++   pthread_mutex_lock(&sweet_ub_lock);
++   bool seen = false;
++   for (uint32_t i = 0; i < sweet_ub_shape_count; i++) {
++      if (sweet_ub_shapes[i].w == image->vk.extent.width && sweet_ub_shapes[i].h == image->vk.extent.height &&
++          sweet_ub_shapes[i].format == (uint32_t) image->vk.format && sweet_ub_shapes[i].usage == info->usage &&
++          sweet_ub_shapes[i].flags == info->flags && sweet_ub_shapes[i].kind == kind)
++         seen = true;
++   }
++   if (!seen && sweet_ub_shape_count < SWEET_UB_SHAPES) {
++      sweet_ub_shapes[sweet_ub_shape_count].w = image->vk.extent.width;
++      sweet_ub_shapes[sweet_ub_shape_count].h = image->vk.extent.height;
++      sweet_ub_shapes[sweet_ub_shape_count].format = (uint32_t) image->vk.format;
++      sweet_ub_shapes[sweet_ub_shape_count].usage = info->usage;
++      sweet_ub_shapes[sweet_ub_shape_count].flags = info->flags;
++      sweet_ub_shapes[sweet_ub_shape_count].kind = kind;
++      sweet_ub_shape_count++;
++   }
++   pthread_mutex_unlock(&sweet_ub_lock);
++}
++
++extern "C" __attribute__((visibility("default"))) size_t sweet_tu_ubwc_report(char *out, size_t size);
++extern "C" __attribute__((visibility("default"))) size_t
++sweet_tu_ubwc_report(char *out, size_t size)
++{
++   if (!out || size == 0)
++      return 0;
++   out[0] = 0;
++   uint64_t n[SWEET_UB_KINDS], mb[SWEET_UB_KINDS], why[SWEET_UBR_COUNT];
++   uint64_t made = 0;
++   for (unsigned k = 0; k < SWEET_UB_KINDS; k++) {
++      n[k] = p_atomic_xchg(&sweet_ub_n[k], 0);
++      mb[k] = p_atomic_xchg(&sweet_ub_bytes[k], 0);
++      made += n[k];
++   }
++   for (unsigned k = 0; k < SWEET_UBR_COUNT; k++)
++      why[k] = p_atomic_xchg(&sweet_ub_why[k], 0);
++   if (!made)
++      return 0;
++   size_t at = 0;
++#define SWEET_PUT(...) (at += snprintf(out + at, size > at ? size - at : 0, __VA_ARGS__))
++   SWEET_PUT("policy %d | new: ubwc %llu (%.1f MB) tiled %llu (%.1f MB) linear %llu (%.1f MB) | since start %llu/%llu/%llu",
++             sweet_ubwc_policy(), (unsigned long long) n[0], mb[0] / 1048576.0, (unsigned long long) n[1],
++             mb[1] / 1048576.0, (unsigned long long) n[2], mb[2] / 1048576.0,
++             (unsigned long long) p_atomic_read(&sweet_ub_total[0]), (unsigned long long) p_atomic_read(&sweet_ub_total[1]),
++             (unsigned long long) p_atomic_read(&sweet_ub_total[2]));
++   SWEET_PUT(" | tiled>=64Kpx without: storage %llu mutable %llu host %llu policy %llu other %llu",
++             (unsigned long long) why[0], (unsigned long long) why[1], (unsigned long long) why[2],
++             (unsigned long long) why[3], (unsigned long long) why[4]);
++   static const char *const kinds[SWEET_UB_KINDS] = { "ubwc", "tiled", "linear" };
++   pthread_mutex_lock(&sweet_ub_lock);
++   if (sweet_ub_shape_logged < sweet_ub_shape_count) {
++      SWEET_PUT(" | first:");
++      for (uint32_t i = sweet_ub_shape_logged; i < sweet_ub_shape_count; i++)
++         SWEET_PUT(" %ux%u vk%u u%#x f%#x %s;", sweet_ub_shapes[i].w, sweet_ub_shapes[i].h, sweet_ub_shapes[i].format,
++                   sweet_ub_shapes[i].usage, sweet_ub_shapes[i].flags, kinds[sweet_ub_shapes[i].kind]);
++      sweet_ub_shape_logged = sweet_ub_shape_count;
++   }
++   pthread_mutex_unlock(&sweet_ub_lock);
++#undef SWEET_PUT
++   return at < size ? at : size - 1;
++}
++
+ template <chip CHIP>
+ VkResult
+ tu_image_init(struct tu_device *device, struct tu_image *image,
+@@ -665,6 +797,15 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
+       ubwc_enabled = false;
+    }
+ 
++   /* sweet 0111 (u-ub): SWEET_UBWC=0 none, =1 private device images only (sweet_ubwc_private); unset as before */
++   bool sweet_policy_refused = false;
++   const int sweet_ubwc = sweet_ubwc_policy();
++   if (ubwc_enabled && (sweet_ubwc == 0 ||
++                        (sweet_ubwc == 1 && !sweet_ubwc_private(pCreateInfo, modifier, plane_layouts)))) {
++      ubwc_enabled = false;
++      sweet_policy_refused = true;
++   }
++
+    /* Layout computation begins here */
+    enum a6xx_tile_mode tile_mode = TILE6_3;
+ #if DETECT_OS_LINUX || DETECT_OS_BSD
+@@ -836,6 +977,7 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
+          image->vk.array_layers * sizeof(struct tu_subsampled_metadata);
+    }
+ 
++   sweet_ubwc_note(image, pCreateInfo, sweet_policy_refused);
+    return VK_SUCCESS;
+ }
+ TU_GENX(tu_image_init);

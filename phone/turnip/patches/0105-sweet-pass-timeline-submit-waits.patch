@@ -1,0 +1,383 @@
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 60ad3a8..5c0888f 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -28,6 +28,10 @@
+ #include "tu_tile_config.h"
+ #include "tu_tracepoints.h"
+ 
++#include <pthread.h>
++#include "util/format/u_format.h"
++#include "vk_format.h"
++
+ enum tu_cmd_buffer_status {
+    TU_CMD_BUFFER_STATUS_IDLE = 0,
+    TU_CMD_BUFFER_STATUS_ACTIVE = 1,
+@@ -3879,11 +3883,188 @@ tu_emit_subsampled(struct tu_cmd_buffer *cmd,
+    free(dst);
+ }
+ 
++/* SweetMetal2 (u-t, frame timeline): each render pass's GPU time, written by the GPU (RB_DONE_TS of the always-on
++ * counter, as u_trace's timestamps) into a ring of 4096 begin/end pairs, with what the pass was (render area, first
++ * attachment's format, load/store, GMEM or sysmem) beside it on the CPU. On only where SWEET_TIMELINE is set and not "0"
++ * (the bundle sets it for backboardd), and only for the first device that records a pass. sweet_tu_pass_report() sums
++ * the passes that completed since its last call by kind and prints the most expensive; backboardd's frontend calls it
++ * every 5 s for its "T 5s" line. Counters of darwin_queue_submit's waits (tu_knl_darwin.cc) are reported with it. */
++#define SWEET_PT_SLOTS 4096u
++struct sweet_pt_meta {
++   uint32_t w, h, format, gen;
++   uint8_t gmem, load, store, atts;
++};
++static pthread_mutex_t sweet_pt_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct tu_device *sweet_pt_dev;
++static struct tu_bo *sweet_pt_bo;
++static volatile uint64_t *sweet_pt_ts;
++static struct sweet_pt_meta sweet_pt_meta[SWEET_PT_SLOTS];
++static uint32_t sweet_pt_next, sweet_pt_gen;
++static int sweet_pt_state = -1;   /* -1 unknown, 0 off, 1 on */
++extern "C" __attribute__((visibility("default"))) size_t sweet_tu_pass_report(char *out, size_t size, unsigned top);
++extern "C" {
++uint64_t sweet_tu_submit_cpu_waits, sweet_tu_submit_cpu_wait_ns, sweet_tu_submit_gpu_waits, sweet_tu_submits;
++}
++
++static int
++sweet_pt_open(struct tu_cmd_buffer *cmd, bool gmem)
++{
++   if (sweet_pt_state == 0)
++      return -1;
++   pthread_mutex_lock(&sweet_pt_lock);
++   if (sweet_pt_state < 0) {
++      const char *e = getenv("SWEET_TIMELINE");
++      sweet_pt_state = e && *e && strcmp(e, "0") ? 1 : 0;
++   }
++   int slot = -1;
++   if (sweet_pt_state == 1 && !sweet_pt_bo && !sweet_pt_dev) {
++      sweet_pt_dev = cmd->device;
++      struct tu_bo *bo = NULL;
++      if (tu_bo_init_new(cmd->device, NULL, &bo, SWEET_PT_SLOTS * 16, TU_BO_ALLOC_NO_FLAGS, "sweet pass timeline") == VK_SUCCESS) {
++         if (tu_bo_map(cmd->device, bo, NULL) == VK_SUCCESS && bo->map) {
++            memset(bo->map, 0, SWEET_PT_SLOTS * 16);
++            sweet_pt_ts = (volatile uint64_t *) bo->map;
++            sweet_pt_bo = bo;
++         }
++      }
++      if (!sweet_pt_bo) {
++         mesa_logw("sweet: pass timeline off (no buffer)");
++         sweet_pt_state = 0;
++      }
++   }
++   if (sweet_pt_state == 1 && sweet_pt_bo && sweet_pt_dev == cmd->device && cmd->state.pass) {
++      slot = (int) (sweet_pt_next++ % SWEET_PT_SLOTS);
++      sweet_pt_ts[2 * slot] = 0;
++      sweet_pt_ts[2 * slot + 1] = 0;
++      struct sweet_pt_meta m = {};
++      m.w = cmd->state.render_areas[0].extent.width;
++      m.h = cmd->state.render_areas[0].extent.height;
++      m.gmem = gmem;
++      const struct tu_render_pass *pass = cmd->state.pass;
++      const struct tu_subpass *sub = &pass->subpasses[0];
++      uint32_t att = VK_ATTACHMENT_UNUSED;
++      for (uint32_t i = 0; i < sub->color_count && att == VK_ATTACHMENT_UNUSED; i++)
++         att = sub->color_attachments[i].attachment;
++      if (att == VK_ATTACHMENT_UNUSED && sub->depth_used)
++         att = sub->depth_stencil_attachment.attachment;
++      if (att != VK_ATTACHMENT_UNUSED && att < pass->attachment_count) {
++         const struct tu_render_pass_attachment *a = &pass->attachments[att];
++         m.format = a->format;
++         m.load = a->clear_mask ? 'C' : a->load ? 'L' : 'D';
++         m.store = a->store ? 'S' : 'D';
++      } else {
++         m.load = m.store = '-';
++      }
++      m.atts = (uint8_t) MIN2(pass->attachment_count, 255u);
++      m.gen = ++sweet_pt_gen ? sweet_pt_gen : ++sweet_pt_gen;
++      sweet_pt_meta[slot] = m;
++   }
++   pthread_mutex_unlock(&sweet_pt_lock);
++   return slot;
++}
++
++template <chip CHIP>
++static void
++sweet_pt_stamp(struct tu_cmd_buffer *cmd, int slot, unsigned end)
++{
++   if (slot < 0)
++      return;
++   const uint64_t iova = sweet_pt_bo->iova + (uint64_t) (2 * slot + end) * 8;
++   struct tu_cs *cs = &cmd->cs;
++   if (CHIP == A6XX) {
++      tu_cs_emit_pkt7(cs, CP_EVENT_WRITE, 4);
++      tu_cs_emit(cs, CP_EVENT_WRITE_0_EVENT(RB_DONE_TS) | CP_EVENT_WRITE_0_TIMESTAMP);
++      tu_cs_emit_qw(cs, iova);
++      tu_cs_emit(cs, 0x00000000);
++   } else {
++      tu_cs_emit_pkt7(cs, CP_EVENT_WRITE7, 3);
++      tu_cs_emit(cs, CP_EVENT_WRITE7_0(.event = RB_DONE_TS, .write_src = EV_WRITE_ALWAYSON,
++                                       .write_dst = EV_DST_RAM, .write_enabled = true).value);
++      tu_cs_emit_qw(cs, iova);
++   }
++}
++
++/* "passes N M.Mms (gmem a sysmem b) top: WxH FMT L/S gmem|sysmem T.Tms/n ... | tu waits cpu n (x ms) gpu n of s submits" */
++extern "C" __attribute__((visibility("default"))) size_t
++sweet_tu_pass_report(char *out, size_t size, unsigned top)
++{
++   if (!out || size == 0)
++      return 0;
++   out[0] = 0;
++   struct key {
++      uint32_t w, h, format;
++      uint8_t gmem, load, store;
++      uint64_t ticks;
++      uint32_t n;
++   } keys[48];
++   unsigned nkeys = 0;
++   uint64_t all_ticks = 0;
++   uint32_t passes = 0, gmem_passes = 0;
++   pthread_mutex_lock(&sweet_pt_lock);
++   if (sweet_pt_ts) {
++      for (uint32_t slot = 0; slot < SWEET_PT_SLOTS; slot++) {
++         struct sweet_pt_meta *m = &sweet_pt_meta[slot];
++         if (!m->gen)
++            continue;
++         const uint64_t b = sweet_pt_ts[2 * slot], e = sweet_pt_ts[2 * slot + 1];
++         if (!b || !e || e < b)
++            continue;   /* not run yet (or a reused slot half written): next time */
++         m->gen = 0;
++         const uint64_t t = e - b;
++         if (t > 19200000ull)
++            continue;   /* over a second: not one pass's time */
++         passes++;
++         gmem_passes += m->gmem;
++         all_ticks += t;
++         unsigned k = 0;
++         for (; k < nkeys; k++)
++            if (keys[k].w == m->w && keys[k].h == m->h && keys[k].format == m->format && keys[k].gmem == m->gmem &&
++                keys[k].load == m->load && keys[k].store == m->store)
++               break;
++         if (k == nkeys) {
++            if (nkeys == ARRAY_SIZE(keys))
++               continue;
++            keys[nkeys++] = (struct key) { m->w, m->h, m->format, m->gmem, m->load, m->store, 0, 0 };
++         }
++         keys[k].ticks += t;
++         keys[k].n++;
++      }
++   }
++   pthread_mutex_unlock(&sweet_pt_lock);
++   /* the always-on counter: 19.2 MHz (timestampPeriod) */
++   const double ms_per_tick = 1000.0 / 19200000.0;
++   size_t at = 0;
++   at += snprintf(out + at, size > at ? size - at : 0, "passes %u %.1fms (gmem %u sysmem %u)", passes, all_ticks * ms_per_tick,
++                  gmem_passes, passes - gmem_passes);
++   for (unsigned i = 0; i < top && i < nkeys; i++) {
++      unsigned best = i;
++      for (unsigned k = i + 1; k < nkeys; k++)
++         if (keys[k].ticks > keys[best].ticks)
++            best = k;
++      struct key tmp = keys[i];
++      keys[i] = keys[best];
++      keys[best] = tmp;
++      const char *f = keys[i].format ? util_format_short_name(vk_format_to_pipe_format((VkFormat) keys[i].format)) : "none";
++      at += snprintf(out + at, size > at ? size - at : 0, "%s %ux%u %s %c/%c %s %.2fms x%u", i ? "," : " top:", keys[i].w,
++                     keys[i].h, f ? f : "?", keys[i].load, keys[i].store, keys[i].gmem ? "gmem" : "sysmem",
++                     keys[i].ticks * ms_per_tick / keys[i].n, keys[i].n);
++   }
++   static uint64_t last[4];
++   const uint64_t now[4] = { p_atomic_read(&sweet_tu_submits), p_atomic_read(&sweet_tu_submit_cpu_waits),
++                             p_atomic_read(&sweet_tu_submit_cpu_wait_ns), p_atomic_read(&sweet_tu_submit_gpu_waits) };
++   at += snprintf(out + at, size > at ? size - at : 0, " | tu submits %llu, cpu-waited %llu (%.1fms), gpu-waited %llu",
++                  (unsigned long long) (now[0] - last[0]), (unsigned long long) (now[1] - last[1]),
++                  (now[2] - last[2]) / 1e6, (unsigned long long) (now[3] - last[3]));
++   memcpy(last, now, sizeof(last));
++   return at < size ? at : size - 1;
++}
++
+ template <chip CHIP>
+ static void
+ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
+                     tu_autotune::rp_ctx_t rp_ctx,
+-                    const VkOffset2D *fdm_offsets)
++                    const VkOffset2D *fdm_offsets,
++                    int sweet_slot)
+ {
+    const struct tu_tiling_config *tiling = cmd->state.tiling;
+    const struct tu_vsc_config *vsc = tu_vsc_config(cmd, tiling);
+@@ -3923,6 +4104,7 @@ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
+    tu6_emit_tile_store_cs<CHIP>(cmd, &cmd->tile_store_cs);
+    tu_cs_end(&cmd->tile_store_cs);
+ 
++   sweet_pt_stamp<CHIP>(cmd, sweet_slot, 0);
+    tu6_tile_render_begin<CHIP>(cmd, &cmd->cs, rp_ctx, fdm_offsets);
+ 
+    /* Note: we reverse the order of walking the pipes and tiles on every
+@@ -3977,6 +4159,7 @@ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
+    }
+ 
+    tu6_tile_render_end<CHIP>(cmd, &cmd->cs, rp_ctx);
++   sweet_pt_stamp<CHIP>(cmd, sweet_slot, 1);
+ 
+    /* Outside of renderpasses we assume all draw states are disabled. We do
+     * this outside the draw CS for the normal case where 3d gmem stores aren't
+@@ -4009,7 +4192,8 @@ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
+ template <chip CHIP>
+ static void
+ tu_cmd_render_sysmem(struct tu_cmd_buffer *cmd,
+-                     tu_autotune::rp_ctx_t rp_ctx)
++                     tu_autotune::rp_ctx_t rp_ctx,
++                     int sweet_slot)
+ {
+    VkResult result = tu_allocate_transient_attachments(cmd, true);
+ 
+@@ -4020,6 +4204,7 @@ tu_cmd_render_sysmem(struct tu_cmd_buffer *cmd,
+ 
+    tu_trace_start_render_pass(cmd);
+ 
++   sweet_pt_stamp<CHIP>(cmd, sweet_slot, 0);
+    tu6_sysmem_render_begin<CHIP>(cmd, &cmd->cs, rp_ctx);
+ 
+    trace_start_draw_ib_sysmem(&cmd->trace, &cmd->cs, cmd);
+@@ -4029,6 +4214,7 @@ tu_cmd_render_sysmem(struct tu_cmd_buffer *cmd,
+    trace_end_draw_ib_sysmem(&cmd->trace, &cmd->cs);
+ 
+    tu6_sysmem_render_end<CHIP>(cmd, &cmd->cs, rp_ctx);
++   sweet_pt_stamp<CHIP>(cmd, sweet_slot, 1);
+ 
+    /* Outside of renderpasses we assume all draw states are disabled. */
+    tu_disable_draw_states(cmd, &cmd->cs);
+@@ -4051,9 +4237,9 @@ tu_cmd_render(struct tu_cmd_buffer *cmd_buffer,
+ 
+    tu_autotune::rp_ctx_t rp_ctx = NULL;
+    if (use_sysmem_rendering(cmd_buffer, &rp_ctx, rp_key))
+-      tu_cmd_render_sysmem<CHIP>(cmd_buffer, rp_ctx);
++      tu_cmd_render_sysmem<CHIP>(cmd_buffer, rp_ctx, sweet_pt_open(cmd_buffer, false));
+    else
+-      tu_cmd_render_tiles<CHIP>(cmd_buffer, rp_ctx, fdm_offsets);
++      tu_cmd_render_tiles<CHIP>(cmd_buffer, rp_ctx, fdm_offsets, sweet_pt_open(cmd_buffer, true));
+ }
+ 
+ static void tu_reset_render_pass(struct tu_cmd_buffer *cmd_buffer)
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index b03c6ee..83c82a5 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -851,6 +851,58 @@ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *e
+    return vk_device_set_lost(&dev->vk, "submit: no free job slot");
+ }
+ 
++/* SweetMetal2 (u-t): counters of the waits below, reported by sweet_tu_pass_report (tu_cmd_buffer.cc). */
++extern "C" uint64_t sweet_tu_submit_cpu_waits, sweet_tu_submit_cpu_wait_ns, sweet_tu_submit_gpu_waits, sweet_tu_submits;
++
++/* SweetMetal2 (u-t): SWEET_TU_GPU_WAIT=1 lets a submission whose wait is on a fence already submitted (every fence is on
++ * the kernel's one ring, in submission order) go at once, behind a CP_WAIT_FOR_IDLE the GPU runs first, instead of
++ * holding the submitting thread until the GPU finished that fence: the GPU waits instead of the CPU, and the next work
++ * is queued while the earlier runs. Turnip ends every command buffer with its caches flushed and starts the next
++ * with them invalidated, so the idle is what the wait's ordering needs. A wait on a sync not yet submitted still
++ * waits on the CPU. Off by default. */
++static bool
++darwin_gpu_waits(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *e = getenv("SWEET_TU_GPU_WAIT");
++      on = e && *e == '1';
++   }
++   return on == 1;
++}
++
++/* The wait's buffer: CP_WAIT_FOR_IDLE, CP_WAIT_FOR_ME (16 bytes), made once. False where it could not be made. */
++static bool
++darwin_wfi(struct tu_device *dev, NativeAdrenoAbiSubmitBuffer *out)
++{
++   static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++   static struct tu_bo *bo;
++   static bool failed;
++   pthread_mutex_lock(&lock);
++   if (!bo && !failed) {
++      struct tu_bo *made = NULL;
++      if (tu_bo_init_new(dev, NULL, &made, 4096, TU_BO_ALLOC_NO_FLAGS, "sweet wfi") == VK_SUCCESS &&
++          tu_bo_map(dev, made, NULL) == VK_SUCCESS && made->map) {
++         uint32_t *ib = (uint32_t *) made->map;
++         ib[0] = pm4_pkt7_hdr(CP_WAIT_FOR_IDLE, 0);
++         ib[1] = pm4_pkt7_hdr(CP_WAIT_FOR_ME, 0);
++         ib[2] = pm4_pkt7_hdr(CP_NOP, 1);
++         ib[3] = 0;
++         __sync_synchronize();
++         bo = made;
++      } else {
++         failed = true;
++         mesa_logw("sweet: SWEET_TU_GPU_WAIT: no buffer for the wait; waits stay on the CPU");
++      }
++   }
++   pthread_mutex_unlock(&lock);
++   if (!bo)
++      return false;
++   if (out)
++      *out = (NativeAdrenoAbiSubmitBuffer) { .handle = bo->darwin_handle, .iova = bo->iova, .bytes = 16 };
++   return true;
++}
++
+ static VkResult
+ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+                     struct vk_sync_wait *waits, uint32_t wait_count,
+@@ -860,17 +912,45 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+    struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
+    struct tu_device *dev = queue->device;
+ 
+-   /* The kernel client has one ring and no GPU-side waits: wait on the CPU before submitting. */
++   /* The kernel client has one ring and no GPU-side waits: wait on the CPU before submitting (or, SWEET_TU_GPU_WAIT=1,
++    * on the GPU for a fence already submitted: above). */
++   bool gpu_wait = false;
++   uint32_t waited_fence = 0;
++   p_atomic_inc(&sweet_tu_submits);
+    for (uint32_t i = 0; i < wait_count; i++) {
+       struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
++      if (s->state == DARWIN_SYNC_SIGNALED)
++         continue;
++      if (s->state == DARWIN_SYNC_FENCE && dw_wait_fence_raw(dev, s->fence, 0) == VK_SUCCESS)
++         continue;   /* already done: no wait */
++      if (s->state == DARWIN_SYNC_FENCE && darwin_gpu_waits() && darwin_wfi(dev, NULL)) {
++         gpu_wait = true;
++         waited_fence = MAX2(waited_fence, s->fence);
++         p_atomic_inc(&sweet_tu_submit_gpu_waits);
++         continue;
++      }
++      const uint64_t t0 = os_time_get_nano();
+       VkResult result = darwin_sync_wait(dev, s, UINT64_MAX);
+       if (result != VK_SUCCESS)
+          return vk_device_set_lost(&dev->vk, "wait before submit failed");
++      p_atomic_inc(&sweet_tu_submit_cpu_waits);
++      p_atomic_add(&sweet_tu_submit_cpu_wait_ns, os_time_get_nano() - t0);
+    }
+ 
+    uint32_t fence = 0;
+    const unsigned total = util_dynarray_num_elements(&submit->commands, NativeAdrenoAbiSubmitBuffer);
+-   if (total) {
++   if (total && gpu_wait) {
++      /* The GPU idles before this submission's work: its first buffer is the wait. */
++      NativeAdrenoAbiSubmitBuffer wfi = {};
++      darwin_wfi(dev, &wfi);
++      *(NativeAdrenoAbiSubmitBuffer *) util_dynarray_grow(&submit->commands, NativeAdrenoAbiSubmitBuffer, 1) = wfi;
++      NativeAdrenoAbiSubmitBuffer *all = util_dynarray_element(&submit->commands, NativeAdrenoAbiSubmitBuffer, 0);
++      memmove(all + 1, all, total * sizeof(*all));
++      all[0] = wfi;
++   }
++   const unsigned count_all = util_dynarray_num_elements(&submit->commands, NativeAdrenoAbiSubmitBuffer);
++   if (count_all) {
++      const unsigned total = count_all;
+       const NativeAdrenoAbiSubmitBuffer *all =
+          util_dynarray_element(&submit->commands, NativeAdrenoAbiSubmitBuffer, 0);
+       for (unsigned at = 0; at < total; at += NativeAdrenoAbiMaxBuffers) {
+@@ -886,8 +966,11 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+       }
+       p_atomic_set(&queue->fence, fence);
+    } else {
+-      /* Nothing to run: the signals resolve with the last earlier submission. */
++      /* Nothing to run: the signals resolve with the last earlier submission (and, waits left to the GPU, with the
++       * last fence waited for, which is earlier on the ring still). */
+       fence = p_atomic_read(&queue->fence) > 0 ? (uint32_t)p_atomic_read(&queue->fence) : 0;
++      if (gpu_wait && waited_fence > fence)
++         fence = waited_fence;
+    }
+ 
+    for (uint32_t i = 0; i < signal_count; i++) {

@@ -1,0 +1,27 @@
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index 83c82a5..9cb7703 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -174,11 +174,21 @@ dw_status_to_vk(struct tu_device *dev, kern_return_t kr, const char *what)
+ static VkResult
+ dw_wait_fence_raw(struct tu_device *dev, uint32_t fence, uint64_t abs_timeout_ns)
+ {
++   /* SweetMetal2 (L9, after UniXNU cd1b9757): SWEET_TU_WAIT_SLICE_MS=N waits up to N ms (1..100) a kernel call, or the
++    * caller's deadline if sooner. The default 1 is the old 1 ms slice. Longer slices pay only with the kernel's interrupt
++    * waits (boot-arg sweetgpuirq=1 / p gpuirq 1, xnu 0999): its poll waits spin the same either way. */
++   static int64_t sweet_slice_ns = -1;
++   if (sweet_slice_ns < 0) {
++      int64_t ms = debug_get_num_option("SWEET_TU_WAIT_SLICE_MS", 1);
++      sweet_slice_ns = (ms < 1 ? 1 : ms > 100 ? 100 : ms) * 1000000ll;
++   }
+    for (;;) {
+       uint64_t now = os_time_get_nano();
+-      uint64_t slice = 1000000; /* 1 ms */
++      uint64_t slice = (uint64_t)sweet_slice_ns;
+       if (abs_timeout_ns != UINT64_MAX && abs_timeout_ns <= now)
+          slice = 0;
++      else if (abs_timeout_ns != UINT64_MAX && slice > 1000000)
++         slice = MAX2(MIN2(abs_timeout_ns - now, slice), 1000000); /* as before: at least 1 ms */
+       NativeAdrenoAbiWaitFence req = {.fence = fence, .timeout_ns = slice};
+       kern_return_t kr = dw_call(NativeAdrenoMethodWaitFence, &req, sizeof(req), NULL, 0);
+       if (kr == KERN_SUCCESS)
