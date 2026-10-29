@@ -8,7 +8,7 @@ Protocol and design: docs/redfin/sweetmon.md (branch ws-z-mon). Python 3 stdlib 
   collector.py --make-key [--force]          agent/sweetmon.key (one hex line; the phone gets it via `mon install`)
   collector.py ctl CMD ...                   client for the phone agent's `mon ...` actions (talks to the API):
       status | snap | trace NAME [kdebug|prof] [SECS] [k=v ...] | stop | traces | wait [SECS] | link usb|wifi|auto
-      | speed [MB] | frames on|off | klog-pa PA | cmd TEXT
+      | speed [MB] | frames on|off | klog-pa PA | usb-fast [POLL_US TXBATCH | off] | cmd TEXT
 
 Files (under --root, default /mnt/c/ClaudeProjects/iOS_Pixel5):
   logs/mon/now.json             latest merged snapshot (rewritten atomically every sample)
@@ -1709,6 +1709,19 @@ class Collector:
             if self.authed:
                 await self.start_klog()
             return self.respond(w, 200, {'ok': True, 'msg': self.klog_ok or 'saved', 'candidates': self.pa_candidates()})
+        if path == '/api/usb-fast':
+            # {"poll_us":100,"txbatch":16} | {"value":null} / "off" (leave alone) | {} (read only); saved in config.json
+            if 'poll_us' in J or 'txbatch' in J:
+                self.cfg['usb_fast'] = {'poll_us': int(J.get('poll_us', 100)), 'txbatch': int(J.get('txbatch', 16))}
+            elif J.get('value', 'read') in (None, 'off', 'null', 'none'):
+                self.cfg['usb_fast'] = None
+            self.save_cfg()
+            if not (self.authed and self.host):
+                return self.respond(w, 200, {'ok': True, 'msg': 'saved; applied on the next connect',
+                                             'usb_fast_cfg': self.cfg.get('usb_fast')})
+            st = await self.usb_fast_apply(self.host)
+            return self.respond(w, 200, {'ok': not st.get('error'), 'msg': st.get('error') or 'ok', 'usb_fast': st,
+                                         'usb_fast_cfg': self.cfg.get('usb_fast')})
         if path == '/api/rate':
             ms = max(200, min(int(J.get('ms') or J.get('value') or 1000), 10000))
             self.cfg['rate_ms'] = ms
@@ -1860,6 +1873,14 @@ def ctl(argv, api):
         return out(call('/api/frames', {'on': (rest[0] if rest else 'on') == 'on'}))
     if c == 'klog-pa':
         return out(call('/api/klog-pa', {'pa': rest[0] if rest else 'auto'}))
+    if c == 'usb-fast':
+        if not rest:
+            body = {}
+        elif rest[0] in ('off', 'null', 'none'):
+            body = {'value': None}
+        else:
+            body = {'poll_us': int(rest[0]), 'txbatch': int(rest[1]) if len(rest) > 1 else 16}
+        return out(call('/api/usb-fast', body))
     if c == 'rate':
         return out(call('/api/rate', {'ms': int(rest[0]) if rest else 1000}))
     if c == 'cmd':

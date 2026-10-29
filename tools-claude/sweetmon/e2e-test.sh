@@ -28,16 +28,37 @@ echo "workdir $W"
 if python3 -c 'import socket; s=socket.socket(); s.settimeout(1); s.connect(("127.0.0.2",5150))' 2>/dev/null; then
 	echo "something already listens on 127.0.0.2:5150 (an old fakephone?): stop it first"; exit 99; fi
 mkdir -p "$W/tools-claude" "$W/agent" "$W/builds/xnu/ws-y-ram-aca60f47b8"
+# fake ssh: runs the remote command locally with /var/local/bin/sctl -> a fake sctl keeping the 1034 sysctls in files
+# ($W/sysctl/NAME); $W/sysctl/OFF makes it behave like a kernel without 1034
+mkdir -p "$W/sysctl" "$W/fakebin"
+cat > "$W/fakebin/sctl" <<EOF2
+#!/bin/bash
+d="$W/sysctl"
+case \$1 in kern.sweet_usb_poll_us|kern.sweet_usb_txbatch|kern.sweet_usb_tx_frames|kern.sweet_usb_tx_xfers|kern.sweet_usb_tx_drops) ;;
+  *) echo "sysctlbyname: No such file or directory" >&2; exit 1;; esac
+[ -e "\$d/OFF" ] && { echo "sysctlbyname: No such file or directory" >&2; exit 1; }
+[ -n "\${2:-}" ] && { [[ \$2 =~ ^[0-9]+\$ ]] || { echo "usage: sctl NAME [INT]" >&2; exit 1; }; echo "\$2" > "\$d/\$1"; }
+echo "\$1: \$(cat "\$d/\$1" 2>/dev/null || echo 0)"
+EOF2
+cat > "$W/fakebin/ssh" <<EOF2
+#!/bin/bash
+cmd="\${@: -1}"
+echo "\$cmd" >> "$W/ssh.log"
+cmd=\${cmd//\/var\/local\/bin\/sctl/$W/fakebin/sctl}
+exec bash -c "\$cmd"
+EOF2
+chmod +x "$W/fakebin/sctl" "$W/fakebin/ssh"
+echo 210434 > "$W/sysctl/kern.sweet_usb_tx_frames"; echo 144198 > "$W/sysctl/kern.sweet_usb_tx_xfers"
 cp "$TOOLS"/sweet-trace.py "$TOOLS"/sweet-prof.py "$W/tools-claude/" 2>/dev/null || echo "(no analyzers in $TOOLS)"
 echo 'klog PA 0x101d0ef08  (_sweet_log_total 0xfffffe0007d0ef08)' > "$W/builds/xnu/ws-y-ram-aca60f47b8/KLOG_PA.txt"
 printf 'KNOWN GOOD\nKernel:   builds/xnu/ws-y-ram-aca60f47b8/ (branch ws-y-ram)\n' > "$W/KNOWN-GOOD.txt"
 python3 "$H/collector.py" --root "$W" --make-key >/dev/null && [ -s "$W/agent/sweetmon.key" ] && ok "--make-key" || bad "--make-key"
-python3 "$H/fakephone.py" --key-file "$W/agent/sweetmon.key" --trace "$SRC" --speedup 5 --ctl-port $CTL --nproc 298 --link-mbps usb=20 --link-mbps wifi=60 \
+python3 "$H/fakephone.py" --key-file "$W/agent/sweetmon.key" --trace "$SRC" --speedup 5 --ctl-port $CTL --nproc 298 --link-mbps usb=4 --link-mbps wifi=60 \
 	--klog-dump "$W/fake-klog.txt" > "$W/fake.log" 2>&1 &
 FP=$!
 sleep 1
 python3 "$H/collector.py" --root "$W" --http-port 18765 --usb-host 127.0.0.2 --poke-host 127.0.0.2 --poke-port 15141 \
-	--ssh-port 1 --usb-probe-every 3 --ping-every 2 > "$W/collector.out" 2>&1 &
+	--ssh-port 1 --ssh-bin "$W/fakebin/ssh" --usb-probe-every 3 --ping-every 2 > "$W/collector.out" 2>&1 &
 CP=$!
 trap 'kill $FP $CP 2>/dev/null' EXIT
 T0=$(date +%s)
@@ -141,9 +162,43 @@ post /api/trace/stop '{}' >/dev/null; m=$(trace_wait 60)
 [ "$(echo "$m" | j 'd["traces"][0]["state"]')" = done ] && ok "prof stopped early (p prof stop)" || bad "prof stop: $(echo "$m" | j 'd["traces"][0]')"
 for f in summary.json report.txt meta.json; do c=$(curl -s -o /dev/null -w '%{http_code}' "$API/api/traces/$(ls -t "$W/logs/traces" | grep t-buffer | head -1)/$f"); [ "$c" = 200 ] && ok "GET /api/traces/DIR/$f" || bad "GET trace file $f $c"; done
 
-# 6. speed test
+# 6. speed test (the fake answers pings sent during the test BEFORE speed's own R: replies matched by cmd)
 r=$(post /api/speed '{"mb":32}' 120)
 [ "$(echo "$r" | j 'd["ok"] and d["bytes"]==32*1048576')" = True ] && ok "speed 32 MiB: $(echo "$r" | j 'd["mbps"]') MB/s over loopback" || bad "speed: $r"
+# slow link (usb paced at 4 MB/s): 24 MiB takes ~6 s while the collector keeps pinging and a cmd is sent in between
+post /api/cmd '{"cmd":"ping warm"}' >/dev/null
+( sleep 1; post /api/cmd '{"cmd":"ping during-speed"}' > "$W/ping-during.json" ) &
+r=$(post /api/speed '{"mb":24}' 120); wait
+[ "$(echo "$r" | j 'd["ok"] and d["bytes"]==24*1048576 and d["pc_s"]>4')" = True ] \
+	&& [ "$(j 'd["ok"] and d["msg"]=="during-speed"' < "$W/ping-during.json")" = True ] \
+	&& ! grep -q 'unsolicited reply' "$W/logs/mon/collector.log" \
+	&& ok "slow speed test: ping answered first, speed reply still matched ($(echo "$r" | j 'd["mbps"]') MB/s in $(echo "$r" | j 'd["pc_s"]') s, no unsolicited reply)" \
+	|| bad "reply matching: speed $r ping $(cat "$W/ping-during.json")"
+# USB fast path (xnu 1034): set over ssh after auth with "sctl NAME VALUE", read back, shown in now.json and snap
+[ "$(curl -s $API/api/now | j 'd["link"]["usb_fast"]["poll_us"]==100 and d["link"]["usb_fast"]["txbatch"]==16 and not d["link"]["usb_fast"].get("error")')" = True ] \
+	&& grep -q 'sctl kern.sweet_usb_poll_us 100; /var/local/bin/sctl kern.sweet_usb_txbatch 16' "$W/ssh.log" \
+	&& grep -q 'USB fast path set: poll_us 100 txbatch 16' "$W/logs/mon/collector.log" && ok "usb fast path set after auth (100/16 read back, logged)" || bad "usb fast path set"
+echo 0 > "$W/sysctl/kern.sweet_usb_poll_us"; echo 0 > "$W/sysctl/kern.sweet_usb_txbatch"; ctl drop >/dev/null; sleep 1
+waitfor 15 'd["link"]["authed"]' && sleep 2
+[ "$(cat "$W/sysctl/kern.sweet_usb_poll_us")/$(cat "$W/sysctl/kern.sweet_usb_txbatch")" = 100/16 ] && ok "usb fast path re-applied on reconnect (0/0 -> 100/16)" || bad "usb fast re-apply"
+SWEETMON_API=$API python3 "$H/collector.py" ctl snap | grep -q 'USB fast path: poll_us 100 txbatch 16, tx 210434 frames / 144198 xfers (1.46 per xfer)' \
+	&& ok "mon snap shows the USB settings and counters" || bad "snap usb line"
+# usb_fast null = leave alone (config.json), then a kernel without 1034: error logged once, everything else goes on
+[ "$(post /api/usb-fast '{"value":null}' | j 'd["usb_fast"]["poll_us"]==100 and d["usb_fast_cfg"] is None')" = True ] || bad "usb-fast null via API"
+echo 0 > "$W/sysctl/kern.sweet_usb_poll_us"; echo 0 > "$W/sysctl/kern.sweet_usb_txbatch"; ctl drop >/dev/null; sleep 1
+waitfor 15 'd["link"]["authed"]' && sleep 2
+[ "$(cat "$W/sysctl/kern.sweet_usb_poll_us")/$(cat "$W/sysctl/kern.sweet_usb_txbatch")" = 0/0 ] \
+	&& [ "$(j 'd["usb_fast"] is None' < "$W/logs/mon/config.json")" = True ] \
+	&& [ "$(curl -s $API/api/now | j 'd["link"]["usb_fast"]["poll_us"]==0')" = True ] && ok "usb_fast null in config.json: left alone (still read back 0/0)" || bad "usb_fast null"
+post /api/usb-fast '{"poll_us":100,"txbatch":16}' >/dev/null
+touch "$W/sysctl/OFF"
+for k in 1 2; do ctl drop >/dev/null; sleep 1; waitfor 15 'd["link"]["authed"]'; sleep 2; done
+[ "$(grep -c 'kernel without the 1034 sysctls' "$W/logs/mon/collector.log")" = 1 ] \
+	&& [ "$(curl -s $API/api/now | j '"1034" in d["link"]["usb_fast"]["error"] and d["link"]["authed"]')" = True ] \
+	&& ok "kernel without 1034: logged once over 2 reconnects, link fine" || bad "no-1034 handling ($(grep -c 'kernel without' "$W/logs/mon/collector.log") log lines)"
+rm -f "$W/sysctl/OFF"
+r=$(SWEETMON_API=$API python3 "$H/collector.py" ctl usb-fast 100 16)
+[ "$(echo "$r" | j 'd["ok"] and d["usb_fast"]["txbatch"]==16')" = True ] && ok "ctl usb-fast 100 16 (= mon usb-fast)" || bad "ctl usb-fast: $r"
 
 # 7. frames on/off
 post /api/frames '{"on":true}' >/dev/null
