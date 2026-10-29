@@ -91,6 +91,12 @@ NmbTexture *nmb_texture_new_on_buffer(NmbBuffer *, const struct NmbTextureDescri
 struct NmbSurfaceFacts {uint32_t pixel_format, matrix; uint64_t plane, width, height, chroma_offset, chroma_bytes_per_row;};
 NmbTexture *nmb_texture_new_on_surface(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, bool planar,
                                        const struct NmbSurfaceFacts *facts);
+/* SweetMetal2: a descriptor's rotation (SPI, 0-4) and framebufferOnly, which NmbTextureDescriptor does not carry. A texture over an
+ * IOSurface plane with them (Core Animation's landscape framebuffer: rotation 1/3 over the portrait panel surface), and a texture's. */
+struct NmbTextureExtras {uint64_t rotation, framebuffer_only;};
+NmbTexture *nmb_texture_new_on_surface_rotated(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row,
+                                               bool planar, const struct NmbTextureExtras *extras);
+void nmb_texture_extras(const NmbTexture *, struct NmbTextureExtras *out);
 NmbTexture *nmb_texture_new_linear(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, uint64_t bytes_per_image);
 /* whole: a view of every level and slice as format; else levels and slices are {start, count} and kind the view's texture type. */
 NmbTexture *nmb_texture_new_view(NmbTexture *, uint64_t format, uint64_t kind, const uint64_t levels[2], const uint64_t slices[2], bool whole);
@@ -189,6 +195,8 @@ int nmb_command_buffer_wait(NmbCommandBuffer *, uint64_t timeout_ms);
 uint64_t nmb_command_buffer_status(const NmbCommandBuffer *);
 size_t nmb_command_buffer_error(const NmbCommandBuffer *, char *out, size_t size);
 double nmb_command_buffer_gpu_time(const NmbCommandBuffer *, bool end);
+void nmb_rotated_copy_stats(uint64_t out[5]);
+void nmb_rotated_planes_written(void);
 
 /* Events: an MTLEvent (shared false) or an MTLSharedEvent within this process. */
 NmbEvent *nmb_event_new(NmbDevice *, bool shared);

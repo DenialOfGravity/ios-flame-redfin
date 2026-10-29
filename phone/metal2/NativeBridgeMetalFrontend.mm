@@ -10,6 +10,7 @@
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -168,6 +169,8 @@ static void waitForResource(id resource);
 @property(nonatomic,strong) id<MTLTexture> parent;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
 @property(nonatomic) NSUInteger heapOffset;
+@property(nonatomic) uint64_t rotationValue;      // SweetMetal2: a rotated framebuffer's rotation (1-4), 0 otherwise
+@property(nonatomic) bool framebufferOnlyValue;
 - (void)holdSurface:(IOSurfaceRef)surface;
 @end
 static void ycbcrRefresh(NBTexture *texture);
@@ -237,6 +240,17 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
 // surface's facts, which nmb_texture_new_on_surface now passes; not used: every such layer would be copied in and out per pass, and
 // backboardd's framebuffer stays 8-bit (supportsExtendedXR10Formats answers no there).)
 static uint64_t sweetFormat(uint64_t format) {return format==550?80:format==551?81:format;}
+// SweetMetal2: the descriptor's SPI rotation (0-4) and framebufferOnly (iOS 16's MTLTextureDescriptor has both getters), 0/NO where absent.
+static uint64_t descriptorRotation(MTLTextureDescriptor *d) {
+ static SEL sel=sel_registerName("rotation");
+ if(!d || ![d respondsToSelector:sel])return 0;
+ return (uint64_t)((NSUInteger(*)(id,SEL))objc_msgSend)(d,sel);
+}
+static bool descriptorFramebufferOnly(MTLTextureDescriptor *d) {
+ static SEL sel=sel_registerName("framebufferOnly");
+ if(!d || ![d respondsToSelector:sel])return false;
+ return ((BOOL(*)(id,SEL))objc_msgSend)(d,sel);
+}
 static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
  if(!d)return false;
  *out={(uint64_t)d.textureType,sweetFormat((uint64_t)d.pixelFormat),d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
@@ -265,14 +279,14 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (MTLResourceOptions)resourceOptions {return (MTLResourceOptions)_descriptor.options;}
 - (MTLStorageMode)storageMode {return (MTLStorageMode)((_descriptor.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
 - (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_descriptor.options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
-- (BOOL)isFramebufferOnly {return NO;}
+- (BOOL)isFramebufferOnly {return _framebufferOnlyValue;}
 - (IOSurfaceRef)iosurface {return _surface?_surface:_ycbcrSource;}
 - (NSUInteger)iosurfacePlane {return _plane;}
 - (id<MTLBuffer>)buffer {return _surface?nil:(id<MTLBuffer>)_buffer;}
 - (NSUInteger)bufferOffset {return _offset;}
 - (NSUInteger)bufferBytesPerRow {return _rowBytes;}
 - (id<MTLTexture>)parentTexture {return _parent;}
-- (NSUInteger)rotation {return 0;}
+- (NSUInteger)rotation {return (NSUInteger)_rotationValue;}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
  const uint64_t answer=nmb_texture_set_purgeable_state(_handle,state);
  if(!answer)NBLOG(@"native-metal: texture setPurgeableState refused: %@",lastError());
@@ -340,7 +354,8 @@ static void flushSurfaces(NSSet *surfaces,bool completion) {
  const bool all=flushAll();
  std::vector<IOSurfaceRef> distinct;
  distinct.reserve(surfaces.count);
- for(NBTexture *texture in surfaces)if(texture.surface)distinct.push_back(texture.surface);
+ std::vector<IOSurfaceRef> rotated;   // rotfb4: surfaces under a rotated texture, whose CPU writes the runtime must copy in again
+ for(NBTexture *texture in surfaces)if(texture.surface){distinct.push_back(texture.surface);if(texture.rotationValue)rotated.push_back(texture.surface);}
  std::sort(distinct.begin(),distinct.end());
  const auto last=std::unique(distinct.begin(),distinct.end());
  gSurfaceFlushDuplicates+=(uint64_t)(distinct.end()-last);
@@ -352,6 +367,7 @@ static void flushSurfaces(NSSet *surfaces,bool completion) {
    auto state=gSurfaceStates.find(surface);
    if(state!=gSurfaceStates.end() && state->second.known && state->second.seed==seed){gSurfaceCleanSkips++;continue;}
   }
+  if(!completion && std::find(rotated.begin(),rotated.end(),surface)!=rotated.end())nmb_rotated_planes_written();
   const uint64_t began=nowUs();const size_t bytes=IOSurfaceGetAllocSize(surface);
   sys_dcache_flush(IOSurfaceGetBaseAddress(surface),bytes);
   gSurfaceFlushBytes+=bytes;gTimeSurfaceFlush.add(began);
@@ -633,6 +649,7 @@ static void notified(void *context,uint64_t value) {
 @property(atomic) BOOL committed,failedLocally;
 @property(nonatomic) uint64_t committedUs;
 @property(nonatomic) uint32_t commitIndex;
+@property(nonatomic) BOOL rotatedFrame;   // rotfb4: a pass of it renders a rotated (landscape framebuffer) texture
 @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
 @property(nonatomic,strong) NSMutableSet *surfaces;          // every surface texture it uses (cleaned at commit if the CPU wrote it)
 @property(nonatomic,strong) NSMutableSet *writtenSurfaces;   // those the GPU may write (flushed at completion)
@@ -1004,6 +1021,7 @@ static void noteDeviceLost(const char *why) {
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface){[_surfaces addObject:texture];[_writtenSurfaces addObject:texture];}
+  if(texture.rotationValue)self.rotatedFrame=YES;
   [_resourceOwners addObject:texture];
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
   return true;
@@ -1125,9 +1143,27 @@ static void noteDeviceLost(const char *why) {
 @end
 static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSchedule];}
 // The runtime's completion: the command buffer's own reference, taken at commit, is given back here.
+// rotfb4: once per 5 s, while landscape frames render: the command buffers with a rotated pass, their GPU ms, and the runtime's rotated
+// copies (in, skipped, back, MB, dispatches) over the same 5 s.
+static void rotatedFrameStats(NBCommandBuffer *commandBuffer) {
+ static std::mutex lock;static uint64_t windowUs,frames,gpuUs,gpuMaxUs,last[5];
+ const double start=nmb_command_buffer_gpu_time(commandBuffer.handle,false),end=nmb_command_buffer_gpu_time(commandBuffer.handle,true);
+ const uint64_t took=end>start && start>0?(uint64_t)((end-start)*1e6):0;
+ std::lock_guard<std::mutex> l(lock);
+ frames++;gpuUs+=took;gpuMaxUs=std::max(gpuMaxUs,took);
+ const uint64_t now=nowUs();
+ if(!windowUs){windowUs=now;nmb_rotated_copy_stats(last);return;}
+ if(now-windowUs<5000000)return;
+ uint64_t c[5];nmb_rotated_copy_stats(c);
+ sm2_logs([NSString stringWithFormat:@"native-metal: rotated 5s: %llu cmdbufs, GPU %llu ms (mean %.1f, max %.1f) | copies in %llu skipped %llu back %llu, %llu MB, %llu dispatches",
+  (unsigned long long)frames,(unsigned long long)(gpuUs/1000),frames?gpuUs/1000.0/frames:0.0,gpuMaxUs/1000.0,(unsigned long long)(c[0]-last[0]),
+  (unsigned long long)(c[1]-last[1]),(unsigned long long)(c[2]-last[2]),(unsigned long long)((c[3]-last[3])>>20),(unsigned long long)(c[4]-last[4])].UTF8String);
+ memcpy(last,c,sizeof c);windowUs=now;frames=gpuUs=gpuMaxUs=0;
+}
 static void completed(void *context) {
  gCompleted++;
  NBCommandBuffer *commandBuffer=(__bridge_transfer NBCommandBuffer *)context;
+ if(commandBuffer.rotatedFrame)rotatedFrameStats(commandBuffer);
  {
   const uint64_t took=nowUs()-commandBuffer.committedUs;
   gTimeEncodeToCommit.count++;gTimeEncodeToCommit.total+=took;
@@ -1773,8 +1809,55 @@ static void ycbcrRefresh(NBTexture *texture) {
  if(planes && (!row || offset>=bytes)){noteSurfaceTexture(surface,d,plane,planes,offset,row,"refused (plane geometry)");return nil;}
  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);
  if(!buffer){noteSurfaceTexture(surface,d,plane,planes,offset,row,"refused (import)");return nil;}
- NBTexture *texture=textureOnBuffer(buffer,d,offset,row,true);
- noteSurfaceTexture(surface,d,plane,planes,offset,row,texture?"made":"refused (texture over the surface)");
+ // SweetMetal2: Core Animation's landscape framebuffer is a 2436x1125 texture of rotation 1/3 (SPI -[MTLTextureDescriptor rotation],
+ // framebufferOnly) over the panel's portrait 1125x2436 surface. NmbTextureDescriptor carries neither, so the runtime checked a 2436-texel
+ // row against the surface's 4608 bytes and refused it (RowPitch) every frame: rotating to landscape froze the screen (r61b 2026-10-29).
+ const uint64_t rotation=descriptorRotation(d);
+ NBTexture *texture=nil;
+ if(rotation) {
+  // SweetMetal2 (rotfb3): a rotated texture is a shadow image plus a tight buffer, a staging buffer and the rotation kernel's sets
+  // (metal2vulkan rotated.rs): ~2 x the surface's bytes of GPU pool and ~20 small allocations each. r62b: Core Animation asked for
+  // them again and again in landscape and backboardd's pool grew 194 -> 451 MB in 30 s (live <256K 2654 -> 4453) until it crashed.
+  // The last few are kept and handed out again for the same surface memory, rotation and descriptor.
+  struct RotKey {uint64_t id,base,bytes,offset,row,rotation,fbo,type,format,width,height,usage,options;};
+  const RotKey key={(uint64_t)IOSurfaceGetID(surface),(uint64_t)(uintptr_t)base,(uint64_t)bytes,(uint64_t)offset,(uint64_t)row,rotation,
+                    descriptorFramebufferOnly(d)?1u:0u,(uint64_t)d.textureType,sweetFormat((uint64_t)d.pixelFormat),(uint64_t)d.width,
+                    (uint64_t)d.height,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
+  static std::mutex rotLock;static std::vector<std::pair<RotKey,NBTexture *>> rotCache;static uint64_t rotMade,rotHits;
+  {
+   std::lock_guard<std::mutex> l(rotLock);
+   for(size_t i=0;i<rotCache.size();i++) if(!memcmp(&rotCache[i].first,&key,sizeof key)) {
+    NBTexture *hit=rotCache[i].second;auto entry=rotCache[i];rotCache.erase(rotCache.begin()+(long)i);rotCache.insert(rotCache.begin(),entry);
+    if(++rotHits==1 || rotHits%500==0)sm2_logs([NSString stringWithFormat:@"native-metal: rotated surface textures: %llu made, %llu reused",
+                                                (unsigned long long)rotMade,(unsigned long long)rotHits].UTF8String);
+    return (id<MTLTexture>)hit;
+   }
+  }
+  NmbTextureDescriptor descriptor;
+  if(textureDescriptor(d,&descriptor)) {
+   const NmbTextureExtras extras={rotation,descriptorFramebufferOnly(d)?1u:0u};
+   NmbTexture *handle=nmb_texture_new_on_surface_rotated(buffer.handle,&descriptor,offset,row,planes!=0,&extras);
+   if(!handle)NBLOG(@"native-metal: rotated surface texture refused (rotation %llu, %lux%lu): %@",(unsigned long long)rotation,
+                    (unsigned long)d.width,(unsigned long)d.height,lastError());
+   else {
+    texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+    texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;
+    NmbTextureExtras made={0,0};nmb_texture_extras(handle,&made);texture.rotationValue=made.rotation;texture.framebufferOnlyValue=made.framebuffer_only!=0;
+    texture.plane=plane;[texture holdSurface:surface];
+    std::lock_guard<std::mutex> l(rotLock);
+    rotCache.insert(rotCache.begin(),{key,texture});
+    if(rotCache.size()>3)rotCache.pop_back();      // CA's landscape chain is 2-3 surfaces; the oldest goes when its last user lets it go
+    if(++rotMade<=24 || rotMade%200==0)sm2_logs([NSString stringWithFormat:@"native-metal: rotated surface texture #%llu (rotation %llu): surface %zux%zu id %u, texture %lux%lu fmt %lu usage %#lx (%llu reused so far)",
+      (unsigned long long)rotMade,(unsigned long long)rotation,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetID(surface),
+      (unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.pixelFormat,(unsigned long)d.usage,(unsigned long long)rotHits].UTF8String);
+   }
+  }
+  noteSurfaceTexture(surface,d,plane,planes,offset,row,texture?(rotation==1?"made (rotation 1)":rotation==2?"made (rotation 2)":rotation==3?"made (rotation 3)":"made (rotation 4)")
+                                                             :"refused (rotated texture over the surface)");
+ } else {
+  texture=textureOnBuffer(buffer,d,offset,row,true);
+  noteSurfaceTexture(surface,d,plane,planes,offset,row,texture?"made":"refused (texture over the surface)");
+ }
  if(!texture)return nil;
  texture.plane=plane;[texture holdSurface:surface];return (id<MTLTexture>)texture;
 }

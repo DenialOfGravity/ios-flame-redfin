@@ -1,0 +1,441 @@
+diff --git a/crates/metal2vulkan-runtime/src/buffer_texture.rs b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+index 2872bb7b..13e54fdf 100644
+--- a/crates/metal2vulkan-runtime/src/buffer_texture.rs
++++ b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+@@ -970,13 +970,16 @@ impl Texels {
+             span: layout.end() - layout.offset,
+         };
+         let hazard = self.options.hazard_tracking_mode()?;
+-        let turn = Box::new(RotatedCopies::new(
++        let mut turn = Box::new(RotatedCopies::new(
+             self.buffer.device(),
+             &staging,
+             frame,
+             hazard,
+         )?);
+         let (bytes, tracked) = self.buffer.tracked(layout.offset..layout.end());
++        // rotfb4: the plane's keys, whose writes decide whether a copy in is needed.
++        let alias = self.buffer.alias().map(|alias| alias.key);
++        turn.watch(std::iter::once(bytes.key).chain(alias).collect());
+         Ok(ShadowCopies {
+             source: ShadowSource::Bytes {
+                 buffer: ShadowBuffer::of(&self.buffer, buffer),
+diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
+index 1194f785..fb47c719 100644
+--- a/crates/metal2vulkan-runtime/src/encoder.rs
++++ b/crates/metal2vulkan-runtime/src/encoder.rs
+@@ -523,6 +523,7 @@ impl EncoderCore {
+         let aliased = self.aliased(uses);
+         let tracked = aliased.as_deref().unwrap_or(uses);
+         let barrier = self.uses.barrier(tracked);
++        super::rotated::note_writes(tracked);
+         self.uses.record(stages, tracked, barrier);
+         self.touch_reaching(uses, resident);
+         Some(barrier)
+@@ -684,6 +685,7 @@ impl EncoderCore {
+         }
+         self.observe_fresh(uses, &[]);
+         let aliased = self.aliased(uses);
++        super::rotated::note_writes(aliased.as_deref().unwrap_or(uses));
+         self.uses
+             .record(stages, aliased.as_deref().unwrap_or(uses), None);
+         self.touch_reaching(uses, resident);
+@@ -728,6 +730,23 @@ impl EncoderCore {
+     /// everything after each copy, in one whose commands Metal leaves unordered.
+     pub(super) fn shadow_copies(&mut self, copies: &[ShadowCopy]) {
+         for copy in copies {
++            // rotfb4: a rotated texture's copy in whose image still holds its plane's bytes
++            // (`rotated.rs`, `RotatedCopies::fresh`) is skipped.
++            let turn = copy.copies.rotated();
++            let moves = matches!(copy.step, Step::Into | Step::Back);
++            if matches!(copy.step, Step::Into) && turn.is_some_and(|turn| turn.fresh()) {
++                continue;
++            }
++            self.shadow_copy(copy);
++            if let Some(turn) = turn.filter(|_| moves) {
++                turn.settle();
++            }
++        }
++    }
++
++    /// One of [`shadow_copies`](Self::shadow_copies).
++    fn shadow_copy(&mut self, copy: &ShadowCopy) {
++        {
+             let stages = copy.stages();
+             let uses = copy.uses();
+             if self.uses.ordered() {
+@@ -740,13 +759,14 @@ impl EncoderCore {
+             } else {
+                 // A copy of a detached buffer's bytes records nothing, nor does what follows.
+                 if self.skips(uses.iter().map(|used| used.key)) {
+-                    continue;
++                    return;
+                 }
+                 self.barrier(Barrier::everything());
+                 // SAFETY: as above.
+                 unsafe { copy.record(self.device().shared().vk(), self.raw) };
+                 self.barrier(Barrier::everything());
+                 let aliased = self.aliased(&uses);
++                super::rotated::note_writes(aliased.as_deref().unwrap_or(&uses));
+                 self.uses
+                     .record(stages, aliased.as_deref().unwrap_or(&uses), None);
+                 self.touch(&uses);
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index 4781491b..69402e00 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -206,6 +206,7 @@ pub use attributes::PurgeableState;
+ pub use binary_archive::{BinaryArchive, BinaryArchiveDescriptor};
+ pub use blit::BlitCommandEncoder;
+ pub use buffer::Buffer;
++pub use rotated::{rotated_copy_stats, rotated_planes_written};
+ pub use buffer_descriptor::{BufferContents, BufferDescriptor};
+ pub use buffer_texture::IoSurfacePlane;
+ pub use capabilities::{DeviceProperties, Query};
+diff --git a/crates/metal2vulkan-runtime/src/rotated.rs b/crates/metal2vulkan-runtime/src/rotated.rs
+index 22af3ce3..d3d78e5a 100644
+--- a/crates/metal2vulkan-runtime/src/rotated.rs
++++ b/crates/metal2vulkan-runtime/src/rotated.rs
+@@ -46,11 +46,72 @@ use super::buffer::Buffer;
+ use super::error::{internal, Error, RuntimeGap};
+ use super::owned_kernel::{OwnedKernel, OwnedModule, OwnedSets};
+ use super::shadow::ShadowStaging;
+-use super::tracker::Barrier;
++use super::resource::ResourceKey;
++use super::tracker::{Barrier, Use};
+ use super::values::{CpuCacheMode, HazardTrackingMode, ResourceOptions, StorageMode};
+ use super::Device;
+ use ash::vk;
+ use metal2vulkan::bind::RotateTexelsModule;
++use std::collections::BTreeMap;
++use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
++use std::sync::{Mutex, OnceLock};
++
++// SweetMetal2 (rotfb4): a rotated texture's copy in is skipped where its image still holds the
++// plane's bytes as they are now: nothing but its own copy back wrote the plane since its last copy
++// in or back (Core Animation's landscape framebuffer, copied in at every encoder and every frame).
++// Every command a core tracks counts its writes of a watched plane's keys (the bytes' and their
++// host memory's) here, and each rotated texture keeps the count its image matched.
++// /var/local/mtl2-env SWEET_M2V_ROT_SKIP=0 turns it off.
++
++/// The keys of rotated textures' planes: the textures watching each, and its writes' count.
++static WATCHED: Mutex<BTreeMap<ResourceKey, (u64, u64)>> = Mutex::new(BTreeMap::new());
++/// How many keys `WATCHED` holds: 0 skips the lock.
++static WATCHING: AtomicUsize = AtomicUsize::new(0);
++/// Bumped where the frontend saw a rotated texture's plane written by the CPU (its IOSurface's
++/// seed moved): every image is then copied in again.
++static EPOCH: AtomicU64 = AtomicU64::new(0);
++
++/// Every rotated texture's next copy in is made, not skipped: the CPU wrote a plane.
++pub fn rotated_planes_written() {
++    EPOCH.fetch_add(1, Ordering::Relaxed);
++}
++
++/// Copies in, copies in skipped, copies back, bytes moved (each step's frame), kernel dispatches.
++static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
++
++fn skipping() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var("SWEET_M2V_ROT_SKIP").map_or(true, |v| v.trim() != "0"))
++}
++
++fn whole_back() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var("SWEET_M2V_ROT_ROWS").map_or(true, |v| v.trim() != "1"))
++}
++
++fn watched() -> std::sync::MutexGuard<'static, BTreeMap<ResourceKey, (u64, u64)>> {
++    WATCHED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
++}
++
++/// Count the writes `uses` make of a watched plane (a command a core tracks, or records apart).
++pub(super) fn note_writes(uses: &[Use<ResourceKey>]) {
++    if WATCHING.load(Ordering::Relaxed) == 0 {
++        return;
++    }
++    let mut map = None;
++    for used in uses.iter().filter(|used| !used.write.is_empty()) {
++        let map = map.get_or_insert_with(watched);
++        if let Some(entry) = map.get_mut(&used.key) {
++            entry.1 += 1;
++        }
++    }
++}
++
++/// The rotated copies' counts since the process began: copies in, copies in skipped, copies
++/// back, bytes the copies moved, kernel dispatches.
++pub fn rotated_copy_stats() -> [u64; 5] {
++    STATS.each_ref().map(|c| c.load(Ordering::Relaxed))
++}
+ 
+ /// Where a shape lies in the shape buffer, per direction: a multiple of every
+ /// `minStorageBufferOffsetAlignment`.
+@@ -153,9 +214,82 @@ pub(super) struct RotatedCopies {
+     apart: bool,
+     kernel: OwnedKernel,
+     sets: OwnedSets,
++    /// The plane's keys this texture watches ([`note_writes`]).
++    keys: Vec<ResourceKey>,
++    /// Their writes' count when the image last matched the plane; `u64::MAX` for never.
++    held: AtomicU64,
++    /// `EPOCH` then.
++    epoch: AtomicU64,
++    /// The frame's bytes, for the counts.
++    frame_bytes: u64,
++}
++
++impl Drop for RotatedCopies {
++    fn drop(&mut self) {
++        if self.keys.is_empty() {
++            return;
++        }
++        let mut map = watched();
++        for key in &self.keys {
++            if let Some(entry) = map.get_mut(key) {
++                entry.0 -= 1;
++                if entry.0 == 0 {
++                    map.remove(key);
++                }
++            }
++        }
++        WATCHING.store(map.len(), Ordering::Relaxed);
++    }
+ }
+ 
+ impl RotatedCopies {
++    /// Watch the plane's `keys` (its bytes', and their host memory's) for writes.
++    pub(super) fn watch(&mut self, keys: Vec<ResourceKey>) {
++        let mut map = watched();
++        for key in &keys {
++            map.entry(*key).or_insert((0, 0)).0 += 1;
++        }
++        WATCHING.store(map.len(), Ordering::Relaxed);
++        self.keys = keys;
++    }
++
++    /// The writes' count of the plane's keys now.
++    fn count(&self) -> u64 {
++        let map = watched();
++        self.keys.iter().map(|key| map.get(key).map_or(0, |e| e.1)).sum()
++    }
++
++    /// Whether the image holds the plane's bytes as they are now, turned as a copy in would
++    /// turn them: then a copy in is skipped. Never where a load and a keep differ.
++    pub(super) fn fresh(&self) -> bool {
++        if !skipping() || self.apart || self.keys.is_empty() {
++            return false;
++        }
++        let held = self.held.load(Ordering::Relaxed);
++        let fresh = held != u64::MAX
++            && self.epoch.load(Ordering::Relaxed) == EPOCH.load(Ordering::Relaxed)
++            && held == self.count();
++        if fresh {
++            STATS[1].fetch_add(1, Ordering::Relaxed);
++        }
++        fresh
++    }
++
++    /// Note that the image may no longer match the plane (a pass rendered into it and stored
++    /// nothing back).
++    pub(super) fn stale(&self) {
++        self.held.store(u64::MAX, Ordering::Relaxed);
++    }
++
++    /// Note that the image and the plane match now: after a copy in or back is recorded (and
++    /// the write of a copy back counted).
++    pub(super) fn settle(&self) {
++        if !self.keys.is_empty() {
++            self.epoch.store(EPOCH.load(Ordering::Relaxed), Ordering::Relaxed);
++            self.held.store(self.count(), Ordering::Relaxed);
++        }
++    }
++
+     /// The turns of `frame` through `staging`, the staging buffer of its plane's bytes (at least
+     /// `span` rounded up to 4 bytes long), of the texture's `hazard` tracking. Refused as
+     /// `new_buffer` refuses the tight and shape buffers, and (`NotImplemented(RotatedTexture)`)
+@@ -191,12 +325,16 @@ impl RotatedCopies {
+         let (shapes_raw, shapes_at) = shapes.at(0);
+         let (staging_raw, staging_at) = (staging.raw(), staging.into.dst_offset);
+         let narrow = |v: u64| u32::try_from(v).map_err(|_| internal("a rotated frame past u32"));
+-        let grid = |words: u64| -> Result<[u32; 2], Error> {
+-            let local = u64::from(RotateTexelsModule::LOCAL_SIZE);
+-            let groups = words.div_ceil(local).max(1);
+-            let across = groups.min(u64::from(limits.max_compute_work_group_count[0]));
+-            let down = groups.div_ceil(across);
+-            if down > u64::from(limits.max_compute_work_group_count[1]) {
++        // rotfb4: the grid's rows are the destination's rows (`row_words` words each), in 8x8
++        // tiles (`RotateTexelsModule::LOCAL`): a tile's reads of a turned source then lie in 8
++        // rows, not in 64.
++        let grid = |words: u64, row_words: u64| -> Result<[u32; 2], Error> {
++            let [lx, ly] = RotateTexelsModule::LOCAL.map(u64::from);
++            let across = row_words.div_ceil(lx).max(1);
++            let down = words.div_ceil(row_words).div_ceil(ly).max(1);
++            if across > u64::from(limits.max_compute_work_group_count[0])
++                || down > u64::from(limits.max_compute_work_group_count[1])
++            {
+                 return Err(Error::NotImplemented(RuntimeGap::RotatedTexture));
+             }
+             Ok([narrow(across)?, narrow(down)?])
+@@ -206,9 +344,10 @@ impl RotatedCopies {
+         let stored_words = (row_pitch * u64::from(stored_height - 1)
+             + u64::from(stored_width) * texel_bytes)
+             .div_ceil(4);
+-        let into_groups = grid(tight_words)?;
+-        let back_groups = grid(stored_words)?;
+-        let local = RotateTexelsModule::LOCAL_SIZE;
++        // Both pitches are whole words (the module docs).
++        let (tight_row_words, stored_row_words) = ((tight_pitch / 4).max(1), (row_pitch / 4).max(1));
++        let into_groups = grid(tight_words, tight_row_words)?;
++        let back_groups = grid(stored_words, stored_row_words)?;
+         let into_shape = |turn: Turn| -> Result<[u8; 52], Error> {
+             Ok(RotateTexelsModule::shape(
+                 texel,
+@@ -216,7 +355,7 @@ impl RotatedCopies {
+                 narrow(row_pitch)?,
+                 source_map(rotation, [width, height], turn),
+                 narrow(tight_words)?,
+-                into_groups[0] * local,
++                narrow(tight_row_words)?,
+             ))
+         };
+         let keep = into_shape(Turn::Keep)?;
+@@ -233,7 +372,7 @@ impl RotatedCopies {
+                     narrow(tight_pitch)?,
+                     source_map(rotation, [width, height], Turn::Store),
+                     narrow(stored_words)?,
+-                    back_groups[0] * local,
++                    narrow(stored_row_words)?,
+                 ),
+                 at: shapes_at + SHAPE_SLOT,
+                 groups: back_groups,
+@@ -286,6 +425,10 @@ impl RotatedCopies {
+             apart: loads_apart(rotation, [width, height]),
+             kernel,
+             sets,
++            keys: Vec::new(),
++            held: AtomicU64::new(u64::MAX),
++            epoch: AtomicU64::new(0),
++            frame_bytes: tight_bytes,
+         })
+     }
+ 
+@@ -317,6 +460,9 @@ impl RotatedCopies {
+             Turn::Store => (&self.moves[1], &self.moves[1].shape, self.sets.sets[1]),
+         };
+         let general = vk::ImageLayout::GENERAL;
++        STATS[if into { 0 } else { 2 }].fetch_add(1, Ordering::Relaxed);
++        STATS[3].fetch_add(3 * self.frame_bytes, Ordering::Relaxed);
++        STATS[4].fetch_add(1, Ordering::Relaxed);
+         // SAFETY: the caller's contract; the copies lie in the buffers and the image (planned
+         // when the texture was made), the shape's 52 bytes fit its slot, and the sets bind the
+         // texture's own buffers.
+@@ -358,6 +504,17 @@ impl RotatedCopies {
+                     general,
+                     &self.regions,
+                 );
++            } else if whole_back() {
++                // rotfb4: the staging buffer back into the plane as one copy, from its first texel
++                // to its last, where it was a copy of each row (2436 of them for Core Animation's
++                // landscape framebuffer): the bytes between rows take the kernel's zeros, which
++                // no texel holds. /var/local/mtl2-env SWEET_M2V_ROT_ROWS=1 keeps the rows.
++                let whole = vk::BufferCopy {
++                    src_offset: staging.into.dst_offset,
++                    dst_offset: staging.into.src_offset,
++                    size: staging.into.size,
++                };
++                device.cmd_copy_buffer(command_buffer, staging.raw(), bytes, &[whole]);
+             } else {
+                 device.cmd_copy_buffer(command_buffer, staging.raw(), bytes, &staging.back);
+             }
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index 9e37fb96..2c157583 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -329,6 +329,14 @@ impl ShadowCopies {
+         }
+     }
+ 
++    /// A rotated texture's turns (`rotated.rs`), or `None` for any other shadow.
++    pub(super) fn rotated(&self) -> Option<&RotatedCopies> {
++        match self.target() {
++            Some(ShadowTarget::Rotated { turn, .. }) => Some(&**turn),
++            _ => None,
++        }
++    }
++
+     /// Whether a render pass that draws loads this shadow other than by the inverse of its
+     /// store: a rotated texture's frame of rotation 4 (`rotated.rs`).
+     pub(super) fn loads_apart(&self) -> bool {
+@@ -1185,6 +1193,13 @@ impl<M: Clone> ShadowSync<M> {
+                 entry.current = false;
+             }
+         }
++        // rotfb4: a rotated texture's frame a command renders without storing it back (a
++        // `DontCare` store) may no longer match its plane: its next copy in is not skipped.
++        for shadow in shadows.iter().filter(|shadow| !shadow.writes) {
++            if let Some(turn) = shadow.copies.rotated() {
++                turn.stale();
++            }
++        }
+         for shadow in shadows.iter().filter(|shadow| shadow.writes) {
+             let i = self.entry(&shadow.copies);
+             // Writes Metal drops are not copied back, and the image no longer holds the bytes.
+diff --git a/crates/metal2vulkan/src/bind/rotate_texels.rs b/crates/metal2vulkan/src/bind/rotate_texels.rs
+index 8db5185e..eb2f363f 100644
+--- a/crates/metal2vulkan/src/bind/rotate_texels.rs
++++ b/crates/metal2vulkan/src/bind/rotate_texels.rs
+@@ -77,8 +77,12 @@ impl RotateTexelsModule {
+     pub const SHAPE_BINDING: u32 = 2;
+     /// The words of a shape (the module docs).
+     pub const SHAPE_WORDS: u32 = 13;
+-    /// Invocations of one workgroup, along x: one destination word each.
++    /// Invocations of one workgroup: one destination word each.
+     pub const LOCAL_SIZE: u32 = 64;
++    /// SweetMetal2 (rotfb4): the workgroup's shape, `LOCAL_SIZE` invocations as 8 x 8, so that a
++    /// workgroup of a grid whose rows are the destination's rows (`grid_width` its row's words)
++    /// reads a turned source in 8 rows, not 64.
++    pub const LOCAL: [u32; 2] = [8, 8];
+ 
+     /// The shape's bytes of a move of `texel_bytes` texels into a destination of `width` by
+     /// `height` texels whose rows are `pitch` bytes apart, from a source whose rows are
+@@ -247,7 +251,10 @@ fn typed_module() -> BResult<TypedModule> {
+     let grid_width = field(&mut f, 12)?;
+     let row = f.binary(BinOp::IMul, gy, grid_width)?;
+     let i = f.binary(BinOp::IAdd, row, gx)?;
+-    let inside = f.binary(BinOp::ULessThan, i, words)?;
++    let below = f.binary(BinOp::ULessThan, i, words)?;
++    // rotfb4: a grid whose rows run past `grid_width` (whole workgroups) takes no word there.
++    let across = f.binary(BinOp::ULessThan, gx, grid_width)?;
++    let inside = f.binary(BinOp::LogicalAnd, below, across)?;
+     let moved: ArmFn<'_, ()> = Box::new(move |f, _| {
+         let two = u32_value(f, 2)?;
+         let three = u32_value(f, 3)?;
+@@ -294,8 +301,8 @@ fn typed_module() -> BResult<TypedModule> {
+         ExecModel::GLCompute,
+         id,
+         vec![ExecMode::LocalSize {
+-            x: RotateTexelsModule::LOCAL_SIZE,
+-            y: 1,
++            x: RotateTexelsModule::LOCAL[0],
++            y: RotateTexelsModule::LOCAL[1],
+             z: 1,
+         }],
+     )?;
+@@ -438,7 +445,7 @@ mod tests {
+                     store_pitch,
+                     map(r, (w, h), true),
+                     words,
+-                    grid,
++                    RotateTexelsModule::LOCAL[0],
+                 );
+                 let rows = words.div_ceil(grid);
+                 let pass = moved(&store, 4 * words as usize, shape, [1, rows]);
+@@ -463,7 +470,7 @@ mod tests {
+                     pass_pitch,
+                     map(r, (w, h), false),
+                     store_words,
+-                    2 * grid,
++                    2 * RotateTexelsModule::LOCAL[0],
+                 );
+                 let back = moved(
+                     &pass,

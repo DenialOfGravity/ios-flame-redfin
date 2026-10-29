@@ -209,11 +209,22 @@ static bool listed(void)
 		uint64_t registryID = 0;
 		IORegistryEntryGetRegistryEntryID(port, &registryID);
 		double t0 = CFAbsoluteTimeGetCurrent();
-		@try {
-			device = native_bridge_metal_open(turnip.UTF8String, cache, registryID, missing);
-		} @catch (NSException *e) {
-			sm2_log("device: exception %s", e.reason.UTF8String);
-			device = nil;
+		/*
+		 * rotfb3: a relaunched backboardd opened its device while the kernel was still freeing the crashed one's GPU pool
+		 * (r62b: "device refused: device: OutOfMemory(Device)" at 3979.2 s, the old client's 438 MB freed by 3983.2 s), and
+		 * stayed on Core Animation's CPU renderer. An OutOfMemory refusal is tried again, once a second, up to 8 times.
+		 */
+		for (int attempt = 0; attempt < 9; attempt++) {
+			@try {
+				device = native_bridge_metal_open(turnip.UTF8String, cache, registryID, missing);
+			} @catch (NSException *e) {
+				sm2_log("device: exception %s", e.reason.UTF8String);
+				device = nil;
+			}
+			if (device || !strstr(nmb_last_error(), "OutOfMemory") || attempt == 8)
+				break;
+			sm2_log("device refused (%s): again in 1 s (%d of 8)", nmb_last_error(), attempt + 1);
+			sleep(1);
 		}
 		sm2_log("device %s in %.0f ms (cache %s)%s%s", device ? [[device name] UTF8String] : "refused",
 			(CFAbsoluteTimeGetCurrent() - t0) * 1000, cache, device ? "" : ": ", device ? "" : nmb_last_error());
@@ -224,6 +235,20 @@ static bool listed(void)
 		if (device && strcmp(getprogname(), "backboardd") != 0)
 			class_replaceMethod(object_getClass(device), sel_registerName("supportsExtendedXR10Formats"),
 					    imp_implementationWithBlock(^BOOL(id me) { (void)me; return YES; }), "B16@0:8");
+		/*
+		 * Render-target rotation: _MTLDevice answers YES, so Core Animation draws its landscape framebuffer as a
+		 * rotated (rotation 1/3) texture over the portrait panel surface. metal2vulkan holds such a texture through a
+		 * shadow image and a rotation kernel copy in and out of every pass: ~220 ms of GPU a frame on the Adreno 620
+		 * (r62b: GPU 99% busy, 30-60 of 60 frames a second dropped, landscape after ~10 s with no animation). Answering
+		 * NO makes CA keep the portrait framebuffer and rotate in its own composite, as on GPUs without the feature.
+		 * /var/local/mtl2-env SWEET_RT_ROTATION=1 keeps Metal's answer.
+		 */
+		const char *rt = getenv("SWEET_RT_ROTATION");
+		if (device && !(rt && atoi(rt))) {
+			class_replaceMethod(object_getClass(device), sel_registerName("supportsRenderTargetTextureRotation"),
+					    imp_implementationWithBlock(^BOOL(id me) { (void)me; return NO; }), "B16@0:8");
+			sm2_log("render-target rotation: answered NO (SWEET_RT_ROTATION=1 keeps Metal's)");
+		}
 		/* image bases, for symbolicating pstack samples (atos -o out/SweetMetal2.dSYM -l BASE ADDR) */
 		Dl_info self = { 0 }, tu = { 0 };
 		dladdr((void *)sm2_logs, &self);
