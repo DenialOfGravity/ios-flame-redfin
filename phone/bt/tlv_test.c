@@ -415,10 +415,74 @@ static void test_flow(int mode, const char *baud)
 	free(nv);
 }
 
+
+/* ---- in-band sleep bytes (hci_qca.c values: 0xFD wake ind, 0xFE sleep ind, 0xFC wake ack) ---- */
+
+static uint8_t ibs_in[64], ibs_out[64];
+static size_t ibs_in_len, ibs_in_pos, ibs_out_len;
+static int ibs_w(struct uart *u, const uint8_t *b, size_t n)
+{
+	(void)u;
+	for (size_t i = 0; i < n && ibs_out_len < sizeof(ibs_out); i++) {
+		ibs_out[ibs_out_len++] = b[i];
+		if (b[i] == 0xFD && ibs_in_pos == ibs_in_len)	/* our wake indication: the controller acks */
+			ibs_in[ibs_in_len++] = 0xFC;
+	}
+	return 0;
+}
+static int ibs_r(struct uart *u, uint8_t *b, size_t n, unsigned ms)
+{
+	(void)u; (void)ms;
+	size_t got = 0;
+	while (ibs_in_pos < ibs_in_len && got < n)
+		b[got++] = ibs_in[ibs_in_pos++];
+	return (int)got;
+}
+static uint8_t ibs_tap_types[16];
+static size_t ibs_ntap;
+static void ibs_tap(struct hci *h, uint8_t type, const uint8_t *d, size_t n)
+{
+	(void)h; (void)n;
+	if (ibs_ntap < sizeof(ibs_tap_types))
+		ibs_tap_types[ibs_ntap++] = d ? type : 0xff;
+}
+
+static void test_ibs(void)
+{
+	struct uart u = { .name = "ibs", .baud = 3000000, .flow = 1, .write = ibs_w, .read = ibs_r };
+	struct hci h;
+	hci_init(&h, &u, 0);
+	h.tap = ibs_tap;
+	/* the controller's wake indication, then the event it was holding */
+	static const uint8_t in1[] = { 0xFD, 0x04, 0x0e, 0x04, 0x01, 0x03, 0x0c, 0x00 };
+	memcpy(ibs_in, in1, sizeof(in1));
+	ibs_in_len = sizeof(in1);
+	struct hci_pkt p;
+	int r = hci_recv(&h, &p, 50);
+	CHECK(r == 1 && p.type == H4_EVT && p.data[0] == 0x0e, "event after 0xFD: r %d", r);
+	CHECK(ibs_out_len == 1 && ibs_out[0] == 0xFC, "0xFD answered with %zu bytes, first 0x%02x", ibs_out_len, ibs_out[0]);
+	CHECK(ibs_ntap == 2 && ibs_tap_types[0] == 0xff && ibs_tap_types[1] == H4_EVT, "tap order");
+	CHECK(!h.peer_asleep, "awake after 0xFD");
+	/* sleep indication, then a send with h.ibs: 0xFD first, the 0xFC answer, then the command */
+	ibs_in[0] = 0xFE;
+	ibs_in_len = 1, ibs_in_pos = 0, ibs_out_len = 0;
+	hci_recv(&h, &p, 0);
+	CHECK(h.peer_asleep, "asleep after 0xFE");
+	ibs_in_len = ibs_in_pos = 0;
+	h.ibs = 1;
+	hci_send_cmd(&h, 0x0c03, NULL, 0);
+	CHECK(ibs_out_len == 5 && ibs_out[0] == 0xFD && ibs_out[1] == 0x01 && ibs_out[2] == 0x03 && ibs_out[3] == 0x0c,
+	      "wake before TX: %zu bytes, 0x%02x 0x%02x", ibs_out_len, ibs_out[0], ibs_out[1]);
+	CHECK(!h.peer_asleep && h.n_wake_tx == 1 && h.n_wake_ack == 1, "after wake: asleep %d tx %lu ack %lu",
+	      h.peer_asleep, h.n_wake_tx, h.n_wake_ack);
+	printf("ibs: 0xFD acked with 0xFC, 0xFE then send -> 0xFD, 0xFC, packet\n");
+}
+
 int main(void)
 {
 	test_segments();
 	test_nvm();
+	test_ibs();
 	for (int mode = 0; mode < 4; mode++)
 		test_flow(mode, "3000000");
 	test_flow(3, "115200");

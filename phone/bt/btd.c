@@ -23,6 +23,12 @@
  *                             to the WCN3998 except QCA's own 0xFC00/0xFC0B/0xFC48 (answered here);
  *                          2: 1 + every other vendor command answered here with status 0 (the pre-ws-y default);
  *                          0: no rules. Each rule is logged once ("BTD SHIM:"), counts at exit.
+ *                        In-band sleep: the NVM keeps it off (as --scan, vayu_bt_ibs=0), but the WCN3998 still
+ *                        sends 0xFE when idle and 0xFD (wake indication) before it answers; btd acknowledges
+ *                        every 0xFD with 0xFC, and with env BTD_IBS=1 (default) sends 0xFD and waits for 0xFC
+ *                        before a packet after a 0xFE (BTD_IBS=0: never). These bytes never reach the host.
+ *                        ws-y-bt2: up to 68cef4c hci.h had 0xFD/0xFE swapped, so 0xFD was never acknowledged
+ *                        (r57a: 25000+ "sleep indications", bluetoothd's Reset unanswered).
  *                        /dev/btbridge missing: "BTD FAIL bridge-open" before any radio work, exit 0 (launchd
  *                        does not restart a successful exit).
  * Options: --baud N (operating speed, default 3000000; 115200 = no change), --os 16|32 (UART oversampling,
@@ -315,6 +321,7 @@ static int le_disallowed_ok(uint16_t op)
  * is not offered (Supported_Commands octet 18 bit 3, clear on Qualcomm) or not answered; it asserts in
  * bcm_vsc.c on an empty status-0 answer to 0xfd48 (create multi-adv instance) but accepts status 0x01.
  */
+static int bridge_nvm_ibs;		/* --ibs given: NVM in-band sleep left on */
 static int bridge_vsc = 1;		/* 0 off, 1 rules, 2 rules + vendor catch-all */
 enum { SR_SC18, SR_0C5B, SR_FD48, SR_QCA_GUARD, SR_VSC_ALL, SR_VSC_FWD, SR_N };
 static const char *const sr_name[SR_N] = {
@@ -371,10 +378,21 @@ static void bridge_local_cc(struct hci *h, uint16_t op, uint8_t status, const ui
 }
 
 /* events/ACL from the controller to the iOS side (hci.c tap; IBS bytes have data == NULL and stay here) */
+static unsigned long bridge_ibs_dropped[3];	/* 0xFD wake ind, 0xFE sleep ind, 0xFC wake ack */
 static void bridge_tap(struct hci *h, uint8_t type, const uint8_t *data, size_t len)
 {
-	if (bridge_fd < 0 || !data)
+	if (bridge_fd < 0)
 		return;
+	if (!data) {
+		/* a single in-band sleep byte (0xFD/0xFE/0xFC between packets): hci.c answers it, bluetoothd's H4
+		   (H4BC) would read it as a packet type, so it never goes to the host (vayu filters them too) */
+		int k = type == IBS_WAKE_IND ? 0 : type == IBS_SLEEP_IND ? 1 : 2;
+		if (bridge_ibs_dropped[0] + bridge_ibs_dropped[1] + bridge_ibs_dropped[2] == 0)
+			hci_log(h, "BTD BRIDGE: in-band sleep byte 0x%02x from the WCN3998 kept from the host (all of them; "
+				"counts at exit)\n", type);
+		bridge_ibs_dropped[k]++;
+		return;
+	}
 	if (bridge_compat && type == H4_EVT && len >= 6 && data[0] == EV_CMD_COMPLETE) {
 		uint16_t op = (uint16_t)(data[3] | data[4] << 8);
 		uint8_t st = data[5];
@@ -484,6 +502,17 @@ static int bridge_dev(struct hci *h, const char *path, int fwd)
 	h->tap = bridge_tap;
 	h->on_async = NULL;
 	{
+		/* in-band sleep: the NVM has it off (tag 17 bit 7, tag 27 bit 0 cleared as in --scan), yet this
+		   WCN3998 still sends 0xFE when idle and 0xFD before it answers (r57a: bluetoothd's first command
+		   came 8.5 s after the bring-up). 0xFD is always acknowledged with 0xFC (hci.c); BTD_IBS=1 (default)
+		   also sends 0xFD and waits for 0xFC before a packet when the controller last said 0xFE. */
+		const char *e = getenv("BTD_IBS");
+		h->ibs = !(e && e[0] == '0');
+		hci_log(h, "BTD BRIDGE: in-band sleep: NVM %s; controller 0xFD answered with 0xFC; wake (0xFD) before TX "
+			"when asleep %s (BTD_IBS=%d); 0xFD/0xFE/0xFC never forwarded to the host\n",
+			bridge_nvm_ibs ? "on (--ibs)" : "off", h->ibs ? "on" : "off", h->ibs);
+	}
+	{
 		/* bluetool (the BlueTool stand-in) answers bluetoothd's "boot" once this names a live btd */
 		FILE *rf = fopen(BTD_READY, "w");
 		if (rf) {
@@ -553,6 +582,9 @@ static int bridge_dev(struct hci *h, const char *path, int fwd)
 	unlink(BTD_READY);
 	hci_log(h, "BTD BRIDGE: %lu host bytes, %lu host packets, %lu controller packets, %u vendor commands faked, "
 		"%u answers fixed\n", bridge_host_bytes, bridge_host_pkts, bridge_ctrl_pkts, bridge_fake, bridge_fixed);
+	hci_log(h, "BTD BRIDGE: in-band sleep bytes kept from the host: %lu wake ind 0xFD, %lu sleep ind 0xFE, %lu wake "
+		"ack 0xFC; %lu 0xFC sent to the WCN3998, %lu 0xFD sent before TX\n", bridge_ibs_dropped[0],
+		bridge_ibs_dropped[1], bridge_ibs_dropped[2], h->n_wake_ack, h->n_wake_tx);
 	for (int r = 0; r < SR_N; r++)
 		if (sr_hits[r])
 			hci_log(h, "BTD SHIM: rule %s used %u times\n", sr_name[r], sr_hits[r]);
@@ -777,9 +809,12 @@ int main(int argc, char **argv)
 	else if (!rc && o.mode == 'r')
 		rc = raw_bridge(&h, o.port);
 	else if (!rc && o.mode == 'b')
-		rc = bridge_dev(&h, o.bridge_dev_path ? o.bridge_dev_path : "/dev/btbridge", o.fwd_vendor);
+		bridge_nvm_ibs = o.ibs, rc = bridge_dev(&h, o.bridge_dev_path ? o.bridge_dev_path : "/dev/btbridge", o.fwd_vendor);
 	hci_log(&h, "BTD: %lu packets out, %lu in, %lu junk bytes, %lu IBS bytes, %lu hardware errors\n", h.n_tx,
 		h.n_rx, h.n_junk, h.n_ibs, h.n_hwerr);
+	if (h.n_wake_ack || h.n_wake_tx)
+		hci_log(&h, "BTD: in-band sleep: %lu wake acknowledgements (0xFC) sent, %lu wake indications (0xFD) sent\n",
+			h.n_wake_ack, h.n_wake_tx);
 	u->close(u);
 	return rc == 3 ? 3 : rc ? 1 : 0;
 }
