@@ -1,0 +1,195 @@
+ios-redfin bridge patch 0135: port of UniXNU AdrenoMetal bridge/patches/0014-map-tracker-keys.patch
+Original author: bluseliu50 <265648257+bluseliu50@users.noreply.github.com> (UniXNU/AdrenoMetal ce5e19e, BSD-2-Clause-Patent).
+Ported onto metal2vulkan 720ef1ce + ios-redfin bridge patches 0001-0111 for the redfin port; changes from the original are
+marked 'ios-on-pixel (bridge 0135)'. Knob: SWEET_U0014=1 (default off: SipHash as before).
+See phone/metal2/bridge/UNIXNU-PORT.md.
+
+diff --git a/crates/metal2vulkan-runtime/src/key_hash.rs b/crates/metal2vulkan-runtime/src/key_hash.rs
+index bf06b74e..31486ea4 100644
+--- a/crates/metal2vulkan-runtime/src/key_hash.rs
++++ b/crates/metal2vulkan-runtime/src/key_hash.rs
+@@ -9,7 +9,8 @@
+ //! follows the hash, which none of these maps' users depends on.
+ 
+ use std::collections::HashMap;
+-use std::hash::{BuildHasherDefault, Hasher};
++use std::collections::hash_map::{DefaultHasher, RandomState};
++use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
+ 
+ /// A map keyed by the runtime's own identities ([`KeyHasher`]).
+ pub(crate) type KeyMap<K, V> = HashMap<K, V, BuildHasherDefault<KeyHasher>>;
+@@ -63,3 +64,99 @@ impl Hasher for KeyHasher {
+         self.mix(value as u64);
+     }
+ }
++
++/// ios-on-pixel (bridge 0135, UniXNU 0014): a map of an encoder's tracked uses (`tracker.rs`
++/// `EncoderUses`, `Part`, `UnorderedWrites`, `merged`), hashed by [`KeyHasher`] where env
++/// `SWEET_U0014` is on, else by the standard maps' SipHash as before.
++pub(crate) type TrackMap<K, V> = HashMap<K, V, TrackBuild>;
++
++/// [`TrackMap`]'s hasher choice, read once per process.
++#[derive(Clone, Debug)]
++pub(crate) enum TrackBuild {
++    Key,
++    Sip(RandomState),
++}
++
++fn sweet_u0014() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        std::env::var("SWEET_U0014").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
++    })
++}
++
++impl Default for TrackBuild {
++    fn default() -> TrackBuild {
++        match sweet_u0014() {
++            true => TrackBuild::Key,
++            false => TrackBuild::Sip(RandomState::new()),
++        }
++    }
++}
++
++/// [`TrackBuild`]'s hasher.
++pub(crate) enum TrackHasher {
++    Key(KeyHasher),
++    Sip(DefaultHasher),
++}
++
++impl BuildHasher for TrackBuild {
++    type Hasher = TrackHasher;
++
++    fn build_hasher(&self) -> TrackHasher {
++        match self {
++            TrackBuild::Key => TrackHasher::Key(KeyHasher::default()),
++            TrackBuild::Sip(state) => TrackHasher::Sip(state.build_hasher()),
++        }
++    }
++}
++
++impl Hasher for TrackHasher {
++    fn finish(&self) -> u64 {
++        match self {
++            TrackHasher::Key(h) => h.finish(),
++            TrackHasher::Sip(h) => h.finish(),
++        }
++    }
++
++    fn write(&mut self, bytes: &[u8]) {
++        match self {
++            TrackHasher::Key(h) => h.write(bytes),
++            TrackHasher::Sip(h) => h.write(bytes),
++        }
++    }
++
++    fn write_u8(&mut self, value: u8) {
++        match self {
++            TrackHasher::Key(h) => h.write_u8(value),
++            TrackHasher::Sip(h) => h.write_u8(value),
++        }
++    }
++
++    fn write_u16(&mut self, value: u16) {
++        match self {
++            TrackHasher::Key(h) => h.write_u16(value),
++            TrackHasher::Sip(h) => h.write_u16(value),
++        }
++    }
++
++    fn write_u32(&mut self, value: u32) {
++        match self {
++            TrackHasher::Key(h) => h.write_u32(value),
++            TrackHasher::Sip(h) => h.write_u32(value),
++        }
++    }
++
++    fn write_u64(&mut self, value: u64) {
++        match self {
++            TrackHasher::Key(h) => h.write_u64(value),
++            TrackHasher::Sip(h) => h.write_u64(value),
++        }
++    }
++
++    fn write_usize(&mut self, value: usize) {
++        match self {
++            TrackHasher::Key(h) => h.write_usize(value),
++            TrackHasher::Sip(h) => h.write_usize(value),
++        }
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/tracker.rs b/crates/metal2vulkan-runtime/src/tracker.rs
+index 58ccac6e..193ab6a1 100644
+--- a/crates/metal2vulkan-runtime/src/tracker.rs
++++ b/crates/metal2vulkan-runtime/src/tracker.rs
+@@ -58,7 +58,7 @@
+ //! `VkQueue`'s listed in its submission order as their plans were applied, not every resource the
+ //! state holds.
+ 
+-use crate::key_hash::KeyMap;
++use crate::key_hash::{KeyMap, TrackMap};
+ use ash::vk;
+ use std::collections::{HashMap, VecDeque};
+ use std::fmt;
+@@ -909,7 +909,7 @@ fn coalesce(entries: &mut Vec<Entry>) {
+ /// The uses one per key and range, sorted by key, without the ones that touch nothing.
+ fn merged<S: Copy + Ord + Hash>(uses: impl IntoIterator<Item = Use<S>>) -> Vec<Use<S>> {
+     let mut merged: Vec<Use<S>> = Vec::new();
+-    let mut index: HashMap<(S, UseRange), usize> = HashMap::new();
++    let mut index: TrackMap<(S, UseRange), usize> = TrackMap::default();
+     for used in uses {
+         if used.is_nothing() {
+             continue;
+@@ -945,7 +945,7 @@ pub(super) struct EncoderUses<K> {
+     /// Whether Metal runs the commands in encoded order (blit encoders, serial compute encoders).
+     ordered: bool,
+     /// The accesses of the current part's commands so far, for that order.
+-    inside: HashMap<Class<K>, Vec<Entry>>,
++    inside: TrackMap<Class<K>, Vec<Entry>>,
+     /// The parts, in order: the last is the current one. Never empty.
+     parts: Vec<Part<K>>,
+     /// The fences waited for: before the encoder's first part.
+@@ -957,7 +957,7 @@ pub(super) struct EncoderUses<K> {
+ /// The uses of one part of an encoder.
+ struct Part<K> {
+     /// The tracked uses so far, one per range, at most [`ENTRIES_PER_KEY`] per resource.
+-    tracked: HashMap<K, KeyUses<K>>,
++    tracked: TrackMap<K, KeyUses<K>>,
+     stages: vk::PipelineStageFlags2,
+ }
+ 
+@@ -1008,7 +1008,7 @@ impl<K> KeyUses<K> {
+ impl<K> Part<K> {
+     fn new() -> Part<K> {
+         Part {
+-            tracked: HashMap::new(),
++            tracked: TrackMap::default(),
+             stages: vk::PipelineStageFlags2::NONE,
+         }
+     }
+@@ -1019,7 +1019,7 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
+     pub(super) fn new(ordered: bool) -> EncoderUses<K> {
+         EncoderUses {
+             ordered,
+-            inside: HashMap::new(),
++            inside: TrackMap::default(),
+             parts: vec![Part::new()],
+             waits: Vec::new(),
+             updates: Vec::new(),
+@@ -1247,14 +1247,14 @@ impl<K> fmt::Debug for EncoderUses<K> {
+ /// commands after them. One entry per range, at most [`ENTRIES_PER_KEY`] per resource, merged
+ /// as [`EncoderUses`] merges its own, which claims more and stays exact.
+ pub(super) struct UnorderedWrites<K> {
+-    writes: HashMap<K, Vec<Use<K>>>,
++    writes: TrackMap<K, Vec<Use<K>>>,
+ }
+ 
+ impl<K: Copy + Ord + Hash> UnorderedWrites<K> {
+     /// No writes.
+     pub(super) fn new() -> UnorderedWrites<K> {
+         UnorderedWrites {
+-            writes: HashMap::new(),
++            writes: TrackMap::default(),
+         }
+     }
+ 

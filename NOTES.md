@@ -215,3 +215,17 @@ all upstream patches. Kernels "0151"/"0152" in the logs = 0901/0902.
   (4 x, 2-16 ms), refusals log both prepare() results.
 - 0942 the `present:` line per 300-frame window: window ms and presents/s, per-frame clean/blit, put off / flips / late in
   the window, mode (single buffer / flip) and `sweetgpufreq`, totals in brackets.
+
+## Metal bridge patches ported from UniXNU (phone/metal2/bridge/patches 0130-0137)
+
+Ports of UniXNU AdrenoMetal bridge patches 0007-0016 (bluseliu50, BSD-2-Clause-Patent) onto metal2vulkan 720ef1ce + our
+0001-0111; mapping and skipped ones (0008 = our 0101, 0009 = our 0107 SWEET_RPCACHE) in phone/metal2/bridge/UNIXNU-PORT.md.
+Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env or /var/local/mtl2-env.
+- 0130 (U0007) textures over the render server's two-plane RGB '_RB4' surfaces (widget snapshots), `SWEET_U0007=1`.
+- 0131 (U0010) viewports/scissors and push-field bytes held inline: no Vec allocations per draw (always on, same values).
+- 0132 (U0011) the encoder keeps the last draw's DrawCommands and refills its vectors, `SWEET_U0011=1`.
+- 0133 (U0012) the encoder keeps the last draw's use and argument-sampler lists, `SWEET_U0012=1`; tracker KeyUses inline (always).
+- 0134 (U0013) devices refuse rebinds so encoders keep no call log while no-copy buffers live, `SWEET_U0013=1`.
+- 0135 (U0014) the encoder's tracker maps hashed by the runtime's KeyHasher instead of SipHash, `SWEET_U0014=1`.
+- 0136 (U0015) a two-plane texture's shadow starts as its memory lies (no zero fill at creation), `SWEET_U0015=1`.
+- 0137 (U0016) a padded render/write texture aliases only where 16x4 tile stores stay inside its rows, else shadow, `SWEET_U0016=1`.
