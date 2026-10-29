@@ -63,3 +63,5 @@ what you need to fetch yourself.
   - Google's factory image, AOSP `mkbootimg` and `avbtool` (Apache 2.0)
   - TWRP
   - dropbear (MIT), toybox (0BSD) and dash (BSD)
+- **LZ4** (Yann Collet, <https://github.com/lz4/lz4>, BSD-2-Clause): `phone/tools/lz4/lz4.c`, `lz4.h` from v1.10.0,
+  unchanged (licence in `phone/tools/lz4/LICENSE`); sweetmon's LZ4 frame writer sits on its block compressor.

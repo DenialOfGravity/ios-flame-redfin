@@ -9,6 +9,7 @@
 #   autolock get|never|SECONDS: Settings > Auto-Lock (ManagedConfiguration maxInactivity), for benches
 #   imgtest  does ImageIO decode real pixels (HEIC: no)       membw    CPU memory bandwidth
 #   sweettrace  kdebug trace (sched, IPC, 0994 display/GPU events) for tools-claude/sweet-trace.py
+#   sweetmon    monitor daemon: samples, klog tail, kdebug traces over TCP 5150 (docs/redfin/sweetmon.md)
 #   expt, exq, runmigrator: one-off probes of ExtensionFoundation and DataMigration (runmigrator needs
 #   com.apple.migrationpluginwrapper's entitlements, not in git)
 set -euo pipefail
@@ -33,5 +34,6 @@ build netsvc netsvc.m -fobjc-arc -framework Foundation -framework SystemConfigur
 build memwarn memwarn.c
 build pmem pmem.c
 build a2s a2s.c
+build sweetmon sweetmon.c lz4/lz4.c -DSWEETMON_VERSION="\"$(git rev-parse --short HEAD 2>/dev/null || date +%F)\""
 build imgdump imgdump.c -lobjc
 ls -l out

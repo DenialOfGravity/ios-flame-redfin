@@ -74,7 +74,7 @@ void mach_timebase_info(mach_timebase_info_data_t *t);
 /* ------------------------------------------------------------------------------------------------ util */
 
 static int verbose, daemonized;
-static FILE *logf;
+static FILE *dlogf;
 static mach_timebase_info_data_t tb;
 
 static uint64_t abs_now(void) { return mach_absolute_time(); }
@@ -84,7 +84,7 @@ static uint64_t now_ms(void) { return abs_to_ns(abs_now()) / 1000000ull; }
 static void dbg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void dbg(const char *fmt, ...)
 {
-	if (logf == NULL && !(verbose && !daemonized))
+	if (dlogf == NULL && !(verbose && !daemonized))
 		return;
 	char m[512];
 	va_list ap;
@@ -93,9 +93,9 @@ static void dbg(const char *fmt, ...)
 	va_end(ap);
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
-	if (logf != NULL) {
-		fprintf(logf, "%ld.%03d %s\n", (long)tv.tv_sec, (int)(tv.tv_usec / 1000), m);
-		fflush(logf);
+	if (dlogf != NULL) {
+		fprintf(dlogf, "%ld.%03d %s\n", (long)tv.tv_sec, (int)(tv.tv_usec / 1000), m);
+		fflush(dlogf);
 	}
 	if (verbose && !daemonized)
 		fprintf(stderr, "sweetmon: %s\n", m);
@@ -1014,7 +1014,7 @@ static int pmem_read(uint64_t pa, void *buf, size_t n)
 }
 
 /* klog */
-static struct { int on; uint64_t pa, pos, total, total_prev, total_t_ms; uint64_t next_ms; } kl;
+static struct { int on; uint64_t pa, pos, total, next_ms; } kl;
 
 static int klog_total(uint64_t *t) { return pmem_read(kl.pa, t, 8); }
 
@@ -1274,7 +1274,7 @@ static void sample(void)
 	jb_pf(j, ",\"self\":{\"cpu_ms\":%.1f,\"rss_kb\":%llu,\"klog_bps\":%.0f,\"tx_bps\":%.0f,\"dropped\":%llu,\"queued\":%zu}",
 	    (double)(su - sp.self_us) / 1000, (unsigned long long)self_rss_kb(), (double)(k_bytes - sp.kbytes) / ds,
 	    (double)(tx_bytes - sp.tx) / ds, (unsigned long long)dropped_frames, cl ? cl->queued : 0);
-	if (kl.on && kl.total_t_ms)
+	if (kl.on)
 		jb_pf(j, ",\"klog_bps\":%.0f,\"klog_total\":%llu", (double)(kl.total - sp.ktotal) / ds, (unsigned long long)kl.total);
 	else
 		jb_pf(j, ",\"klog_bps\":null");
@@ -1283,7 +1283,6 @@ static void sample(void)
 	sp.tx = tx_bytes;
 	sp.kbytes = k_bytes;
 	sp.ktotal = kl.total;
-	kl.total_t_ms = 1;
 	sp.abs = now;
 	sp.n++;
 	send_json(cl, 'S', j, 1);
@@ -1390,7 +1389,7 @@ static void frames_read(void)
 
 /* ------------------------------------------------------------------------------------------------ worker (trace, pmem) */
 
-enum { J_IDLE, J_RUN, J_DONE, J_SEND };
+enum { J_IDLE, J_RUN, J_SEND };
 static struct job {
 	int state, kind;                /* kind 1 kdebug, 2 pmem */
 	uint32_t id, seq;
@@ -1720,8 +1719,6 @@ static void job_abort(void)
 		}
 		if (job.kind == 1)
 			kd(KERN_KDREMOVE, 0, NULL, NULL);
-	} else if (job.state == J_DONE) {
-		pthread_join(job.th, NULL);
 	}
 	if (job.state != J_IDLE)
 		job_reset();
@@ -2085,7 +2082,6 @@ static void cmd_klog(struct conn *c, char **av, int ac)
 	kl.pos = total > KLOG_RING ? total - KLOG_RING : 0;
 	kl.next_ms = now_ms() + KLOG_POLL_MS;
 	sp.ktotal = total;
-	kl.total_t_ms = 0;
 	snprintf(ex, sizeof(ex), ",\"pa\":\"0x%llx\",\"total\":%llu,\"pos\":%llu", (unsigned long long)pa,
 	    (unsigned long long)total, (unsigned long long)kl.pos);
 	reply(c, "klog", 1, ex, "tailing");
@@ -2108,7 +2104,7 @@ static void cmd_info(struct conn *c)
 		    bi.nolog, bi.flags, bi.nkdthreads, bi.bufid);
 	else
 		jb_pf(&j, "\"kdebug\":null,");
-	static const char *js[] = { "idle", "recording", "done", "sending" };
+	static const char *js[] = { "idle", "running", "sending" };
 	jb_pf(&j, "\"job\":{\"state\":\"%s\",\"id\":%u,\"kind\":%d,\"zbytes\":%zu},\"rss_kb\":%llu,\"cpu_ms_total\":%.0f,"
 	    "\"queued\":%zu,\"tx_bytes\":%llu,\"dropped\":%llu", js[job.state], job.id, job.kind, job.z.n,
 	    (unsigned long long)self_rss_kb(), (double)self_cpu_us() / 1000, c->queued, (unsigned long long)tx_bytes,
@@ -2123,8 +2119,7 @@ static void activate(struct conn *c)
 		conn_close(cl);
 	c->authed = 1;
 	cl = c;
-	sample_base();
-	sp.n = 0;
+	sp.n = 0;               /* deltas of the first sample: since the previous one (or daemon start) */
 	temps_resolve();
 	next_sample_ms = now_ms() + rate_ms;
 	dbg("client %s active", c->peer);
@@ -2430,7 +2425,7 @@ int main(int argc, char **argv)
 	if (daemon_mode)
 		daemonize();
 	if (logpath != NULL)
-		logf = fopen(logpath, "a");
+		dlogf = fopen(logpath, "a");
 	if (nice(10) == -1 && errno != 0)
 		dbg("nice: %s", strerror(errno));
 	signal(SIGPIPE, SIG_IGN);
