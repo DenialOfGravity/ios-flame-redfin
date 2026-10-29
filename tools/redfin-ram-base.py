@@ -15,7 +15,7 @@ so a RAM-layout change needs a base that already has both:
 BASE's header arguments and AVB footer parameters (partition size, name, salt) are kept, as mkimage does.
 Name the output so the agent's `boot` refuses it (not r...): it is only a BASE for mkimage, its kernel is BASE's.
 """
-import os, shlex, struct, subprocess, sys, tempfile
+import os, shlex, shutil, struct, subprocess, sys, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
@@ -151,7 +151,7 @@ def main():
         run([sys.executable, os.path.join(avb, 'avbtool.py'), 'add_hash_footer', '--image', img,
              '--partition_size', get('Image size').split()[0], '--partition_name', get('Partition Name'),
              '--salt', get('Salt'), '--hash_algorithm', get('Hash Algorithm')])
-        os.replace(img, out)
+        shutil.move(img, out)
     print('wrote', out)
 
 
