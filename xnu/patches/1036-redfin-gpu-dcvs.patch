@@ -20,8 +20,8 @@ Claude-Session: https://claude.ai/code/session_013SvAC2ugyLE29nbFLJoQZd
  bsd/dev/sweet_a6xx.c    |  72 +++++++++-
  bsd/dev/sweet_a6xx.h    |   7 +
  bsd/dev/sweet_cpufreq.c |   4 +-
- bsd/dev/sweet_gpu.c     | 290 +++++++++++++++++++++++++++++++++++++++-
- 4 files changed, 366 insertions(+), 7 deletions(-)
+ bsd/dev/sweet_gpu.c     | 297 +++++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 373 insertions(+), 7 deletions(-)
 
 diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
 index b1c28de..ef93e98 100644
@@ -164,7 +164,7 @@ index 53006cd..a46eac8 100644
  		return;
  	}
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index 293c23f..154a9c8 100644
+index 293c23f..5106a7c 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
 @@ -480,17 +480,30 @@ sweet_gpu_ready(void)
@@ -202,7 +202,7 @@ index 293c23f..154a9c8 100644
  	if (lvl != gpu.perf_level) {
  		gpu.perf_level = lvl;   /* also what a reset/recovery brings the GPU up at */
  		rc = gpu_ready ? a6_perf_vote(&gpu, lvl) : 0;
-@@ -499,6 +512,274 @@ sweet_gpu_level_cap(unsigned max_lvl)
+@@ -499,6 +512,281 @@ sweet_gpu_level_cap(unsigned max_lvl)
  	return rc;
  }
  
@@ -274,7 +274,11 @@ index 293c23f..154a9c8 100644
 +			last_abs = 0;
 +			counter_on = false;
 +			assert_wait((event_t)&dcvs_chan, THREAD_UNINT);
-+			thread_block(THREAD_CONTINUE_NULL);
++			if (!(dcvs_on & 1) || !gpu_ready) {
++				thread_block(THREAD_CONTINUE_NULL);
++			} else {
++				clear_wait(current_thread(), THREAD_AWAKENED);  /* switched on meanwhile */
++			}
 +			continue;
 +		}
 +		lck_mtx_lock(&sweet_gpu_lock);
@@ -420,6 +424,9 @@ index 293c23f..154a9c8 100644
 +		dcvs_thread_up = true;
 +	}
 +	lck_mtx_lock(&sweet_gpu_lock);
++	if (!gpu_boot_lvl) {
++		gpu_boot_lvl = gpu.perf_level ? gpu.perf_level : 1;     /* sweetgpufreq's, before the governor moves it */
++	}
 +	dcvs_on = value;
 +	if (!(value & 1)) {
 +		dcvs_fixed_locked();    /* back to sweetgpufreq's level (under the thermal cap) */
@@ -477,7 +484,7 @@ index 293c23f..154a9c8 100644
  /* ---- hangs and resets (all with sweet_gpu_lock held) ---- */
  
  /*
-@@ -557,6 +838,7 @@ gpu_stats_locked(void)
+@@ -557,6 +845,7 @@ gpu_stats_locked(void)
  		gstat_own[o].busy += t;
  		gstat_n++;
  		gstat_busy += t;

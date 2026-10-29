@@ -75,10 +75,10 @@ index 7dba219..a591e57 100644
  uint32_t a6_fault_status(const struct a6_gpu *g, uint64_t *far, uint32_t *fsynr0);
  
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index a2416f2..d96a0bd 100644
+index a006ad9..bc88eb6 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -807,6 +807,8 @@ static struct { int pid; uint32_t n; uint64_t busy; } gstat_own[GSTAT_OWNERS + 1
+@@ -814,6 +814,8 @@ static struct { int pid; uint32_t n; uint64_t busy; } gstat_own[GSTAT_OWNERS + 1
  static uint32_t gstat_n, gstat_missed;
  static uint64_t gstat_busy, gstat_longest;
  
@@ -87,7 +87,7 @@ index a2416f2..d96a0bd 100644
  static void
  gpu_owner_locked(uint32_t fence, int pid)
  {
-@@ -871,6 +873,7 @@ gpu_stats_locked(void)
+@@ -878,6 +880,7 @@ gpu_stats_locked(void)
  		    gstat_n, gstat_missed, gstat_busy / 19200, gstat_busy * 100 / 19200 / (ns / 1000000),
  		    gstat_longest * 10 / 192, gstat_busy * 10 / 192 / gstat_n, who);
  	}
@@ -95,7 +95,7 @@ index a2416f2..d96a0bd 100644
  	gstat_n = gstat_missed = 0;
  	gstat_busy = gstat_longest = 0;
  	bzero(gstat_own, sizeof(gstat_own));
-@@ -960,6 +963,94 @@ gpu_recover_locked(const char *why)
+@@ -967,6 +970,94 @@ gpu_recover_locked(const char *why)
  	thread_wakeup((event_t)&gpu_irq_chan);  /* 0999: interrupt waiters see the forced fence now */
  }
  
@@ -190,7 +190,7 @@ index a2416f2..d96a0bd 100644
  /* ---- the panel ---- */
  
  #define MDP             0x0ae00000ULL
-@@ -1205,7 +1296,7 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
+@@ -1212,7 +1303,7 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
  	(void)present_wait_locked(0, "surface remap");
  	(void)present_wait_locked(1, "surface remap");
  	int rc = a6_map_pages(&gpu, SLOT_IOVA(s), pages, npages, page_size);
@@ -199,7 +199,7 @@ index a2416f2..d96a0bd 100644
  	lck_mtx_unlock(&sweet_gpu_lock);
  	if (rc) {
  		slot[s].npages = 0;
-@@ -1701,7 +1792,7 @@ sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, u
+@@ -1708,7 +1799,7 @@ sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, u
  		a6_unmap(&gpu, iova, size);
  		user_va_release(iova, size);
  	}
@@ -208,7 +208,7 @@ index a2416f2..d96a0bd 100644
  	lck_mtx_unlock(&sweet_gpu_lock);
  	if (rc) {
  		return -1;
-@@ -1721,7 +1812,7 @@ sweet_gpu_unmap_user(uint64_t iova, uint64_t len)
+@@ -1728,7 +1819,7 @@ sweet_gpu_unmap_user(uint64_t iova, uint64_t len)
  	lck_mtx_lock(&sweet_gpu_lock);
  	if (gpu_ready) {
  		a6_unmap(&gpu, iova, size);
@@ -217,7 +217,7 @@ index a2416f2..d96a0bd 100644
  	}
  	user_va_release(iova, size);
  	lck_mtx_unlock(&sweet_gpu_lock);
-@@ -1955,7 +2046,7 @@ sweet_gpu_map_at(uint64_t iova, const uint64_t *pages, uint32_t npages)
+@@ -1962,7 +2053,7 @@ sweet_gpu_map_at(uint64_t iova, const uint64_t *pages, uint32_t npages)
  	if (rc) {
  		a6_unmap(&gpu, iova, (uint64_t)npages << 12);
  	}
@@ -226,7 +226,7 @@ index a2416f2..d96a0bd 100644
  	lck_mtx_unlock(&sweet_gpu_lock);
  	return rc;
  }
-@@ -1969,7 +2060,7 @@ sweet_gpu_unmap_at(uint64_t iova, uint64_t len)
+@@ -1976,7 +2067,7 @@ sweet_gpu_unmap_at(uint64_t iova, uint64_t len)
  	lck_mtx_lock(&sweet_gpu_lock);
  	if (gpu_ready) {
  		a6_unmap(&gpu, iova, len);

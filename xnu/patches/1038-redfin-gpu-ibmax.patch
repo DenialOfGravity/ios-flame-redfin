@@ -59,10 +59,10 @@ index 030accd..7dba219 100644
  	unsigned timeout_ms, uint64_t wait_va, uint32_t wait_ref);	/* 0989 */
  #define A6_SCAN_WORD_OFF	0x3000ull	/* 0989: in the scratch page: the direct scanout's latched frame */
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index 154a9c8..a2416f2 100644
+index 5106a7c..a006ad9 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -2003,7 +2003,42 @@ sweet_gpu_fence_of(int pid)
+@@ -2010,7 +2010,42 @@ sweet_gpu_fence_of(int pid)
  	return 0;
  }
  
@@ -106,7 +106,7 @@ index 154a9c8..a2416f2 100644
  uint32_t
  sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bool *busy)
  {
-@@ -2053,7 +2088,7 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bo
+@@ -2060,7 +2095,7 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bo
  		pid_fence[slot].fence = fence;
  	}
  	lck_mtx_unlock(&sweet_gpu_lock);
