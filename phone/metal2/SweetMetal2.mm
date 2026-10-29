@@ -209,11 +209,22 @@ static bool listed(void)
 		uint64_t registryID = 0;
 		IORegistryEntryGetRegistryEntryID(port, &registryID);
 		double t0 = CFAbsoluteTimeGetCurrent();
-		@try {
-			device = native_bridge_metal_open(turnip.UTF8String, cache, registryID, missing);
-		} @catch (NSException *e) {
-			sm2_log("device: exception %s", e.reason.UTF8String);
-			device = nil;
+		/*
+		 * rotfb3: a relaunched backboardd opened its device while the kernel was still freeing the crashed one's GPU pool
+		 * (r62b: "device refused: device: OutOfMemory(Device)" at 3979.2 s, the old client's 438 MB freed by 3983.2 s), and
+		 * stayed on Core Animation's CPU renderer. An OutOfMemory refusal is tried again, once a second, up to 8 times.
+		 */
+		for (int attempt = 0; attempt < 9; attempt++) {
+			@try {
+				device = native_bridge_metal_open(turnip.UTF8String, cache, registryID, missing);
+			} @catch (NSException *e) {
+				sm2_log("device: exception %s", e.reason.UTF8String);
+				device = nil;
+			}
+			if (device || !strstr(nmb_last_error(), "OutOfMemory") || attempt == 8)
+				break;
+			sm2_log("device refused (%s): again in 1 s (%d of 8)", nmb_last_error(), attempt + 1);
+			sleep(1);
 		}
 		sm2_log("device %s in %.0f ms (cache %s)%s%s", device ? [[device name] UTF8String] : "refused",
 			(CFAbsoluteTimeGetCurrent() - t0) * 1000, cache, device ? "" : ": ", device ? "" : nmb_last_error());
