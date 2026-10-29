@@ -159,17 +159,27 @@ int hci_send(struct hci *h, uint8_t type, const uint8_t *data, size_t n, int qui
 	if (n > H4_MAX)
 		return -1;
 	if (h->ibs && h->peer_asleep) {
-		/* the controller said it sleeps: wake it, then expect IBS_WAKE_ACK (hci_recv clears peer_asleep) */
+		/* the controller said it sleeps (0xFE): wake indication 0xFD, resent every 10 ms as hci_qca does,
+		   until its wake acknowledgement 0xFC (or its own 0xFD, which ibs_byte acknowledges) clears
+		   peer_asleep in hci_recv */
 		uint8_t w = IBS_WAKE_IND;
-		hci_log(h, "BTD > IBS wake indication\n");
-		h->u->write(h->u, &w, 1);
 		struct hci_pkt p;
 		uint64_t end = now_ms() + 100;
-		while (h->peer_asleep && now_ms() < end)
-			if (hci_recv(h, &p, 10) > 0 && h->on_async)
-				h->on_async(h, &p);
-		if (h->peer_asleep)
-			hci_log(h, "BTD: no IBS wake acknowledgement in 100 ms; sending anyway\n");
+		unsigned sent = 0;
+		while (h->peer_asleep && now_ms() < end) {
+			if (sent++ < 3 && h->n_wake_tx < 20)
+				hci_log(h, "BTD > IBS wake indication\n");
+			h->n_wake_tx++;
+			h->u->write(h->u, &w, 1);
+			uint64_t next = now_ms() + 10;
+			while (h->peer_asleep && now_ms() < next)
+				if (hci_recv(h, &p, 2) > 0 && h->on_async)
+					h->on_async(h, &p);
+		}
+		if (h->peer_asleep) {
+			hci_log(h, "BTD: no IBS wake acknowledgement in 100 ms (%u wake indications); sending anyway\n", sent);
+			h->peer_asleep = 0;
+		}
 	}
 	pkt[0] = type;
 	memcpy(pkt + 1, data, n);
@@ -207,26 +217,32 @@ static void ibs_byte(struct hci *h, uint8_t c)
 		h->ibs_run = 1;
 		h->ibs_first = now_ms();
 	}
-	/* the first three of a run one by one, then one line per 50: a flood is a stuck sleep state or bytes
-	   decoded at the wrong speed (one byte repeated at a mismatched baud also reads as the same value) */
+	/* the first three of a run one by one, then one line per 50: a run of wake indications is the
+	   controller retransmitting because our 0xFC does not reach it; of anything else, a stuck sleep
+	   state or bytes decoded at the wrong speed (one byte repeated at a mismatched baud also reads the same) */
 	if (h->ibs_run > 3) {
 		if (h->ibs_run % 50 == 0)
-			hci_log(h, "BTD < IBS %s x%lu in a row over %llu ms (flood: controller stuck asleep, or a baud "
-				"mismatch -- nothing else is getting through)\n", ibs_name(c), h->ibs_run,
-				(unsigned long long)(now_ms() - h->ibs_first));
+			hci_log(h, "BTD < IBS %s x%lu in a row over %llu ms (%s -- nothing else is getting through)\n",
+				ibs_name(c), h->ibs_run, (unsigned long long)(now_ms() - h->ibs_first),
+				c == IBS_WAKE_IND ? "flood: the controller resends its wake indication, our wake "
+				"acknowledgement 0xFC is not reaching it (TX/flow control?)" : "flood: controller stuck "
+				"asleep, or a baud mismatch");
 	}
 	switch (c) {
 	case IBS_WAKE_IND: {
+		/* hci_qca: the controller wants to send; it holds the data until it gets HCI_IBS_WAKE_ACK */
 		if (h->ibs_run <= 3)
-			hci_log(h, "BTD < IBS wake indication%s\n", h->ibs ? ": acknowledged" : " (IBS off: acknowledged anyway)");
+			hci_log(h, "BTD < IBS wake indication: acknowledged (0xFC)%s\n", h->ibs ? "" : " (NVM in-band sleep off)");
 		uint8_t a = IBS_WAKE_ACK;
 		h->u->write(h->u, &a, 1);
+		h->n_wake_ack++;
 		h->peer_asleep = 0;
 		break;
 	}
 	case IBS_SLEEP_IND:
+		/* no answer (hci_qca only notes it); the next send starts with a wake indication if h->ibs */
 		if (h->ibs_run <= 3)
-			hci_log(h, "BTD < IBS sleep indication\n");
+			hci_log(h, "BTD < IBS sleep indication%s\n", h->ibs ? ": next send wakes it first" : "");
 		h->peer_asleep = 1;
 		break;
 	case IBS_WAKE_ACK:

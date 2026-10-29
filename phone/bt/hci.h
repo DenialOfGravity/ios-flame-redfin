@@ -15,9 +15,12 @@
 #define H4_ISO		0x05
 #define H4_MAX		(4 + 1024 + 8)
 
-/* QCA in-band sleep (hci_qca.c), single bytes between packets */
-#define IBS_WAKE_IND	0xFE
-#define IBS_SLEEP_IND	0xFD
+/* QCA in-band sleep (Linux hci_qca.c HCI_IBS_*, hakios vayu_bt.c BT_H4_*), single bytes between packets.
+   Up to 68cef4c these two were swapped: the WCN3998's 0xFD wake indications (it wants to send, waiting for
+   our 0xFC) were taken for sleep indications and never acknowledged, so it retransmitted 0xFD every ~20 ms
+   and no event after an idle period ever came through (r57a: the HCI Reset of bluetoothd). */
+#define IBS_WAKE_IND	0xFD
+#define IBS_SLEEP_IND	0xFE
 #define IBS_WAKE_ACK	0xFC
 
 #define EV_CMD_COMPLETE	0x0E
@@ -44,7 +47,8 @@ struct hci_pkt {
 struct hci {
 	struct uart *u;
 	int verbose;		/* 0 errors only, 1 every packet one line, 2 + full hex */
-	int ibs;		/* answer/track in-band sleep (only if the NVM enabled it) */
+	int ibs;		/* wake the controller (0xFD, wait for 0xFC) before sending when it said it sleeps: --ibs,
+			   and btd --bridge unless BTD_IBS=0. 0xFD from the controller is acknowledged either way. */
 	int peer_asleep;
 	uint8_t rbuf[512];
 	size_t rpos, rlen;
@@ -54,6 +58,7 @@ struct hci {
 	uint8_t ibs_last;		/* the last IBS byte and how many came in a row (with no packet between) */
 	unsigned long ibs_run;
 	uint64_t ibs_first;
+	unsigned long n_wake_ack, n_wake_tx;	/* 0xFC sent for the controller's 0xFD; 0xFD sent by hci_send */
 	/* every received packet not consumed by the command being waited for (advertising reports...) */
 	void (*on_async)(struct hci *h, const struct hci_pkt *p);
 	/* raw bridge: every received packet and IBS byte, before any interpretation */
