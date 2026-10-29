@@ -10,6 +10,7 @@
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -168,6 +169,8 @@ static void waitForResource(id resource);
 @property(nonatomic,strong) id<MTLTexture> parent;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
 @property(nonatomic) NSUInteger heapOffset;
+@property(nonatomic) uint64_t rotationValue;      // SweetMetal2: a rotated framebuffer's rotation (1-4), 0 otherwise
+@property(nonatomic) bool framebufferOnlyValue;
 - (void)holdSurface:(IOSurfaceRef)surface;
 @end
 static void ycbcrRefresh(NBTexture *texture);
@@ -237,6 +240,17 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
 // surface's facts, which nmb_texture_new_on_surface now passes; not used: every such layer would be copied in and out per pass, and
 // backboardd's framebuffer stays 8-bit (supportsExtendedXR10Formats answers no there).)
 static uint64_t sweetFormat(uint64_t format) {return format==550?80:format==551?81:format;}
+// SweetMetal2: the descriptor's SPI rotation (0-4) and framebufferOnly (iOS 16's MTLTextureDescriptor has both getters), 0/NO where absent.
+static uint64_t descriptorRotation(MTLTextureDescriptor *d) {
+ static SEL sel=sel_registerName("rotation");
+ if(!d || ![d respondsToSelector:sel])return 0;
+ return (uint64_t)((NSUInteger(*)(id,SEL))objc_msgSend)(d,sel);
+}
+static bool descriptorFramebufferOnly(MTLTextureDescriptor *d) {
+ static SEL sel=sel_registerName("framebufferOnly");
+ if(!d || ![d respondsToSelector:sel])return false;
+ return ((BOOL(*)(id,SEL))objc_msgSend)(d,sel);
+}
 static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
  if(!d)return false;
  *out={(uint64_t)d.textureType,sweetFormat((uint64_t)d.pixelFormat),d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
@@ -265,14 +279,14 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (MTLResourceOptions)resourceOptions {return (MTLResourceOptions)_descriptor.options;}
 - (MTLStorageMode)storageMode {return (MTLStorageMode)((_descriptor.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
 - (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_descriptor.options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
-- (BOOL)isFramebufferOnly {return NO;}
+- (BOOL)isFramebufferOnly {return _framebufferOnlyValue;}
 - (IOSurfaceRef)iosurface {return _surface?_surface:_ycbcrSource;}
 - (NSUInteger)iosurfacePlane {return _plane;}
 - (id<MTLBuffer>)buffer {return _surface?nil:(id<MTLBuffer>)_buffer;}
 - (NSUInteger)bufferOffset {return _offset;}
 - (NSUInteger)bufferBytesPerRow {return _rowBytes;}
 - (id<MTLTexture>)parentTexture {return _parent;}
-- (NSUInteger)rotation {return 0;}
+- (NSUInteger)rotation {return (NSUInteger)_rotationValue;}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
  const uint64_t answer=nmb_texture_set_purgeable_state(_handle,state);
  if(!answer)NBLOG(@"native-metal: texture setPurgeableState refused: %@",lastError());
@@ -1773,8 +1787,30 @@ static void ycbcrRefresh(NBTexture *texture) {
  if(planes && (!row || offset>=bytes)){noteSurfaceTexture(surface,d,plane,planes,offset,row,"refused (plane geometry)");return nil;}
  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);
  if(!buffer){noteSurfaceTexture(surface,d,plane,planes,offset,row,"refused (import)");return nil;}
- NBTexture *texture=textureOnBuffer(buffer,d,offset,row,true);
- noteSurfaceTexture(surface,d,plane,planes,offset,row,texture?"made":"refused (texture over the surface)");
+ // SweetMetal2: Core Animation's landscape framebuffer is a 2436x1125 texture of rotation 1/3 (SPI -[MTLTextureDescriptor rotation],
+ // framebufferOnly) over the panel's portrait 1125x2436 surface. NmbTextureDescriptor carries neither, so the runtime checked a 2436-texel
+ // row against the surface's 4608 bytes and refused it (RowPitch) every frame: rotating to landscape froze the screen (r61b 2026-10-29).
+ const uint64_t rotation=descriptorRotation(d);
+ NBTexture *texture=nil;
+ if(rotation) {
+  NmbTextureDescriptor descriptor;
+  if(textureDescriptor(d,&descriptor)) {
+   const NmbTextureExtras extras={rotation,descriptorFramebufferOnly(d)?1u:0u};
+   NmbTexture *handle=nmb_texture_new_on_surface_rotated(buffer.handle,&descriptor,offset,row,planes!=0,&extras);
+   if(!handle)NBLOG(@"native-metal: rotated surface texture refused (rotation %llu, %lux%lu): %@",(unsigned long long)rotation,
+                    (unsigned long)d.width,(unsigned long)d.height,lastError());
+   else {
+    texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+    texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;
+    NmbTextureExtras made={0,0};nmb_texture_extras(handle,&made);texture.rotationValue=made.rotation;texture.framebufferOnlyValue=made.framebuffer_only!=0;
+   }
+  }
+  noteSurfaceTexture(surface,d,plane,planes,offset,row,texture?(rotation==1?"made (rotation 1)":rotation==2?"made (rotation 2)":rotation==3?"made (rotation 3)":"made (rotation 4)")
+                                                             :"refused (rotated texture over the surface)");
+ } else {
+  texture=textureOnBuffer(buffer,d,offset,row,true);
+  noteSurfaceTexture(surface,d,plane,planes,offset,row,texture?"made":"refused (texture over the surface)");
+ }
  if(!texture)return nil;
  texture.plane=plane;[texture holdSurface:surface];return (id<MTLTexture>)texture;
 }

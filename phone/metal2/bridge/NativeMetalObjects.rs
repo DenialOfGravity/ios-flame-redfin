@@ -689,6 +689,16 @@ pub struct NmbTextureDescriptor {
 
 pub struct NmbTexture(Texture);
 
+/// SweetMetal2: a texture descriptor's `rotation` (SPI, 0-4) and `framebufferOnly`, which `NmbTextureDescriptor` does not carry.
+/// Core Animation's landscape framebuffer is a 2436x1125 texture of rotation 1 or 3 over the panel's portrait 1125x2436 surface
+/// (4608-byte rows): without its rotation the runtime checks 2436 x 4 = 9744 bytes a row against 4608 and refuses it (RowPitch),
+/// every frame, so backboardd composites nothing while the UI is in landscape.
+#[repr(C)]
+pub struct NmbTextureExtras {
+    pub rotation: u64,
+    pub framebuffer_only: u64,
+}
+
 fn texture_descriptor(d: *const NmbTextureDescriptor) -> Result<TextureDescriptor, String> {
     let d = get(d)?;
     let mut out = TextureDescriptor::default();
@@ -766,6 +776,32 @@ pub extern "C" fn nmb_texture_new_on_surface(buffer: *mut NmbBuffer, descriptor:
         let plane = IoSurfacePlane::new(offset, bytes_per_row, planar).with_ycbcr(ycbcr);
         let texture = buffer.new_texture_with_iosurface_plane(&descriptor, plane);
         Ok(boxed(NmbTexture(texture.map_err(e("texture over surface"))?)))
+    })
+}
+
+/// `nmb_texture_new_on_buffer` over an IOSurface plane with the descriptor's rotation and framebufferOnly (`NmbTextureExtras`).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_new_on_surface_rotated(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64,
+                                                     bytes_per_row: u64, planar: bool, extras: *const NmbTextureExtras) -> *mut NmbTexture {
+    guard(std::ptr::null_mut(), || {
+        let mut descriptor = texture_descriptor(descriptor)?;
+        let x = get(extras)?;
+        descriptor.rotation = x.rotation;
+        descriptor.framebuffer_only = x.framebuffer_only != 0;
+        let buffer = &get(buffer)?.0;
+        let texture = buffer.new_texture_with_iosurface_plane(&descriptor, IoSurfacePlane::new(offset, bytes_per_row, planar));
+        Ok(boxed(NmbTexture(texture.map_err(e("texture over rotated surface"))?)))
+    })
+}
+
+/// A texture's `rotation` and `framebufferOnly` (`NmbTextureExtras`).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_extras(texture: *const NmbTexture, out: *mut NmbTextureExtras) {
+    guard((), || {
+        let t = &get(texture)?.0;
+        let out = get_mut(out)?;
+        *out = NmbTextureExtras { rotation: t.rotation(), framebuffer_only: u64::from(t.framebuffer_only()) };
+        Ok(())
     })
 }
 
