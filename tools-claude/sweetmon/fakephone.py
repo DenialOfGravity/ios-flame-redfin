@@ -366,15 +366,23 @@ class Phone:
             self.frames = len(a) > 1 and a[1] == 'on'
             await R(True, 'frames %s' % ('on' if self.frames else 'off'))
         elif word == 'speed':
+            # in the background, like a daemon that keeps serving commands while it sends: replies to commands that
+            # arrive meanwhile (ping) go out BEFORE speed's own R (the collector must match replies by cmd)
             mb = int(a[1]) if len(a) > 1 else 16
-            blk = os.urandom(CHUNK)
-            t0 = time.time()
-            lim = self.a.link_mbps.get(c.get('lname'))
-            for _ in range(mb):
-                await self.send(w, 'P', blk)
-                if lim:
-                    await asyncio.sleep(CHUNK / 1e6 / lim)        # this listener's simulated link speed
-            await R(True, 'sent %d MiB' % mb, secs=round(time.time() - t0, 3), cpu_ms=int(mb * 4))
+
+            async def run():
+                blk = os.urandom(CHUNK)
+                t0 = time.time()
+                lim = self.a.link_mbps.get(c.get('lname'))
+                try:
+                    for _ in range(mb):
+                        await self.send(w, 'P', blk)
+                        if lim:
+                            await asyncio.sleep(CHUNK / 1e6 / lim)        # this listener's simulated link speed
+                    await R(True, 'sent %d MiB' % mb, secs=round(time.time() - t0, 3), cpu_ms=int(mb * 4))
+                except (ConnectionError, OSError):
+                    pass
+            c['tasks'].append(asyncio.ensure_future(run()))
         elif word == 'ping':
             await R(True, ' '.join(a[1:]))
         elif word == 'info':

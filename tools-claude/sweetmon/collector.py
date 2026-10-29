@@ -39,6 +39,7 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_ROOT = '/mnt/c/ClaudeProjects/iOS_Pixel5'
 USB_HOST = '192.168.7.2'
+USB_FAST_DEFAULT = {'poll_us': 100, 'txbatch': 16}     # xnu 1034 (r64u): 28 MB/s instead of 1.2 MB/s
 DEFAULT_KLOG_PA = '0x101d0ef08'     # r63a (builds/xnu/ws-y-ram-aca60f47b8/KLOG_PA.txt)
 PORT = 5150
 MAX_FRAME = 4 << 20
@@ -350,6 +351,7 @@ class Collector:
         self.cfg.setdefault('top_every', 2)
         self.cfg.setdefault('top', 15)
         self.cfg.setdefault('frames', False)
+        self.cfg.setdefault('usb_fast', dict(USB_FAST_DEFAULT))
         self.phone_cfg = read_json(os.path.join(self.mon, 'phone.json'), {}) or {}
         self.state = read_json(os.path.join(self.mon, 'state.json'), {}) or {}
         self.key = None
@@ -371,6 +373,8 @@ class Collector:
         self.last_autostart = {}
         self.speed = None
         self.speed_res = None
+        self.usb_fast = None
+        self.usb_fast_warned = False
         # data
         self.hist = collections.deque()
         self.snap = {}
@@ -561,7 +565,8 @@ class Collector:
         return {'mode': self.cfg.get('link'), 'via': self.via, 'host': self.host, 'connected': self.connected,
                 'authed': self.authed, 'rtt_ms': r1(self.rtt_ms), 'since': self.link_since, 'reconnects': self.reconnects,
                 'rx_bps': rx and int(rx), 'msg': self.link_msg, 'wifi_host': self.wifi_host(), 'usb_host': self.a.usb_host,
-                'speed': self.phone_cfg.get('speed') or {}, 'preferred': self.link_order()[0]}
+                'speed': self.phone_cfg.get('speed') or {}, 'preferred': self.link_order()[0],
+                'usb_fast': self.usb_fast}
 
     async def send(self, line):
         if not self.writer:
@@ -575,14 +580,19 @@ class Collector:
         if not self.connected:
             return {'cmd': line.split()[0] if line.split() else '', 'ok': False, 'msg': 'not connected'}
         fut = asyncio.get_running_loop().create_future()
-        self.pending.append((line, fut))
+        ent = (line, fut)
+        self.pending.append(ent)
         try:
             await self.send(line)
             return await asyncio.wait_for(asyncio.shield(fut), timeout)
         except asyncio.TimeoutError:
+            log.warning('no reply to %r in %.0f s', line[:60], timeout)
             return {'cmd': line.split()[0], 'ok': False, 'msg': 'timeout (%.0f s)' % timeout}
         except (ConnectionError, OSError) as e:
             return {'cmd': line.split()[0], 'ok': False, 'msg': 'link: %s' % e}
+        finally:
+            if ent in self.pending:
+                self.pending.remove(ent)
 
     async def read_frame(self, r):
         h = await r.readexactly(5)
@@ -627,6 +637,7 @@ class Collector:
             await self.start_klog()
             if self.cfg.get('frames'):
                 await self.cmd('frames on')
+            tasks.append(asyncio.ensure_future(self.usb_fast_apply(host)))
             tasks.append(asyncio.ensure_future(self.ping_loop()))
             if self.cfg.get('link') == 'auto' and via != self.link_order()[0]:
                 tasks.append(asyncio.ensure_future(self.better_link_loop(via)))
@@ -668,10 +679,74 @@ class Collector:
     async def ping_loop(self):
         while True:
             await asyncio.sleep(self.a.ping_every)
+            if self.speed is not None or (self.trace and self.trace.state == 'transferring'):
+                continue            # the reply would queue behind the bulk data: no useful rtt
             t0 = time.perf_counter()
             rep = await self.cmd('ping %d' % int(t0 * 1000), timeout=10)
             if rep.get('ok'):
                 self.rtt_ms = (time.perf_counter() - t0) * 1000
+
+    async def usb_fast_apply(self, host, apply=True):
+        """xnu 1034 USB Ethernet fast path: set kern.sweet_usb_poll_us / txbatch over ssh after every connect
+        (config.json usb_fast: {"poll_us":100,"txbatch":16}; null = leave alone), read them back with the counters.
+        sctl syntax: NAME [INT] (a space, not NAME=VALUE); output "NAME: VALUE"."""
+        want = self.cfg.get('usb_fast', USB_FAST_DEFAULT) if apply else None
+        sctl = '/var/local/bin/sctl'
+        parts = []
+        if isinstance(want, dict):
+            for k in ('poll_us', 'txbatch'):
+                if want.get(k) is not None:
+                    parts.append('%s kern.sweet_usb_%s %d' % (sctl, k, int(want[k])))
+        parts.append('for n in poll_us txbatch tx_frames tx_xfers tx_drops; do %s kern.sweet_usb_$n; done' % sctl)
+        cmd = '; '.join(parts) + ' 2>&1'
+        t0 = time.time()
+        rc, out = await self.ssh_run(host, cmd, 20)
+        vals = {}
+        for ln in out.splitlines():
+            m = re.match(r'\s*kern\.sweet_usb_(\w+):\s*(-?\d+)\s*$', ln)
+            if m:
+                vals[m.group(1)] = int(m.group(2))
+        st = {'want': want, 't': now_s(), 'host': host, 'ssh_s': round(time.time() - t0, 2)}
+        st.update({k: vals.get(k) for k in ('poll_us', 'txbatch', 'tx_frames', 'tx_xfers', 'tx_drops')})
+        if st['tx_frames'] and st['tx_xfers']:
+            st['frames_per_xfer'] = round(st['tx_frames'] / st['tx_xfers'], 2)
+        if rc is None:
+            st['error'] = 'ssh: %s' % out.strip()[:200]
+        elif 'poll_us' not in vals or 'txbatch' not in vals:
+            st['error'] = 'kernel without the 1034 sysctls (%s)' % (out.strip().splitlines() or ['no output'])[-1][:120]
+        elif isinstance(want, dict) and any(want.get(k) is not None and vals.get(k) != int(want[k])
+                                            for k in ('poll_us', 'txbatch')):
+            st['error'] = 'read back %s/%s, wanted %s/%s' % (vals.get('poll_us'), vals.get('txbatch'),
+                                                          want.get('poll_us'), want.get('txbatch'))
+        self.usb_fast = st
+        msg = 'USB fast path %s: poll_us %s txbatch %s (tx %s frames / %s xfers)%s' % (
+            'set' if isinstance(want, dict) else 'read (usb_fast null: left alone)', st['poll_us'], st['txbatch'],
+            st['tx_frames'], st['tx_xfers'], ', ERROR ' + st['error'] if st.get('error') else '')
+        if st.get('error') and st['error'].startswith('kernel without'):
+            if not self.usb_fast_warned:
+                log.warning(msg)
+                self.usb_fast_warned = True
+        elif st.get('error'):
+            log.warning(msg)
+        else:
+            log.info(msg)
+        self.emit('link', self.link_info())
+        return st
+
+    async def ssh_run(self, host, cmd, timeout):
+        """(exit code or None when ssh itself failed, output)"""
+        argv = [self.a.ssh_bin, '-i', os.path.expanduser('~/.ssh/redfin-claude'), '-o', 'StrictHostKeyChecking=no',
+                '-o', 'UserKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=5', '-o', 'LogLevel=ERROR',
+                '-o', 'BatchMode=yes', 'root@' + host, cmd]
+
+        def run():
+            try:
+                r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
+                out = (r.stdout + r.stderr).decode(errors='replace')
+                return (r.returncode if r.returncode != 255 else None), out
+            except (OSError, subprocess.SubprocessError) as e:
+                return None, str(e)
+        return await asyncio.get_running_loop().run_in_executor(None, run)
 
     async def better_link_loop(self, via):
         """auto mode on the slower (or fallback) link: switch when the preferred link answers again. The probe is a
@@ -755,28 +830,21 @@ class Collector:
     def on_frame(self, t, p):
         if t == 'R':
             rep = json.loads(p)
-            # replies come in command order; one whose command word does not match the oldest pending one means the
-            # phone dropped that reply: resolve the skipped ones as lost so later replies stay aligned
-            idx = 0
+            # replies are matched to commands by their "cmd" word, oldest first per word: the daemon may answer a
+            # quick command (ping) before a slow one (speed, trace start) that was sent earlier. A command whose reply
+            # never comes is ended by its own timeout in cmd(), not by a later reply.
             cw = rep.get('cmd')
-            if cw:
-                for i, (line, _) in enumerate(self.pending):
-                    if (line.split() or [''])[0] == cw:
-                        idx = i
-                        break
-                else:
-                    idx = -1
-            if idx < 0 or not self.pending:
+            hit = None
+            for ent in self.pending:
+                if not cw or (ent[0].split() or [''])[0] == cw:
+                    hit = ent
+                    break
+            if hit is None:
                 log.info('unsolicited reply %s', str(rep)[:300])
                 return
-            for _ in range(idx):
-                line, fut = self.pending.popleft()
-                log.warning('no reply to %r', line[:60])
-                if not fut.done():
-                    fut.set_result({'cmd': line.split()[0], 'ok': False, 'msg': 'no reply from the phone'})
-            line, fut = self.pending.popleft()
-            if not fut.done():
-                fut.set_result(rep)
+            self.pending.remove(hit)
+            if not hit[1].done():
+                hit[1].set_result(rep)
         elif t == 'S':
             self.on_sample(json.loads(p))
         elif t == 'K':
@@ -1475,7 +1543,8 @@ class Collector:
         mb = max(1, min(int(mb), 256))
         self.speed = {'bytes': 0, 't_first': None, 't_last': None}
         t0 = time.perf_counter()
-        rep = await self.cmd('speed %d' % mb, timeout=30 + mb * 5)
+        # the R comes after all P frames: allow for a slow link (32 MiB at 1.2 MB/s = 28 s; floor 0.25 MB/s)
+        rep = await self.cmd('speed %d' % mb, timeout=30 + mb * 1.05 / 0.25)
         t1 = time.perf_counter()
         sp, self.speed = self.speed, None
         el = t1 - t0
@@ -1488,6 +1557,10 @@ class Collector:
                                                                'host': self.host, 'rtt_ms': res['rtt_ms']}
             atomic_json(os.path.join(self.mon, 'phone.json'), self.phone_cfg)
         log.info('speed test %d MiB via %s: %s MB/s (auto prefers %s)', mb, self.via, res['mbps'], self.link_order()[0])
+        if self.authed and self.host:
+            uf = await self.usb_fast_apply(self.host, apply=False)
+            res['usb_fast'] = {k: uf.get(k) for k in ('poll_us', 'txbatch', 'tx_frames', 'tx_xfers', 'frames_per_xfer',
+                                                    'error')}
         self.emit('speed', res)
         return res
 
@@ -1805,6 +1878,11 @@ def snap_text(s):
         s['time'], L['via'], L['host'], L['rtt_ms'], up // 3600, up // 60 % 60, up % 60, s['self'].get('cpu_ms_s'),
         s['self']['cpu_pct'], s['self']['rss_mb'], '  [STALE: link down, %s s old]' % s.get('age_s') if s.get('stale')
         else ''))
+    uf = L.get('usb_fast')
+    if uf:
+        print('USB fast path: poll_us %s txbatch %s, tx %s frames / %s xfers (%s per xfer)%s' % (
+            uf.get('poll_us'), uf.get('txbatch'), uf.get('tx_frames'), uf.get('tx_xfers'), uf.get('frames_per_xfer'),
+            '  ERROR ' + uf['error'] if uf.get('error') else ''))
     sp = L.get('speed') or {}
     if sp:
         print('link speed: ' + ', '.join('%s %s MB/s' % (k, v.get('mbps')) for k, v in sp.items()) +
