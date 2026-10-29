@@ -1,0 +1,160 @@
+diff --git a/crates/metal2vulkan/src/env_vars.rs b/crates/metal2vulkan/src/env_vars.rs
+index 00644e28..15b4e378 100644
+--- a/crates/metal2vulkan/src/env_vars.rs
++++ b/crates/metal2vulkan/src/env_vars.rs
+@@ -41,7 +41,10 @@ pub const REGISTRY: &[EnvVar] = &[
+                  conversion (unorm, snorm, sRGB, half), not rounded to Metal's code in the \
+                  fragment function first; the two differ only at the exact ties between two \
+                  codes. sweet 0110: `fetch`: so only in fragment functions that read the \
+-                 framebuffer. Changes the SPIR-V (and every cache key)",
++                 framebuffer. sweet 0162: `plain`: as `fetch`, and every other function stores \
++                 an 8-bit unorm channel's float as written (other formats keep Metal's \
++                 rounding); such an attachment blending by one and zero takes no Vulkan blend. \
++                 Changes the SPIR-V (and every cache key)",
+     },
+     EnvVar {
+         name: "SWEET_FP16",
+@@ -122,6 +125,24 @@ pub fn sweet_color_writes_fetch() -> bool {
+     *ON.get_or_init(|| std::env::var("SWEET_M2V_COLOR_WRITES").is_ok_and(|v| v == "fetch"))
+ }
+ 
++/// sweet 0162: `SWEET_M2V_COLOR_WRITES=plain`: what `fetch` does (a fetching function leaves every
++/// float colour output to the device), and in every other function an 8-bit unorm channel
++/// (`ChannelWrite::Unorm { bits: 8 }`, unblended or blended by one and zero) is stored as written:
++/// the render backend's float-to-unorm8 conversion, which differs from Metal's exact rounding only
++/// within a code of a tie (`pipeline::color_writes::sweet_plain_rule`). sRGB, 10/16-bit unorm,
++/// snorm and the small floats keep Metal's rounding. Link keeps such an attachment's state as
++/// `fetch` gives it: a blend of one and zero takes no Vulkan blend (`link::graphics`).
++pub fn sweet_color_writes_plain() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("SWEET_M2V_COLOR_WRITES").is_ok_and(|v| v == "plain"))
++}
++
++/// sweet 0110/0162: whether a fetching fragment function leaves its float colour outputs to the
++/// device: `SWEET_M2V_COLOR_WRITES` is `fetch` or `plain`.
++pub fn sweet_color_writes_fetching_device() -> bool {
++    sweet_color_writes_fetch() || sweet_color_writes_plain()
++}
++
+ /// sweet 0160: how `half` arithmetic is compiled (`SWEET_FP16`, `REGISTRY`).
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum SweetFp16 {
+@@ -165,6 +186,9 @@ pub fn sweet_key_tag() -> &'static [u8] {
+         if sweet_color_writes_fetch() {
+             t.extend_from_slice(b"sweet-color-writes-fetch\0");
+         }
++        if sweet_color_writes_plain() {
++            t.extend_from_slice(b"sweet-color-writes-plain\0");
++        }
+         if sweet_contract() {
+             t.extend_from_slice(b"sweet-contract\0");
+         }
+diff --git a/crates/metal2vulkan/src/pipeline/color_writes.rs b/crates/metal2vulkan/src/pipeline/color_writes.rs
+index dc5eb6b9..0e08ee00 100644
+--- a/crates/metal2vulkan/src/pipeline/color_writes.rs
++++ b/crates/metal2vulkan/src/pipeline/color_writes.rs
+@@ -120,6 +120,12 @@ pub(crate) fn exact_writes(
+             true => write.map(|w| w.map(|r| r.map(sweet_device_rule))),
+             false => write,
+         };
++        // sweet 0162: under SWEET_M2V_COLOR_WRITES=plain an 8-bit unorm channel the function
++        // would round is stored as written (`sweet_plain_rule`).
++        let write = match crate::env_vars::sweet_color_writes_plain() {
++            true => write.map(|w| w.map(|r| r.map(sweet_plain_rule))),
++            false => write,
++        };
+         if let Some(write) = write {
+             out.insert(attachment, write);
+         }
+@@ -137,6 +143,29 @@ pub(crate) fn sweet_device_rule(r: ChannelWrite) -> ChannelWrite {
+     }
+ }
+ 
++/// sweet 0162: the rule a channel of rule `r` takes under SWEET_M2V_COLOR_WRITES=plain: an 8-bit
++/// unorm channel's rounding is left to the device's conversion. The render backend converts the
++/// stored float itself (Vulkan: `c = convertFloatToUint(f * 255)`, one of the two nearest codes,
++/// nearest recommended); Metal's code is the exact product rounded to nearest, so the two differ
++/// only where `f * 255` lies within an `f32` rounding of a half-integer, by one code. Every other
++/// rule is kept: sRGB (the device's encode is its own approximation, off well away from ties, and
++/// the function reads a table), the 10/16-bit unorm and snorm channels (rare, deep-colour or
++/// signed targets, left exact), and the small floats (Metal rounds toward zero, the device to
++/// nearest: a difference at every value, not only near ties).
++pub(crate) fn sweet_plain_rule(r: ChannelWrite) -> ChannelWrite {
++    match r {
++        ChannelWrite::Unorm { bits: 8 } => ChannelWrite::Device,
++        _ => r,
++    }
++}
++
++/// sweet 0162: whether pixel format `pf` has a channel [`sweet_plain_rule`] leaves to the device
++/// (an 8-bit unorm one): link then keeps a blend of one and zero off the Vulkan state.
++pub(crate) fn sweet_plain_format(pf: metal::PixelFormat) -> bool {
++    matches!(write_conversion(pf), Some(WriteConversion::Rules(rules))
++        if rules.contains(&Some(ChannelWrite::Unorm { bits: 8 })))
++}
++
+ /// A rule word's code of a channel that takes no rule: the output as written.
+ pub(crate) const NO_RULE_CODE: u32 = 0;
+ 
+@@ -748,15 +777,17 @@ fn writes_hold(
+     let exact = exact_writes(written(fragment), colors, rounding, p);
+     let compiled = &fragment.interface.io.color_writes;
+     let mut attachments = selected.keys().chain(exact.keys()).chain(compiled.keys());
+-    // sweet 0110: under SWEET_M2V_COLOR_WRITES=fetch a fetching function is compiled with every
+-    // rounding left to the device (`pipeline::compile`).
+-    let device = |w: Option<&[Option<ChannelWrite>; 4]>| w.map(|w| w.map(|r| r.map(sweet_device_rule)));
++    // sweet 0110/0162: under SWEET_M2V_COLOR_WRITES=fetch (or plain) a fetching function is
++    // compiled with every rounding left to the device (`pipeline::compile`).
++    let device =
++        |w: Option<&[Option<ChannelWrite>; 4]>| w.map(|w| w.map(|r| r.map(sweet_device_rule)));
+     attachments.all(|a| {
+         let got = compiled.get(a);
+         got == selected.get(a)
+             || got == exact.get(a)
+-            || (crate::env_vars::sweet_color_writes_fetch()
+-                && (got.copied() == device(exact.get(a)) || got.copied() == device(selected.get(a))))
++            || (crate::env_vars::sweet_color_writes_fetching_device()
++                && (got.copied() == device(exact.get(a))
++                    || got.copied() == device(selected.get(a))))
+     })
+ }
+ 
+diff --git a/crates/metal2vulkan/src/pipeline/compile.rs b/crates/metal2vulkan/src/pipeline/compile.rs
+index 657ab7fd..497d1acd 100644
+--- a/crates/metal2vulkan/src/pipeline/compile.rs
++++ b/crates/metal2vulkan/src/pipeline/compile.rs
+@@ -1740,11 +1740,10 @@ fn lower_inputs(
+                 .params
+                 .iter()
+                 .any(|b| matches!(b.role, ParamRole::ColorInput { .. }));
+-            if crate::env_vars::sweet_color_writes_fetch() && fetches {
++            // sweet 0162: SWEET_M2V_COLOR_WRITES=plain does so too.
++            if crate::env_vars::sweet_color_writes_fetching_device() && fetches {
+                 for rules in out.color_writes.values_mut() {
+-                    *rules = rules.map(|r| {
+-                        r.map(crate::pipeline::color_writes::sweet_device_rule)
+-                    });
++                    *rules = rules.map(|r| r.map(crate::pipeline::color_writes::sweet_device_rule));
+                 }
+             }
+             out.srgb_fetches = srgb_fetches(spec, d.color_attachments);
+diff --git a/crates/metal2vulkan/src/pipeline/link/graphics.rs b/crates/metal2vulkan/src/pipeline/link/graphics.rs
+index 4b88ffdf..f4ee9370 100644
+--- a/crates/metal2vulkan/src/pipeline/link/graphics.rs
++++ b/crates/metal2vulkan/src/pipeline/link/graphics.rs
+@@ -317,7 +317,14 @@ pub fn graphics_state(
+                         f.io.rounded_colors.contains(&(index as u32))
+                             || f.io.half_bit_colors.contains(&(index as u32))
+                     }) || selected_rounds(index as u32);
+-                    let replaced = rounded && color_writes::replaces(a);
++                    // sweet 0162: under SWEET_M2V_COLOR_WRITES=plain an attachment with an 8-bit
++                    // unorm channel blending by one and zero takes no Vulkan blend even where the
++                    // function no longer rounds it: the state `fetch` gives it (a device that
++                    // blends reads the destination for nothing; a normalized texel is finite, so
++                    // `src * 1 + dst * 0` is `src`).
++                    let plain = crate::env_vars::sweet_color_writes_plain()
++                        && color_writes::sweet_plain_format(a.pixel_format);
++                    let replaced = (rounded || plain) && color_writes::replaces(a);
+                     // An extended-range attachment whose blend the function computes over its
+                     // input attachment takes no Vulkan blend, and the function's write stores
+                     // every raw component (none where it keeps every channel).
