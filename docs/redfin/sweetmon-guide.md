@@ -305,7 +305,8 @@ Rules:
 
 ## 11. USB fast path (kernel 1034, image r64u) — results
 
-Test image, **not promoted**: r63a stays the known-good fallback.
+**Promoted 2026-10-29 (user decision): r64u is the KNOWN-GOOD image** (sha256 8df336ee39dff4df…); fallback r63a, then
+r62b. `agent/cycle-base.txt` = `r64u`, so new cycles inherit its cmdline (with `sweetrtcoff`).
 
 - **r64u** = r63a + kernel patch **1034** (branch `ws-z-usbfast` ce6a61b, kernel `builds/xnu/ce6a61b5…-ce6a61b5ed`,
   klog PA unchanged **0x101d0ef08**) + `sweetrtcoff=1792779327` (date correct from boot), minus `,mediaserverd` in
@@ -325,7 +326,10 @@ Test image, **not promoted**: r63a stays the known-good fallback.
 | **poll 100 + txbatch 16** | **28** (5.7-6.6 frames per transfer; phone CPU 255 ms per 32 MiB vs 776 on the old path; no extra idle CPU) |
 
 - A 20 s kdebug trace moved 2.48 MB in 0.1 s (39 MB/s). Live log, poke and the command server work.
-- Until a default is chosen, after **each boot of r64u** apply by hand:
+- The kernel default stays 0/0 (old path). The **collector applies poll_us 100 / txbatch 16 over ssh on every connect**
+  (logs/mon/config.json `usb_fast`; `null` = leave alone) and shows the values in `mon snap` / the dashboard. If that
+  isn't in place (older collector, or ssh down), apply by hand:
   `phone /var/local/bin/sctl kern.sweet_usb_poll_us 100` and `phone /var/local/bin/sctl kern.sweet_usb_txbatch 16`.
   Then `mon speed 32` once so auto learns the new USB speed (Wi-Fi stays ~0.8 MB/s).
+- Next step for the kernel: make 100/16 the built-in default once it has soaked (keep the sysctls to switch back).
 - With the fast path, a USB speed test is no longer a long blocking request; on the old path a 32 MiB test takes ~27 s.
