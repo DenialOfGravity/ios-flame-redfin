@@ -25,6 +25,8 @@ trace_wait() {	# SECS -> prints the newest finished trace's meta when no trace i
 		r=$(curl -s -m 3 $API/api/traces); [ "$(echo "$r" | j 'd["current"] is None')" = True ] && { echo "$r"; return 0; }; sleep 0.5; done; return 1; }
 
 echo "workdir $W"
+if python3 -c 'import socket; s=socket.socket(); s.settimeout(1); s.connect(("127.0.0.2",5150))' 2>/dev/null; then
+	echo "something already listens on 127.0.0.2:5150 (an old fakephone?): stop it first"; exit 99; fi
 mkdir -p "$W/tools-claude" "$W/agent" "$W/builds/xnu/ws-y-ram-aca60f47b8"
 cp "$TOOLS"/sweet-trace.py "$TOOLS"/sweet-prof.py "$W/tools-claude/" 2>/dev/null || echo "(no analyzers in $TOOLS)"
 echo 'klog PA 0x101d0ef08  (_sweet_log_total 0xfffffe0007d0ef08)' > "$W/builds/xnu/ws-y-ram-aca60f47b8/KLOG_PA.txt"
