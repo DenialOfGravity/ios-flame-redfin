@@ -21,7 +21,15 @@ MEM_SIZE = 0x4d000000
 # limited below 4G. ABL puts the ramdisk (our payload) at 0x84700000 or, if
 # big, 0xc0000000, so XNU takes 0x1_00000000 up (same size as on the Redmi).
 HIGH_PHYS_BASE = 0x100000000
-HIGH_MEM_SIZE = 0xf8c00000  # sunfish: RAM ends 0x1fcc00000; top 64 MiB kept for log stashes
+# redfin (live DT /memory): DDR 0x80000000+0x3bb00000, 0xc0000000+3G, 0x180000000+4G = 8 GB, contiguous from
+# 0xc0000000 to 0x280000000 with no reserved-memory node above 4G (the CMA pools are below 4G). XNU takes all of
+# 0x100000000-0x27ec00000 (6 GiB - 20 MiB); the log stashes sit above it (LOGSTASH_*, shim/ramlog.c, sweet_ufs.c 1033)
+# and 0x27fc00000-0x280000000 is never touched (Linux's top-of-RAM reserved pages; ABL may use it).
+# Was 0xf8c00000 (sunfish's 6 GB phone: RAM ends 0x1fcc00000): 2 GiB of the Pixel 5 sat unused.
+HIGH_MEM_SIZE = 0x17ec00000
+PANIC_LOG_PA_REDFIN = 0x27f000000   # pram, 512 KiB
+MIRROR_PA_REDFIN = 0x27f200000      # sweet_ufs.c SWEET_MIRROR_PA: 4 KiB header + 4 MiB ring
+MAILBOX_PA_REDFIN = 0x27f800000     # shim/ramlog.c MAILBOX_PA
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
@@ -104,7 +112,7 @@ u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
 
 
-PANIC_LOG_PA = 0x1f9000000
+PANIC_LOG_PA = PANIC_LOG_PA_REDFIN  # was 0x1f9000000 (sunfish), inside XNU's range since 1033
 PANIC_LOG_SIZE = 0x80000
 
 
@@ -278,7 +286,7 @@ def build(seed=None, qemu=False, highmem=False, camera=False, flash=False, backl
     ])
 
     # iBoot's panic region (pe_init.c check_for_panic_log): RAM above XNU's range
-    # (which ends at 0x1f8c00000 on sunfish) and below the console mirror at 0x1fa000000.
+    # (which ends at 0x27ec00000 on redfin since 1033) and below the console mirror at 0x27f200000.
     pram = node('pram', [ph(), ('reg', struct.pack('<2Q', PANIC_LOG_PA, PANIC_LOG_SIZE))])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).

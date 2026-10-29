@@ -238,7 +238,7 @@ static void redfin_pmic_gpios(void)
 /* Plain RAM where XNU will live: is it there and writable with the MMU off? */
 static void log_ram(void)
 {
-	static const uint64_t probe[] = { 0x100000000ULL, 0x180000000ULL, 0x1fbf00000ULL };
+	static const uint64_t probe[] = { 0x100000000ULL, 0x200000000ULL, 0x27ebfc000ULL };
 	for (unsigned i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
 		volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)probe[i];
 		uint64_t old = p[0];
