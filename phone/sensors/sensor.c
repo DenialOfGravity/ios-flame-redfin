@@ -80,9 +80,27 @@ static void emit(struct sensor_env *e, struct sensor *s, uint32_t type, uint32_t
 		e->out(e->out_ctx, s, &m);
 }
 
+/*
+ * Face up / face down (UIDeviceOrientation 5/6) when gravity is mostly along z; else sensor_orientation_of.
+ * cur is the orientation posted last: leaving it needs a clearer reading than entering it (hysteresis).
+ */
+int sensor_orientation_hyst(float x, float y, float z, int cur)
+{
+	float ax = x < 0 ? -x : x, ay = y < 0 ? -y : y, az = z < 0 ? -z : z, m = ax > ay ? ax : ay;
+	if (cur >= 5 ? az > 4.5f && az > 1.2f * m : az > 7.0f && az > 1.6f * m)
+		return z > 0 ? 5 : 6;
+	int o = sensor_orientation_of(x, y, z);
+	if (o && cur >= 1 && cur <= 4 && o != cur) {
+		/* portrait <-> landscape: the new axis must lead by 1.6x, not 1.3x */
+		if ((cur <= 2) != (o <= 2) && (o <= 2 ? ay < 1.6f * ax : ax < 1.6f * ay))
+			return cur;
+	}
+	return o;
+}
+
 static void orient_filter(struct sensor_env *e, struct sensor *s, uint64_t ts, const float *v)
 {
-	int o = sensor_orientation_of(v[0], v[1], v[2]);
+	int o = sensor_orientation_hyst(v[0], v[1], v[2], e->orient_cur);
 	if (!o)
 		return;
 	if (o != e->orient_cand) {
