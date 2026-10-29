@@ -1,16 +1,16 @@
-From 812559c7a7e032466c311a12d2c1e245fc1387d9 Mon Sep 17 00:00:00 2001
+From dd24d12eb7280c2a6620cae56f5aaf3f4ec3fb6b Mon Sep 17 00:00:00 2001
 From: Rory Axton <roryaxton@gmail.com>
 Date: Thu, 29 Oct 2026 23:07:50 +0000
 Subject: [PATCH] 1041 redfin: kern.sweet_ui_bigcore: CA
  display/render-server threads on the big cores
 
 ---
- bsd/dev/sweet_cpufreq.c |  27 ++++++++++
+ bsd/dev/sweet_cpufreq.c |  27 +++++++++
  bsd/dev/sweet_thermal.c |   2 +
- bsd/kern/proc_info.c    |   6 +++
- osfmk/kern/sched_prim.c | 116 ++++++++++++++++++++++++++++++++++++++++
- osfmk/kern/thread.h     |   3 ++
- 5 files changed, 154 insertions(+)
+ bsd/kern/proc_info.c    |   6 ++
+ osfmk/kern/sched_prim.c | 118 ++++++++++++++++++++++++++++++++++++++++
+ osfmk/kern/thread.h     |   3 +
+ 5 files changed, 156 insertions(+)
 
 diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
 index 1a1bf19..5648ef7 100644
@@ -95,22 +95,23 @@ index 82607ee..54d9ffc 100644
  
  void
 diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
-index 3953805..9ef38f1 100644
+index 3953805..497baf2 100644
 --- a/osfmk/kern/sched_prim.c
 +++ b/osfmk/kern/sched_prim.c
-@@ -3564,6 +3564,11 @@ thread_dispatch(
+@@ -3564,6 +3564,12 @@ thread_dispatch(
  #endif /* defined(CONFIG_SCHED_MULTIQ) */
  			}
  
 +#if defined(__arm64__)
 +			if (__improbable(thread->sched_flags & TH_SFLAG_SWEET_UI_MASK)) {
++				extern void sweet_ui_account(thread_t thread, processor_t processor);
 +				sweet_ui_account(thread, processor);    /* 1041 */
 +			}
 +#endif
  			thread->computation_metered += (processor->last_dispatch - thread->computation_epoch);
  
  			if (!(thread->state & TH_WAIT)) {
-@@ -5015,6 +5020,86 @@ choose_next_pset(
+@@ -5015,6 +5021,87 @@ choose_next_pset(
   * and DVFS governor (bsd/dev/sweet_cpufreq.c); 0 if the CPU does not exist.
   */
  uint64_t sweet_cpu_idle_abs(int cpu);
@@ -163,7 +164,8 @@ index 3953805..9ef38f1 100644
 +}
 +
 +/* thread_dispatch, the tagged thread going off core (thread locked): one run of processor->last_dispatch - epoch */
-+static void
++void sweet_ui_account(thread_t thread, processor_t processor);
++void
 +sweet_ui_account(thread_t thread, processor_t processor)
 +{
 +	int c = (thread->sched_flags & TH_SFLAG_SWEET_UI_DISPLAY) ? 0 : 1, b = processor->cpu_id >= 6 ? 0 : 1;
@@ -197,7 +199,7 @@ index 3953805..9ef38f1 100644
  uint64_t
  sweet_cpu_idle_abs(int cpu)
  {
-@@ -5099,6 +5184,37 @@ choose_processor(
+@@ -5099,6 +5186,37 @@ choose_processor(
  				}
  			}
  		}

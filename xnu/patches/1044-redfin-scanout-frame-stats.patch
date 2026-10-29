@@ -1,4 +1,4 @@
-From d6dde9c49553ecaf08cace4553e6cbe67da809e9 Mon Sep 17 00:00:00 2001
+From 395722fc99d0c8be14326cf05dcb5fb432586aa6 Mon Sep 17 00:00:00 2001
 From: Rory Axton <roryaxton@gmail.com>
 Date: Thu, 29 Oct 2026 23:11:11 +0000
 Subject: [PATCH] 1044 redfin: direct scanout smoothness line
@@ -9,7 +9,7 @@ Subject: [PATCH] 1044 redfin: direct scanout smoothness line
  2 files changed, 100 insertions(+)
 
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 79e2821..b54d03a 100644
+index 089631f..d2de1d2 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -3177,6 +3177,96 @@ sweet_scan_corners(AppleCLCD *fb, SweetSurface *s)

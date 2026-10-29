@@ -1,4 +1,4 @@
-From cf34648ad2eccb522526946f5a72d6c6b1f1d205 Mon Sep 17 00:00:00 2001
+From 0e06c8c85733343293a3b93bd31f5161076b5f8a Mon Sep 17 00:00:00 2001
 From: Rory Axton <roryaxton@gmail.com>
 Date: Thu, 29 Oct 2026 23:09:47 +0000
 Subject: [PATCH] 1042 redfin: kern.sweet_vsync_lock
@@ -48,7 +48,7 @@ index ae5e0a7..b1153cb 100644
  
  #define USER_VA_BASE    0x200000000ULL  /* above the surface slots */
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index b3bda33..79e2821 100644
+index b3bda33..089631f 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -198,6 +198,20 @@ static uint32_t sweet_vsync, sweet_vsync_lead = 500, sweet_fb_refresh;

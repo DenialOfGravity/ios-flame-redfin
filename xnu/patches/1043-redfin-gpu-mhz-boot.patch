@@ -1,4 +1,4 @@
-From 5f0ed830c9eecfaf1b3471328549d68ae4a4d085 Mon Sep 17 00:00:00 2001
+From e12289211b3e8f0997c58e892a85753da671625f Mon Sep 17 00:00:00 2001
 From: Rory Axton <roryaxton@gmail.com>
 Date: Thu, 29 Oct 2026 21:45:51 +0000
 Subject: [PATCH] 1043 redfin: kern.sweet_gpu_mhz reports the sweetgpufreq
