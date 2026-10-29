@@ -1,0 +1,59 @@
+From 5f0ed830c9eecfaf1b3471328549d68ae4a4d085 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Thu, 29 Oct 2026 21:45:51 +0000
+Subject: [PATCH] 1043 redfin: kern.sweet_gpu_mhz reports the sweetgpufreq
+ level's MHz from boot
+
+---
+ bsd/dev/sweet_gpu.c | 28 ++++++++++++++++++++++++++--
+ 1 file changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index b1153cb..bee90a3 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -469,6 +469,7 @@ sweet_gpu_init(void)
+ 	}
+ 	gpu_irq_boot_args();    /* 0999 */
+ 	gpu.perf_level = lvl;
++	a6_log("level %u = %u MHz at boot (1043: kern.sweet_gpu_mhz reads it from boot)\n", lvl, a6_level_khz(lvl) / 1000);
+ 	pool_kva = va;
+ 	vm_offset_t pva = 0;
+ 	if (kmem_alloc_contig(kernel_map, &pva, PT_EXTRA_SIZE, PAGE_MASK, 0, 0,
+@@ -797,8 +798,31 @@ sysctl_sweet_gpu_dcvs_boost_ms SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_dcvs_boost_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_gpu_dcvs_boost_ms, "I", "SWEET GPU: DCVS touch/SwapEnd boost at the top, ms (0 none)");
+-SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_mhz, CTLFLAG_RD | CTLFLAG_LOCKED, &gpu_mhz_now, 0,
+-    "SWEET GPU: level voted now, MHz (set when DCVS runs or stops)");
++/*
++ * 1043: kern.sweet_gpu_mhz read 0 from boot until kern.sweet_gpu_dcvs was written (gpu_mhz_now was only set by the
++ * governor and dcvs_fixed_locked). Now computed on each read from the level the GPU is at (or comes up at):
++ * gpu.perf_level, which is the sweetgpufreq level from boot (under 0964's cap), and DCVS's level while it runs;
++ * before the GPU is set up, the sweetgpufreq boot-arg's level.
++ */
++static int
++sysctl_sweet_gpu_mhz SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint32_t lvl = gpu.perf_level;
++	if (lvl == 0) {
++#if A6_GPU_ID == 620
++		lvl = 3;
++#else
++		lvl = 4;
++#endif
++		PE_parse_boot_argn("sweetgpufreq", &lvl, sizeof(lvl));
++	}
++	int mhz = (int)(a6_level_khz(lvl) / 1000);
++	gpu_mhz_now = mhz;
++	return sysctl_io_number(req, mhz, sizeof(mhz), NULL, NULL);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_mhz, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_gpu_mhz, "I",
++    "SWEET GPU: level voted now, MHz (1043: the sweetgpufreq level from boot, DCVS's level while it runs)");
+ 
+ /* ---- hangs and resets (all with sweet_gpu_lock held) ---- */
+ 
+-- 
+2.43.0
+

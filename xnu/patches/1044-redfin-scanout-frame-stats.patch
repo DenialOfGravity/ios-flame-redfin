@@ -1,0 +1,161 @@
+From d6dde9c49553ecaf08cace4553e6cbe67da809e9 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Thu, 29 Oct 2026 23:11:11 +0000
+Subject: [PATCH] 1044 redfin: direct scanout smoothness line
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 93 +++++++++++++++++++++++++++
+ iokit/Kernel/arm/hid/SweetHID.cpp     |  7 ++
+ 2 files changed, 100 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 79e2821..b54d03a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -3177,6 +3177,96 @@ sweet_scan_corners(AppleCLCD *fb, SweetSurface *s)
+ 	sweet_scan.stCorners++;
+ }
+ 
++/*
++ * 1044: direct-scanout smoothness (always on, a few counters per latch; fLock): latch-to-latch intervals in panel
++ * periods (1/2/3/4+), p50/p95/max ms, jitter = mean |interval - previous interval|, repeats = intervals of >= 3
++ * periods (one frame held >= 3 vsyncs); gaps over 100 ms are pauses (counted, not in the statistics). Touch -> latch:
++ * the newest touch HID event (SweetHID, IRQ time) before the swap's SwapEnd -> that swap's latch, when < 200 ms.
++ * Second line of the 5 s report: SWEET SCANOUT: 5s frames: ...
++ */
++extern "C" volatile uint64_t sweet_hid_touch_abs[2];   /* iokit/Kernel/arm/hid/SweetHID.cpp: newest, previous */
++#define SWEET_SF_BINS   1000                            /* 0.1 ms bins to 100 ms */
++static struct {
++	uint64_t lastLatch, prevIntv;
++	uint32_t per[4], pauses, repeats, n, tn;
++	uint64_t jitAbs, maxAbs;
++	uint16_t hist[SWEET_SF_BINS];
++	uint16_t thist[200];                            /* touch -> latch, 1 ms bins */
++} sweet_sf;
++
++static void
++sweet_scan_frame_latched(AppleCLCD *fb, uint64_t now, uint64_t swapAbs)
++{
++	uint64_t per = fb->fFcPeriod, ns;
++	if (per == 0) {
++		nanoseconds_to_absolutetime(fb->fHz == 90 ? 11111111ULL : 16666667ULL, &per);
++	}
++	uint64_t t0 = sweet_hid_touch_abs[0], t1 = sweet_hid_touch_abs[1];
++	uint64_t t = t0 != 0 && t0 <= swapAbs ? t0 : (t1 != 0 && t1 <= swapAbs ? t1 : 0);
++	if (t != 0 && now > t) {
++		absolutetime_to_nanoseconds(now - t, &ns);
++		if (ns < 200 * NSEC_PER_MSEC) {
++			sweet_sf.thist[ns / NSEC_PER_MSEC]++;
++			sweet_sf.tn++;
++		}
++	}
++	if (sweet_sf.lastLatch != 0 && now > sweet_sf.lastLatch) {
++		uint64_t iv = now - sweet_sf.lastLatch;
++		absolutetime_to_nanoseconds(iv, &ns);
++		if (ns >= 100 * NSEC_PER_MSEC) {
++			sweet_sf.pauses++;
++			sweet_sf.prevIntv = 0;
++		} else {
++			uint64_t k = (iv + per / 2) / per;
++			sweet_sf.per[k <= 1 ? 0 : (k >= 4 ? 3 : k - 1)]++;
++			sweet_sf.repeats += k >= 3;
++			sweet_sf.hist[ns / 100000]++;
++			sweet_sf.n++;
++			if (iv > sweet_sf.maxAbs) {
++				sweet_sf.maxAbs = iv;
++			}
++			if (sweet_sf.prevIntv != 0) {
++				sweet_sf.jitAbs += iv > sweet_sf.prevIntv ? iv - sweet_sf.prevIntv : sweet_sf.prevIntv - iv;
++			}
++			sweet_sf.prevIntv = iv;
++		}
++	}
++	sweet_sf.lastLatch = now;
++}
++
++static uint32_t
++sweet_sf_pct(const uint16_t *h, uint32_t bins, uint32_t n, uint32_t pct)
++{
++	uint32_t want = (n * pct + 99) / 100, acc = 0;
++	for (uint32_t i = 0; n != 0 && i < bins; i++) {
++		acc += h[i];
++		if (acc >= want) {
++			return i;
++		}
++	}
++	return 0;
++}
++
++static void
++sweet_sf_line_locked(void)
++{
++	uint32_t n = sweet_sf.n;
++	uint32_t p50 = sweet_sf_pct(sweet_sf.hist, SWEET_SF_BINS, n, 50), p95 = sweet_sf_pct(sweet_sf.hist, SWEET_SF_BINS, n, 95);
++	uint32_t t50 = sweet_sf_pct(sweet_sf.thist, 200, sweet_sf.tn, 50), t95 = sweet_sf_pct(sweet_sf.thist, 200, sweet_sf.tn, 95);
++	uint64_t mx = 0, jit = 0;
++	absolutetime_to_nanoseconds(sweet_sf.maxAbs, &mx);
++	absolutetime_to_nanoseconds(sweet_sf.jitAbs, &jit);
++	jit = n > 1 ? jit / 1000 / (n - 1) : 0;
++	IOLog("SWEET SCANOUT: 5s frames: latches %u | vsyncs 1:%u 2:%u 3:%u 4+:%u | p50 %u.%u p95 %u.%u max %llu.%llu ms | "
++	    "jitter %llu us | repeats>=3 %u | pauses %u | touch->latch n %u p50 %u p95 %u ms\n", n, sweet_sf.per[0],
++	    sweet_sf.per[1], sweet_sf.per[2], sweet_sf.per[3], p50 / 10, p50 % 10, p95 / 10, p95 % 10, mx / 1000000,
++	    mx / 100000 % 10, jit, sweet_sf.repeats, sweet_sf.pauses, sweet_sf.tn, t50, t95);
++	uint64_t last = sweet_sf.lastLatch, prev = sweet_sf.prevIntv;
++	bzero(&sweet_sf, sizeof(sweet_sf));
++	sweet_sf.lastLatch = last;
++	sweet_sf.prevIntv = prev;
++}
++
+ /* With fLock, from the scanout thread: latch, then the next flip. False: nothing in flight. */
+ static bool
+ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
+@@ -3201,6 +3291,7 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
+ 		sweet_scan_word_locked((uint32_t)sweet_scan.shownSeq);     /* 0989: the CP's wait goes on */
+ 		sweet_scan.shownSwap = sweet_scan.flipSwap;
+ 		uint64_t l = now - sweet_scan.flipSwapAbs;
++		sweet_scan_frame_latched(fb, now, sweet_scan.flipSwapAbs);    /* 1044 */
+ 		sweet_scan.stLatched++;
+ 		sweet_scan.stLatchN++;
+ 		sweet_scan.stLatchAbs += l;
+@@ -3280,6 +3371,7 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
+ 		sweet_scan.stLatched++;
+ 		sweet_scan.stLatchN++;
+ 		sweet_scan.stLatchAbs += mach_absolute_time() - sAbs;
++		sweet_sf.lastLatch = 0;         /* 1044: the pipes switched: a new run of latches */
+ 		SWEET_TRACE(SWT_SCAN_LATCH, sSwap, sSeq, mach_absolute_time() - sAbs, 0);    /* 0994: pipes switched to it */
+ 		IOLockWakeup(fb->fLock, &sweet_scan.shownSeq, false);
+ 		return sweet_scan.next != NULL;
+@@ -3328,6 +3420,7 @@ sweet_scan_stats_locked(uint64_t now)
+ 	    sweet_scan.stWait, sweet_scan.stWaitTimeout, sweet_scan.stWaitNewest, sweet_scan.stDepthMin, sweet_scan.stDepthMax,
+ 	    sweet_scan.stClean, sweet_scan.stEnter, sweet_scan.stLeave,
+ 	    sweet_scan.stHold, sweet_scan.stLatchFc, sweet_scan.geom ? "direct" : "panel buffer");
++	sweet_sf_line_locked();         /* 1044 */
+ 	{
+ 		uint64_t gw = 0;    /* 0985 */
+ 		absolutetime_to_nanoseconds(sweet_scan.stGateAbs, &gw);
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index a20b00c..f9921a4 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -565,11 +565,18 @@ sweetTouchStat(IOLock *lock, const bool *fingersDown, int finger, bool was, bool
+ }
+ 
+ extern "C" void sweet_cpufreq_boost(int why);     /* 0970: bsd/dev/sweet_cpufreq.c */
++/* 1044: the newest two touch event times (IRQ time with sectouchx 0x1), for SweetFramebuffer's touch -> latch */
++extern "C" volatile uint64_t sweet_hid_touch_abs[2];
++volatile uint64_t sweet_hid_touch_abs[2];
+ 
+ void
+ SweetHIDTouch::touch(int finger, bool down, int x, int y, uint64_t stamp)
+ {
+ 	uint64_t now = stamp ? stamp : mach_absolute_time();
++	if (now != sweet_hid_touch_abs[0]) {
++		sweet_hid_touch_abs[1] = sweet_hid_touch_abs[0];        /* 1044 */
++		sweet_hid_touch_abs[0] = now;
++	}
+ 	if (down) {
+ 		sweet_cpufreq_boost(0);         /* 0970: touch boost (w boost 1 / sweetgov) */
+ 	}
+-- 
+2.43.0
+

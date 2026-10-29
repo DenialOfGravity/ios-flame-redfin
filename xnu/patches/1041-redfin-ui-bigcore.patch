@@ -1,0 +1,254 @@
+From 812559c7a7e032466c311a12d2c1e245fc1387d9 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Thu, 29 Oct 2026 23:07:50 +0000
+Subject: [PATCH] 1041 redfin: kern.sweet_ui_bigcore: CA
+ display/render-server threads on the big cores
+
+---
+ bsd/dev/sweet_cpufreq.c |  27 ++++++++++
+ bsd/dev/sweet_thermal.c |   2 +
+ bsd/kern/proc_info.c    |   6 +++
+ osfmk/kern/sched_prim.c | 116 ++++++++++++++++++++++++++++++++++++++++
+ osfmk/kern/thread.h     |   3 ++
+ 5 files changed, 154 insertions(+)
+
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 1a1bf19..5648ef7 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -202,6 +202,33 @@ sysctl_sweet_gov_framehold SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_gov_framehold, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_gov_framehold, "I", "SWEET GOV: % of each domain's top held 300 ms after a SwapEnd (0 off)");
+ 
++/*
++ * 1041: kern.sweet_ui_bigcore MASK (osfmk/kern/sched_prim.c, choose_processor; default 0 = as before): 1 threads named
++ * com.apple.coreanimation.display* (backboardd's CA display thread), 2 com.apple.coreanimation.render-server*: an idle
++ * big core (CPU6/7, sweetbig order), else preempt the big core running the lowest priority below theirs, else the
++ * normal choice (never waits). Line SWEET UI: bigcore 5s every 5 s while tagged threads run (also with 0: baseline).
++ */
++extern int sweet_ui_bigcore;
++static int
++sysctl_sweet_ui_bigcore SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, sweet_ui_bigcore, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value < 0 || value > 3) {
++		return EINVAL;
++	}
++	sweet_ui_bigcore = value;
++	printf("SWEET UI: bigcore %d (1041: 1 CA display threads, 2 render-server threads on CPU6/7: idle, else preempt lower)\n",
++	    value);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ui_bigcore, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_ui_bigcore, "I", "SWEET UI: CA threads on the big cores (1 display, 2 render-server; 0 off)");
++
+ /* 1037: the lowest choosable position at or above PCT % of the top (0 = no hold) */
+ static unsigned
+ cf_hold_pos(const struct cf_dom *d, int pct)
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+index b27d6ba..22763cf 100644
+--- a/bsd/dev/sweet_thermal.c
++++ b/bsd/dev/sweet_thermal.c
+@@ -50,6 +50,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_cpufreq_log(void);
++extern void sweet_ui_bigcore_log(void);         /* 1041: osfmk/kern/sched_prim.c */
+ extern int sweet_cpufreq_set(unsigned dom, unsigned idx, const char *why);
+ extern void sweet_cpufreq_table_log(unsigned dom);
+ extern int sweet_cpufreq_gov(int on, unsigned period_ms);
+@@ -323,6 +324,7 @@ ts_thread(void *arg __unused, wait_result_t wr __unused)
+ 		}
+ 		ts_log();
+ 		sweet_cpufreq_log();
++		sweet_ui_bigcore_log();         /* 1041 */
+ 		if (!dumped && elapsed >= 20000) {
+ 			dumped = true;
+ 			sweet_thermal_pmic_dump("boot");
+diff --git a/bsd/kern/proc_info.c b/bsd/kern/proc_info.c
+index 82607ee..54d9ffc 100644
+--- a/bsd/kern/proc_info.c
++++ b/bsd/kern/proc_info.c
+@@ -938,6 +938,9 @@ bsd_getthreadname(void *uth, char *buffer)
+  * This is known to race with regards to the contents of the thread name; concurrent
+  * callers may result in a garbled name.
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern void sweet_ui_thread_named(void *uth, const char *name);    /* osfmk/kern/sched_prim.c (1041) */
++#endif
+ void
+ bsd_setthreadname(void *uth, const char *name)
+ {
+@@ -959,6 +962,9 @@ bsd_setthreadname(void *uth, const char *name)
+ 
+ 	strncpy(ut->pth_name, name, MAXTHREADNAMESIZE - 1);
+ 	kernel_debug_string_simple(TRACE_STRING_THREADNAME, ut->pth_name);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_ui_thread_named(ut, ut->pth_name);        /* redfin 1041: CA display / render-server threads tagged */
++#endif
+ }
+ 
+ void
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 3953805..9ef38f1 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -3564,6 +3564,11 @@ thread_dispatch(
+ #endif /* defined(CONFIG_SCHED_MULTIQ) */
+ 			}
+ 
++#if defined(__arm64__)
++			if (__improbable(thread->sched_flags & TH_SFLAG_SWEET_UI_MASK)) {
++				sweet_ui_account(thread, processor);    /* 1041 */
++			}
++#endif
+ 			thread->computation_metered += (processor->last_dispatch - thread->computation_epoch);
+ 
+ 			if (!(thread->state & TH_WAIT)) {
+@@ -5015,6 +5020,86 @@ choose_next_pset(
+  * and DVFS governor (bsd/dev/sweet_cpufreq.c); 0 if the CPU does not exist.
+  */
+ uint64_t sweet_cpu_idle_abs(int cpu);
++
++/*
++ * redfin 1041: kern.sweet_ui_bigcore MASK (bsd/dev/sweet_cpufreq.c; default 0 = as before). Trace of a Settings scroll
++ * (2026-10-29): backboardd's com.apple.coreanimation.display.primary (CA prepare, ~10 ms of CPU per frame on an A76)
++ * ran 8 of 174 frames on an A55 at ~19.7 ms and cost 44 "display thread busy" ticks: 0962 only takes an IDLE big core.
++ * Threads are tagged when named (bsd_setthreadname): com.apple.coreanimation.display* (class 1) and
++ * com.apple.coreanimation.render-server* (class 2). For a tagged thread whose class bit is set in the mask,
++ * choose_processor() takes, in sweetbig's order (CPU6 first with sweetbig=2): an idle big core; else the big core
++ * running the lowest priority below this thread's (it is preempted at once: IPI); else the normal choice. That last
++ * step is the no-starvation fallback, at 0 ms: on this one-cluster clutch scheduler a runnable unbound thread waits in
++ * the shared run queue (no per-CPU queue to wait on without binding it, and binding a queued thread desynchronises the
++ * clutch bucket run counts), so it never waits for a big core that runs equal or higher priority work.
++ * Stats always (cheap): runs and on-CPU ms of tagged threads on big (CPU6/7) and little cores, counted when they go off
++ * core; line every 5 s while tagged threads run: SWEET UI: bigcore 5s: ... (sweet_thermal.c's 5 s tick).
++ */
++int sweet_ui_bigcore;
++static uint32_t sweet_ui_tagged;
++static uint32_t sweet_ui_st_idle, sweet_ui_st_preempt, sweet_ui_st_fallback;
++static uint64_t sweet_ui_runs[2][2], sweet_ui_abs[2][2];     /* [class display, render-server][big, little] */
++
++void sweet_ui_thread_named(void *uth, const char *name);
++void
++sweet_ui_thread_named(void *uth, const char *name)
++{
++	thread_t th = get_machthread((struct uthread *)uth);
++	uint32_t f = 0;
++	if (name == NULL || th == THREAD_NULL) {
++		return;
++	}
++	if (strncmp(name, "com.apple.coreanimation.display", 31) == 0) {
++		f = TH_SFLAG_SWEET_UI_DISPLAY;
++	} else if (strncmp(name, "com.apple.coreanimation.render-server", 37) == 0) {
++		f = TH_SFLAG_SWEET_UI_RS;
++	}
++	if (f == 0 && !(th->sched_flags & TH_SFLAG_SWEET_UI_MASK)) {
++		return;
++	}
++	spl_t s = splsched();
++	thread_lock(th);
++	th->sched_flags = (th->sched_flags & ~TH_SFLAG_SWEET_UI_MASK) | f;
++	thread_unlock(th);
++	splx(s);
++	if (f != 0 && os_atomic_inc(&sweet_ui_tagged, relaxed) <= 16) {
++		printf("SWEET UI: tagged thread %llu %s (1041 class %d, kern.sweet_ui_bigcore %d)\n", thread_tid(th), name,
++		    f == TH_SFLAG_SWEET_UI_DISPLAY ? 1 : 2, sweet_ui_bigcore);
++	}
++}
++
++/* thread_dispatch, the tagged thread going off core (thread locked): one run of processor->last_dispatch - epoch */
++static void
++sweet_ui_account(thread_t thread, processor_t processor)
++{
++	int c = (thread->sched_flags & TH_SFLAG_SWEET_UI_DISPLAY) ? 0 : 1, b = processor->cpu_id >= 6 ? 0 : 1;
++	uint64_t ran = processor->last_dispatch > thread->computation_epoch ? processor->last_dispatch - thread->computation_epoch : 0;
++	os_atomic_inc(&sweet_ui_runs[c][b], relaxed);
++	os_atomic_add(&sweet_ui_abs[c][b], ran, relaxed);
++}
++
++void sweet_ui_bigcore_log(void);
++void
++sweet_ui_bigcore_log(void)
++{
++	uint64_t r[2][2], ms[2][2];
++	for (int c = 0; c < 2; c++) {
++		for (int b = 0; b < 2; b++) {
++			r[c][b] = os_atomic_xchg(&sweet_ui_runs[c][b], 0, relaxed);
++			absolutetime_to_nanoseconds(os_atomic_xchg(&sweet_ui_abs[c][b], 0, relaxed), &ms[c][b]);
++			ms[c][b] /= NSEC_PER_MSEC;
++		}
++	}
++	uint32_t pi = sweet_ui_st_idle, pp = sweet_ui_st_preempt, pf = sweet_ui_st_fallback;
++	sweet_ui_st_idle = sweet_ui_st_preempt = sweet_ui_st_fallback = 0;
++	if (r[0][0] + r[0][1] + r[1][0] + r[1][1] == 0) {
++		return;
++	}
++	printf("SWEET UI: bigcore 5s: runs big/little, ms: display %llu/%llu, %llu/%llu | render-server %llu/%llu, %llu/%llu | "
++	    "placed idle %u preempt %u fallback %u | mode %d tagged %u\n", r[0][0], r[0][1], ms[0][0], ms[0][1], r[1][0], r[1][1],
++	    ms[1][0], ms[1][1], pi, pp, pf, sweet_ui_bigcore, sweet_ui_tagged);
++}
++
+ uint64_t
+ sweet_cpu_idle_abs(int cpu)
+ {
+@@ -5099,6 +5184,37 @@ choose_processor(
+ 				}
+ 			}
+ 		}
++		/* 1041: kern.sweet_ui_bigcore: a tagged CA thread takes an idle big core, else preempts the lower-priority one */
++		int ui = ((thread->sched_flags & TH_SFLAG_SWEET_UI_DISPLAY) ? 1 : 0) | ((thread->sched_flags & TH_SFLAG_SWEET_UI_RS) ? 2 : 0);
++		if (__improbable(ui & sweet_ui_bigcore)) {
++			processor_t idle = PROCESSOR_NULL, low = PROCESSOR_NULL;
++			for (int k = 0; k < 2; k++) {
++				int i = sweet_big == 2 ? 6 + k : 7 - k;
++				processor_t bp = processor_array[i];
++				if (bp == PROCESSOR_NULL || bp->processor_set != pset || !bp->is_recommended) {
++					continue;
++				}
++				if (bp->state == PROCESSOR_IDLE) {
++					if (idle == PROCESSOR_NULL) {
++						idle = bp;
++					}
++				} else if (bp->state == PROCESSOR_RUNNING && bp->current_pri < thread->sched_pri &&
++				    !bit_test(pset->pending_AST_URGENT_cpu_mask, bp->cpu_id) &&
++				    (low == PROCESSOR_NULL || bp->current_pri < low->current_pri)) {
++					low = bp;
++				}
++			}
++			if (idle != PROCESSOR_NULL) {
++				processor = idle;       /* an idle hint is taken as is below (RT: if a fast-track candidate) */
++				sweet_ui_st_idle++;
++			} else if (low != PROCESSOR_NULL && (thread->sched_pri < BASEPRI_RTQUEUES ||
++			    processor_is_fast_track_candidate_for_realtime_thread(pset, low))) {
++				sweet_ui_st_preempt++;
++				return low;             /* pset locked; processor_setrun / realtime_setrun preempt it */
++			} else {
++				sweet_ui_st_fallback++;
++			}
++		}
+ 	}
+ #endif
+ 
+diff --git a/osfmk/kern/thread.h b/osfmk/kern/thread.h
+index 242233a..be0e96f 100644
+--- a/osfmk/kern/thread.h
++++ b/osfmk/kern/thread.h
+@@ -471,6 +471,9 @@ struct thread {
+ #define TH_SFLAG_PROMOTE_REASON_MASK    (TH_SFLAG_RW_PROMOTED | TH_SFLAG_WAITQ_PROMOTED | TH_SFLAG_EXEC_PROMOTED | TH_SFLAG_FLOOR_PROMOTED)
+ 
+ #define TH_SFLAG_RT_DISALLOWED         0x100000         /* thread wants RT but may not have joined a work interval that allows it */
++#define TH_SFLAG_SWEET_UI_RS           0x20000000       /* redfin 1041: named com.apple.coreanimation.render-server* */
++#define TH_SFLAG_SWEET_UI_DISPLAY      0x40000000       /* redfin 1041: named com.apple.coreanimation.display* */
++#define TH_SFLAG_SWEET_UI_MASK         (TH_SFLAG_SWEET_UI_RS | TH_SFLAG_SWEET_UI_DISPLAY)
+ #define TH_SFLAG_DEMOTED_MASK      (TH_SFLAG_THROTTLED | TH_SFLAG_FAILSAFE | TH_SFLAG_RT_DISALLOWED)     /* saved_mode contains previous sched_mode */
+ 
+ 	int16_t                 sched_pri;              /* scheduled (current) priority */
+-- 
+2.43.0
+
