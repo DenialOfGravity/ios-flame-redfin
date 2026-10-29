@@ -33,10 +33,10 @@ Made by `tools/docs-gen.py redfin` from [devices/redfin/device.conf](../../devic
 | audio | works | speaker (two CS35L41 amps) and microphone through the ADSP (0915-0917, 0952-0958) |
 | camera | works | Camera.app capture (0919-0934); needs fw/camera-<sensor>.tab made by tools/redfin-camtab.py from the vendor module file |
 | usb | works | USB networking (CDC Ethernet) and the live kernel log |
-| wifi | works | WCN3990 via the modem DSP, wland in userland, wifid joins (1012 + 1013); 1014 signal events excluded: they reset the phone on wifid's join |
-| bluetooth | works | WCN3998 HCI over UART (btd, 0981/0982, 1010, 1015): scan and basic connect; a crash when pairing headphones is under investigation |
+| wifi | works | WCN3990 via the modem DSP; wland (1363de7, retries the RPMh EBUSY race) starts it at boot; wifid joins when picked in Settings (1012 + 1013); auto-join refused "Below minimum RSSI threshold"; no signal bars (1014 resets the phone on join, excluded) |
+| bluetooth | works | WCN3998 HCI over UART (btd 43320fd: select()-based bridge, IBS wake ack, vayu HCI shim); scan, pairing and headphone (A2DP) audio work (1016 Skywalk privilege) |
 | battery | partial | charge level is an estimate (SDAM-seeded coulomb count + voltage, 0966); not calibrated |
-| sensors | partial | accelerometer and gyroscope as HID services work (ADSP sensors PD over fastrpcd/sensd, 0971/0972); proximity crashes backboardd |
+| sensors | partial | accelerometer, gyroscope, orientation via the ADSP (fastrpcd, sensd ws-y-sensd-orient daemon at boot); auto-rotate works (1031 sensor-time child; landscape 3-5 s, rotated-framebuffer path slow); proximity off (crashes backboardd) |
 | charging | missing | does not charge under iOS (SMB5 policy 0967/0968 in tree); charges only in fastboot |
 | cellular | missing | the modem DSP is booted (by wland) only to run Wi-Fi; no SIM, voice or data |
 | nfc | missing | not started |
