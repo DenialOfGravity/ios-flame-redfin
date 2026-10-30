@@ -1,0 +1,96 @@
+ios-redfin bridge patch 0137: port of UniXNU AdrenoMetal bridge/patches/0016-tile-stores-within-rows.patch
+Original author: bluseliu50 <265648257+bluseliu50@users.noreply.github.com> (UniXNU/AdrenoMetal ce5e19e, BSD-2-Clause-Patent).
+Ported onto metal2vulkan 720ef1ce + ios-redfin bridge patches 0001-0111 for the redfin port; changes from the original are
+marked 'ios-on-pixel (bridge 0137)'. Knob: SWEET_U0016=1 (default off: bridge 0101 aliases every padded writer).
+See phone/metal2/bridge/UNIXNU-PORT.md.
+
+diff --git a/crates/metal2vulkan-runtime/src/linear_plan.rs b/crates/metal2vulkan-runtime/src/linear_plan.rs
+index bda5059b..5a1e19aa 100644
+--- a/crates/metal2vulkan-runtime/src/linear_plan.rs
++++ b/crates/metal2vulkan-runtime/src/linear_plan.rs
+@@ -777,6 +777,26 @@ pub(super) fn only_reads(usage: TextureUsage) -> bool {
+     )
+ }
+ 
++/// Whether a render pass that keeps a texture `width` texels wide over `layout`'s texels in tile
++/// memory stores it back within the bytes an image over them may hold, in a buffer of
++/// `buffer_length` bytes: a tile store reaching the texture's right or bottom edge writes whole
++/// 16x4-texel blocks, so up to 15 texels past a row's last and 3 rows past its last row. Every
++/// row's block must end within its pitch, and the last block within the buffer; one slice only.
++pub(super) fn tile_store_fits(layout: &BufferLayout, width: u64, buffer_length: u64) -> bool {
++    const TILE: (u64, u64) = (16, 4);
++    if layout.slices != 1 || width == 0 || !layout.row_bytes.is_multiple_of(width) {
++        return false;
++    }
++    let block_row = width.next_multiple_of(TILE.0) * (layout.row_bytes / width);
++    let last_row = layout.rows.next_multiple_of(TILE.1) - 1;
++    layout.row_pitch >= block_row
++        && layout
++            .offset
++            .saturating_add(layout.row_pitch.saturating_mul(last_row))
++            .saturating_add(block_row)
++            <= buffer_length
++}
++
+ /// What an image over `layout`'s texels may hold beside them, for a texture of Metal `usage` (as
+ /// [`only_reads`] takes it) under `policy`, or why no image may hold them: the texels alone
+ /// where its rows (and slices) lie one after another, or it has one row (one slice); else, where
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index c79ba385..2b565dff 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -83,8 +83,8 @@ use super::image_plan::{
+     ImagePlan, ImageRefusal,
+ };
+ use super::linear_plan::{
+-    aliases, check_linear_limits, holding, linear_lack, BufferLayout, Holds, LinearImage,
+-    LinearLack,
++    aliases, check_linear_limits, holding, linear_lack, only_reads, tile_store_fits, BufferLayout,
++    Holds, LinearImage, LinearLack,
+ };
+ use super::memory::{MemoryClass, Placement};
+ use super::metal_texture::{self, MetalOver};
+@@ -121,7 +121,7 @@ use first_move::{FirstMove, Fresh, Pattern, Patterned, TexelCopy, PATTERN_BYTES}
+ use heap_tiled::{FreshDepth, FreshPattern};
+ use metal2vulkan::bind::{ImageViewDesc, TextureFacts};
+ use metal2vulkan::device::{
+-    DeviceDescription, DeviceProfile, DriverFact, FormatSupport, VkFeature,
++    DeviceDescription, DeviceProfile, DriverFact, FormatSupport, PaddedReadsPolicy, VkFeature,
+ };
+ use metal2vulkan::error::{
+     Capability, Feature, LinearNeed, RuntimeDriverDefect, SparseNeed, Unsupported,
+@@ -1961,7 +1961,19 @@ impl Device {
+         })?;
+         // What an image over the texels may hold beside them: the bytes between padded rows too
+         // where the texture only reads, by the policy (`linear_plan::holding`); else why none may.
+-        let policy = self.compile_device().policy().padded_reads;
++        let mut policy = self.compile_device().policy().padded_reads;
++        // ios-on-pixel (bridge 0137, UniXNU 0016; env `SWEET_U0016`): a written texture's tile
++        // stores may reach past its rows (`linear_plan::tile_store_fits`): whole 16x4-texel blocks
++        // at its right and bottom edges. Where they would leave the row gaps or the buffer, a texture
++        // that renders or writes is a shadow (bridge 0101 aliases it under `Alias` otherwise); one
++        // that only reads aliases as before.
++        if sweet_u0016()
++            && policy == PaddedReadsPolicy::Alias
++            && !only_reads(usage)
++            && !tile_store_fits(&texels.layout, u64::from(layout.extent[0]), texels.buffer.length())
++        {
++            policy = PaddedReadsPolicy::Shadow;
++        }
+         let holds = holding(&texels.layout, usage, policy);
+         // Over bytes detached from their pages (`detach.rs`) no image aliases them: the texture
+         // is their shadow, which presents a stand-in until they lie in pages again.
+@@ -5846,3 +5858,13 @@ struct HostCopy {
+     /// (`two_planes.rs`).
+     planes: bool,
+ }
++
++/// ios-on-pixel (bridge 0137, UniXNU 0016): whether a padded texture that renders or writes aliases
++/// its rows only where its tile stores stay within them (env `SWEET_U0016`, off unless set and not
++/// `0`).
++fn sweet_u0016() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        std::env::var("SWEET_U0016").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
++    })
++}

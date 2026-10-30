@@ -1,0 +1,172 @@
+ios-redfin bridge patch 0160: SWEET_FP16 -- half precision mode (default off = upstream rounding).
+Base: metal2vulkan 720ef1ce + ios-redfin bridge patches 0001-0111, 0120, 0130-0137.
+  SWEET_FP16=wide    half values stay in f32 and are never rounded back to half: lower/arith/narrow.rs
+                     round / round_exact_below_normal / round_texel are the identity on half (no
+                     FConvert f32->f16->f32 pair, no `x + -0.0` NoContraction barrier).
+  SWEET_FP16=native  derive::Device::new inserts MetalHalfArithmetic, MetalHalfConversion and MetalHalfFma
+                     into the driver deviations (unmeasured on Turnip: a relaxed-precision choice), so half
+                     + - * emit 16-bit OpFAdd/OpFSub/Fma(a,b,-0), half fma the 16-bit Fma, and roundings the
+                     conversion pair; the conversion barrier is dropped under either mode.
+  Both cap a finite half code at 0x7C00 when stored (as native half rounding does). Off: byte-identical SPIR-V.
+  The knob value is part of every cache key (env_vars::sweet_key_tag, as 0109), and `native` also changes
+  the device profile fingerprint. Clear /var/local/m2v-cache/backboardd when switching.
+
+diff --git a/crates/metal2vulkan/src/device/derive.rs b/crates/metal2vulkan/src/device/derive.rs
+index 33108bc3..e3d558e7 100644
+--- a/crates/metal2vulkan/src/device/derive.rs
++++ b/crates/metal2vulkan/src/device/derive.rs
+@@ -66,7 +66,20 @@ impl Device {
+     /// is on (`InvalidDescriptor`).
+     pub fn new(desc: DeviceDescription, policy: DevicePolicy) -> Result<Device, Error> {
+         // The driver's measured deviations at its release, never its name.
+-        let deviations = super::driver_facts::deviations(&desc);
++        let mut deviations = super::driver_facts::deviations(&desc);
++        // sweet 0160: SWEET_FP16=native takes the device's 16-bit `half` arithmetic, conversion
++        // and fused multiply-add as Metal's (unmeasured on this driver: a relaxed-precision
++        // choice), so `half` `+ - *` and `fma` emit 16-bit instructions. The deviations enter the
++        // profile, its properties and so its fingerprint; off, the table's alone.
++        if crate::env_vars::sweet_fp16() == crate::env_vars::SweetFp16::Native {
++            for d in [
++                DriverDeviation::MetalHalfArithmetic,
++                DriverDeviation::MetalHalfConversion,
++                DriverDeviation::MetalHalfFma,
++            ] {
++                deviations.entry(d).or_insert(Standing::Measured);
++            }
++        }
+         Device::with_deviations(desc, policy, deviations)
+     }
+ 
+diff --git a/crates/metal2vulkan/src/env_vars.rs b/crates/metal2vulkan/src/env_vars.rs
+index 1e8f181f..d5b88bf1 100644
+--- a/crates/metal2vulkan/src/env_vars.rs
++++ b/crates/metal2vulkan/src/env_vars.rs
+@@ -43,6 +43,15 @@ pub const REGISTRY: &[EnvVar] = &[
+                  codes. sweet 0110: `fetch`: so only in fragment functions that read the \
+                  framebuffer. Changes the SPIR-V (and every cache key)",
+     },
++    EnvVar {
++        name: "SWEET_FP16",
++        default: "unset (each `half` result rounded to `half` in `f32`, as today)",
++        effect: "sweet 0160: `wide`: `half` values are held in `f32` and never rounded back to \
++                 `half` (no conversion pair); `native`: `half` `+ - *` and `fma` take the \
++                 device's 16-bit instructions (the profile takes MetalHalfArithmetic, \
++                 MetalHalfConversion and MetalHalfFma) and the rounding of other `half` results \
++                 has no `NoContraction` barrier. Changes the SPIR-V (and every cache key)",
++    },
+     EnvVar {
+         name: "METAL2VULKAN_LOG_PIPELINES",
+         default: "unset (off)",
+@@ -103,6 +112,29 @@ pub fn sweet_color_writes_fetch() -> bool {
+     *ON.get_or_init(|| std::env::var("SWEET_M2V_COLOR_WRITES").is_ok_and(|v| v == "fetch"))
+ }
+ 
++/// sweet 0160: how `half` arithmetic is compiled (`SWEET_FP16`, `REGISTRY`).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum SweetFp16 {
++    /// Unset (or any other value): upstream's rounding of each `half` result.
++    Off,
++    /// `wide`: `half` held in `f32`, never rounded back (`narrow::round` is the identity).
++    Wide,
++    /// `native`: the device's 16-bit `+ - *` and `fma` (`derive::Device::new` takes the three
++    /// `half` deviations), and no barrier before a conversion to 16 bits.
++    Native,
++}
++
++/// sweet 0160: `SWEET_FP16` (`wide` or `native`), read once per process. It changes what the
++/// library compiles, so every cache key includes it ([`sweet_key_tag`]).
++pub fn sweet_fp16() -> SweetFp16 {
++    static MODE: std::sync::OnceLock<SweetFp16> = std::sync::OnceLock::new();
++    *MODE.get_or_init(|| match std::env::var("SWEET_FP16").as_deref() {
++        Ok("wide") => SweetFp16::Wide,
++        Ok("native") => SweetFp16::Native,
++        _ => SweetFp16::Off,
++    })
++}
++
+ /// sweet: the bytes the sweet knobs that change compiled modules add to every cache key (the
+ /// compile layer's keys, the runtime's shader cache build); empty with every knob off, so the
+ /// keys are then upstream's.
+@@ -116,6 +148,11 @@ pub fn sweet_key_tag() -> &'static [u8] {
+         if sweet_color_writes_fetch() {
+             t.extend_from_slice(b"sweet-color-writes-fetch\0");
+         }
++        match sweet_fp16() {
++            SweetFp16::Off => {}
++            SweetFp16::Wide => t.extend_from_slice(b"sweet-fp16-wide\0"),
++            SweetFp16::Native => t.extend_from_slice(b"sweet-fp16-native\0"),
++        }
+         t
+     })
+ }
+diff --git a/crates/metal2vulkan/src/lower/arith/narrow.rs b/crates/metal2vulkan/src/lower/arith/narrow.rs
+index d42bc072..473de6fb 100644
+--- a/crates/metal2vulkan/src/lower/arith/narrow.rs
++++ b/crates/metal2vulkan/src/lower/arith/narrow.rs
+@@ -100,6 +100,8 @@ pub fn round_words_in(q: QuantizeForm, f: Form) -> u32 {
+ /// [`converted`]'s alone, which is the same value where the device's conversion is Metal's.
+ pub fn round(fb: &mut FunctionBuilder<'_>, f: Form, x: Value) -> BResult<Value> {
+     match f.held {
++        // sweet 0160: SWEET_FP16=wide keeps a `half` result at its `f32` value.
++        Held::Float(FloatFmt::Half) if sweet_wide() => Ok(x),
+         Held::Float(FloatFmt::Half) => {
+             let wide = f.with(Held::Float(FloatFmt::F32));
+             match fb.module().quantize_form() {
+@@ -275,7 +277,9 @@ fn converted(fb: &mut FunctionBuilder<'_>, wide: Form, x: Value) -> BResult<Valu
+         len => fb.module().ty(Type::Vector { elem: e, len })?,
+     };
+     let w = ty(fb, wide)?;
+-    let held = if fb.module().native_half() {
++    // sweet 0160: under SWEET_FP16 (`native`) no barrier either: it only keeps Metal's compiler
++    // (SPIRV-Cross) from folding the conversion, and its `NoContraction` add costs Turnip.
++    let held = if fb.module().native_half() || sweet_fp16_on() {
+         x
+     } else {
+         let minus_zero = fsplat(fb, wide, BARRIER)?;
+@@ -285,6 +289,20 @@ fn converted(fb: &mut FunctionBuilder<'_>, wide: Form, x: Value) -> BResult<Valu
+     fb.convert(ConvOp::FConvert, n, w)
+ }
+ 
++/// sweet 0160: `SWEET_FP16=wide`: no `half` rounding at all ([`round`] and its kin are the
++/// identity on `half`), so a `half` value is any `f32`. Its bits ([`f32_bits_to_half_bits`]) are
++/// then the truncation, a finite magnitude capped at infinity's code as under native half rounding
++/// (the cap is taken under `native` too, where the device's compiler may fold a conversion pair
++/// that no barrier keeps).
++fn sweet_wide() -> bool {
++    crate::env_vars::sweet_fp16() == crate::env_vars::SweetFp16::Wide
++}
++
++/// sweet 0160: `SWEET_FP16` is `wide` or `native`.
++fn sweet_fp16_on() -> bool {
++    crate::env_vars::sweet_fp16() != crate::env_vars::SweetFp16::Off
++}
++
+ /// The addend of [`converted`]'s barrier: `x + -0.0` is `x` for every `x` (`+0 + -0` is `+0`,
+ /// `-0 + -0` is `-0`), and a NaN stays a NaN. The add may quiet a signalling NaN; measured on
+ /// every `f32` (`DriverDeviation::MetalHalfConversion`), the half of each NaN through it has the
+@@ -370,6 +388,8 @@ pub fn round_texel_words(f: Form) -> u32 {
+ /// `ModuleBuilder::texel_nans`), which keeps them. Another form is [`round`]ed.
+ pub fn round_texel(fb: &mut FunctionBuilder<'_>, f: Form, x: Value) -> BResult<Value> {
+     match f.held {
++        // sweet 0160: SWEET_FP16=wide: the device's decode as it is (NaN included).
++        Held::Float(FloatFmt::Half) if sweet_wide() => Ok(x),
+         Held::Float(FloatFmt::Half) if fb.module().native_half() && !fb.module().texel_nans() => {
+             round(fb, f, x)
+         }
+@@ -399,6 +419,7 @@ pub fn round_texel(fb: &mut FunctionBuilder<'_>, f: Form, x: Value) -> BResult<V
+ /// as [`round`] does.
+ pub fn round_exact_below_normal(fb: &mut FunctionBuilder<'_>, f: Form, x: Value) -> BResult<Value> {
+     match f.held {
++        Held::Float(FloatFmt::Half) if sweet_wide() => Ok(x),
+         Held::Float(FloatFmt::Half) => {
+             let wide = f.with(Held::Float(FloatFmt::F32));
+             match fb.module().quantize_form() {
+@@ -962,7 +983,7 @@ fn f32_bits_to_half_bits(fb: &mut FunctionBuilder<'_>, u: Form, b: Value) -> BRe
+     let normal = bin(fb, BinOp::ISub, t, bias)?;
+     // The cap is the bias less `0x14400`: `0x7C00` for a finite lane, `0x23C00` for an infinity
+     // or NaN, whose code (at most `0x7FFF`) it leaves alone.
+-    let normal = match fb.module().native_half() {
++    let normal = match fb.module().native_half() || sweet_fp16_on() {
+         true => {
+             let less = c(fb, 0x14400)?;
+             let cap = bin(fb, BinOp::ISub, bias, less)?;

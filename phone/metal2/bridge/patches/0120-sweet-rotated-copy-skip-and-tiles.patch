@@ -1,5 +1,5 @@
 diff --git a/crates/metal2vulkan-runtime/src/buffer_texture.rs b/crates/metal2vulkan-runtime/src/buffer_texture.rs
-index 2872bb7b..13e54fdf 100644
+index 6082ef4b..6cf2c378 100644
 --- a/crates/metal2vulkan-runtime/src/buffer_texture.rs
 +++ b/crates/metal2vulkan-runtime/src/buffer_texture.rs
 @@ -970,13 +970,16 @@ impl Texels {
@@ -21,26 +21,26 @@ index 2872bb7b..13e54fdf 100644
              source: ShadowSource::Bytes {
                  buffer: ShadowBuffer::of(&self.buffer, buffer),
 diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
-index 1194f785..fb47c719 100644
+index 53ad6c54..33447de8 100644
 --- a/crates/metal2vulkan-runtime/src/encoder.rs
 +++ b/crates/metal2vulkan-runtime/src/encoder.rs
-@@ -523,6 +523,7 @@ impl EncoderCore {
-         let aliased = self.aliased(uses);
-         let tracked = aliased.as_deref().unwrap_or(uses);
-         let barrier = self.uses.barrier(tracked);
+@@ -526,6 +526,7 @@ impl EncoderCore {
+         if crate::sweet_drawstat::shadow_seed() {
+             crate::sweet_seed::written(tracked);
+         }
 +        super::rotated::note_writes(tracked);
          self.uses.record(stages, tracked, barrier);
          self.touch_reaching(uses, resident);
          Some(barrier)
-@@ -684,6 +685,7 @@ impl EncoderCore {
+@@ -690,6 +691,7 @@ impl EncoderCore {
+         if crate::sweet_drawstat::shadow_seed() {
+             crate::sweet_seed::written(aliased.as_deref().unwrap_or(uses));
          }
-         self.observe_fresh(uses, &[]);
-         let aliased = self.aliased(uses);
 +        super::rotated::note_writes(aliased.as_deref().unwrap_or(uses));
          self.uses
              .record(stages, aliased.as_deref().unwrap_or(uses), None);
          self.touch_reaching(uses, resident);
-@@ -728,6 +730,23 @@ impl EncoderCore {
+@@ -734,6 +736,23 @@ impl EncoderCore {
      /// everything after each copy, in one whose commands Metal leaves unordered.
      pub(super) fn shadow_copies(&mut self, copies: &[ShadowCopy]) {
          for copy in copies {
@@ -64,7 +64,7 @@ index 1194f785..fb47c719 100644
              let stages = copy.stages();
              let uses = copy.uses();
              if self.uses.ordered() {
-@@ -740,13 +759,14 @@ impl EncoderCore {
+@@ -746,7 +765,7 @@ impl EncoderCore {
              } else {
                  // A copy of a detached buffer's bytes records nothing, nor does what follows.
                  if self.skips(uses.iter().map(|used| used.key)) {
@@ -73,18 +73,19 @@ index 1194f785..fb47c719 100644
                  }
                  self.barrier(Barrier::everything());
                  // SAFETY: as above.
-                 unsafe { copy.record(self.device().shared().vk(), self.raw) };
-                 self.barrier(Barrier::everything());
-                 let aliased = self.aliased(&uses);
+@@ -756,6 +775,7 @@ impl EncoderCore {
+                 if crate::sweet_drawstat::shadow_seed() {
+                     crate::sweet_seed::written(aliased.as_deref().unwrap_or(&uses));
+                 }
 +                super::rotated::note_writes(aliased.as_deref().unwrap_or(&uses));
                  self.uses
                      .record(stages, aliased.as_deref().unwrap_or(&uses), None);
                  self.touch(&uses);
 diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
-index 4781491b..69402e00 100644
+index b87dbded..19ab5cd7 100644
 --- a/crates/metal2vulkan-runtime/src/lib.rs
 +++ b/crates/metal2vulkan-runtime/src/lib.rs
-@@ -206,6 +206,7 @@ pub use attributes::PurgeableState;
+@@ -210,6 +210,7 @@ pub use attributes::PurgeableState;
  pub use binary_archive::{BinaryArchive, BinaryArchiveDescriptor};
  pub use blit::BlitCommandEncoder;
  pub use buffer::Buffer;
@@ -93,7 +94,7 @@ index 4781491b..69402e00 100644
  pub use buffer_texture::IoSurfacePlane;
  pub use capabilities::{DeviceProperties, Query};
 diff --git a/crates/metal2vulkan-runtime/src/rotated.rs b/crates/metal2vulkan-runtime/src/rotated.rs
-index 22af3ce3..d3d78e5a 100644
+index 1b43f111..ee1a3db6 100644
 --- a/crates/metal2vulkan-runtime/src/rotated.rs
 +++ b/crates/metal2vulkan-runtime/src/rotated.rs
 @@ -46,11 +46,72 @@ use super::buffer::Buffer;
@@ -170,7 +171,7 @@ index 22af3ce3..d3d78e5a 100644
  
  /// Where a shape lies in the shape buffer, per direction: a multiple of every
  /// `minStorageBufferOffsetAlignment`.
-@@ -153,9 +214,82 @@ pub(super) struct RotatedCopies {
+@@ -153,9 +214,85 @@ pub(super) struct RotatedCopies {
      apart: bool,
      kernel: OwnedKernel,
      sets: OwnedSets,
@@ -182,6 +183,9 @@ index 22af3ce3..d3d78e5a 100644
 +    epoch: AtomicU64,
 +    /// The frame's bytes, for the counts.
 +    frame_bytes: u64,
++    /// ws-z-merge: a turned frame (rotation 1-4), not a repack at rotation 0 (bridge 0104): only a
++    /// turned frame's copies are counted and copied back whole, as on rotfb4; a repack's as on u-combo.
++    turned: bool,
 +}
 +
 +impl Drop for RotatedCopies {
@@ -253,7 +257,7 @@ index 22af3ce3..d3d78e5a 100644
      /// The turns of `frame` through `staging`, the staging buffer of its plane's bytes (at least
      /// `span` rounded up to 4 bytes long), of the texture's `hazard` tracking. Refused as
      /// `new_buffer` refuses the tight and shape buffers, and (`NotImplemented(RotatedTexture)`)
-@@ -191,12 +325,16 @@ impl RotatedCopies {
+@@ -197,12 +334,16 @@ impl RotatedCopies {
          let (shapes_raw, shapes_at) = shapes.at(0);
          let (staging_raw, staging_at) = (staging.raw(), staging.into.dst_offset);
          let narrow = |v: u64| u32::try_from(v).map_err(|_| internal("a rotated frame past u32"));
@@ -276,7 +280,7 @@ index 22af3ce3..d3d78e5a 100644
                  return Err(Error::NotImplemented(RuntimeGap::RotatedTexture));
              }
              Ok([narrow(across)?, narrow(down)?])
-@@ -206,9 +344,10 @@ impl RotatedCopies {
+@@ -212,9 +353,10 @@ impl RotatedCopies {
          let stored_words = (row_pitch * u64::from(stored_height - 1)
              + u64::from(stored_width) * texel_bytes)
              .div_ceil(4);
@@ -290,7 +294,7 @@ index 22af3ce3..d3d78e5a 100644
          let into_shape = |turn: Turn| -> Result<[u8; 52], Error> {
              Ok(RotateTexelsModule::shape(
                  texel,
-@@ -216,7 +355,7 @@ impl RotatedCopies {
+@@ -222,7 +364,7 @@ impl RotatedCopies {
                  narrow(row_pitch)?,
                  source_map(rotation, [width, height], turn),
                  narrow(tight_words)?,
@@ -299,7 +303,7 @@ index 22af3ce3..d3d78e5a 100644
              ))
          };
          let keep = into_shape(Turn::Keep)?;
-@@ -233,7 +372,7 @@ impl RotatedCopies {
+@@ -239,7 +381,7 @@ impl RotatedCopies {
                      narrow(tight_pitch)?,
                      source_map(rotation, [width, height], Turn::Store),
                      narrow(stored_words)?,
@@ -308,7 +312,7 @@ index 22af3ce3..d3d78e5a 100644
                  ),
                  at: shapes_at + SHAPE_SLOT,
                  groups: back_groups,
-@@ -286,6 +425,10 @@ impl RotatedCopies {
+@@ -293,6 +435,11 @@ impl RotatedCopies {
              apart: loads_apart(rotation, [width, height]),
              kernel,
              sets,
@@ -316,24 +320,27 @@ index 22af3ce3..d3d78e5a 100644
 +            held: AtomicU64::new(u64::MAX),
 +            epoch: AtomicU64::new(0),
 +            frame_bytes: tight_bytes,
++            turned: rotation != 0,
          })
      }
  
-@@ -317,6 +460,9 @@ impl RotatedCopies {
+@@ -324,6 +471,11 @@ impl RotatedCopies {
              Turn::Store => (&self.moves[1], &self.moves[1].shape, self.sets.sets[1]),
          };
          let general = vk::ImageLayout::GENERAL;
-+        STATS[if into { 0 } else { 2 }].fetch_add(1, Ordering::Relaxed);
-+        STATS[3].fetch_add(3 * self.frame_bytes, Ordering::Relaxed);
-+        STATS[4].fetch_add(1, Ordering::Relaxed);
++        if self.turned {
++            STATS[if into { 0 } else { 2 }].fetch_add(1, Ordering::Relaxed);
++            STATS[3].fetch_add(3 * self.frame_bytes, Ordering::Relaxed);
++            STATS[4].fetch_add(1, Ordering::Relaxed);
++        }
          // SAFETY: the caller's contract; the copies lie in the buffers and the image (planned
          // when the texture was made), the shape's 52 bytes fit its slot, and the sets bind the
          // texture's own buffers.
-@@ -358,6 +504,17 @@ impl RotatedCopies {
+@@ -365,6 +517,17 @@ impl RotatedCopies {
                      general,
                      &self.regions,
                  );
-+            } else if whole_back() {
++            } else if self.turned && whole_back() {
 +                // rotfb4: the staging buffer back into the plane as one copy, from its first texel
 +                // to its last, where it was a copy of each row (2436 of them for Core Animation's
 +                // landscape framebuffer): the bytes between rows take the kernel's zeros, which
@@ -348,10 +355,10 @@ index 22af3ce3..d3d78e5a 100644
                  device.cmd_copy_buffer(command_buffer, staging.raw(), bytes, &staging.back);
              }
 diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
-index 9e37fb96..2c157583 100644
+index f824e002..ac8370cd 100644
 --- a/crates/metal2vulkan-runtime/src/shadow.rs
 +++ b/crates/metal2vulkan-runtime/src/shadow.rs
-@@ -329,6 +329,14 @@ impl ShadowCopies {
+@@ -335,6 +335,14 @@ impl ShadowCopies {
          }
      }
  
@@ -366,7 +373,7 @@ index 9e37fb96..2c157583 100644
      /// Whether a render pass that draws loads this shadow other than by the inverse of its
      /// store: a rotated texture's frame of rotation 4 (`rotated.rs`).
      pub(super) fn loads_apart(&self) -> bool {
-@@ -1185,6 +1193,13 @@ impl<M: Clone> ShadowSync<M> {
+@@ -1247,6 +1255,13 @@ impl<M: Clone> ShadowSync<M> {
                  entry.current = false;
              }
          }

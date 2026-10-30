@@ -1,0 +1,277 @@
+diff --git a/crates/metal2vulkan-runtime/src/buffer_texture.rs b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+index 2872bb7..6082ef4 100644
+--- a/crates/metal2vulkan-runtime/src/buffer_texture.rs
++++ b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+@@ -1206,11 +1206,46 @@ impl Texels {
+             true => 4,
+             false => self.texel_bytes,
+         };
+-        let staging = if at.is_multiple_of(align) {
++        // ios-on-pixel: Turnip copies a buffer whose rows are not 64-byte multiples, or whose
++        // first texel is not 64-byte aligned, to and from an image one 2D blit per row on the
++        // A6xx (`tu_copy_buffer_to_image`, `tu_copy_image_to_buffer`; the 2D engine's source
++        // pitch is in 64-byte units, A6XX `TPL1_A2D_SRC_TEXTURE_PITCH`). Such a one-slice color
++        // texture's copies go through its staging buffer: at 64-byte rows a staged copy is one
++        // blit; at other rows the rotation kernel at rotation 0 repacks them, rows 64 bytes
++        // apart (`repack`). `SWEET_SHADOW_REPACK=0` copies as before.
++        let unaligned_rows = !layout.row_pitch.is_multiple_of(64);
++        let repacks = crate::sweet_counts::repack_enabled()
++            && aspects == vk::ImageAspectFlags::COLOR
++            && layout.slices == 1
++            && matches!(self.texel_bytes, 1 | 2 | 4 | 8 | 16)
++            && layout.row_bytes == (layout.row_bytes / self.texel_bytes) * self.texel_bytes
++            && (unaligned_rows || !at.is_multiple_of(64));
++        let staging = if at.is_multiple_of(align) && !repacks {
+             None
+         } else {
+             Some(self.staging(layout, at)?)
+         };
++        let repack = match (&staging, repacks && unaligned_rows) {
++            (Some(staging), true) => {
++                let frame = Frame {
++                    rotation: 0,
++                    extent: [
++                        (layout.row_bytes / self.texel_bytes) as u32,
++                        layout.rows as u32,
++                    ],
++                    texel_bytes: self.texel_bytes,
++                    row_pitch: layout.row_pitch,
++                    span: layout.end() - layout.offset,
++                };
++                // Refused (a buffer past `maxStorageBufferRange`, a grid too large): copied as
++                // before.
++                let hazard = self.options.hazard_tracking_mode()?;
++                RotatedCopies::new(self.buffer.device(), staging, frame, hazard)
++                    .ok()
++                    .map(Box::new)
++            }
++            _ => None,
++        };
+         let start = staging
+             .as_ref()
+             .map_or(at, |staging| staging.into.dst_offset);
+@@ -1249,6 +1284,7 @@ impl Texels {
+                     regions,
+                     staging,
+                     texel: Some(self.texel_bytes),
++                    repack,
+                 },
+                 alias: self.buffer.alias().map(|alias| alias.key),
+             },
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index 4781491..93c5ee9 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -169,6 +169,8 @@ mod sampler_listing;
+ mod scheduler;
+ mod shader_cache;
+ mod shadow;
++/// ios-on-pixel: shadow copy counts for the SweetMetal2 bridge's telemetry.
++pub mod sweet_counts;
+ mod shadow_merge;
+ mod shadow_stencil;
+ mod sharing;
+diff --git a/crates/metal2vulkan-runtime/src/rotated.rs b/crates/metal2vulkan-runtime/src/rotated.rs
+index 22af3ce..1b43f11 100644
+--- a/crates/metal2vulkan-runtime/src/rotated.rs
++++ b/crates/metal2vulkan-runtime/src/rotated.rs
+@@ -175,7 +175,13 @@ impl RotatedCopies {
+             span,
+         } = frame;
+         let [stored_width, stored_height] = stored_extent(rotation, [width, height]);
+-        let tight_pitch = u64::from(width) * texel_bytes;
++        // ios-on-pixel: at rotation 0 (a texture repacked, `shadow.rs`'s `repack`) the tight
++        // buffer's rows lie 64 bytes apart, a pitch Turnip copies into an image in one blit (it
++        // copies one row per blit otherwise on the A6xx). Every texel size divides 64.
++        let tight_pitch = match rotation {
++            0 => (u64::from(width) * texel_bytes).next_multiple_of(64),
++            _ => u64::from(width) * texel_bytes,
++        };
+         let tight_bytes = (tight_pitch * u64::from(height)).next_multiple_of(4);
+         let staged_bytes = span.next_multiple_of(4);
+         let limits = &device.properties().description.limits;
+@@ -260,7 +266,8 @@ impl RotatedCopies {
+         )?;
+         let regions = [vk::BufferImageCopy {
+             buffer_offset: tight_at,
+-            buffer_row_length: 0,
++            // Texels; the tight rows `tight_pitch` apart (wider than the frame at rotation 0).
++            buffer_row_length: narrow(tight_pitch / texel_bytes)?,
+             buffer_image_height: 0,
+             image_subresource: vk::ImageSubresourceLayers {
+                 aspect_mask: vk::ImageAspectFlags::COLOR,
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index c468031..13d45c3 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -244,6 +244,12 @@ pub(super) enum ShadowTarget {
+         /// texture ([`ShadowCopy::area`]) offsets its region; `None` where no copy of it is
+         /// bounded (a heap's depth or stencil texture, which is no color attachment).
+         texel: Option<u64>,
++        /// ios-on-pixel: where the texture's rows are not 64-byte multiples (or its first texel
++        /// is not 64-byte aligned), copies through `staging`, a tight buffer of rows 64 bytes
++        /// apart, and the rotation kernel at rotation 0 (`rotated.rs`): Turnip on the A6xx copies
++        /// a buffer of such rows to or from an image one 2D blit per row, which cost ~0.5 ms per
++        /// small texture per frame. `None` copies as `regions` say.
++        repack: Option<Box<RotatedCopies>>,
+     },
+     /// A texture buffer's staging buffer, which its bindings view.
+     Buffer(ShadowStaging),
+@@ -540,6 +546,14 @@ impl ShadowCopy {
+             || matches!(
+                 self.copies.target(),
+                 Some(ShadowTarget::Rotated { .. } | ShadowTarget::Planes { .. })
++            )
++            || matches!(
++                self.copies.target(),
++                Some(ShadowTarget::Image {
++                    repack: Some(_),
++                    staging: Some(_),
++                    ..
++                })
+             );
+         let converted = matches!(self.copies.source, ShadowSource::Converted { .. });
+         let encoded = matches!(self.copies.source, ShadowSource::YCbCrWrite { .. });
+@@ -727,7 +741,27 @@ impl ShadowCopy {
+                 regions,
+                 staging,
+                 texel,
++                repack,
+             } => {
++                let moved: u64 = regions
++                    .iter()
++                    .map(|r| {
++                        u64::from(r.image_extent.width)
++                            * u64::from(r.image_extent.height)
++                            * texel.unwrap_or(0)
++                    })
++                    .sum();
++                if let (Some(turn), Some(staging)) = (repack, staging) {
++                    crate::sweet_counts::copied(moved, true);
++                    let turned = if into_shadow { Turn::Load } else { Turn::Store };
++                    // SAFETY: the caller's contract, which the turn's record takes; at rotation
++                    // 0 every turn into the image is the identity.
++                    unsafe {
++                        turn.record(device, command_buffer, *image, (buffer, staging), turned);
++                    }
++                    return;
++                }
++                crate::sweet_counts::copied(moved, false);
+                 let regions = match (self.area, staging, regions.as_slice(), *texel) {
+                     (Some(area), None, [region], Some(texel)) if !into_shadow => {
+                         match part_of(region, area, texel) {
+@@ -1153,6 +1187,9 @@ impl<M: Clone> ShadowSync<M> {
+                     ShadowSource::Converted { conversion, .. } => !conversion.needs_copy_in(),
+                     _ => false,
+                 };
++                if unchanged && !overwrites {
++                    crate::sweet_counts::skipped();
++                }
+                 if !overwrites && !unchanged {
+                     copies.push(ShadowCopy {
+                         copies: Arc::clone(&shadow.copies),
+diff --git a/crates/metal2vulkan-runtime/src/sweet_counts.rs b/crates/metal2vulkan-runtime/src/sweet_counts.rs
+new file mode 100644
+index 0000000..bd87c5a
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/sweet_counts.rs
+@@ -0,0 +1,55 @@
++//! ios-on-pixel: process-wide counts of shadowed textures' copies (`shadow.rs`), which the
++//! SweetMetal2 bridge reads for its telemetry (`J copies` lines in the kernel's log).
++//!
++//! - **copies**, **bytes**: copies between a buffer's bytes and a 2D texture's shadow image
++//!   recorded, either way, and the texel bytes they moved;
++//! - **repacked**: of those, the ones made through the rotation kernel at rotation 0 into rows
++//!   64 bytes apart (`ShadowTarget::Image::repack`), which Turnip copies in one blit;
++//! - **skipped**: converted (two-plane YCbCr) copies in not made, the planes' generation held;
++//! - **refusals**: `DRM_FORMAT_MOD_LINEAR` layouts the driver refused, or that were refused
++//!   again unasked (`texture/pitch_refusals.rs`), each a texture made a shadow instead.
++
++use std::sync::atomic::{AtomicU64, Ordering};
++
++static COPIES: AtomicU64 = AtomicU64::new(0);
++static BYTES: AtomicU64 = AtomicU64::new(0);
++static REPACKED: AtomicU64 = AtomicU64::new(0);
++static SKIPPED: AtomicU64 = AtomicU64::new(0);
++static REFUSALS: AtomicU64 = AtomicU64::new(0);
++
++/// A copy of `bytes` texel bytes recorded, `repacked` through the kernel or not.
++pub(crate) fn copied(bytes: u64, repacked: bool) {
++    COPIES.fetch_add(1, Ordering::Relaxed);
++    BYTES.fetch_add(bytes, Ordering::Relaxed);
++    if repacked {
++        REPACKED.fetch_add(1, Ordering::Relaxed);
++    }
++}
++
++/// A converted copy in not made.
++pub(crate) fn skipped() {
++    SKIPPED.fetch_add(1, Ordering::Relaxed);
++}
++
++/// A linear layout refused.
++pub(crate) fn refused() {
++    REFUSALS.fetch_add(1, Ordering::Relaxed);
++}
++
++/// The counts since the process started: copies, bytes, repacked, skipped, refusals.
++pub fn snapshot() -> [u64; 5] {
++    [
++        COPIES.load(Ordering::Relaxed),
++        BYTES.load(Ordering::Relaxed),
++        REPACKED.load(Ordering::Relaxed),
++        SKIPPED.load(Ordering::Relaxed),
++        REFUSALS.load(Ordering::Relaxed),
++    ]
++}
++
++/// Whether textures whose rows Turnip copies a blit per row repack (env `SWEET_SHADOW_REPACK`,
++/// on unless `0`).
++pub(crate) fn repack_enabled() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("SWEET_SHADOW_REPACK").map_or(true, |v| v.trim() != "0"))
++}
+diff --git a/crates/metal2vulkan-runtime/src/tests/shadow.rs b/crates/metal2vulkan-runtime/src/tests/shadow.rs
+index 2120cac..4e645db 100644
+--- a/crates/metal2vulkan-runtime/src/tests/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/tests/shadow.rs
+@@ -35,6 +35,7 @@ fn shadow_joined(
+                 regions: Vec::new(),
+                 staging: None,
+                 texel: Some(4),
++                repack: None,
+             },
+             alias,
+         },
+diff --git a/crates/metal2vulkan-runtime/src/texture/heap.rs b/crates/metal2vulkan-runtime/src/texture/heap.rs
+index 1210427..5e1c0e1 100644
+--- a/crates/metal2vulkan-runtime/src/texture/heap.rs
++++ b/crates/metal2vulkan-runtime/src/texture/heap.rs
+@@ -2535,6 +2535,7 @@ impl Device {
+                         regions,
+                         staging: None,
+                         texel: None,
++                        repack: None,
+                     },
+                     // A heap's bytes join no other memory (`host_aliases.rs`).
+                     alias: None,
+diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
+index 7fda01b..5afb309 100644
+--- a/crates/metal2vulkan-runtime/src/work_counts.rs
++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
+@@ -499,6 +499,7 @@ impl Counters {
+     /// `host_pitched_image`).
+     #[cfg(unix)]
+     pub(crate) fn pitched_host_image_refused(&self) {
++        crate::sweet_counts::refused();
+         self.pitched_host_image_refusals
+             .fetch_add(1, Ordering::Relaxed);
+     }
+@@ -507,6 +508,7 @@ impl Counters {
+     /// image before (`texture/pitch_refusals.rs`).
+     #[cfg(unix)]
+     pub(crate) fn pitched_host_image_refusal_recalled(&self) {
++        crate::sweet_counts::refused();
+         self.pitched_host_image_refusals_recalled
+             .fetch_add(1, Ordering::Relaxed);
+     }

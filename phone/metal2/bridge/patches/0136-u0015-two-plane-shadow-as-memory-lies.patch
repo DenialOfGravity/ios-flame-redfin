@@ -1,0 +1,67 @@
+ios-redfin bridge patch 0136: port of UniXNU AdrenoMetal bridge/patches/0015-two-plane-shadow-as-memory-lies.patch
+Original author: bluseliu50 <265648257+bluseliu50@users.noreply.github.com> (UniXNU/AdrenoMetal ce5e19e, BSD-2-Clause-Patent).
+Ported onto metal2vulkan 720ef1ce + ios-redfin bridge patches 0001-0111 for the redfin port; changes from the original are
+marked 'ios-on-pixel (bridge 0136)'. Knob: SWEET_U0015=1 (default off: the image is zeroed first).
+See phone/metal2/bridge/UNIXNU-PORT.md.
+
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index c9ff2e10..c79ba385 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -3282,7 +3282,8 @@ impl Device {
+     /// its storage mode: a heap texture's in memory of its own where its bytes in the heap are no
+     /// layout of its texels (`texture/heap.rs`, `AliasRoute::Lossless`), as a heap's textures hold
+     /// what their bytes held; and the shadow of a texture over a buffer whose copy in writes every
+-    /// texel of every aspect before any command reads it (`storage_over_buffer`).
++    /// texel of every aspect before any command reads it (`storage_over_buffer`, and a two-plane
++    /// texture's over a surface's planes, `texture/surface_two_planes.rs`).
+     fn new_image_as_it_lies(
+         &self,
+         plan: ImagePlan,
+diff --git a/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs b/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
+index 44931f57..e549851a 100644
+--- a/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
++++ b/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
+@@ -58,6 +58,7 @@ use crate::degradation::Degradation;
+ use crate::error::{Error, RuntimeGap};
+ use crate::image_plan::plan_image;
+ use crate::linear_plan::{BufferLayout, LINEAR_ALIGNMENT};
++use crate::resource::Identity;
+ use crate::shadow::{ShadowBuffer, ShadowCopies, ShadowSource, ShadowTarget};
+ use crate::texture_descriptor::{texture_usage, TextureDescriptor, TextureLayout};
+ use crate::tracker::UseRange;
+@@ -206,7 +207,20 @@ impl Device {
+             return Err(Error::NotImplemented(RuntimeGap::Textures));
+         }
+         let hazard = texels.options().hazard_tracking_mode()?;
+-        let image = self.new_image(plan, layout, descriptor, hazard)?;
++        // Its copy in writes every texel of its one aspect before any command reads it, or a pass
++        // that clears it whole does (`shadow.rs`, `render/shadows.rs`), so it starts as its memory
++        // lies, as the other shadows of a buffer's bytes do (`storage_over_buffer`): zeros there
++        // would never be read, and the host's zeros copied into a full-screen surface's image
++        // were most of its making on a phone's render server.
++        // ios-on-pixel (bridge 0136, UniXNU 0015): only with env `SWEET_U0015` on; else zeroed
++        // first, as before.
++        let image = match sweet_u0015() {
++            true => {
++                let identity = Identity::new(hazard, false);
++                self.new_image_as_it_lies(plan, layout, descriptor, identity, Device::runtime_owner)?
++            }
++            false => self.new_image(plan, layout, descriptor, hazard)?,
++        };
+         let (raw, start) = texels.buffer.at(color.offset);
+         let staging = HeapPlaneCopies::staging(self, &planes, start, hazard)?;
+         let moves = Box::new(HeapPlaneCopies::new(self, &staging, &planes, hazard)?);
+@@ -256,3 +270,12 @@ impl Device {
+         Ok(Texture::made(self, storage, record, None, id_use))
+     }
+ }
++
++/// ios-on-pixel (bridge 0136, UniXNU 0015): whether a two-plane texture's shadow starts as its
++/// memory lies (env `SWEET_U0015`, off unless set and not `0`).
++fn sweet_u0015() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        std::env::var("SWEET_U0015").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
++    })
++}

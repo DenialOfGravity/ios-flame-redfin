@@ -1,0 +1,91 @@
+sweet 0109 (u-tr): four upstream Mesa fixes from after our pin 85fda3b3 that touch the a6xx paths we use, backported
+as they are (drop this patch on a Mesa bump past them):
+  cadc7e42 tu/a6xx: Invalidate shared consts before disabling them (MR 45447): SP_UPDATE_CNTL before HLSQ_SHARED_CONSTS,
+           or a pending shared-consts load can write a previous pipeline's push constants into the next draw's consts
+  5cf8c6b2 tu: Don't bail after the first instr when gathering push const range (MR 45129)
+  c140fdd2 tu: Fix resetting command streams with writeable BOs (MR 43045)
+  761d5c8a tu/a6xx: Set correct value for GRAS_MODE_CNTL (0x2 on a6xx too; misrendering/hangs on a650).
+           SWEET_TU_GRAS_MODE_CNTL_OLD=1 puts back the pin's 0.
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index ef66976..14dad50 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -2220,7 +2220,10 @@ tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs)
+    tu_cs_emit_regs(cs, A6XX_VFD_MODE_CNTL(.vertex = true, .instance = true));
+    tu_cs_emit_write_reg(cs, REG_A6XX_RB_MODE_CNTL, 0x00000010);
+ 
+-   tu_cs_emit_regs(cs, GRAS_MODE_CNTL(CHIP, CHIP >= A7XX ? 0x2 : 0));
++   /* sweet 0109 (u-tr): upstream 761d5c8a ("tu/a6xx: Set correct value for GRAS_MODE_CNTL", 0x2 on a6xx too, a650
++    * misrendering/hang fix); SWEET_TU_GRAS_MODE_CNTL_OLD=1 puts back the 0 that a6xx had at our pin. */
++   static const bool sweet_gras_old = debug_get_bool_option("SWEET_TU_GRAS_MODE_CNTL_OLD", false);
++   tu_cs_emit_regs(cs, GRAS_MODE_CNTL(CHIP, CHIP >= A7XX || !sweet_gras_old ? 0x2 : 0));
+ 
+    tu_cs_emit_write_reg(cs, REG_A6XX_RB_UNKNOWN_8818, 0);
+ 
+diff --git a/src/freedreno/vulkan/tu_cs.cc b/src/freedreno/vulkan/tu_cs.cc
+index 47e1939..95a28bd 100644
+--- a/src/freedreno/vulkan/tu_cs.cc
++++ b/src/freedreno/vulkan/tu_cs.cc
+@@ -534,6 +534,8 @@ tu_cs_reset(struct tu_cs *cs)
+    if (cs->read_write.bo_count) {
+       cs->read_write.bos[0] = cs->read_write.bos[cs->read_write.bo_count - 1];
+       cs->read_write.bo_count = 1;
++
++      cs->read_write.start = (uint32_t *) cs->read_write.bos[0]->map;
+    }
+ 
+    cs->entry_count = 0;
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index 1b778a0..2153056 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -1353,12 +1353,20 @@ tu6_emit_program_config(struct tu_cs *cs,
+ 
+    bool shared_consts_enable =
+       prog->shared_consts.type == IR3_PUSH_CONSTS_SHARED;
+-   tu6_emit_shared_consts_enable<CHIP>(crb, shared_consts_enable);
+ 
++   /* A6XX: SP_UPDATE_CNTL::GFX_SHARED_CONST only has an effect while HLSQ_SHARED_CONSTS is enabled.
++    * If SP_UPDATE_CNTL is emitted after shared consts are disabled, it _presumably_ doesn't clear
++    * the pending shared consts load of a previous pipeline. If there is an event between the draws,
++    * the second draw executes in the same context as the previous one (an event also flips the
++    * context), and the pending load writes the old shared consts into its const space. So
++    * SP_UPDATE_CNTL must happen before HLSQ_SHARED_CONSTS.
++    */
+    crb.add(SP_UPDATE_CNTL(CHIP, .vs_state = true, .hs_state = true,
+                           .ds_state = true, .gs_state = true,
+                           .fs_state = true, .gfx_uav = true,
+-                          .gfx_shared_const = shared_consts_enable));
++                          .gfx_shared_const = CHIP == A6XX));
++
++   tu6_emit_shared_consts_enable<CHIP>(crb, shared_consts_enable);
+ 
+    const struct ir3_shader_variant *vs = variants[MESA_SHADER_VERTEX];
+    const struct ir3_shader_variant *hs = variants[MESA_SHADER_TESS_CTRL];
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index d99d55c..f881b4a 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -1180,7 +1180,6 @@ gather_push_constants(nir_shader *shader, struct tu_shader *tu_shader)
+             uint32_t range = nir_intrinsic_range(intrin);
+             min = MIN2(min, base);
+             max = MAX2(max, base + range);
+-            break;
+          }
+       }
+    }
+@@ -2155,10 +2154,11 @@ tu6_emit_cs_config(struct tu_cs *cs,
+       ir3_const_state(v)->push_consts_type == IR3_PUSH_CONSTS_SHARED;
+ 
+    with_crb (cs) {
+-      tu6_emit_shared_consts_enable<CHIP>(crb, shared_consts_enable);
+-
++      /* A6XX: SP_UPDATE_CNTL must happen before HLSQ_SHARED_CONSTS(), see tu6_emit_program_config */
+       crb.add(SP_UPDATE_CNTL(CHIP, .cs_state = true, .cs_uav = true,
+-                             .cs_shared_const = shared_consts_enable));
++                             .cs_shared_const = CHIP == A6XX));
++
++      tu6_emit_shared_consts_enable<CHIP>(crb, shared_consts_enable);
+       tu6_emit_xs_config<CHIP>(crb, { .cs = v });
+       tu6_emit_xs<CHIP>(crb, cs->device, MESA_SHADER_COMPUTE, v, pvtmem, binary_iova);
+    }

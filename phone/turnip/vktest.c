@@ -15,6 +15,8 @@
 
 static PFN_vkGetInstanceProcAddr gipa;
 static PFN_vkGetDeviceProcAddr gdpa;
+/* u-perfctr: Turnip 0113's counter report (SWEET_TIMELINE=1 SWEET_TU_PERFCTR=<preset> [SWEET_TU_PERFCTR_DRAW=1]) */
+static size_t (*perf_report)(char *, size_t, unsigned);
 static VkInstance inst;
 static VkDevice dev;
 #define IFN(n) PFN_##n n = (PFN_##n)gipa(inst, #n)
@@ -189,6 +191,125 @@ static int test_compute(void)
 	return bad != 0;
 }
 
+
+/* u-gpudraw: fill rate. vktest bench [N]: N (default 40) full-target triangles of tri.frag into a 1125x2436 BGRA8
+ * image (CA's framebuffer size), blend off and src-alpha blend on, in one render pass; the GPU time per draw is the
+ * submit time of N draws minus that of 1 draw, over N-1. TU_DEBUG=sysmem|gmem picks the mode.
+ * u-perfctr: then alu.frag (16 dependent vec4 mul+fma steps: ~128 fp32 ALU instructions a pixel) and alu16.frag (the
+ * same in mediump), blend off, to calibrate the ALU counters; with Turnip 0113's counters on, a "PERF" report after
+ * each variant. */
+static double fill_run(VkPipeline p, VkImageView view, uint32_t W, uint32_t H, VkImage img, int draws)
+{
+	DFN(vkCmdPipelineBarrier); DFN(vkCmdBeginRendering); DFN(vkCmdEndRendering); DFN(vkCmdBindPipeline);
+	DFN(vkCmdDraw); DFN(vkCmdSetViewport); DFN(vkCmdSetScissor);
+	VkCommandBuffer c = begin();
+	VkImageMemoryBarrier b0 = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .image = img,
+		.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+	vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &b0);
+	VkRenderingAttachmentInfo att = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view,
+		.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+		.storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue.color.float32 = { 0, 0, 1, 1 } };
+	VkRenderingInfo rinfo = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { W, H } }, .layerCount = 1,
+		.colorAttachmentCount = 1, .pColorAttachments = &att };
+	vkCmdBeginRendering(c, &rinfo);
+	vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+	VkViewport v = { 0, 0, W, H, 0, 1 };
+	VkRect2D sc = { { 0, 0 }, { W, H } };
+	vkCmdSetViewport(c, 0, 1, &v);
+	vkCmdSetScissor(c, 0, 1, &sc);
+	for (int i = 0; i < draws; i++)
+		vkCmdDraw(c, 3, 1, 0, 0);
+	vkCmdEndRendering(c);
+	return submit_wait(c);
+}
+
+static int bench_fill(int n)
+{
+	DFN(vkCreateImage); DFN(vkGetImageMemoryRequirements); DFN(vkAllocateMemory); DFN(vkBindImageMemory);
+	DFN(vkCreateImageView); DFN(vkCreatePipelineLayout); DFN(vkCreateGraphicsPipelines);
+	const uint32_t W = 1125, H = 2436;
+	VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
+	VkImageCreateInfo ii = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+		.format = fmt, .extent = { W, H, 1 }, .mipLevels = 1, .arrayLayers = 1,
+		.samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+		.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT };
+	VkImage img;
+	CHECK(vkCreateImage(dev, &ii, NULL, &img));
+	VkMemoryRequirements mr;
+	vkGetImageMemoryRequirements(dev, img, &mr);
+	VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+		.memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) };
+	VkDeviceMemory im;
+	CHECK(vkAllocateMemory(dev, &ai, NULL, &im));
+	CHECK(vkBindImageMemory(dev, img, im, 0));
+	VkImageViewCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+		.format = fmt, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+	VkImageView view;
+	CHECK(vkCreateImageView(dev, &vi, NULL, &view));
+	VkPipelineLayoutCreateInfo pli = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+	VkPipelineLayout pl;
+	CHECK(vkCreatePipelineLayout(dev, &pli, NULL, &pl));
+	VkPipelineShaderStageCreateInfo st[2] = {
+		{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+		  .module = module(full_vert, sizeof(full_vert)), .pName = "main" },
+		{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+		  .module = module(tri_frag, sizeof(tri_frag)), .pName = "main" },
+	};
+	VkPipelineVertexInputStateCreateInfo vin = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+	VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+		.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+	VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1,
+		.scissorCount = 1 };
+	VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+		.polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1 };
+	VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+		.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+	VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+	VkPipelineDynamicStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2,
+		.pDynamicStates = dyn };
+	VkPipelineRenderingCreateInfo ri = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1,
+		.pColorAttachmentFormats = &fmt };
+	static const char *names[4] = { "fill", "fill", "alu32", "alu16" };
+	if (perf_report) {	/* what ran before the bench is not its */
+		char drop[1400];
+		for (unsigned part = 0; part < 3; part++)
+			perf_report(drop, sizeof(drop), part);
+	}
+	for (int variant = 0; variant < 4; variant++) {
+		const int blend = variant == 1;
+		st[1].module = variant < 2 ? module(tri_frag, sizeof(tri_frag)) :
+			variant == 2 ? module(alu_frag, sizeof(alu_frag)) : module(alu16_frag, sizeof(alu16_frag));
+		VkPipelineColorBlendAttachmentState cba = { .colorWriteMask = 0xf, .blendEnable = (VkBool32)blend,
+			.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+			.colorBlendOp = VK_BLEND_OP_ADD, .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+			.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .alphaBlendOp = VK_BLEND_OP_ADD };
+		VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+			.attachmentCount = 1, .pAttachments = &cba };
+		VkGraphicsPipelineCreateInfo gpi = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
+			.stageCount = 2, .pStages = st, .pVertexInputState = &vin, .pInputAssemblyState = &ia, .pViewportState = &vp,
+			.pRasterizationState = &rs, .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &ds, .layout = pl };
+		VkPipeline p;
+		CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, NULL, &p));
+		double one = 1e9, many = 1e9;
+		for (int r = 0; r < 5; r++) {
+			double a = fill_run(p, view, W, H, img, 1), b = fill_run(p, view, W, H, img, n);
+			if (a < one) one = a;
+			if (b < many) many = b;
+		}
+		const double per = (many - one) / (n - 1);
+		printf("BENCH %s %ux%u blend %d: 1 draw %.2f ms, %d draws %.2f ms -> %.3f ms per full-target draw, %.3f ns/px, %.2f px/clk at 625 MHz\n",
+		       names[variant], W, H, blend, one, n, many, per, per * 1e6 / ((double)W * H), (double)W * H / (per * 1e-3 * 625e6));
+		if (perf_report) {	/* the counters of this variant's 5 + 5 passes (1 and N draws) */
+			char text[1400];
+			for (unsigned part = 0; part < 3; part++)
+				if (perf_report(text, sizeof(text), part))
+					printf("PERF %s blend %d part %u: %s\n", names[variant], blend, part, text);
+		}
+	}
+	return 0;
+}
+
 static int test_draw(void)
 {
 	DFN(vkCreateImage); DFN(vkGetImageMemoryRequirements); DFN(vkAllocateMemory); DFN(vkBindImageMemory);
@@ -316,6 +437,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	printf("loaded %s in %.0f ms\n", lib, now_ms() - t0);
+	perf_report = (size_t (*)(char *, size_t, unsigned))dlsym(h, "sweet_tu_perf_report");
 	PFN_vkCreateInstance vkCreateInstance = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
 	VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "vktest", .apiVersion = VK_API_VERSION_1_3 };
 	VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
@@ -353,6 +475,10 @@ int main(int argc, char **argv)
 	VkCommandPoolCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = 0 };
 	CHECK(vkCreateCommandPool(dev, &cpi, NULL, &pool));
 	int fails = test_empty();
+	if (argc > 2 && !strcmp(argv[2], "bench")) {
+		bench_fill(argc > 3 ? atoi(argv[3]) : 40);
+		return 0;
+	}
 	fails += test_fill();
 	fails += test_compute();
 	fails += test_draw();
