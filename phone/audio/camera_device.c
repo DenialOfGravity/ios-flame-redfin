@@ -481,9 +481,12 @@ static const struct camera {
 	 * as HackiOS's phone's was */
 	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", true, 2.59, 2.0, 1.12, 70.9,
 	  { { 3088, 2320, 30, REDWOOD_CAMERA_MODE_PHOTO }, { 3840, 2160, 30, REDWOOD_CAMERA_MODE_VIDEO } }, false },  /* "Photo", "Video-30" */
-	/* (the iPhone 11's uniqueID for its ultra-wide; the back camera's plist keys) */
+	/*
+	 * (the iPhone 11's uniqueID for its ultra-wide) redfin: the IMX481's own modes (kernel, verified): photo 7,
+	 * 2328x1746 at 30; video and video60 both 3, 2328x1310 at 60
+	 */
 	{ 3, "Back Ultra Wide Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:5", false, 2.13, 2.2, 1.0, 94.5,
-	  { { 4032, 3024, 30, REDWOOD_CAMERA_MODE_PHOTO }, { 4224, 2376, 60, REDWOOD_CAMERA_MODE_VIDEO60 } }, false },
+	  { { 2328, 1746, 30, REDWOOD_CAMERA_MODE_PHOTO }, { 2328, 1310, 60, REDWOOD_CAMERA_MODE_VIDEO60 } }, false },
 };
 #define CAMERAS 3
 
