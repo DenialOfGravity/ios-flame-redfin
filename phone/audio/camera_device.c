@@ -896,6 +896,24 @@ gains_of(CFTypeRef value, float g[3])
 	return true;
 }
 
+/*
+ * FlashMode: the capture stack sets it as a string (r21: "ForceFlashOff", "ForceFlashOn", "AutoFlash"), or a number (0 off,
+ * 1 on, 2 auto); anything else leaves the mode as it was.
+ */
+static int
+flash_mode_of(CFTypeRef value, int otherwise)
+{
+	double mode;
+
+	if (value != NULL && CFGetTypeID(value) == CFStringGetTypeID()) {
+		return name_has(value, "Off") ? 0 : name_has(value, "Auto") ? 2 : name_has(value, "On") ? 1 : otherwise;
+	}
+	if (number_of(value, &mode)) {
+		return mode <= 0 ? 0 : mode >= 2 ? 2 : 1;
+	}
+	return otherwise;
+}
+
 /* StillImageCaptureNow's: how many pictures, and the flash (0 off, 1 on, 2 auto; -1 not said) */
 static void
 still_request(CFTypeRef value, unsigned *count, int *flash)
@@ -1184,11 +1202,13 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 	}
 	/* ---- redfin (plan B6): the flash ---- */
 	if (key_is(key, "FlashMode")) {
-		double mode = 0;
+		int mode = flash_mode_of(value, s->flash_mode);
 
-		number_of(value, &mode);
-		s->flash_mode = mode <= 0 ? 0 : mode >= 2 ? 2 : 1;
 		say_value("stream: set", key, value);
+		if (mode != s->flash_mode) {
+			say("stream: flash mode %d (%s)", mode, mode == 0 ? "off" : mode == 1 ? "on" : "auto");
+		}
+		s->flash_mode = mode;
 		return 0;
 	}
 	if (key_is(key, "AutoFocusNow") || key_is(key, "ContinuousAutoFocusNow") || key_is(key, "FocusNow") ||
