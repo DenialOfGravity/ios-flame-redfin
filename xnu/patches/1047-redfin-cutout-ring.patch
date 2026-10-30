@@ -1,0 +1,420 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Fri, 30 Oct 2026 12:00:00 +0000
+Subject: [PATCH] 1047 redfin: camera cutout ring (kern.sweet_cutout_aa)
+
+An anti-aliased black disc over the selfie-camera hole (LineageOS redfin
+cutout: centre 81,77, radius 39-40 panel px) hides the panel's jagged
+edge around it. kern.sweet_cutout_aa 0 off (default), 1 CPU disc drawn
+into each direct frame after its fence, 2 display engine: DMA0 staged on
+LM0 over the VIGs with a premultiplied 128x128 ARGB layer in splash
+memory (0xa2100000), set up once, no per-frame cost, also in the blit
+path. Geometry kern.sweet_cutout_x16/_y16/_r16/_aa16 or
+p cutout MODE [X16 Y16 R16 AA16]; SWEET CUTOUT 5 s line while on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC2ugyLE29nbFLJoQZd
+---
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index bee90a3..5064b30 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1773,6 +1773,35 @@ sysctl_sweet_vsync_lock SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_vsync_lock, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_vsync_lock, "I", "SWEET FB: vsync ticks + IOMFBDisplayRefresh on the measured panel period (0995 mask 7)");
+ 
++/*
++ * 1047: the camera cutout ring (SweetFramebuffer.cpp sweet_cut; default 0 = as before). kern.sweet_cutout_aa 0 off,
++ * 1 CPU disc in each direct frame, 2 display-engine layer (DMA0 on LM0, no per-frame cost, also the blit path);
++ * kern.sweet_cutout_x16 / _y16 / _r16 / _aa16: centre, radius, alpha-ramp width in 1/16 panel px (81,77 r 40.5 aa 1.5).
++ */
++extern int sweet_fb_cutout(int which, int value);       /* iokit/Kernel/arm/SweetFramebuffer.cpp */
++extern int sweet_fb_cutout_get(int which);
++static int
++sysctl_sweet_cutout SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, sweet_fb_cutout_get(arg2), sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	return sweet_fb_cutout(arg2, value);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cutout_aa, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_cutout, "I", "SWEET FB: camera cutout ring 0 off, 1 CPU (direct frames), 2 display engine (1047)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cutout_x16, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 1, sysctl_sweet_cutout, "I", "SWEET FB: cutout centre x, 1/16 panel px");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cutout_y16, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 2, sysctl_sweet_cutout, "I", "SWEET FB: cutout centre y, 1/16 panel px");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cutout_r16, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 3, sysctl_sweet_cutout, "I", "SWEET FB: cutout ring radius, 1/16 panel px");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cutout_aa16, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 4, sysctl_sweet_cutout, "I", "SWEET FB: cutout alpha ramp width, 1/16 panel px");
++
+ /* ---- buffers and submissions for Metal (iokit/Kernel/arm/SweetAccelerator.cpp) ---- */
+ 
+ #define USER_VA_BASE    0x200000000ULL  /* above the surface slots */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2c96689..692a669 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -370,6 +370,7 @@ public:
+ 	void          publishRefresh(uint64_t ns);
+ 	void          vsyncCmd(const char *s, const char *end);
+ 	int           vsyncLock(int on);             /* 1042 */
++	int           cutoutSet(int which, int value);  /* 1047 */
+ 	void          vsyncLockLine(void);
+ 	bool          presentCPU(const uint8_t *rec);
+ 	uintptr_t     cpuBuffer(uint64_t pa);
+@@ -3152,6 +3153,287 @@ sweet_scan_poll(AppleCLCD *fb, uint32_t id)
+ 	return pending ? kIOReturnBusy : kIOReturnSuccess;
+ }
+ 
++/*
++ * 1047: the camera cutout ring (kern.sweet_cutout_aa 0|1|2, bsd/dev/sweet_gpu.c; default 0 = as before). redfin's
++ * selfie camera is a hole in the panel's top-left corner (LineageOS redfin overlay config_mainBuiltInDisplayCutout:
++ * circle centre 81,77 radius 39 panel px, Android fills radius 40 black). The panel's pixel staircase around the hole
++ * shows as a jagged edge; an anti-aliased black disc a little larger than the hole hides it, as Android's
++ * config_fillMainBuiltInDisplayCutout does. Geometry in 1/16 panel px: kern.sweet_cutout_x16 / _y16 / _r16 (radius)
++ * / _aa16 (width of the alpha ramp), or p cutout MODE [X16 Y16 R16 AA16].
++ *   2 = the display engine blends it: DMA0 (free; the two VIGs carry the split frame) as one more stage on LM0, a
++ *       128x128 premultiplied ARGB layer in splash memory at SWEET_CUT_PA, set up once: no per-frame cost, panel
++ *       pixel exact, and the same in direct scanout and in the blit path (the pipes underneath do not matter).
++ *   1 = the CPU draws it into each direct frame after its fence, before the flip, like 0986's corners (in CA's
++ *       1125x2436 space, coverage from the panel geometry); direct scanout only. Cost in the 5 s line.
++ * Stage encoding as the SDE driver (sde_hw_ctl_setup_blendstage): CTL_LAYER field = stage + 1, blend registers of
++ * stage n at blendstage_base[n - 1]. ABL stages VIG0 at field 5 (LM0 blend 0x68); DMA0 goes to field 6 (0x80). Both
++ * 0x80 and 0x98 get the premultiplied op (fg const 0xff, bg = 1 - fg pixel alpha): over the black border that is
++ * also exact for the VIG should its stage be the next one. Old values go back at mode != 2.
++ */
++#define SWEET_CUT_PA            0xa2100000ULL   /* splash: above slot 0 (ends 0xa1eb8000), below the BL packet */
++#define SWEET_CUT_DIM           128u
++#define SWEET_CUT_LEN           (SWEET_CUT_DIM * SWEET_CUT_DIM * 4u)
++#define SWEET_CUT_FIELD         6u              /* CTL_LAYER(LM0) DMA0 bits 20:18 */
++#define LM_BLEND_OP(n)          (0x20u + 0x18u * (n))
++#define LM_BLEND_ALPHA(n)       (0x24u + 0x18u * (n))
++#define MDP_FLUSH_LM0           (1u << 6)
++#define MDP_FLUSH_DMA0          (1u << 11)
++#define MDP_FLUSH_CTL           (1u << 17)
++#define SSPP_UNPACK             0x034u
++#define SSPP_OP_MODE            0x038u
++#define SWEET_CA_W              1125u
++#define SWEET_CA_H              2436u
++static struct {
++	uint32_t mode;
++	int32_t  x16, y16, r16, aa16;
++	uint32_t ox, oy;                        /* the MDP layer's origin, panel px */
++	volatile uint32_t *va;                  /* the layer (ml_io_map, device memory) */
++	bool     mdpOn;
++	uint32_t oldLayer, oldOp[2], oldAlpha[2];
++	uint32_t cox, coy, cw, ch;              /* CPU: the box in CA pixels */
++	uint16_t span[SWEET_CUT_DIM][2];        /* CPU: per box row, columns [x0, x1) with alpha > 0 */
++	uint8_t  cov[SWEET_CUT_DIM * SWEET_CUT_DIM];    /* CPU: alpha of black, CA pixels */
++	uint64_t stAbs;
++	uint32_t stN, reassert;
++} sweet_cut = { 0, 81 * 16, 77 * 16, 648, 24, 0, 0, NULL, false, 0, { 0, 0 }, { 0, 0 }, 0, 0, 0, 0, { { 0, 0 } }, { 0 },
++	        0, 0, 0 };
++
++static uint32_t
++sweet_cut_isqrt(uint64_t v)
++{
++	uint64_t r = 0, b = 1ULL << 62;
++	while (b > v) {
++		b >>= 2;
++	}
++	while (b != 0) {
++		if (v >= r + b) {
++			v -= r + b;
++			r = (r >> 1) + b;
++		} else {
++			r >>= 1;
++		}
++		b >>= 2;
++	}
++	return (uint32_t)r;
++}
++
++/* Alpha (0..255) of the black disc at a point given in 1/16 panel px. */
++static uint32_t
++sweet_cut_alpha(int64_t px16, int64_t py16)
++{
++	int64_t dx = px16 - sweet_cut.x16, dy = py16 - sweet_cut.y16;
++	int64_t d = (int64_t)sweet_cut_isqrt((uint64_t)(dx * dx + dy * dy));
++	int64_t aa = sweet_cut.aa16 > 0 ? sweet_cut.aa16 : 1;
++	int64_t a = ((int64_t)sweet_cut.r16 + aa / 2 - d) * 255 / aa;
++	return a <= 0 ? 0 : (a >= 255 ? 255 : (uint32_t)a);
++}
++
++/* Both tables from the geometry: the MDP layer (if mapped) and the CPU's CA-space box. */
++static void
++sweet_cut_build(void)
++{
++	int32_t ext = (sweet_cut.r16 + sweet_cut.aa16) / 16 + 2;
++	int32_t ox = sweet_cut.x16 / 16 - ext, oy = sweet_cut.y16 / 16 - ext;
++	ox = ox < 0 ? 0 : (ox + (int32_t)SWEET_CUT_DIM > 540 ? 540 - (int32_t)SWEET_CUT_DIM : ox);
++	oy = oy < 0 ? 0 : oy;
++	sweet_cut.ox = (uint32_t)ox;
++	sweet_cut.oy = (uint32_t)oy;
++	if (sweet_cut.va != NULL) {
++		for (uint32_t y = 0; y < SWEET_CUT_DIM; y++) {
++			for (uint32_t x = 0; x < SWEET_CUT_DIM; x++) {
++				uint32_t a = sweet_cut_alpha((int64_t)(ox + x) * 16 + 8, (int64_t)(oy + y) * 16 + 8);
++				sweet_cut.va[y * SWEET_CUT_DIM + x] = a << 24;  /* premultiplied black */
++			}
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	/* CA pixel X covers panel x (X + 0.5) * 1080 / 1125, y (Y + 0.5) * 2340 / 2436 at its centre */
++	uint32_t cox = (uint32_t)ox * SWEET_CA_W / 1080, coy = (uint32_t)oy * SWEET_CA_H / 2340;
++	uint32_t cw = (uint32_t)(2 * ext + 2) * SWEET_CA_W / 1080 + 2, ch = (uint32_t)(2 * ext + 2) * SWEET_CA_H / 2340 + 2;
++	cw = cw > SWEET_CUT_DIM ? SWEET_CUT_DIM : cw;
++	ch = ch > SWEET_CUT_DIM ? SWEET_CUT_DIM : ch;
++	for (uint32_t y = 0; y < ch; y++) {
++		uint16_t x0 = (uint16_t)cw, x1 = 0;
++		for (uint32_t x = 0; x < cw; x++) {
++			int64_t px16 = ((int64_t)(cox + x) * 32 + 16) * 1080 / SWEET_CA_W / 2;
++			int64_t py16 = ((int64_t)(coy + y) * 32 + 16) * 2340 / SWEET_CA_H / 2;
++			uint32_t a = sweet_cut_alpha(px16, py16);
++			sweet_cut.cov[y * SWEET_CUT_DIM + x] = (uint8_t)a;
++			if (a != 0) {
++				x0 = x < x0 ? (uint16_t)x : x0;
++				x1 = (uint16_t)(x + 1);
++			}
++		}
++		sweet_cut.span[y][0] = x0;
++		sweet_cut.span[y][1] = x1;
++	}
++	sweet_cut.cox = cox;
++	sweet_cut.coy = coy;
++	sweet_cut.cw = cw;
++	sweet_cut.ch = ch;
++}
++
++/* With fLock: DMA0 on LM0 (on) or the CTL/LM words as they were (off). */
++static void
++sweet_cut_mdp_locked(bool on)
++{
++	uint32_t ctl = MDP_CTL(0), lm = MDP_LM(0), d = MDP_DMA(0);
++	if (on) {
++		uint32_t sz = SWEET_CUT_DIM << 16 | SWEET_CUT_DIM, v = MDP_VIG(0);
++		sweet_mdp_wr(d + SSPP_SRC_SIZE, sz);
++		sweet_mdp_wr(d + SSPP_SRC_IMG, sz);
++		sweet_mdp_wr(d + SSPP_SRC_XY, 0);
++		sweet_mdp_wr(d + SSPP_OUT_SIZE, sz);
++		sweet_mdp_wr(d + SSPP_OUT_XY, sweet_cut.oy << 16 | sweet_cut.ox);
++		sweet_mdp_wr(d + SSPP_SRC0, (uint32_t)SWEET_CUT_PA);
++		sweet_mdp_wr(d + SSPP_YSTRIDE0, SWEET_CUT_DIM * 4);
++		sweet_mdp_wr(d + SSPP_FORMAT, 0x237ffu);        /* ARGB8888 + alpha, as ABL's VIG (r35 dump) */
++		sweet_mdp_wr(d + SSPP_UNPACK, 0x03020001u);
++		sweet_mdp_wr(d + SSPP_OP_MODE, 0x80000000u);    /* PE override */
++		for (uint32_t c = 0; c < 3; c++) {
++			sweet_mdp_wr(d + SSPP_PE(c, 0), 0);
++			sweet_mdp_wr(d + SSPP_PE(c, 1), 0);
++			sweet_mdp_wr(d + SSPP_PE(c, 2), sz);
++		}
++		static const uint16_t qos[] = { 0x48, 0x60, 0x64, 0x6c, 0x74, 0x78, 0x134 };  /* fetch, danger/safe, QoS, CREQ, CDP */
++		for (uint32_t i = 0; i < sizeof(qos) / sizeof(qos[0]); i++) {
++			sweet_mdp_wr(d + qos[i], sweet_mdp_rd(v + qos[i]));
++		}
++		if (!sweet_cut.mdpOn) {
++			sweet_cut.oldLayer = sweet_mdp_rd(ctl);
++			for (uint32_t i = 0; i < 2; i++) {
++				sweet_cut.oldOp[i] = sweet_mdp_rd(lm + LM_BLEND_OP(4 + i));
++				sweet_cut.oldAlpha[i] = sweet_mdp_rd(lm + LM_BLEND_ALPHA(4 + i));
++			}
++		}
++		for (uint32_t i = 0; i < 2; i++) {
++			sweet_mdp_wr(lm + LM_BLEND_OP(4 + i), 0x600u);          /* fg const, bg 1 - fg pixel alpha */
++			sweet_mdp_wr(lm + LM_BLEND_ALPHA(4 + i), 0xff0000u);    /* fg 0xff, bg 0 */
++		}
++		sweet_mdp_wr(ctl, (sweet_cut.oldLayer & ~(7u << 18)) | SWEET_CUT_FIELD << 18);
++		sweet_cut.mdpOn = true;
++	} else if (sweet_cut.mdpOn) {
++		sweet_mdp_wr(ctl, (sweet_mdp_rd(ctl) & ~(7u << 18)) | (sweet_cut.oldLayer & (7u << 18)));
++		for (uint32_t i = 0; i < 2; i++) {
++			sweet_mdp_wr(lm + LM_BLEND_OP(4 + i), sweet_cut.oldOp[i]);
++			sweet_mdp_wr(lm + LM_BLEND_ALPHA(4 + i), sweet_cut.oldAlpha[i]);
++		}
++		sweet_cut.mdpOn = false;
++	} else {
++		return;
++	}
++	uint32_t f = sweet_mdp_rd(ctl + MDP_CTL_FLUSH);         /* keep a flip's pending VIG bits */
++	sweet_mdp_wr(ctl + MDP_CTL_FLUSH, f | MDP_FLUSH_DMA0 | MDP_FLUSH_LM0 | MDP_FLUSH_CTL);
++}
++
++/* 1047 CPU mode: the disc into a direct frame (fence passed, before its flip); 1125x2436 surfaces only. */
++static void
++sweet_cut_draw(SweetSurface *s)
++{
++	uintptr_t va = s->kernelAddress();
++	uint32_t bpr = s->bytesPerRow;
++	if (va == 0 || s->width != SWEET_CA_W || s->height != SWEET_CA_H || sweet_cut.cw == 0) {
++		return;
++	}
++	uint64_t t0 = mach_absolute_time();
++	for (uint32_t y = 0; y < sweet_cut.ch; y++) {
++		uint32_t x0 = sweet_cut.span[y][0], x1 = sweet_cut.span[y][1];
++		const uint8_t *cov = sweet_cut.cov + (size_t)y * SWEET_CUT_DIM;
++		volatile uint32_t *row = (volatile uint32_t *)(va + (uint64_t)(sweet_cut.coy + y) * bpr) + sweet_cut.cox;
++		for (uint32_t x = x0; x < x1; x++) {
++			uint32_t a = cov[x];
++			if (a == 255) {
++				row[x] = 0xff000000u;
++			} else if (a != 0) {
++				row[x] = sweet_display_dim(row[x], 255 - a);
++			}
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	sweet_cut.stAbs += mach_absolute_time() - t0;
++	sweet_cut.stN++;
++}
++
++/* With fLock, from the 5 s scanout line: the CPU cost, and mode 2 put back if something restaged LM0. */
++static void
++sweet_cut_stats_locked(void)
++{
++	if (sweet_cut.mode == 2 && ((sweet_mdp_rd(MDP_CTL(0)) >> 18) & 7u) != SWEET_CUT_FIELD) {
++		sweet_cut.mdpOn = false;
++		sweet_cut_mdp_locked(true);
++		sweet_cut.reassert++;
++	}
++	if (sweet_cut.mode != 0) {
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(sweet_cut.stAbs, &ns);
++		IOLog("SWEET CUTOUT: 5s mode %u: cpu draws %u (avg %llu us) | mdp %s ctl0 %x lm0 op %x/%x | reasserted %u\n",
++		    sweet_cut.mode, sweet_cut.stN, sweet_cut.stN ? ns / 1000 / sweet_cut.stN : 0, sweet_cut.mdpOn ? "on" : "off",
++		    sweet_mdp_rd(MDP_CTL(0)), sweet_mdp_rd(MDP_LM(0) + LM_BLEND_OP(4)), sweet_mdp_rd(MDP_LM(0) + LM_BLEND_OP(5)),
++		    sweet_cut.reassert);
++	}
++	sweet_cut.stAbs = 0;
++	sweet_cut.stN = 0;
++}
++
++/* which: 0 mode, 1 x16, 2 y16, 3 r16, 4 aa16. */
++int
++AppleCLCD::cutoutSet(int which, int value)
++{
++	if (which < 0 || which > 4 || (which == 0 && (value < 0 || value > 2)) || (which == 1 && (value < 0 || value > 540 * 16)) ||
++	    (which == 2 && (value < 0 || value > 400 * 16)) || (which == 3 && (value < 0 || value > 60 * 16)) ||
++	    (which == 4 && (value < 1 || value > 8 * 16))) {
++		return 22;      /* EINVAL */
++	}
++	if (sweet_cut.va == NULL && which == 0 && value == 2) {
++		sweet_cut.va = (volatile uint32_t *)ml_io_map(SWEET_CUT_PA, SWEET_CUT_LEN);
++		if (sweet_cut.va == NULL) {
++			return 12;  /* ENOMEM */
++		}
++	}
++	IOLockLock(fLock);
++	switch (which) {
++	case 0: sweet_cut.mode = (uint32_t)value; break;
++	case 1: sweet_cut.x16 = value; break;
++	case 2: sweet_cut.y16 = value; break;
++	case 3: sweet_cut.r16 = value; break;
++	default: sweet_cut.aa16 = value; break;
++	}
++	sweet_cut_build();
++	sweet_cut_mdp_locked(sweet_cut.mode == 2);
++	sweet_cut.stAbs = 0;
++	sweet_cut.stN = 0;
++	IOLockUnlock(fLock);
++	IOLog("SWEET CUTOUT: mode %u centre %d.%02d,%d.%02d r %d.%02d aa %d.%02d panel px | mdp layer %ux%u at %u,%u %s | cpu box "
++	    "%ux%u at %u,%u\n", sweet_cut.mode, sweet_cut.x16 / 16, sweet_cut.x16 % 16 * 100 / 16, sweet_cut.y16 / 16,
++	    sweet_cut.y16 % 16 * 100 / 16, sweet_cut.r16 / 16, sweet_cut.r16 % 16 * 100 / 16, sweet_cut.aa16 / 16,
++	    sweet_cut.aa16 % 16 * 100 / 16, SWEET_CUT_DIM, SWEET_CUT_DIM, sweet_cut.ox, sweet_cut.oy,
++	    sweet_cut.mdpOn ? "staged (DMA0 on LM0)" : "off", sweet_cut.cw, sweet_cut.ch, sweet_cut.cox, sweet_cut.coy);
++	return 0;
++}
++
++extern "C" int sweet_fb_cutout(int which, int value);
++extern "C" int sweet_fb_cutout_get(int which);
++int
++sweet_fb_cutout(int which, int value)
++{
++	if (sweet_fb_instance == NULL) {
++		return 19;      /* ENODEV */
++	}
++	return sweet_fb_instance->cutoutSet(which, value);
++}
++
++int
++sweet_fb_cutout_get(int which)
++{
++	switch (which) {
++	case 0: return (int)sweet_cut.mode;
++	case 1: return sweet_cut.x16;
++	case 2: return sweet_cut.y16;
++	case 3: return sweet_cut.r16;
++	default: return sweet_cut.aa16;
++	}
++}
++
+ /*
+  * 0986: corner mattes in direct mode (p scanout corners 1). The CPU present darkens the panel's rounded corners with
+  * fCornerCov (copyRow); the display engine has no matte, so the drawn frame gets one itself: after its fence (the GPU
+@@ -3344,6 +3626,9 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
+ 	if (sweet_scan.corners) {
+ 		sweet_scan_corners(fb, s);      /* 0986 */
+ 	}
++	if (sweet_cut.mode == 1) {
++		sweet_cut_draw(s);              /* 1047 */
++	}
+ 	sweet_scan.next = NULL;
+ 	uint64_t sSeq = sweet_scan.nextSeq, sAbs = sweet_scan.nextAbs;    /* 0979: a newer frame may come while entering */
+ 	uint32_t sSwap = sweet_scan.nextSwap;
+@@ -3431,6 +3716,7 @@ sweet_scan_stats_locked(uint64_t now)
+ 	    sweet_scan.stClean, sweet_scan.stEnter, sweet_scan.stLeave,
+ 	    sweet_scan.stHold, sweet_scan.stLatchFc, sweet_scan.geom ? "direct" : "panel buffer");
+ 	sweet_sf_line_locked();         /* 1044 */
++	sweet_cut_stats_locked();       /* 1047 */
+ 	{
+ 		uint64_t gw = 0;    /* 0985 */
+ 		absolutetime_to_nanoseconds(sweet_scan.stGateAbs, &gw);
+@@ -3594,6 +3880,8 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+  *   p scanout gate 0|1|2   0985: SwapEnd back pressure (0), the swapper's GPU submits wait (1, default), 0989: the
+  *                          CP waits for the latch (2; boot-arg sweetscangate)
+  *   p scanout corners 0|1  0986: corner mattes drawn into each direct frame (default off)
++ *   p cutout [MODE [X16 Y16 R16 AA16]]  1047: camera cutout ring 0 off, 1 CPU (direct frames), 2 display engine (DMA0
++ *                          on LM0); geometry in 1/16 panel px (kern.sweet_cutout_*); no argument: the state
+  *   p scanout tribuf 0|1   0996: SwapWait polls (0x80000000) answer Busy until latched; gate by chain depth (off)
+  *   p vsync [MASK [LEAD_US]] | p vsync refresh [NS]   0995: tick timer options, IOMFBDisplayRefresh (above)
+  *   p vsync vrr N [STEP_NS]                         0998: IOMFBDisplayRefresh max = N periods, step (above)
+@@ -3604,6 +3892,33 @@ extern "C" void sweet_prof_cmd(const char *s, const char *end);   /* 0991 */
+ void
+ AppleCLCD::fbCmd(const char *s, const char *end)
+ {
++	if (end - s >= 6 && !strncmp(s, "cutout", 6)) {
++		/* 1047: p cutout [MODE [X16 Y16 R16 AA16]] */
++		const char *q = s + 6;
++		int v[5], n = 0;
++		while (n < 5) {
++			while (q < end && *q == ' ') {
++				q++;
++			}
++			if (q >= end || *q < '0' || *q > '9') {
++				break;
++			}
++			int x = 0;
++			while (q < end && *q >= '0' && *q <= '9' && x < 100000) {
++				x = x * 10 + (*q++ - '0');
++			}
++			v[n++] = x;
++		}
++		int err = 0;
++		for (int i = 1; i < n && err == 0; i++) {
++			err = cutoutSet(i, v[i]);
++		}
++		err = err ? err : cutoutSet(0, n > 0 ? v[0] : (int)sweet_cut.mode);   /* also logs the state */
++		if (err) {
++			IOLog("SWEET CUTOUT: p cutout: error %d (MODE 0-2, X16 <= 8640, Y16 <= 6400, R16 <= 960, AA16 1-128)\n", err);
++		}
++		return;
++	}
+ 	if (end - s >= 4 && !strncmp(s, "disp", 4)) {
+ 		/* 0991: p disp: the display power state, for scripts (tools-claude/redfin-fpsbench.sh) */
+ 		IOLog("SWEET FB: display %s (p disp; scanout %s)\n", fPowerOff ? "off" : "on", sweet_scan_live() ? "direct" : "panel buffer");
+-- 
+2.43.0
