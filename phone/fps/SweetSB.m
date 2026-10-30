@@ -96,7 +96,7 @@ sb_shift(UIView *v)
 	if (mine != nil && t.tx == mine.doubleValue) {
 		return;         /* our shift is still there */
 	}
-	t = CGAffineTransformTranslate(t, sb_dxt / (t.a != 0 ? t.a : 1), 0);
+	t.tx += sb_dxt;         /* in the superview: after UIKit's own transform (no CoreGraphics call) */
 	v.transform = t;
 	objc_setAssociatedObject(v, &sb_assoc, @(t.tx), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
