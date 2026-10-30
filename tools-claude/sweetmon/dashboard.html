@@ -319,7 +319,7 @@ const chTemp = new Chart($('#ch-temp'), { min: null, max: null, unit: '°C', dec
 const chGpu = new Chart($('#ch-gpu'), { min: 0, max: 100, unit: '%', fill: true, series: [{ name: 'GPU busy', color: '--s3', get: (h) => h.gpu }] });
 const sMem = [{ name: 'used', color: '--s1', get: (h) => h.mem_used }, { name: 'free', color: '--s3', get: (h) => h.mem_free }, { name: 'compressed', color: '--s2', get: (h) => h.mem_comp }];
 const chMem = new Chart($('#ch-mem'), { min: 0, max: null, unit: 'MB', series: sMem });
-const sFps = [{ name: 'shown (FB 5 s)', color: '--s1', get: (h) => h.fb_fps }, { name: 'frame mode', color: '--s2', get: (h) => h.fps }];
+const sFps = [{ name: 'shown (5 s: FB or scanout latched)', color: '--s1', get: (h) => h.fb_fps }, { name: 'frame mode', color: '--s2', get: (h) => h.fps }];
 const chFps = new Chart($('#ch-fps'), { min: 0, max: null, floor: 60, unit: 'fps', dec: 1, series: sFps });
 const chKlog = new Chart($('#ch-klog'), { min: 0, max: null, floor: 1024, unit: 'B/s', fill: true, series: [{ name: 'kernel log', color: '--s7', get: (h) => h.klog_bps }] });
 legend($('#lg-mhz'), sMhz); legend($('#lg-temp'), sTemp); legend($('#lg-mem'), sMem); legend($('#lg-fps'), sFps);
@@ -372,7 +372,10 @@ function onSnap(s) {
   // frames
   $('#frames-on').checked = !!s.frames_on;
   const f = s.frames, fb = s.fb;
-  $('#fps-kv').innerHTML = (fb ? '<span class="k">FB 5 s</span><span class="num">shown ' + fb.shown + ', dropped ' + fb.dropped + ', p50 ' + fb.p50_ms + ' / p95 ' + fb.p95_ms + ' ms, ' + fb.hz + ' Hz</span>' : '') +
+  $('#fps-sub').textContent = fb ? fmt(fb.fps, 1) + ' fps (' + (fb.source === 'scanout' ? 'direct scanout' : 'GPU blit') + ')' : 'fps';
+  $('#fps-kv').innerHTML = (fb ? (fb.source === 'scanout'
+      ? '<span class="k">scanout 5 s</span><span class="num">latched ' + fb.latched + ' (' + fmt(fb.fps, 1) + ' fps), dropped ' + fb.scan_dropped + ', nonslot ' + fb.nonslot + ', swap\u2192latch ' + fmt(fb.swap_latch_ms, 1) + ' / max ' + fmt(fb.swap_latch_max_ms, 1) + ' ms, chain ' + (fb.chain || '-') + (fb.direct ? '' : ' (panel buffer)') + (fb.hz ? ', ' + fb.hz + ' Hz' : '') + '</span>'
+      : '<span class="k">FB 5 s</span><span class="num">shown ' + fb.shown + ' (' + fmt(fb.fps, 1) + ' fps), dropped ' + fb.dropped + ', p50 ' + fb.p50_ms + ' / p95 ' + fb.p95_ms + ' ms, ' + fb.hz + ' Hz</span>') : '') +
     (f ? '<span class="k">frame mode</span><span class="num">' + fmt(f.fps, 1) + ' fps, vsync ' + f.vsync + ', GPU p50 ' + fmt(f.gpu_ms_p50, 1) + ' / p90 ' + fmt(f.gpu_ms_p90, 1) + ' ms, present-to-shown p50 ' + fmt(f.present_to_shown_ms_p50, 1) + ' ms</span>' : '');
   procTable();
   // klog

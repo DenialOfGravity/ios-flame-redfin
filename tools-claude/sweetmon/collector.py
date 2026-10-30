@@ -42,6 +42,7 @@ USB_HOST = '192.168.7.2'
 USB_FAST_DEFAULT = {'poll_us': 100, 'txbatch': 16}     # xnu 1034 (r64u): 28 MB/s instead of 1.2 MB/s
 DEFAULT_KLOG_PA = '0x101d0ef08'     # r63a (builds/xnu/ws-y-ram-aca60f47b8/KLOG_PA.txt)
 PORT = 5150
+TRACE_COLLECTOR_OPTS = ('app',)    # trace k=v options used by the collector's analysis only, never sent to the phone
 MAX_FRAME = 4 << 20
 CLUSTERS = (('silver', range(0, 6)), ('gold', range(6, 7)), ('prime', range(7, 8)))
 TEMP_KEYS = ('silver', 'gold', 'prime', 'cpuss', 'gpu', 'ddr', 'camera', 'npu', 'aoss')
@@ -254,6 +255,9 @@ R_GPU = re.compile(r'SWEET GPU: 5s: (\d+) submits \((\d+) missed\), GPU busy (\d
                    r'mean (\d+) us;?(.*)$')
 R_OWN = re.compile(r'(\S+) (\d+)/(\d+)ms')
 R_FB = re.compile(r'SWEET FB: 5s: swaps (\d+) shown (\d+) dropped (\d+).*?p50 ([\d.]+) p95 ([\d.]+) ms.*?hz (\d+)')
+# sc1: direct scanout (0976+): frames latched from CA's slot surfaces; the FB line then shows 'shown 0'
+R_SCAN = re.compile(r'SWEET SCANOUT: 5s: frames (\d+) flips (\d+) latched (\d+) dropped (\d+) nonslot (\d+).*?'
+                    r'swap->latch (\d+) us max (\d+) us(?:.*?\| chain (\d+)-(\d+) \|)?.*\| (direct|panel buffer)\s*$')
 R_CRASH = re.compile(r'^CRASH (\S+?)\[(\d+)\] sig (\d+)')
 R_PROF_START = re.compile(r'SWEET PROF: start (\S+?)\[(\d+)\] (\d+) Hz (\d+) s .*buffer (\d+) KiB at pa (0x[0-9a-fA-F]+)')
 R_PROF_DONE = re.compile(r'SWEET PROF: (?:done|dump) (\S+?)\[(\d+)\] .*\| pa (0x[0-9a-fA-F]+) bytes (\d+)')
@@ -993,6 +997,16 @@ class Collector:
                 self.latest['fb'] = (ts, {'swaps': int(g[0]), 'shown': int(g[1]), 'dropped': int(g[2]),
                                           'fps': round(int(g[1]) / 5, 1), 'p50_ms': float(g[3]), 'p95_ms': float(g[4]),
                                           'hz': int(g[5])})
+        elif msg.startswith('SWEET SCANOUT: 5s: frames'):
+            m = R_SCAN.search(msg)
+            if m:
+                g = m.groups()
+                self.latest['scan'] = (ts, {'frames': int(g[0]), 'flips': int(g[1]), 'latched': int(g[2]),
+                                            'dropped': int(g[3]), 'nonslot': int(g[4]),
+                                            'swap_latch_ms': round(int(g[5]) / 1000, 2),
+                                            'swap_latch_max_ms': round(int(g[6]) / 1000, 2),
+                                            'chain': '%s-%s' % (g[7], g[8]) if g[7] else None,
+                                            'direct': g[9] == 'direct'})
         elif msg.startswith('CRASH '):
             m = R_CRASH.match(msg)
             if m:
@@ -1022,6 +1036,24 @@ class Collector:
             self.watchers.remove(w)
 
     # ---------------------------------------------------------------- samples
+    def fb_view(self, up):
+        """sc1: the frames view: the FB line, or in direct scanout the SCANOUT line (source 'scanout'; fps = latched +
+        the few blit-shown frames per 5 s; the FB p50/p95 describe the unused panel-buffer path and are None)"""
+        fb, fb_age = self.fresh('fb', up)
+        sc, sc_age = self.fresh('scan', up)
+        if sc is not None and sc_age is not None and sc_age < 12 and sc['latched'] and \
+                (sc['direct'] or fb is None or sc['latched'] > fb['shown']):
+            v = dict(fb or {}, source='scanout', fps=round((sc['latched'] + (fb['shown'] if fb else 0)) / 5, 1),
+                     latched=sc['latched'], scan_frames=sc['frames'], scan_dropped=sc['dropped'],
+                     nonslot=sc['nonslot'], swap_latch_ms=sc['swap_latch_ms'],
+                     swap_latch_max_ms=sc['swap_latch_max_ms'], chain=sc['chain'], direct=sc['direct'])
+            v.setdefault('shown', 0)
+            v['p50_ms'] = v['p95_ms'] = None
+            return v, min(sc_age, fb_age) if fb_age is not None else sc_age
+        if fb is None:
+            return None, None
+        return dict(fb, source='blit'), fb_age
+
     def fresh(self, key, up, max_age=12):
         v = self.latest.get(key)
         if not v:
@@ -1063,7 +1095,7 @@ class Collector:
         lvl, _ = self.fresh('level', up)
         bat, bat_age = self.fresh('battery', up)
         gpu, gpu_age = self.fresh('gpu', up)
-        fb, fb_age = self.fresh('fb', up)
+        fb, fb_age = self.fb_view(up)
         vm = s.get('vm') or {}
         pk = vm.get('page_kb') or 16
         mb = lambda k: round(vm[k] * pk / 1024, 1) if isinstance(vm.get(k), (int, float)) else None
@@ -1281,6 +1313,8 @@ class Collector:
         if kind == 'kdebug':
             o = {'secs': secs}
             for k, v in opts.items():
+                if k in TRACE_COLLECTOR_OPTS:      # collector-side only (app= goes to sweet-trace.py --app): the
+                    continue                       # phone daemon rejects unknown options ("unknown option app")
                 if re.fullmatch(r'[a-z_]+', str(k)) and re.fullmatch(r'[A-Za-z0-9,._-]+', str(v)):
                     o[k] = v
             line = 'trace start kdebug ' + ' '.join('%s=%s' % kv for kv in o.items())
@@ -1931,8 +1965,12 @@ def snap_text(s):
                                                                                         for o in g['owners'])))
     if s.get('fb'):
         f = s['fb']
-        print('fb 5s: shown %s (%.1f fps) dropped %s p50 %s p95 %s ms hz %s' % (f['shown'], f['fps'], f['dropped'],
-                                                                               f['p50_ms'], f['p95_ms'], f['hz']))
+        if f.get('source') == 'scanout':
+            print('frames 5s (direct scanout): latched %s (%.1f fps) dropped %s swap->latch %s / max %s ms chain %s' % (
+                f['latched'], f['fps'], f['scan_dropped'], f['swap_latch_ms'], f['swap_latch_max_ms'], f['chain']))
+        else:
+            print('fb 5s: shown %s (%.1f fps) dropped %s p50 %s p95 %s ms hz %s' % (f['shown'], f['fps'], f['dropped'],
+                                                                                   f['p50_ms'], f['p95_ms'], f.get('hz')))
     if s.get('frames'):
         print('frames: %s' % json.dumps({k: v for k, v in s['frames'].items() if not k.startswith('_')}))
     bt = s.get('battery')
