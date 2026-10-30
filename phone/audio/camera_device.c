@@ -490,6 +490,42 @@ static const struct camera {
 };
 #define CAMERAS 3
 
+/*
+ * redfin: /private/var/local/camera-uw-as-back: the back camera (its name, uniqueID and port) streams from the ultra-wide
+ * IMX481 (sensor 3), so that Camera.app has it with nothing changed on iOS's side: with the IMX481's formats, or -- the
+ * file says "keys" -- with the iPhone X's back camera's (the plist's keys, should formats the plist does not have lose
+ * the AVCaptureDevice formats). Without the file the back camera is the IMX363, as before.
+ */
+static const struct camera uw_as_back[2] = {
+	{ 3, "Back Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:0", false, 2.13, 2.2, 1.0, 94.5,
+	  { { 2328, 1746, 30, REDWOOD_CAMERA_MODE_PHOTO }, { 2328, 1310, 60, REDWOOD_CAMERA_MODE_VIDEO60 } }, false },
+	{ 3, "Back Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:0", false, 2.13, 2.2, 1.0, 94.5,
+	  { { 4032, 3024, 30, REDWOOD_CAMERA_MODE_PHOTO }, { 4224, 2376, 60, REDWOOD_CAMERA_MODE_VIDEO60 } }, false },
+};
+
+/* the camera the back camera's stream is (see uw_as_back) */
+static const struct camera *
+back_camera(void)
+{
+	char text[16] = "";
+	int fd = open("/private/var/local/camera-uw-as-back", O_RDONLY);
+	const struct camera *c;
+
+	if (fd < 0) {
+		c = &cameras[0];
+	} else {
+		ssize_t n = read(fd, text, sizeof(text) - 1);
+
+		close(fd);
+		text[n > 0 ? n : 0] = 0;
+		c = &uw_as_back[strncmp(text, "keys", 4) == 0];
+	}
+	say("the back camera's stream is sensor %u (%s%s): formats %dx%d@%d, %dx%d@%d", c->sensor, c->sensor == 3 ? "the ultra-wide IMX481" :
+	    "the wide IMX363", c == &cameras[0] ? "" : ", camera-uw-as-back", c->formats[0].width, c->formats[0].height, c->formats[0].fps,
+	    c->formats[1].width, c->formats[1].height, c->formats[1].fps);
+	return c;
+}
+
 struct stream {
 	CFArrayRef      formats;
 	CFDictionaryRef supported;
@@ -2979,7 +3015,7 @@ redwood_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, 
 		if (ports[i] == NULL) {
 			continue;
 		}
-		if ((stream[n] = stream_create(allocator, &cameras[i], ports[i])) == NULL) {
+		if ((stream[n] = stream_create(allocator, i == 0 ? back_camera() : &cameras[i], ports[i])) == NULL) {
 			while (n > 0) {
 				CFRelease(stream[--n]);
 			}
