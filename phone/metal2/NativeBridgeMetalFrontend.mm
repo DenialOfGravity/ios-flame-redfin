@@ -30,6 +30,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <unistd.h>
+#include <stdarg.h>
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
@@ -813,6 +814,216 @@ static void waitForResource(id resource);
 - (void)holdSurface:(IOSurfaceRef)surface;
 @end
 static void ycbcrRefresh(NBTexture *texture,id commandBuffer);
+// ---- ws-cam-textrace: SWEET_TEXTRACE=N (off by default) ----
+// A diagnostic for "a draw samples another IOSurface (or an older picture of it) than Core Animation bound": every IOSurface-backed
+// texture made (TT new), every bind of one into an encoder (TT bind: fragment f, vertex v, compute c, blit b, attachment a; direct or
+// the encode thread's replay), and each command buffer's commit and completion (TT commit / TT done: the surfaces' seeds at bind,
+// commit and completion). Flags: MISMATCH (the handle passed is not the texture's handle now; the surface's ID or base moved under a
+// texture), ALIAS (two live textures over different surface IDs share a runtime handle or an import buffer), REUSE/REMAP (a surface
+// base seen with another ID while an older texture still holds it, or the other way round), RACE (a read surface's seed moved
+// between commit and completion, or a YCbCr copy's turn was refilled while in flight), PRESUB (the seed moved between CA's bind and
+// the commit), BACKSTEP (a YCbCr copy shows an older picture than it showed before). N = lines per 5 s (anomalies have their own N);
+// a 5 s summary "J textrace: binds=..." is always printed. Read once from the environment (/var/local/mtl2-env); unset or 0: no
+// change to any path beyond one cached check.
+static int textraceLimit() {
+ static const int n=[]{const char *e=getenv("SWEET_TEXTRACE");const int v=e && *e?atoi(e):0;return v>0?v:0;}();
+ return n;
+}
+static inline bool textraceOn() {return textraceLimit()>0;}
+static thread_local const char *tTtCache;   // the cache a creation was answered from (set only while tracing)
+static thread_local bool tTtImportHit;       // surfaceBuffer answered an import it had (set only while tracing)
+struct TTTex {const void *tex;IOSurfaceRef surface;uint32_t sid,fourcc,plane,seedMade,lastShown;bool ycopy;const void *base,*buffer;NmbTexture *handle;
+              uint64_t w,h,rows,mtl;const char *src;};
+struct TTUse {const void *tex;IOSurfaceRef surface;uint32_t sid,seedBind,seedCommit,fillBind,binds;const void *buffer;bool ycopy;char stage;};
+struct TTCb {uint32_t serial=0,binds=0;uint64_t committedUs=0;std::vector<TTUse> uses;};
+static std::mutex gTTLock;
+static std::unordered_map<const void *,TTTex> gTTTex;                          // live traced textures
+static std::unordered_map<const void *,std::pair<uint32_t,uint32_t>> gTTBase;  // surface base -> (ID, live textures)
+static std::unordered_map<uint32_t,std::pair<const void *,uint32_t>> gTTSid;   // surface ID -> (base, live textures)
+static std::unordered_map<const void *,std::pair<const void *,uint32_t>> gTTBound;   // runtime handle -> (texture, ID) at its last bind
+static std::unordered_map<const void *,uint32_t> gTTFill;                      // YCbCr copy turn buffer -> fills started
+static std::unordered_map<const void *,TTCb> gTTCb;
+static std::atomic<uint32_t> gTTCbSerial{0};
+static std::atomic<uint64_t> gTTWindow{0};
+static std::atomic<int> gTTLines{0},gTTAnomLines{0};
+static std::atomic<uint64_t> gTTBinds,gTTMismatch,gTTAlias,gTTRace,gTTCreates,gTTReuse,gTTPresub,gTTBackstep,gTTDropped,
+                             gTTTotMismatch,gTTTotAlias,gTTTotRace;
+static void ttTick() {
+ const uint64_t now=nowUs();uint64_t due=gTTWindow.load();
+ if(!due){gTTWindow.compare_exchange_strong(due,now+5000000);return;}
+ if(now<due || !gTTWindow.compare_exchange_strong(due,now+5000000))return;
+ const uint64_t mi=gTTMismatch.exchange(0),al=gTTAlias.exchange(0),ra=gTTRace.exchange(0);
+ gTTTotMismatch+=mi;gTTTotAlias+=al;gTTTotRace+=ra;
+ size_t live,cbs;{std::lock_guard<std::mutex> l(gTTLock);live=gTTTex.size();cbs=gTTCb.size();}
+ char line[400];
+ snprintf(line,sizeof line,"native-metal: J textrace: binds=%llu mismatches=%llu aliases=%llu races=%llu | creates=%llu reuse=%llu presub=%llu backsteps=%llu dropped=%llu live=%zu cbs=%zu | total mism=%llu alias=%llu race=%llu",
+  (unsigned long long)gTTBinds.exchange(0),(unsigned long long)mi,(unsigned long long)al,(unsigned long long)ra,
+  (unsigned long long)gTTCreates.exchange(0),(unsigned long long)gTTReuse.exchange(0),(unsigned long long)gTTPresub.exchange(0),
+  (unsigned long long)gTTBackstep.exchange(0),(unsigned long long)gTTDropped.exchange(0),live,cbs,
+  (unsigned long long)gTTTotMismatch.load(),(unsigned long long)gTTTotAlias.load(),(unsigned long long)gTTTotRace.load());
+ gTTLines=0;gTTAnomLines=0;
+ sm2_logs(line);
+}
+static void ttLog(bool anomaly,const char *format,...) __attribute__((format(printf,2,3)));
+static void ttLog(bool anomaly,const char *format,...) {
+ if((anomaly?gTTAnomLines:gTTLines).fetch_add(1)>=textraceLimit()){gTTDropped++;return;}
+ char line[640];memcpy(line,"native-metal: TT ",17);
+ va_list args;va_start(args,format);vsnprintf(line+17,sizeof line-17,format,args);va_end(args);
+ sm2_logs(line);
+}
+static const char *ttFourcc(uint32_t f,char out[5]) {
+ for(int i=0;i<4;i++){const char c=(char)(f>>(24-8*i));out[i]=c>=32 && c<127?c:'?';}
+ out[4]=0;return out;
+}
+// A YCbCr copy turn's buffer is about to be filled (ycbcrFillTurn).
+static void ttNoteFill(const void *buffer) {std::lock_guard<std::mutex> l(gTTLock);if(gTTFill.size()>=4096)gTTFill.clear();gTTFill[buffer]++;}
+// An IOSurface-backed texture handed to the client (made, or answered from a cache: tTtCache).
+static void ttCreated(NBTexture *texture,IOSurfaceRef surface,const char *src) {
+ const char *cache=tTtCache?tTtCache:tTtImportHit?"import":"none";tTtCache=nullptr;tTtImportHit=false;
+ if(!texture || !surface)return;
+ ttTick();gTTCreates++;
+ TTTex t={};t.tex=(__bridge const void *)texture;t.surface=surface;t.sid=IOSurfaceGetID(surface);t.fourcc=IOSurfaceGetPixelFormat(surface);
+ t.plane=(uint32_t)texture.plane;t.seedMade=IOSurfaceGetSeed(surface);t.ycopy=texture.ycbcrSource!=nullptr && !texture.surface;
+ t.lastShown=t.ycopy?texture.surfaceSeed:0;t.base=IOSurfaceGetBaseAddress(surface);t.buffer=(__bridge const void *)texture.buffer;
+ t.handle=texture.handle;t.w=texture.descriptor.width;t.h=texture.descriptor.height;
+ t.rows=IOSurfaceGetPlaneCount(surface)?IOSurfaceGetBytesPerRowOfPlane(surface,t.plane):IOSurfaceGetBytesPerRow(surface);
+ const uint64_t trow=texture.rowBytes;
+ if(!strcmp(src,"plain") && trow%64)src="shadow";   // rows Turnip will not alias: its shadow image, copied in
+ t.src=src;
+ t.mtl=texture.reportedFormat?texture.reportedFormat:texture.descriptor.format;
+ char fc[5];std::string flags;bool alias=false,reuse=false;
+ {
+  std::lock_guard<std::mutex> l(gTTLock);
+  const bool known=gTTTex.count(t.tex)!=0;   // a cache answer of a texture already traced
+  if(!known) {
+   for(auto &other:gTTTex) {   // live textures over another surface ID sharing this handle or import buffer
+    if(other.second.sid==t.sid)continue;
+    char note[160];
+    if(other.second.handle==t.handle){snprintf(note,sizeof note," ALIAS(handle with tex=%p sid=%u)",other.first,other.second.sid);flags+=note;alias=true;}
+    if(!t.ycopy && !other.second.ycopy && t.buffer && other.second.buffer==t.buffer){snprintf(note,sizeof note," ALIAS(buffer with tex=%p sid=%u)",other.first,other.second.sid);flags+=note;alias=true;}
+   }
+   auto b=gTTBase.find(t.base);
+   if(b!=gTTBase.end() && b->second.first!=t.sid && b->second.second){
+    char note[128];snprintf(note,sizeof note," REUSE(base was sid %u, %u live)",b->second.first,b->second.second);flags+=note;reuse=true;}
+   auto s=gTTSid.find(t.sid);
+   if(s!=gTTSid.end() && s->second.first!=t.base && s->second.second){
+    char note[128];snprintf(note,sizeof note," REMAP(sid was at base %p, %u live)",s->second.first,s->second.second);flags+=note;reuse=true;}
+   gTTTex[t.tex]=t;
+   if(b!=gTTBase.end() && b->second.first==t.sid)b->second.second++;else gTTBase[t.base]={t.sid,1};
+   if(s!=gTTSid.end() && s->second.first==t.base)s->second.second++;else gTTSid[t.sid]={t.base,1};
+  }
+ }
+ if(alias)gTTAlias++;
+ if(reuse)gTTReuse++;
+ ttLog(alias || reuse,"new tex=%p h=%p sid=%u base=%p plane=%u fmt=%s mtl=%llu %llux%llu rows=%llu trow=%llu seed=%u src=%s cache=%s buf=%p%s",
+       t.tex,(void *)t.handle,t.sid,t.base,t.plane,ttFourcc(t.fourcc,fc),(unsigned long long)t.mtl,(unsigned long long)t.w,
+       (unsigned long long)t.h,(unsigned long long)t.rows,(unsigned long long)trow,t.seedMade,src,cache,t.buffer,flags.c_str());
+}
+static void ttForget(const void *tex) {
+ std::lock_guard<std::mutex> l(gTTLock);
+ auto it=gTTTex.find(tex);if(it==gTTTex.end())return;
+ auto b=gTTBase.find(it->second.base);if(b!=gTTBase.end() && b->second.first==it->second.sid && b->second.second && !--b->second.second)gTTBase.erase(b);
+ auto s=gTTSid.find(it->second.sid);if(s!=gTTSid.end() && s->second.first==it->second.base && s->second.second && !--s->second.second)gTTSid.erase(s);
+ auto bound=gTTBound.find((const void *)it->second.handle);if(bound!=gTTBound.end() && bound->second.first==tex)gTTBound.erase(bound);
+ gTTTex.erase(it);
+}
+// A traced texture bound into an encoder of command buffer `cb`: `passed` is the handle given to the runtime, `recHandle`/`recSeed`
+// what CA's (recorded) bind saw (the replay's), `replay` whether this is the encode thread's replay.
+static void ttBind(const void *cb,char stage,uint32_t slot,NBTexture *texture,NmbTexture *passed,const char *via,bool replay,NmbTexture *recHandle,uint32_t recSeed) {
+ if(!texture)return;
+ IOSurfaceRef surface=texture.surface?texture.surface:texture.ycbcrSource;
+ if(!surface)return;
+ ttTick();gTTBinds++;
+ const void *tex=(__bridge const void *)texture;
+ const uint32_t sid=IOSurfaceGetID(surface),seed=IOSurfaceGetSeed(surface);const void *base=IOSurfaceGetBaseAddress(surface);
+ const bool ycopy=texture.ycbcrSource!=nullptr && !texture.surface;
+ NmbTexture *current=texture.handle;const void *buffer=(__bridge const void *)texture.buffer;
+ const uint32_t shown=ycopy?texture.surfaceSeed:0;
+ std::string flags;bool mismatch=false,alias=false,backstep=false;uint32_t serial=0,fill=0;char note[200];
+ if(passed!=current){snprintf(note,sizeof note," MISMATCH(passed %p, texture now %p)",(void *)passed,(void *)current);flags+=note;mismatch=true;}
+ if(replay && !ycopy && recHandle!=passed){snprintf(note,sizeof note," MISMATCH(recorded %p, replayed %p)",(void *)recHandle,(void *)passed);flags+=note;mismatch=true;}
+ {
+  std::lock_guard<std::mutex> l(gTTLock);
+  auto it=gTTTex.find(tex);
+  if(it!=gTTTex.end()) {
+   if(it->second.sid!=sid){snprintf(note,sizeof note," MISMATCH(made over sid %u)",it->second.sid);flags+=note;mismatch=true;}
+   if(it->second.base!=base){snprintf(note,sizeof note," MISMATCH(base moved %p -> %p)",it->second.base,base);flags+=note;mismatch=true;}
+   if(ycopy) {
+    if(it->second.lastShown && shown!=it->second.lastShown && shown<it->second.lastShown){
+     snprintf(note,sizeof note," BACKSTEP(shown %u after %u)",shown,it->second.lastShown);flags+=note;backstep=true;}
+    if(shown>it->second.lastShown || !it->second.lastShown)it->second.lastShown=shown;
+   }
+  } else {flags+=" untraced";}
+  auto bound=gTTBound.find((const void *)passed);
+  if(bound!=gTTBound.end() && bound->second.first!=tex && bound->second.second!=sid && gTTTex.count(bound->second.first)) {
+   snprintf(note,sizeof note," ALIAS(handle last bound for tex=%p sid=%u)",bound->second.first,bound->second.second);flags+=note;alias=true;
+  }
+  if(gTTBound.size()>=4096)gTTBound.clear();
+  gTTBound[(const void *)passed]={tex,sid};
+  if(ycopy){auto f=gTTFill.find(buffer);fill=f==gTTFill.end()?0:f->second;}
+  TTCb &c=gTTCb[cb];
+  if(!c.serial)c.serial=gTTCbSerial.fetch_add(1)+1;
+  serial=c.serial;c.binds++;
+  bool seen=false;
+  for(TTUse &u:c.uses)if(u.tex==tex){u.binds++;seen=true;break;}
+  if(!seen)c.uses.push_back({tex,surface,sid,replay?recSeed:seed,0,fill,1,buffer,ycopy,stage});
+ }
+ if(mismatch)gTTMismatch++;
+ if(alias)gTTAlias++;
+ if(backstep)gTTBackstep++;
+ char extra[160]="";
+ if(replay)snprintf(extra,sizeof extra," rec(h=%p seed=%u)",(void *)recHandle,recSeed);
+ char ys[80]="";
+ if(ycopy)snprintf(ys,sizeof ys," shown=%u fill=%u",shown,fill);
+ ttLog(mismatch || alias || backstep,"bind cb=#%u %c%u tex=%p h=%p sid=%u seed=%u base=%p buf=%p via=%s%s%s%s",serial,stage,slot,tex,(void *)passed,
+       sid,seed,base,buffer,via,extra,ys,flags.c_str());
+}
+// commitSubmit (the bridge's commit is next): each traced use's seed now.
+static void ttCommit(const void *cb) {
+ std::vector<TTUse> uses;uint32_t serial=0,binds=0;
+ {
+  std::lock_guard<std::mutex> l(gTTLock);
+  auto it=gTTCb.find(cb);if(it==gTTCb.end())return;
+  it->second.committedUs=nowUs();
+  for(TTUse &u:it->second.uses)u.seedCommit=IOSurfaceGetSeed(u.surface);
+  uses=it->second.uses;serial=it->second.serial;binds=it->second.binds;
+ }
+ ttTick();
+ std::string list;char item[64];
+ for(size_t i=0;i<uses.size();i++) {
+  const TTUse &u=uses[i];
+  if(i<8){snprintf(item,sizeof item," %u%s:%u>%u",u.sid,u.ycopy?"y":"",u.seedBind,u.seedCommit);list+=item;}
+  if(!u.ycopy && u.seedBind!=u.seedCommit) {
+   gTTPresub++;
+   ttLog(true,"PRESUB cb=#%u %c tex=%p sid=%u seed bind=%u commit=%u (surface written between CA's bind and the commit)",serial,u.stage,u.tex,u.sid,u.seedBind,u.seedCommit);
+  }
+ }
+ ttLog(false,"commit cb=#%u uses=%zu binds=%u:%s%s",serial,uses.size(),binds,list.c_str(),uses.size()>8?" ...":"");
+}
+// finish (completion or a local refusal), before the surfaces are flushed and released.
+static void ttDone(const void *cb,bool failed) {
+ TTCb c;
+ {std::lock_guard<std::mutex> l(gTTLock);auto it=gTTCb.find(cb);if(it==gTTCb.end())return;c=std::move(it->second);gTTCb.erase(it);}
+ ttTick();
+ std::string list;char item[80];
+ for(size_t i=0;i<c.uses.size();i++) {
+  const TTUse &u=c.uses[i];
+  const uint32_t done=IOSurfaceGetSeed(u.surface);
+  if(i<8){snprintf(item,sizeof item," %u%s:%u>%u>%u",u.sid,u.ycopy?"y":"",u.seedBind,u.seedCommit,done);list+=item;}
+  if(failed || !c.committedUs)continue;
+  if(u.ycopy) {
+   uint32_t fill=0;{std::lock_guard<std::mutex> l(gTTLock);auto f=gTTFill.find(u.buffer);fill=f==gTTFill.end()?0:f->second;}
+   if(fill!=u.fillBind){gTTRace++;ttLog(true,"RACE cb=#%u %c tex=%p sid=%u turn buf=%p fills bind=%u done=%u (YCbCr copy turn refilled while in flight)",
+                                        c.serial,u.stage,u.tex,u.sid,u.buffer,u.fillBind,fill);}
+  } else if(done!=u.seedCommit) {
+   gTTRace++;
+   ttLog(true,"RACE cb=#%u %c tex=%p sid=%u seed bind=%u commit=%u done=%u (CPU wrote while the GPU read)",c.serial,u.stage,u.tex,u.sid,u.seedBind,u.seedCommit,done);
+  }
+ }
+ ttLog(false,"done cb=#%u uses=%zu gpu=%lluus%s:%s%s",c.serial,c.uses.size(),(unsigned long long)(c.committedUs?nowUs()-c.committedUs:0),
+       failed?" FAILED":"",list.c_str(),c.uses.size()>8?" ...":"");
+}
+static void ttCbGone(const void *cb) {std::lock_guard<std::mutex> l(gTTLock);gTTCb.erase(cb);}
 static uint64_t linearAlignment();
 // C4: the device's linear pitch for `format` x `width` rounded up to linearAlignment() (64: Turnip's explicit-layout pitch).
 static uint64_t sweetLinearRow(uint64_t format,uint64_t width);
@@ -856,7 +1067,7 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  std::lock_guard<std::mutex> lock(gSurfaceImportLock);
  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
  NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
- if(buffer)return buffer;
+ if(buffer){if(textraceOn())tTtImportHit=true;return buffer;}
  NmbBuffer *handle=nmb_buffer_new_no_copy(gDevice,base,bytes,MTLResourceStorageModeShared);
  if(!handle){NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
  buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
@@ -901,6 +1112,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 }
 @implementation NBTexture
 - (void)dealloc {
+ if(textraceOn())ttForget((__bridge const void *)self);
  if(!_borrowedHandle)nmb_texture_release(_handle);
  if(_surface){surfaceDrop(_surface);CFRelease(_surface);}
  if(_ycbcrSource)CFRelease(_ycbcrSource);
@@ -942,6 +1154,7 @@ NB_RESOURCE_SPI
  NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
  view.parent=(id<MTLTexture>)self;view.buffer=_buffer;view.offset=_offset;view.rowBytes=_rowBytes;
  [view holdSurface:_surface];view.ycbcrGPU=_ycbcrGPU;
+ if(textraceOn() && _surface)ttCreated(view,_surface,"view");
  return (id<MTLTexture>)view;
 }
 // A view of a GPU-converted YCbCr texture in another format (CA's 501 view of a 500 texture: Metal's sRGB twin, which reads the
@@ -1823,11 +2036,17 @@ static void waitForResource(id resource) {
   }
   EncCmd c={};c.op=EO_TEXTURE;c.stage=(uint8_t)stage;c.index=(uint32_t)index;c.target=(__bridge void *)self;c.a=(__bridge void *)texture;
   if(texture)c.u[0]=((NBTexture *)texture)->encReplaceEpoch.load();
+  if(texture && textraceOn()) {   // ws-cam-textrace: what CA's bind saw, for the replay's line
+   NBTexture *t=(NBTexture *)texture;IOSurfaceRef sf=t.surface?t.surface:t.ycbcrSource;
+   c.b=(void *)t.handle;c.u[1]=sf?IOSurfaceGetSeed(sf):0;
+  }
   encPush(c);return;
  }
  if(texture)ycbcrRefresh((NBTexture *)texture,_commandBuffer);
  if(texture && shadowSeedOn() && [(NBTexture *)texture surface] && !((NBTexture *)texture).ycbcrGPU)
   nmb_texture_set_bytes_generation([(NBTexture *)texture handle],(uint64_t)IOSurfaceGetSeed([(NBTexture *)texture surface])+1);
+ if(textraceOn() && texture)ttBind((__bridge const void *)_commandBuffer,"cvf"[stage<3?stage:0],(uint32_t)index,(NBTexture *)texture,
+                                   [(NBTexture *)texture handle],"direct",false,nullptr,0);
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
 }
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {ENC_SCOPE(EC_BIND,"setSamplerState");
@@ -2337,6 +2556,7 @@ static void waitForResource(id resource) {
    if(written&(1u<<i))[self.commandBuffer.writtenSurfaces addObject:o];
   }
   if(!(written&(1u<<i)) && !encDeferred)ycbcrRefresh((NBTexture *)o,self.commandBuffer);   // u-encthread: the replay's
+  if(!encDeferred && textraceOn())ttBind((__bridge const void *)self.commandBuffer,'b',(uint32_t)i,(NBTexture *)o,[(NBTexture *)o handle],"direct-blit",false,nullptr,0);
  }
  return true;
 }
@@ -2473,6 +2693,7 @@ static void encReplay(const EncCmd &c,const uint8_t *bytes) {
    if(shadowSeedOn() && t.surface && !t.ycbcrGPU)
     nmb_texture_set_bytes_generation(t.handle,t->encReplaceEpoch.load()==(uint32_t)c.u[0]?(uint64_t)IOSurfaceGetSeed(t.surface)+1:0);
   }
+  if(t && textraceOn())ttBind((__bridge const void *)e.commandBuffer,"cvf"[stage<3?stage:0],index,t,t.handle,"replay",true,(NmbTexture *)c.b,(uint32_t)c.u[1]);
   [e check:nmb_encoder_set_texture(h,stage,t?t.handle:nullptr,index) what:"setTexture"];
   break;
  }
@@ -2508,11 +2729,13 @@ static void encReplay(const EncCmd &c,const uint8_t *bytes) {
  case EO_COPY_TEXTURE: {
   NBTexture *s=(NBTexture *)a,*d=(__bridge NBTexture *)c.b;
   if(c.mask&1)ycbcrRefresh(s,e.commandBuffer);
+  if(textraceOn()){ttBind((__bridge const void *)e.commandBuffer,'b',0,s,s.handle,"replay-blit",false,nullptr,0);ttBind((__bridge const void *)e.commandBuffer,'b',1,d,d.handle,"replay-blit",false,nullptr,0);}
   const uint64_t *v=(const uint64_t *)(bytes+c.off);
   [e check:nmb_blit_copy_texture(h,s.handle,v[0],v[1],v+2,v+5,d.handle,v[8],v[9],v+10) what:"copyFromTexture:toTexture:"];
   break;
  }
  case EO_BUFFER_TO_TEXTURE: {
+  if(textraceOn())ttBind((__bridge const void *)e.commandBuffer,'b',1,(__bridge NBTexture *)c.b,[(__bridge NBTexture *)c.b handle],"replay-blit",false,nullptr,0);
   const uint64_t *v=(const uint64_t *)(bytes+c.off);
   [e check:nmb_blit_buffer_to_texture(h,[(NBBuffer *)a handle],v[0],v[1],v[2],v+3,[(__bridge NBTexture *)c.b handle],v[6],v[7],v+8)
        what:"copyFromBuffer:toTexture:"];
@@ -2521,11 +2744,14 @@ static void encReplay(const EncCmd &c,const uint8_t *bytes) {
  case EO_TEXTURE_TO_BUFFER: {
   NBTexture *s=(NBTexture *)a;
   if(c.mask&1)ycbcrRefresh(s,e.commandBuffer);
+  if(textraceOn())ttBind((__bridge const void *)e.commandBuffer,'b',0,s,s.handle,"replay-blit",false,nullptr,0);
   const uint64_t *v=(const uint64_t *)(bytes+c.off);
   [e check:nmb_blit_texture_to_buffer(h,s.handle,v[0],v[1],v+2,v+5,[(__bridge NBBuffer *)c.b handle],v[8],v[9],v[10]) what:"copyFromTexture:toBuffer:"];
   break;
  }
- case EO_MIPMAPS:[e check:nmb_blit_generate_mipmaps(h,[(NBTexture *)a handle]) what:"generateMipmapsForTexture"];break;
+ case EO_MIPMAPS:
+  if(textraceOn())ttBind((__bridge const void *)e.commandBuffer,'b',0,(NBTexture *)a,[(NBTexture *)a handle],"replay-blit",false,nullptr,0);
+  [e check:nmb_blit_generate_mipmaps(h,[(NBTexture *)a handle]) what:"generateMipmapsForTexture"];break;
  default:break;
  }
 }
@@ -2559,7 +2785,7 @@ static void noteDeviceLost(const char *why) {
  if(self){createdUs=nowUs();if(timelineOn())tlCreated=tlNow();encDeferred=encThreadOn();}
  return self;
 }
-- (void)dealloc {nmb_command_buffer_release(_handle);}
+- (void)dealloc {if(textraceOn())ttCbGone((__bridge const void *)self);nmb_command_buffer_release(_handle);}
 - (id<MTLCommandQueue>)commandQueue {return (id<MTLCommandQueue>)_queue;}
 - (BOOL)retainedReferences {return YES;}
 // Protected content is not supported (the runtime's AppleOnlyCall::SetProtectionOptions takes Metal's default only): any other option fails
@@ -2648,6 +2874,7 @@ static void noteDeviceLost(const char *why) {
   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface){[_surfaces addObject:texture];[_writtenSurfaces addObject:texture];}
   if(texture.rotationValue)self.rotatedFrame=YES;
   [_resourceOwners addObject:texture];
+  if(textraceOn())ttBind((__bridge const void *)self,'a',0,texture,texture.handle,"attach",false,nullptr,0);
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
   return true;
  };
@@ -2743,6 +2970,7 @@ static void noteDeviceLost(const char *why) {
 }
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
+ if(textraceOn())ttDone((__bridge const void *)self,self.failedLocally);
  if(!self.failedLocally && nmb_command_buffer_status(_handle)==MTLCommandBufferStatusError) {
   char text[512]={};nmb_command_buffer_error(_handle,text,sizeof text);noteDeviceLost(text);
  }
@@ -2842,6 +3070,7 @@ static void noteDeviceLost(const char *why) {
 - (void)commitSubmit {
  @synchronized(gInFlight){[gInFlight addObject:self];}
  if(!self.encodeFailure) {
+  if(textraceOn())ttCommit((__bridge const void *)self);
   flushSurfaces(_surfaces,false);
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
@@ -3559,7 +3788,7 @@ static NBTexture *ycbcrSurfaceTexture(IOSurfaceRef surface,MTLTextureDescriptor 
  static NSMapTable<NSValue *,NBTexture *> *made;static std::mutex lock;
  {std::lock_guard<std::mutex> l(lock);
   if(!made)made=[NSMapTable strongToWeakObjectsMapTable];
-  if(NBTexture *known=[made objectForKey:key]){why="";return known;}}
+  if(NBTexture *known=[made objectForKey:key]){why="";if(textraceOn())tTtCache="ycbcr-map";return known;}}
  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);
  if(!buffer){why="import";return nil;}
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor)){why="descriptor";return nil;}
@@ -3641,6 +3870,7 @@ static NBTexture *copyTexture(MTLPixelFormat format,size_t w,size_t h,uint64_t r
 static std::atomic<uint64_t> gYCbCrFills,gYCbCrSkips,gYCbCrFillUs,gYCbCrFillMaxUs;
 // A picture into `turn`, timed; every 300th fill a J line in the log (/dev/console, so the klog has it).
 static bool ycbcrFillTurn(NBTexture *turn,IOSurfaceRef surface,size_t w,size_t h,bool bt709) {
+ if(textraceOn())ttNoteFill((__bridge const void *)turn.buffer);
  const uint64_t began=nowUs();
  if(!ycbcrFill(turn.buffer,turn.rowBytes,surface,w,h,bt709))return false;
  const uint64_t took=nowUs()-began;gYCbCrFillUs+=took;
@@ -3740,6 +3970,7 @@ static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {ENC_SCOPE(EC_TEX,"newTexture(iosurface)");if(surface && d && encStatOn())snprintf(tEncDetail,sizeof tEncDetail,"surface %u %zux%zu fmt %lu plane %lu",IOSurfaceGetID(surface),IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),(unsigned long)d.pixelFormat,(unsigned long)plane);
  if(!surface || !d)return nil;
+ if(textraceOn()){tTtImportHit=false;tTtCache=nullptr;}
  const size_t planes=IOSurfaceGetPlaneCount(surface);
  if(planes?plane>=planes:plane!=0){noteSurfaceTexture(surface,d,plane,planes,0,0,"refused (no such plane)");return nil;}
  if((d.pixelFormat==500 || d.pixelFormat==501) && plane==0) {
@@ -3752,11 +3983,15 @@ static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
   if(ycbcrOnGPU()) {
    std::string why;uint64_t lumaRow=0;
    if(NBTexture *texture=ycbcrSurfaceTexture(surface,d,why,&lumaRow)){
-    noteSurfaceTexture(surface,d,plane,planes,lumaAt,(NSUInteger)lumaRow,"made (YCbCr on the GPU)");return (id<MTLTexture>)texture;}
+    noteSurfaceTexture(surface,d,plane,planes,lumaAt,(NSUInteger)lumaRow,"made (YCbCr on the GPU)");
+    if(textraceOn())ttCreated(texture,surface,"ycbcr-gpu");
+    return (id<MTLTexture>)texture;}
    noteSurfaceTexture(surface,d,plane,planes,lumaAt,(NSUInteger)lumaRow,("YCbCr on the GPU refused, CPU copy instead: "+why).c_str());
   }
+  if(textraceOn()){tTtImportHit=false;tTtCache=nullptr;}   // a refused GPU texture's import is not the copy's
   NBTexture *copy=ycbcrCopy(surface,d);
   noteSurfaceTexture(surface,d,plane,planes,lumaAt,IOSurfaceGetBytesPerRowOfPlane(surface,0),copy?"made (YCbCr copy)":"refused (YCbCr copy)");
+  if(textraceOn())ttCreated(copy,surface,"ycbcr-copy");
   return (id<MTLTexture>)copy;
  }
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
@@ -3790,6 +4025,7 @@ static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
     NBTexture *hit=rotCache[i].second;auto entry=rotCache[i];rotCache.erase(rotCache.begin()+(long)i);rotCache.insert(rotCache.begin(),entry);
     if(++rotHits==1 || rotHits%500==0)sm2_logs([NSString stringWithFormat:@"native-metal: rotated surface textures: %llu made, %llu reused",
                                                 (unsigned long long)rotMade,(unsigned long long)rotHits].UTF8String);
+    if(textraceOn()){tTtCache="rotation";tTtImportHit=false;ttCreated(hit,surface,"rotated");}
     return (id<MTLTexture>)hit;
    }
   }
@@ -3818,8 +4054,10 @@ static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
   texture=textureOnBuffer(buffer,d,offset,row,true);
   noteSurfaceTexture(surface,d,plane,planes,offset,row,texture?"made":"refused (texture over the surface)");
  }
- if(!texture)return nil;
- texture.plane=plane;[texture holdSurface:surface];return (id<MTLTexture>)texture;
+ if(!texture){if(textraceOn())tTtImportHit=false;return nil;}
+ texture.plane=plane;[texture holdSurface:surface];
+ if(textraceOn())ttCreated(texture,surface,rotation?"rotated":"plain");
+ return (id<MTLTexture>)texture;
 }
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {ENC_SCOPE(EC_PIPE,"newLibrary(data)");
  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
