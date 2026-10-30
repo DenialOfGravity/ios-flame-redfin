@@ -3542,6 +3542,17 @@ static bool ycbcrOnGPU() {
  if(gpu<0){const char *e=getenv("SWEET_YCBCR");gpu=e && !strcmp(e,"gpu");}
  return gpu>0;
 }
+// SWEET_YCBCR=cpu2: the CPU copy, one texture per surface and request while CA holds it (CA asks again for every frame of a pool
+// surface: the default made new turns each time, 256 -> 581 MB and OutOfMemory), and filled synchronously at its first use in a
+// command buffer whose surface seed moved (the default showed the newest completed async fill: a pool surface one cycle old, the
+// preview jumping back in time). Any other value: the default.
+static bool ycbcrCpu2() {
+ static int on=-1;
+ if(on<0){const char *e=getenv("SWEET_YCBCR");on=e && !strcmp(e,"cpu2");
+  if(on)sm2_logs("native-metal: YCbCr cpu2 (cached per surface, filled at use)");}
+ return on>0;
+}
+static std::atomic<uint64_t> gYCbCr2Hits,gYCbCr2Sync,gYCbCr2Skips,gYCbCr2FillUs,gYCbCr2FillMaxUs;
 static NBTexture *ycbcrSurfaceTexture(IOSurfaceRef surface,MTLTextureDescriptor *d,std::string &why,uint64_t *lumaRowOut) {
  if(IOSurfaceGetPlaneCount(surface)!=2){why="not two planes";return nil;}
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
@@ -3649,9 +3660,32 @@ static bool ycbcrFillTurn(NBTexture *turn,IOSurfaceRef surface,size_t w,size_t h
  if(n<=2 || n%300==0)sm2_logs([NSString stringWithFormat:@"native-metal: J ycbcr cpu fills=%llu skips=%llu fill mean %llu us max %llu us",
      (unsigned long long)n,(unsigned long long)gYCbCrSkips.load(),(unsigned long long)(gYCbCrFillUs.load()/n),
      (unsigned long long)gYCbCrFillMaxUs.load()].UTF8String);
+ if(ycbcrCpu2() && (n<=2 || n%300==0)) {const uint64_t s=gYCbCr2Sync.load();
+  sm2_logs([NSString stringWithFormat:@"native-metal: J ycbcr cpu2 hits=%llu sync=%llu skips=%llu fill mean %llu us max %llu us",
+     (unsigned long long)gYCbCr2Hits.load(),(unsigned long long)s,(unsigned long long)gYCbCr2Skips.load(),
+     (unsigned long long)(s?gYCbCr2FillUs.load()/s:0),(unsigned long long)gYCbCr2FillMaxUs.load()].UTF8String);}
  return true;
 }
+static NBTexture *ycbcrCopyMake(IOSurfaceRef surface,MTLTextureDescriptor *d);
 static NBTexture *ycbcrCopy(IOSurfaceRef surface,MTLTextureDescriptor *d) {
+ if(!ycbcrCpu2())return ycbcrCopyMake(surface,d);
+ // cpu2: the same key and pruning as ycbcrSurfaceTexture (a strong-to-weak map: kept while CA holds the texture).
+ struct Key {uint64_t id,base,format,width,height,usage;};
+ const Key value={IOSurfaceGetID(surface),(uintptr_t)IOSurfaceGetBaseAddress(surface),(uint64_t)d.pixelFormat,d.width,d.height,(uint64_t)d.usage};
+ NSValue *key=[NSValue valueWithBytes:&value objCType:@encode(Key)];
+ static NSMapTable<NSValue *,NBTexture *> *made;static std::mutex lock;
+ {std::lock_guard<std::mutex> l(lock);
+  if(!made)made=[NSMapTable strongToWeakObjectsMapTable];
+  if(NBTexture *known=[made objectForKey:key]){gYCbCr2Hits++;return known;}}
+ NBTexture *texture=ycbcrCopyMake(surface,d);
+ if(!texture)return nil;
+ {std::lock_guard<std::mutex> l(lock);
+  if(made.count>=64)for(NSValue *old in made.keyEnumerator.allObjects)if(![made objectForKey:old])[made removeObjectForKey:old];
+  if(NBTexture *known=[made objectForKey:key]){gYCbCr2Hits++;return known;}   // made meanwhile on another thread
+  [made setObject:texture forKey:key];}
+ return texture;
+}
+static NBTexture *ycbcrCopyMake(IOSurfaceRef surface,MTLTextureDescriptor *d) {
  if(IOSurfaceGetPlaneCount(surface)!=2)return nil;
  const size_t w=d.width,h=d.height;
  if(!w || !h || IOSurfaceGetWidthOfPlane(surface,0)<w || IOSurfaceGetHeightOfPlane(surface,0)<h ||
@@ -3701,6 +3735,27 @@ static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
   if(cb && texture.lastCommandBuffer==cb)return;   // this command buffer already chose its picture
   const bool firstUse=!texture.lastCommandBuffer;
   texture.lastCommandBuffer=cb;
+  if(ycbcrCpu2()) {   // filled here, synchronously, into a free turn; none free: the current picture stays (a skip)
+   const uint32_t seed=IOSurfaceGetSeed(texture.ycbcrSource);
+   if(seed==texture.surfaceSeed)return;
+   const NmbTextureDescriptor current=texture.descriptor;
+   NBTexture *next=nil;
+   if(firstUse)for(NBTexture *turn in texture.turns)if(turn.handle==texture.handle){next=turn;break;}   // nothing sampled it yet
+   if(!next)for(NBTexture *turn in texture.turns)
+    if(turn.handle!=texture.handle && turn.handle!=texture.previousHandle && !bufferInFlight(turn.buffer)){next=turn;break;}
+   if(!next && texture.turns.count<3) {
+    next=copyTexture((MTLPixelFormat)current.format,current.width,current.height,texture.rowBytes);
+    if(next)[texture.turns addObject:next];
+   }
+   if(!next){gYCbCr2Skips++;gYCbCrSkips++;return;}
+   const uint64_t began=nowUs();
+   if(!ycbcrFillTurn(next,texture.ycbcrSource,current.width,current.height,texture.ycbcr709)){gYCbCr2Skips++;return;}
+   const uint64_t took=nowUs()-began;gYCbCr2Sync++;gYCbCr2FillUs+=took;
+   uint64_t seen=gYCbCr2FillMaxUs.load();while(took>seen && !gYCbCr2FillMaxUs.compare_exchange_weak(seen,took)){}
+   if(next.handle!=texture.handle){texture.previousHandle=texture.handle;texture.handle=next.handle;texture.buffer=next.buffer;}
+   texture.surfaceSeed=seed;
+   return;
+  }
   // The first use of a copy whose surface was written after it was made (a picture decoded into a surface CA already made the
   // texture for, drawn once: thumbnails, Photos) is filled here, synchronously, into the bound turn (nothing has sampled it yet).
   if(firstUse && !texture.filling && IOSurfaceGetSeed(texture.ycbcrSource)!=texture.surfaceSeed) {
@@ -4566,6 +4621,8 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("J surface cleans skipped (seed)=%llu invalidates=%llu%s",(unsigned long long)gSurfaceCleanSkips.load(),
   (unsigned long long)gSurfaceInvalidates.load(),flushAll()?" (SWEET_FLUSH=all)":"");
  row("J ycbcr %s fills=%llu skips=%llu",ycbcrOnGPU()?"gpu":"cpu",(unsigned long long)gYCbCrFills.load(),(unsigned long long)gYCbCrSkips.load());
+ if(ycbcrCpu2())row("J ycbcr cpu2 hits=%llu sync=%llu skips=%llu max=%lluus",(unsigned long long)gYCbCr2Hits.load(),
+  (unsigned long long)gYCbCr2Sync.load(),(unsigned long long)gYCbCr2Skips.load(),(unsigned long long)gYCbCr2FillMaxUs.load());
  {uint64_t c[5]={};if(nmb_sweet_shadow_counts(c))row("J copies: %llu done (%llu bytes) %llu skipped, refusals %llu, repacked %llu",(unsigned long long)c[0],
    (unsigned long long)c[1],(unsigned long long)c[3],(unsigned long long)c[4],(unsigned long long)c[2]);}
  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
