@@ -67,6 +67,13 @@ static std::atomic<int64_t> gLiveCpuFast{-1},gLiveEncStat{-1},gLiveFnStat{-1},gL
 // (backboardd command buffers with a framebuffer pass) every render pass and draw as "DB" lines: pipeline functions + label,
 // blend, write mask, viewport, scissor, the position attribute's bounding box (raw and in pixels) and the vertex uniform bytes.
 static std::atomic<int32_t> gDrawboxLeft{0};static std::atomic<uint32_t> gDrawboxSeq{0};
+// g10: SWEET_DEADFILL defaults to 2 (unset); 0 turns it off. Passes: backboardd's, colour 0 an 8-bit unorm single-sample 2D IOSurface
+// (the composited framebuffer; +4 in the value: any such texture), no depth/stencil, no visibility buffer; colours 1..7 (CA's memoryless
+// scratch) are allowed. The g9 mode-2 hold demanded colour 0 alone, and every CA pass carries the scratch as colour 1: never held,
+// "cleared 0". Fills: also single-sample, no alpha-to-coverage, cull none, fill mode fill; a fill is dropped only for the next fill of the
+// same pipeline object with the same other vertex bindings; the Clear needs the transform (the first other vertex binding, a column-major
+// 4x4) to map the fill onto the whole target in clip space (w 1, z in [0,1]) and the fill's pipeline not to write an attached colour 1..7
+// that is not memoryless; the clear colour is the fill's, rounded to the 8-bit code.
 // g9 SWEET_DEADFILL (env or /var/local/mtl2-live, read at each render encoder's creation; default 0 = off). 1: a draw that is a
 // full-target opaque constant-colour fill (Core Animation's "draw.PBGRAXm_A2Xhf" pipeline: no blending, all channels written, no
 // depth/stencil, untextured; viewport/scissor the whole attachment; every vertex the same colour with alpha 1; position bbox covering
@@ -76,9 +83,9 @@ static std::atomic<int32_t> gDrawboxLeft{0};static std::atomic<uint32_t> gDrawbo
 // attachment 0 loads (Load or DontCare) and it has no other attachment: if its first surviving draw is such a fill, the pass clears
 // to the fill's colour instead and the draw is dropped (A6xx fast clear). "native-metal: DF 5s:" counts them (with the timeline).
 static std::atomic<int64_t> gLiveDeadfill{-1};
-static std::atomic<uint64_t> gDfDeferred{0},gDfDropped{0},gDfCleared{0},gDfPx{0};static std::atomic<int32_t> gDfCapturing{0};
+static std::atomic<uint64_t> gDfDeferred{0},gDfDropped{0},gDfCleared{0},gDfPx{0},gDfHeldPasses{0},gDfNoClear{0};static std::atomic<int32_t> gDfCapturing{0};
 static int deadfillMode() {
- static const int env=[]{const char *e=getenv("SWEET_DEADFILL");return e && *e?atoi(e):0;}();
+ static const int env=[]{const char *e=getenv("SWEET_DEADFILL");return e && *e?atoi(e):2;}();   // g10: default 2
  const int64_t live=gLiveDeadfill.load(std::memory_order_relaxed);
  return live>=0?(int)live:env;
 }
@@ -1256,6 +1263,7 @@ static std::string quartzCoreCallers();
  char encNames[80];   // u-e: its vertex + fragment function names, for "E slow" draws
  // ovd (SWEET_DRAWBOX): colour attachment 0's blend and mask, the label's tail, attribute 0 (format, offset, buffer, stride)
  char dbLabel[48];uint8_t dbBlend,dbMask,dbSrc,dbDst,dbSrcA,dbDstA;uint32_t dbFmt,dbOff,dbBuf,dbStride,dbCFmt,dbCOff;   // + the first 4-wide colour-like attribute after 0 (half4/float4/uchar4n)
+ uint8_t dfMasks[8],dfSamples;bool dfA2C;   // g10: every colour's write mask (0 where no format), raster sample count, alpha to coverage
 }
 @property(nonatomic) NmbRenderPipeline *handle;
 @end
@@ -1677,6 +1685,7 @@ static void fnReport() {
  // data in dfBytes; an entry whose op is EO_COUNT is skipped), the held draw's index there (-1: none), the creation held (mode 2),
  // and whether the encoder is a direct one (encDeferred only while capturing)
  bool dfTrack,dfCapturing,dfPending,dfDirect,dfHeldPx;int8_t dfMode;int32_t dfHeld;uint32_t dfHeldD;float dfHeldCol[4];
+ uint8_t dfAttached,dfWhy;__unsafe_unretained id dfHeldPipe;   // g10: the pass's colours 1..7 attached (bit i); why the held fill may not clear (bits); its pipeline
  std::vector<EncCmd> dfList;std::vector<uint8_t> dfBytes;NmbRenderPassDescriptor *dfPass;uint64_t dfPx,dfHeldBind;
  bool encDeferred,encEnded;   // u-encthread: recorded for the worker (then `handle` is the worker's alone); endEncoding recorded
 }
@@ -1732,7 +1741,7 @@ static void waitForResource(id resource) {
 - (void)dfCreate:(bool)clear {
  if(!dfPending)return;
  NmbRenderPassDescriptor pass=*dfPass;delete dfPass;dfPass=nullptr;dfPending=false;
- if(clear){pass.colors[0].load=MTLLoadActionClear;for(int i=0;i<4;i++)pass.colors[0].clear[i]=dfHeldCol[i];}
+ if(clear){pass.colors[0].load=MTLLoadActionClear;for(int i=0;i<4;i++)pass.colors[0].clear[i]=std::min(255.,std::max(0.,floor(dfHeldCol[i]*255.+0.5)))/255.;}   // g10: the 8-bit code
  NBCommandBuffer *cb=_commandBuffer;
  if(dfDirect) {
   NmbEncoder *h=cb.committed?nullptr:nmb_render_encoder_new(cb.handle,&pass);
@@ -1761,6 +1770,7 @@ static void waitForResource(id resource) {
 - (void)endEncoding {
  if(dfCapturing) {   // g9: a fill still held at the end is the pass's last draw: it goes out (mode 2: a pass of only fills clears)
   const bool clearIt=dfPending && dfHeld>=0 && dfHeldPx;
+  if(dfPending && dfHeld>=0 && !dfHeldPx)gDfNoClear.fetch_add(1);
   if(clearIt){gDfCleared.fetch_add(1);gDfPx.fetch_add(dfPx);if(dbFrame){char l[120];snprintf(l,sizeof l,"native-metal: DB f%u p%u d%u DF cleared (pass end)",dbFrame,dbPass,dfHeldD);sm2_logs(l);}}
   [self dfRelease:clearIt clear:clearIt];
  }
@@ -1906,7 +1916,7 @@ static void waitForResource(id resource) {
  bool haveViewport,haveScissor;double lastViewport[6];uint64_t lastScissor[4];
  // ovd: the bound pipeline, viewport/scissor as set (any CPUFAST), the colour attachment's size and load action
  NBRenderPipeline *dbPipe;double dbVp[4];uint64_t dbSc[4];bool dbHaveVp,dbHaveSc;uint32_t dbW,dbH,dbLoad;
- bool dfDss,dfClipKind;   // g9: a depth/stencil state was set; the last fill tested was in clip space (else pixels)
+ bool dfDss,dfClipKind,dfClearOK;uint8_t dfWhyLast;   // g9: a depth/stencil state was set; the last fill tested was in clip space (else pixels); g10: it may be the clear
 }
 @end
 @implementation NBRenderEncoder
@@ -1987,6 +1997,7 @@ static void waitForResource(id resource) {
  NBRenderPipeline *p=dbPipe;
  if(!p || dfDss || inst!=1 || (prim!=MTLPrimitiveTypeTriangle && prim!=MTLPrimitiveTypeTriangleStrip) || count<3 || count>64)return false;
  if(strcmp(p->dbLabel,"draw.PBGRAXm_A2Xhf") || p->dbBlend || p->dbMask!=0xf)return false;
+ if(p->dfSamples>1 || p->dfA2C || rasterCull!=MTLCullModeNone || rasterFill!=MTLTriangleFillModeFill)return false;   // g10: every pixel, once
  if(p->dbFmt!=MTLVertexFormatFloat4 && p->dbFmt!=MTLVertexFormatFloat2)return false;
  if(p->dbCFmt!=MTLVertexFormatHalf4 && p->dbCFmt!=MTLVertexFormatFloat4 && p->dbCFmt!=MTLVertexFormatUChar4Normalized)return false;
  if(!dbW || !dbH || p->dbBuf>=8)return false;
@@ -2003,7 +2014,7 @@ static void waitForResource(id resource) {
  const int comps=p->dbFmt==MTLVertexFormatFloat4?4:2;
  const uint32_t stride=p->dbStride?p->dbStride:(uint32_t)comps*4;
  if(!(prim==MTLPrimitiveTypeTriangle?count==6:count==4))return false;   // one rectangle: two triangles
- float x0=1e30f,y0=1e30f,x1=-1e30f,y1=-1e30f;float c0[4]={0,0,0,0};float vx[6],vy[6];
+ float x0=1e30f,y0=1e30f,x1=-1e30f,y1=-1e30f;float c0[4]={0,0,0,0};float vx[6],vy[6],vz[6];
  for(uint32_t k=0;k<count;k++) {
   int64_t v;
   if(ib){if(itype==MTLIndexTypeUInt16){if((k+1)*2>ilen)return false;v=((const uint16_t *)ix)[k];}else{if((k+1)*4>ilen)return false;v=((const uint32_t *)ix)[k];}v+=base;}
@@ -2012,7 +2023,7 @@ static void waitForResource(id resource) {
   const size_t o=(size_t)v*stride+p->dbOff;if(o+comps*4>len)return false;
   float q[4]={0,0,0,1};memcpy(q,src+o,comps*4);
   if(q[3]!=1)return false;
-  vx[k]=q[0];vy[k]=q[1];
+  vx[k]=q[0];vy[k]=q[1];vz[k]=comps==4?q[2]:0;
   x0=std::min(x0,q[0]);x1=std::max(x1,q[0]);y0=std::min(y0,q[1]);y1=std::max(y1,q[1]);
   const size_t co=(size_t)v*stride+p->dbCOff;float c[4];
   if(p->dbCFmt==MTLVertexFormatHalf4){if(co+8>len)return false;const __fp16 *h=(const __fp16 *)(src+co);for(int i=0;i<4;i++)c[i]=(float)h[i];}
@@ -2040,7 +2051,42 @@ static void waitForResource(id resource) {
  if(ns!=2 || (shared[0]^shared[1])!=3)return false;
  memcpy(col,c0,sizeof c0);
  dfClipKind=clip;
+ // g10: may this fill become the pass's clear? CA's fixed vertex function, no other attached colour written, and its transform (the first
+ // vertex binding other than the position's: a column-major 4x4, as DRAWBOX prints it) taking every vertex exactly onto a corner of clip
+ // space with w 1 and z in [0,1]: the rectangle drawn is the whole target, whatever the positions' space
+ // (a clear writes colour 0 only: a fill that may write a lasting colour 1..7 too keeps its draw)
+ uint8_t why=0;
+ if(strncmp(p->encNames,"fixed_vert_lph_spc + ",21))why|=1;
+ for(int i=1;i<8;i++)if(((dfAttached>>i)&1) && p->dfMasks[i])why|=2;
+ const float *m=[self dfTransform];
+ if(!m)why|=4;
+ bool clr=!why;
+ float cx0=1e30f,cx1=-1e30f,cy0=1e30f,cy1=-1e30f;
+ for(uint32_t k=0;k<count && clr;k++) {
+  const float x=vx[k],y=vy[k],z=vz[k];
+  const float cx=m[0]*x+m[4]*y+m[8]*z+m[12],cy=m[1]*x+m[5]*y+m[9]*z+m[13],cz=m[2]*x+m[6]*y+m[10]*z+m[14],cw=m[3]*x+m[7]*y+m[11]*z+m[15];
+  if(fabsf(cw-1)>1e-5f || fabsf(fabsf(cx)-1)>1e-4f || fabsf(fabsf(cy)-1)>1e-4f || cz<0 || cz>1)clr=false;
+  cx0=std::min(cx0,cx);cx1=std::max(cx1,cx);cy0=std::min(cy0,cy);cy1=std::max(cy1,cy);
+ }
+ if(clr && (cx0>-0.999f || cx1<0.999f || cy0>-0.999f || cy1<0.999f))clr=false;
+ if(!why && !clr)why|=8;
+ dfClearOK=clr;dfWhyLast=why;
  return true;
+}
+// g10: the vertex transform: the first vertex-stage binding other than the position's with 16 floats (bytes, else a buffer at its offset)
+- (const float *)dfTransform {
+ const uint32_t buf=dbPipe?dbPipe->dbBuf:99;
+ for(uint32_t k=0;k<8;k++) {
+  if(k==buf)continue;
+  if(!dbVbytes[k].empty())return dbVbytes[k].size()>=64?(const float *)dbVbytes[k].data():nullptr;
+  if(id vb=dbVb[k]) {
+   if(![vb isKindOfClass:[NBBuffer class]])return nullptr;
+   const uint8_t *c=(const uint8_t *)[(id<MTLBuffer>)vb contents];const NSUInteger l=[(id<MTLBuffer>)vb length];
+   if(!c || dbVbOff[k]+64>l || (dbVbOff[k]&3))return nullptr;
+   return (const float *)(c+dbVbOff[k]);
+  }
+ }
+ return nullptr;
 }
 // g9: the vertex stage's bindings other than the position's (CA's transform/uniforms): a held fill is dropped only for a fill drawn
 // with the same ones (same positions and same transform: the same pixels)
@@ -2068,7 +2114,7 @@ static void waitForResource(id resource) {
  const uint32_t d=dbDraws?dbDraws-1:0;
  if(fill) {
   const uint64_t bind=[self dfBindHash]^(dfClipKind?0x9e3779b97f4a7c15ull:0);
-  if(dfCapturing && dfHeld>=0 && bind!=dfHeldBind) {   // a fill under another transform: the held one goes out first (kept)
+  if(dfCapturing && dfHeld>=0 && (bind!=dfHeldBind || (id)dbPipe!=dfHeldPipe)) {   // another transform or pipeline: the held one goes out first (kept)
    const bool clearIt=false;[self dfRelease:clearIt clear:clearIt];
   }
   if(dfCapturing && dfHeld>=0) {   // the held fill is completely overwritten by this one
@@ -2077,11 +2123,12 @@ static void waitForResource(id resource) {
   }
   gDfDeferred.fetch_add(1);
   [self dfCapture];
-  dfHeld=(int32_t)dfList.size();dfHeldD=d;memcpy(dfHeldCol,col,sizeof col);dfPx=(uint64_t)dbW*dbH;dfHeldBind=bind;dfHeldPx=!dfClipKind;
+  dfHeld=(int32_t)dfList.size();dfHeldD=d;memcpy(dfHeldCol,col,sizeof col);dfPx=(uint64_t)dbW*dbH;dfHeldBind=bind;dfHeldPx=dfClearOK;dfWhy=dfWhyLast;dfHeldPipe=dbPipe;
   return;
  }
  if(!dfCapturing)return;
- const bool clearIt=dfPending && dfHeld>=0 && dfHeldPx;   // mode 2: the first surviving draw of the pass is a fill (in pixels): a clear instead
+ const bool clearIt=dfPending && dfHeld>=0 && dfHeldPx;   // mode 2: the first surviving draw of the pass is a fill (g10: covering the target): a clear instead
+ if(dfPending && dfHeld>=0 && !dfHeldPx){gDfNoClear.fetch_add(1);if(dbFrame){char l[120];snprintf(l,sizeof l,"native-metal: DB f%u p%u d%u DF no clear (why 0x%x: 1 function 2 other colour written 4 no transform 8 not the target)",dbFrame,dbPass,dfHeldD,dfWhy);sm2_logs(l);}}
  if(clearIt){gDfCleared.fetch_add(1);gDfPx.fetch_add(dfPx);if(dbFrame){char l[160];snprintf(l,sizeof l,"native-metal: DB f%u p%u d%u DF cleared (load->clear %.3f,%.3f,%.3f,%.3f)",dbFrame,dbPass,dfHeldD,
   dfHeldCol[0],dfHeldCol[1],dfHeldCol[2],dfHeldCol[3]);sm2_logs(l);}}
  [self dfRelease:clearIt clear:clearIt];
@@ -2627,21 +2674,31 @@ static void noteDeviceLost(const char *why) {
    (t && [(id)t isKindOfClass:[NBTexture class]] && ((NBTexture *)t).surface)?IOSurfaceGetID(((NBTexture *)t).surface):0u);
   sm2_logs(line);
  }
- // g9 (SWEET_DEADFILL, backboardd): fills tracked; mode 2 holds the creation of a pass that loads colour 0 and has nothing else attached
+ // g9 (SWEET_DEADFILL, backboardd): fills tracked; mode 2 holds the creation of a pass that loads colour 0. g10: the pass's colour 0 is an
+ // 8-bit unorm single-sample 2D IOSurface (the composited frame; mode +4: any such texture), nothing depth/stencil/visibility; colours
+ // 1..7 may be attached (CA's memoryless scratch is colour 1 of every pass: g9 demanded colour 0 alone, so the hold never happened)
  static const bool dfProc=!strcmp(getprogname(),"backboardd");
  if(const int mode=dfProc?deadfillMode():0) {
   id<MTLTexture> t=d.colorAttachments[0].texture;
-  re->dfTrack=true;re->dfMode=(int8_t)mode;re->dfHeld=-1;re->dbW=t?(uint32_t)t.width:0;re->dbH=t?(uint32_t)t.height:0;
-  bool alone=t && !d.depthAttachment.texture && !d.stencilAttachment.texture && !d.visibilityResultBuffer;
-  for(unsigned i=1;i<8 && alone;i++)if(d.colorAttachments[i].texture)alone=false;
-  const MTLLoadAction load=d.colorAttachments[0].loadAction;
   const MTLPixelFormat pf=t?t.pixelFormat:MTLPixelFormatInvalid;   // 8-bit unorm targets only: a clear value and a written colour store alike
-  if(mode>=2 && alone && (pf==MTLPixelFormatBGRA8Unorm || pf==MTLPixelFormatRGBA8Unorm) && (load==MTLLoadActionLoad || load==MTLLoadActionDontCare) && !self.committed) {
-   if(!tlFirstEncoder && tlCreated)tlFirstEncoder=tlNow();
-   re.commandBuffer=self;re->dfPass=new NmbRenderPassDescriptor(pass);re->dfPending=true;
-   if(encDeferred){re->encDeferred=true;encOpen=re;}
-   [re dfCapture];
-   return re;
+  bool target=(mode&3) && t && (pf==MTLPixelFormatBGRA8Unorm || pf==MTLPixelFormatRGBA8Unorm) && t.sampleCount<=1 && t.textureType==MTLTextureType2D &&
+   !d.depthAttachment.texture && !d.stencilAttachment.texture && !d.visibilityResultBuffer && d.colorAttachments[0].level==0 && d.colorAttachments[0].slice==0;
+  if(target && !(mode&4))target=[(id)t isKindOfClass:[NBTexture class]] && ((NBTexture *)t).surface;
+  if(target) {
+   re->dfTrack=true;re->dfMode=(int8_t)mode;re->dfHeld=-1;re->dbW=(uint32_t)t.width;re->dbH=(uint32_t)t.height;
+   // colours 1..7 whose contents outlive the pass (not memoryless): a fill that may write one keeps its draw. CA's memoryless scratch
+   // (colour 1) is written only by its "S1" pipelines (r51); the fill pipeline is exactly draw.PBGRAXm_A2Xhf, never one of them.
+   re->dfAttached=0;
+   for(unsigned i=1;i<8;i++)if(id<MTLTexture> c=d.colorAttachments[i].texture)if(c.storageMode!=MTLStorageModeMemoryless)re->dfAttached|=(uint8_t)(1u<<i);
+   const MTLLoadAction load=d.colorAttachments[0].loadAction;
+   if((mode&3)>=2 && (load==MTLLoadActionLoad || load==MTLLoadActionDontCare) && !self.committed) {
+    if(!tlFirstEncoder && tlCreated)tlFirstEncoder=tlNow();
+    re.commandBuffer=self;re->dfPass=new NmbRenderPassDescriptor(pass);re->dfPending=true;
+    if(encDeferred){re->encDeferred=true;encOpen=re;}
+    gDfHeldPasses.fetch_add(1,std::memory_order_relaxed);
+    [re dfCapture];
+    return re;
+   }
   }
  }
  if(encDeferred)return [self deferredEncoder:re op:EO_RENDER_NEW pass:&pass what:@"renderCommandEncoder"];
@@ -3858,6 +3915,8 @@ static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
   state->dbBlend=a.blendingEnabled;state->dbMask=(uint8_t)a.writeMask;state->dbSrc=(uint8_t)a.sourceRGBBlendFactor;state->dbDst=(uint8_t)a.destinationRGBBlendFactor;
   state->dbSrcA=(uint8_t)a.sourceAlphaBlendFactor;state->dbDstA=(uint8_t)a.destinationAlphaBlendFactor;
   state->dbFmt=0;state->dbCFmt=0;
+  for(unsigned i=0;i<8;i++){MTLRenderPipelineColorAttachmentDescriptor *c=d.colorAttachments[i];state->dfMasks[i]=c.pixelFormat==MTLPixelFormatInvalid?0:(uint8_t)c.writeMask;}
+  state->dfSamples=(uint8_t)std::min<NSUInteger>(d.rasterSampleCount,255);state->dfA2C=d.alphaToCoverageEnabled;   // g10
   if(MTLVertexDescriptor *v=d.vertexDescriptor){MTLVertexAttributeDescriptor *at=v.attributes[0];
    if(at.format!=MTLVertexFormatInvalid && at.bufferIndex<31){state->dbFmt=(uint32_t)at.format;state->dbOff=(uint32_t)at.offset;state->dbBuf=(uint32_t)at.bufferIndex;state->dbStride=(uint32_t)v.layouts[at.bufferIndex].stride;
     for(unsigned k=1;k<31;k++){MTLVertexAttributeDescriptor *c=v.attributes[k];
@@ -4276,10 +4335,11 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
   uint64_t d[6];for(int i=0;i<6;i++)d[i]=cf[i]-lastCf[i];
   memcpy(lastCf,cf,sizeof lastCf);
   {   // g9: SWEET_DEADFILL in the window
-   static uint64_t lastDf[4];const uint64_t df[4]={gDfDeferred.load(),gDfDropped.load(),gDfCleared.load(),gDfPx.load()};
+   static uint64_t lastDf[6];const uint64_t df[6]={gDfDeferred.load(),gDfDropped.load(),gDfCleared.load(),gDfPx.load(),gDfHeldPasses.load(),gDfNoClear.load()};
    if(deadfillMode() || memcmp(df,lastDf,sizeof df)) {
-    char dl[200];snprintf(dl,sizeof dl,"native-metal: DF 5s: deferred %llu dropped %llu cleared %llu px_saved %llu (mode %d)",(unsigned long long)(df[0]-lastDf[0]),
-     (unsigned long long)(df[1]-lastDf[1]),(unsigned long long)(df[2]-lastDf[2]),(unsigned long long)(df[3]-lastDf[3]),deadfillMode());
+    char dl[240];snprintf(dl,sizeof dl,"native-metal: DF 5s: deferred %llu dropped %llu cleared %llu px_saved %llu held_passes %llu no_clear %llu (mode %d)",
+     (unsigned long long)(df[0]-lastDf[0]),(unsigned long long)(df[1]-lastDf[1]),(unsigned long long)(df[2]-lastDf[2]),(unsigned long long)(df[3]-lastDf[3]),
+     (unsigned long long)(df[4]-lastDf[4]),(unsigned long long)(df[5]-lastDf[5]),deadfillMode());
     sm2_logs(dl);
    }
    memcpy(lastDf,df,sizeof df);
