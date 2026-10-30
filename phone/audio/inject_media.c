@@ -60,6 +60,9 @@
 #include <sys/sysctl.h>
 #include <unistd.h>
 
+void redwood_camera_log_line(const char *line, size_t n);
+void redwood_camera_log_check(const char *why);
+
 static void
 say(const char *format, ...)
 {
@@ -74,6 +77,7 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	write(2, line, (size_t)n);
+	redwood_camera_log_line(line, (size_t)n);      /* (camera_device.c: /private/var/local/camera.log, when wanted) */
 }
 
 /* (SPI of libdyld; looked up at run time, the SDK's stubs need not have it) */
@@ -1506,6 +1510,8 @@ redwood_media_init(void)
 	if (name == NULL || strcmp(name, "mediaserverd") != 0) {
 		return;
 	}
+	redwood_camera_log_check("load");
+	say("redwood: mediaserverd: RedwoodAudio built %s %s (camera plug-in loaded)\n", __DATE__, __TIME__);
 	shared_cache_range = (const void *(*)(size_t *))dlsym(RTLD_DEFAULT, "_dyld_get_shared_cache_range");
 	slide = shared_cache_range != NULL ? (uintptr_t)shared_cache_range(&length) - CACHE_BASE : 0;
 	/* redfin: MTL_DEVICE_ARRAY is iOS 16.5's address; on this build Metal's device list is left alone always */

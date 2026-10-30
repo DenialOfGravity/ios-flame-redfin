@@ -47,11 +47,147 @@
 #include <string.h>
 #include <unistd.h>
 #include <stddef.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include "camera_isp.h"
 
 void redwood_camera_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
+void redwood_camera_log_check(const char *why);
+void redwood_camera_log_line(const char *line, size_t n);
+uint64_t redwood_camera_ms(void);
+
+/*
+ * redfin (2026-10-30): the plug-in's own log file. The kernel copies stderr into the klog only for the processes in
+ * boot-arg sweetnull (now backboardd alone), so mediaserverd's "redwood: camera:" lines went nowhere. With
+ * /private/var/local/camera-log (looked for at load and at each stream start), every line written to stderr is also
+ * appended to /private/var/local/camera.log, "<ms since boot> " before it, one write a line; past 8 MB the file is renamed
+ * camera.log.1 (or, where the directory is not writable -- mediaserverd runs as mobile --, emptied) and begun again.
+ * Where camera.log cannot be opened (create it beforehand: `: > /private/var/local/camera.log; chmod 666 ...`) the
+ * process's temporary directory has it instead, and the first line says where.
+ */
+#define CAMLOG_FLAG     "/private/var/local/camera-log"
+#define CAMLOG_PATH     "/private/var/local/camera.log"
+#define CAMLOG_MAX      (8u << 20)
+static pthread_mutex_t camlog_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile int camlog_fd = -1;
+static off_t camlog_size;
+static char camlog_path[256];
+
+uint64_t
+redwood_camera_ms(void)
+{
+	static mach_timebase_info_data_t tb;
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	return mach_absolute_time() * tb.numer / tb.denom / 1000000u;
+}
+
+static int
+camlog_open(char *path, size_t size, int *first_errno)
+{
+	int fd = open(CAMLOG_PATH, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+
+	*first_errno = fd < 0 ? errno : 0;
+	snprintf(path, size, "%s", CAMLOG_PATH);
+	if (fd < 0) {
+		char dir[200];
+		size_t got = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof(dir));
+
+		if (got == 0 || got > sizeof(dir)) {
+			snprintf(dir, sizeof(dir), "/private/var/tmp/");
+		}
+		snprintf(path, size, "%s%scamera.log", dir, dir[strlen(dir) - 1] == '/' ? "" : "/");
+		fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+	}
+	if (fd >= 0) {
+		(void)fchmod(fd, 0644);
+	}
+	return fd;
+}
+
+/* the flag looked for again (at load and at each stream start): the file opened or closed to match */
+void
+redwood_camera_log_check(const char *why)
+{
+	bool wanted = access(CAMLOG_FLAG, F_OK) == 0;
+	int err = 0, fd;
+	char line[400];
+
+	pthread_mutex_lock(&camlog_lock);
+	if (!wanted && camlog_fd >= 0) {
+		close(camlog_fd);
+		camlog_fd = -1;
+	}
+	if (!wanted || camlog_fd >= 0) {
+		pthread_mutex_unlock(&camlog_lock);
+		return;
+	}
+	fd = camlog_open(camlog_path, sizeof(camlog_path), &err);
+	if (fd >= 0) {
+		struct stat st;
+
+		camlog_size = fstat(fd, &st) == 0 ? st.st_size : 0;
+		camlog_fd = fd;
+	}
+	pthread_mutex_unlock(&camlog_lock);
+	if (fd >= 0) {
+		int n = snprintf(line, sizeof(line), "redwood: camera: log: %s (%s, pid %d%s%s)\n", camlog_path, why, getpid(),
+		    err ? "; " CAMLOG_PATH ": " : "", err ? strerror(err) : "");
+
+		write(2, line, (size_t)n);
+		redwood_camera_log_line(line, (size_t)n);
+	} else {
+		int n = snprintf(line, sizeof(line), "redwood: camera: log: no file (%s: %s; %s: %s)\n", CAMLOG_PATH, strerror(err),
+		    camlog_path, strerror(errno));
+
+		write(2, line, (size_t)n);
+	}
+}
+
+/* a line written to stderr, also to the log file (when there is one) */
+void
+redwood_camera_log_line(const char *line, size_t n)
+{
+	char buffer[600];
+	int head;
+
+	if (camlog_fd < 0 || n == 0) {
+		return;
+	}
+	head = snprintf(buffer, sizeof(buffer), "%llu ", (unsigned long long)redwood_camera_ms());
+	n = n > sizeof(buffer) - (size_t)head - 1 ? sizeof(buffer) - (size_t)head - 1 : n;
+	memcpy(buffer + head, line, n);
+	n += (size_t)head;
+	if (buffer[n - 1] != '\n') {
+		buffer[n++] = '\n';
+	}
+	pthread_mutex_lock(&camlog_lock);
+	if (camlog_fd >= 0) {
+		if (camlog_size + (off_t)n > (off_t)CAMLOG_MAX) {
+			char old[sizeof(camlog_path) + 4];
+
+			snprintf(old, sizeof(old), "%s.1", camlog_path);
+			if (rename(camlog_path, old) == 0) {
+				int fd = open(camlog_path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+
+				if (fd >= 0) {
+					close(camlog_fd);
+					camlog_fd = fd;
+				}
+			} else {
+				(void)ftruncate(camlog_fd, 0);  /* (the directory not ours: the file emptied in place) */
+			}
+			camlog_size = 0;
+		}
+		if (write(camlog_fd, buffer, n) == (ssize_t)n) {
+			camlog_size += (off_t)n;
+		}
+	}
+	pthread_mutex_unlock(&camlog_lock);
+}
 
 void
 redwood_camera_say(const char *format, ...)
@@ -68,6 +204,7 @@ redwood_camera_say(const char *format, ...)
 	}
 	line[n++] = '\n';
 	write(2, line, (size_t)n);
+	redwood_camera_log_line(line, (size_t)n);
 }
 #define say redwood_camera_say
 
@@ -2745,6 +2882,7 @@ stream_start(CMBaseObjectRef o)
 		s->out[i].said_layout = false;  /* (a session's first moving picture's layout said again) */
 	}
 	pthread_mutex_unlock(&s->lock);
+	redwood_camera_log_check("stream start");
 	say("stream: the graph starts the %s's stream (format %d)", s->camera->name, s->format_index);
 	stream_want(o, "no output to give pictures to");
 	if (!s->running) {
