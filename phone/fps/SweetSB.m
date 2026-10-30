@@ -17,10 +17,11 @@
  * because the display item owns its view's transform and the leading region positions it with constraints):
  *   /var/local/sweetsb.d   diagnostic (any size; one shot: SpringBoard deletes it at load): it logs the _UIStatusBar hierarchy (regions, their
  *                          properties, display items, view tree with window frames) to /var/tmp/sweetsb.log
- *   /var/local/sweetsb.x   DX pt: after every -[_UIStatusBar layoutSubviews], a translation of DX on the leading
- *                          region (identifier "leading"). How, from the size of /var/local/sweetsb.xm (100 + mode,
- *                          default 1): 1 = the region's contentView transform, 2 = each display item view's centre
- *                          moved by DX after layout, 3 = the region's layoutItem transform if it is a view.
+ *   /var/local/sweetsb.x   DX pt: the leading region (identifier "leading": on iOS 16 a UILayoutGuide in
+ *                          _UIStatusBarForegroundView, no container view; its item views sit in the foreground view)
+ *                          moves right by DX. How, from the size of /var/local/sweetsb.xm (100 + mode, default 1):
+ *                          1 = after -[_UIStatusBarForegroundView layoutSubviews], each leading item view's centre + DX
+ *                          2 = after -[_UIStatusBar layoutSubviews], the guide's outside position constraints + DX
  * No file: nothing hooked. Both: both apply. Make one: head -c 118 /dev/zero > /var/local/sweetsb.m  (DX +18).
  * SpringBoard (not sandboxed) appends what it hooked to /var/tmp/sweetsb.log.
  */
@@ -267,62 +268,113 @@ sb_dump(UIView *bar)
 	sb_note(out);
 }
 
-static void
-sb_xshift(UIView *bar)
+static NSArray *
+sb_leading_views(UIView *bar, id *rgp)
 {
 	NSDictionary *regions = sb_get(bar, @"regions");
 	if (![regions isKindOfClass:[NSDictionary class]]) {
-		return;
+		return nil;
 	}
 	id rg = regions[@"leading"];
-	if (rg == nil) {
+	if (rgp != NULL) {
+		*rgp = rg;
+	}
+	NSMutableArray *vs = [NSMutableArray array];
+	id items = sb_get(rg, @"displayItems");
+	if ([items isKindOfClass:[NSDictionary class]]) {
+		items = [items allValues];
+	}
+	for (id it in items) {
+		UIView *v = sb_get(it, @"view");
+		if ([v isKindOfClass:[UIView class]]) {
+			[vs addObject:v];
+		}
+	}
+	return vs;
+}
+
+static int sb_noted;
+
+/* mode 1: after the foreground view's own layout pass (Auto Layout has just pushed the item frames), move each
+ * leading-region item view's centre right by DX; remember where we put it so a pass that changed nothing is a no-op */
+static void
+sb_xshift_fg(UIView *fg)
+{
+	UIView *bar = fg.superview;
+	Class sbc = objc_getClass("_UIStatusBar");
+	if (bar == nil || sbc == Nil || ![bar isKindOfClass:sbc]) {
 		return;
 	}
-	static int noted;
-	NSMutableString *what = noted < 3 ? [NSMutableString string] : nil;
-	if (sb_xmode == 1 || sb_xmode == 3) {
-		UIView *v = sb_get(rg, sb_xmode == 1 ? @"contentView" : @"layoutItem");
-		if ([v isKindOfClass:[UIView class]] && v != bar) {
-			CGAffineTransform t = v.transform;
-			if (t.tx != sb_dxx) {
-				t.tx = sb_dxx;
-				v.transform = t;
-			}
-			[what appendFormat:@"mode %d: %@", sb_xmode, sb_desc(v)];
-		} else {
-			[what appendFormat:@"mode %d: no view (%@)", sb_xmode, sb_desc(v)];
+	NSMutableString *what = sb_noted < 4 && fg.window != nil ? [NSMutableString string] : nil;
+	for (UIView *v in sb_leading_views(bar, NULL)) {
+		if (v.superview == nil) {
+			continue;
 		}
-	} else if (sb_xmode == 2) {
-		id items = sb_get(rg, @"displayItems");
-		if ([items isKindOfClass:[NSDictionary class]]) {
-			items = [items allValues];
+		NSNumber *mine = objc_getAssociatedObject(v, &sb_xassoc);
+		CGPoint c = v.center;
+		if (mine == nil || fabs(c.x - mine.doubleValue) > 0.01) {
+			c.x += sb_dxx;
+			v.center = c;
+			objc_setAssociatedObject(v, &sb_xassoc, @(c.x), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 		}
-		for (id it in items) {
-			UIView *v = sb_get(it, @"view");
-			if (![v isKindOfClass:[UIView class]] || v.superview == nil) {
-				continue;
-			}
-			NSNumber *mine = objc_getAssociatedObject(v, &sb_xassoc);
-			CGPoint c = v.center;
-			if (mine == nil || fabs(c.x - mine.doubleValue) > 0.01) {
-				c.x += sb_dxx;  /* fresh layout position: move it and remember where we put it */
-				v.center = c;
-				objc_setAssociatedObject(v, &sb_xassoc, @(c.x), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-			}
-			[what appendFormat:@"mode 2: %@ %@; ", sb_get(it, @"identifier"), sb_desc(v)];
-		}
+		[what appendFormat:@"%@; ", sb_desc(v)];
 	}
-	if (what != nil && bar.window != nil) {
-		noted++;
-		sb_note([NSString stringWithFormat:@"x shift %g: %@", sb_dxx, what]);
+	if (what.length > 0) {
+		sb_noted++;
+		sb_note([NSString stringWithFormat:@"x mode 1 (+%g): %@", sb_dxx, what]);
+	}
+}
+
+/* mode 2: move the leading region's layout guide itself: every horizontal position constraint between the guide and
+ * something outside the region (not its item views) gets DX (once per constraint object) */
+static void
+sb_xshift_guide(UIView *bar)
+{
+	id rg = nil;
+	NSArray *inside = sb_leading_views(bar, &rg);
+	UILayoutGuide *g = sb_get(rg, @"layoutGuide");
+	if (![g isKindOfClass:[UILayoutGuide class]]) {
+		return;
+	}
+	NSMutableString *what = sb_noted < 4 && bar.window != nil ? [NSMutableString string] : nil;
+	for (NSLayoutConstraint *k in [g constraintsAffectingLayoutForAxis:UILayoutConstraintAxisHorizontal]) {
+		if (objc_getAssociatedObject(k, &sb_xassoc) != nil) {
+			continue;
+		}
+		NSLayoutAttribute a1 = k.firstAttribute, a2 = k.secondAttribute;
+		bool pos1 = a1 == NSLayoutAttributeLeading || a1 == NSLayoutAttributeTrailing || a1 == NSLayoutAttributeLeft
+			|| a1 == NSLayoutAttributeRight || a1 == NSLayoutAttributeCenterX;
+		bool pos2 = a2 == NSLayoutAttributeLeading || a2 == NSLayoutAttributeTrailing || a2 == NSLayoutAttributeLeft
+			|| a2 == NSLayoutAttributeRight || a2 == NSLayoutAttributeCenterX;
+		id other = nil;
+		CGFloat d = 0;
+		if (k.firstItem == g && pos1 && (k.secondItem == nil || pos2)) {
+			other = k.secondItem;
+			d = sb_dxx;
+		} else if (k.secondItem == g && pos2 && pos1) {
+			other = k.firstItem;
+			d = -sb_dxx;
+		} else {
+			continue;
+		}
+		if (other == g || (other != nil && [inside containsObject:other])) {
+			continue;
+		}
+		k.constant += d;
+		objc_setAssociatedObject(k, &sb_xassoc, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+		[what appendFormat:@"%@ ; ", k];
+	}
+	if (what.length > 0) {
+		sb_noted++;
+		sb_note([NSString stringWithFormat:@"x mode 2 (+%g): guide now %@ via %@", sb_dxx, sb_desc(g), what]);
 	}
 }
 
 static void
 sb_after_layout(UIView *bar)
 {
-	if (sb_dxx != 0) {
-		sb_xshift(bar);
+	if (sb_dxx != 0 && sb_xmode == 2) {
+		sb_xshift_guide(bar);
 	}
 	if (sb_diag && sb_dumps < 6 && objc_getAssociatedObject(bar, &sb_dumped) == nil && bar.window != nil
 		&& bar.bounds.size.width > 0) {
@@ -339,27 +391,38 @@ sb_after_layout(UIView *bar)
 }
 
 static void
-sb_hook_layout(void)
+sb_hook_after_layout(const char *cls, void (*after)(UIView *))
 {
-	Class c = objc_getClass("_UIStatusBar");
+	Class c = objc_getClass(cls);
 	SEL sel = @selector(layoutSubviews);
 	Method m = c != Nil ? class_getInstanceMethod(c, sel) : NULL;
 	if (m == NULL) {
-		sb_note(@"no -[_UIStatusBar layoutSubviews]");
+		sb_note([NSString stringWithFormat:@"no -[%s layoutSubviews]", cls]);
 		return;
 	}
 	void (*old)(id, SEL) = (void (*)(id, SEL))method_getImplementation(m);
 	IMP imp = imp_implementationWithBlock(^(UIView *self) {
 		old(self, sel);
-		sb_after_layout(self);
+		after(self);
 	});
-	/* add on _UIStatusBar itself when it only inherits UIView's (never hook UIView for every view) */
+	/* add on the class itself when it only inherits UIView's (never hook UIView for every view) */
 	bool added = class_addMethod(c, sel, imp, method_getTypeEncoding(m));
 	if (!added) {
 		method_setImplementation(m, imp);
 	}
-	sb_note([NSString stringWithFormat:@"-[_UIStatusBar layoutSubviews] hooked (%s), diag %d, x %g mode %d",
+	sb_note([NSString stringWithFormat:@"-[%s layoutSubviews] hooked (%s), diag %d, x %g mode %d", cls,
 		added ? "added" : "own", sb_diag, sb_dxx, sb_xmode]);
+}
+
+static void
+sb_hook_layout(void)
+{
+	if (sb_diag || (sb_dxx != 0 && sb_xmode == 2)) {
+		sb_hook_after_layout("_UIStatusBar", sb_after_layout);
+	}
+	if (sb_dxx != 0 && sb_xmode == 1) {
+		sb_hook_after_layout("_UIStatusBarForegroundView", sb_xshift_fg);
+	}
 }
 
 __attribute__((constructor)) static void
@@ -374,7 +437,7 @@ sb_init(void)
 	}
 	bool x = sb_flag("/var/local/sweetsb.x", &sb_dxx);
 	CGFloat xm;
-	if (sb_flag("/var/local/sweetsb.xm", &xm) && xm >= 1 && xm <= 3) {
+	if (sb_flag("/var/local/sweetsb.xm", &xm) && xm >= 1 && xm <= 2) {
 		sb_xmode = (int)xm;
 	}
 	if (!m && !t && !sb_diag && !x) {
