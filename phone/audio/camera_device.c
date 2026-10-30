@@ -208,6 +208,67 @@ redwood_camera_say(const char *format, ...)
 }
 #define say redwood_camera_say
 
+/*
+ * redfin (2026-10-30): AE's tunables, read at each stream start (and every 300 frames):
+ *   /private/var/local/camera-ae-target    a number: AE's target, green's mean as a fraction of white (default 0.15;
+ *                                          over 1 taken as percent: 12 = 0.12)
+ *   /private/var/local/camera-ae-unshaded  AE meters the frame as it comes (before 2026-10-30), not lens-shaded
+ */
+static volatile float camera_ae_target;         /* 0: camera_isp.c's ISP_AE_TARGET */
+static volatile bool camera_ae_unshaded;
+
+static void
+camera_settings_check(void)
+{
+	char text[32];
+	int fd = open("/private/var/local/camera-ae-target", O_RDONLY);
+	float target = 0;
+	bool unshaded = access("/private/var/local/camera-ae-unshaded", F_OK) == 0;
+
+	if (fd >= 0) {
+		ssize_t n = read(fd, text, sizeof(text) - 1);
+
+		close(fd);
+		text[n > 0 ? n : 0] = 0;
+		target = strtof(text, NULL);
+		target = target > 1 ? target / 100 : target;
+		target = target < 0.01f || target > 0.7f ? 0 : target;
+	}
+	if (target != camera_ae_target || unshaded != camera_ae_unshaded) {
+		say("AE: target %.3f of white%s, metered %s", target > 0 ? target : ISP_AE_TARGET,
+		    target > 0 ? " (camera-ae-target)" : " (the default)", unshaded ? "on the frame as it comes (camera-ae-unshaded)" :
+		    "lens-shaded, as the picture has it");
+	}
+	camera_ae_target = target;
+	camera_ae_unshaded = unshaded;
+}
+
+/* the mean of a picture's luma (every 8th pixel of every 8th row) and the fraction of it at 250 or above (locked) */
+static double
+picture_y(CVPixelBufferRef pb, double *clipped)
+{
+	bool planar = CVPixelBufferGetPlaneCount(pb) >= 2;
+	const uint8_t *y = planar ? CVPixelBufferGetBaseAddressOfPlane(pb, 0) : CVPixelBufferGetBaseAddress(pb);
+	size_t bpr = planar ? CVPixelBufferGetBytesPerRowOfPlane(pb, 0) : CVPixelBufferGetBytesPerRow(pb);
+	size_t w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), step = planar ? 1 : 4;
+	uint64_t sum = 0, n = 0, top = 0;
+
+	for (size_t r = 0; y != NULL && r < h; r += 8) {
+		for (size_t x = 0; x < w; x += 8) {
+			/* (BGRA: green's byte, near enough) */
+			uint8_t v = y[r * bpr + x * step + (planar ? 0 : 1)];
+
+			sum += v;
+			top += v >= 250;
+			n++;
+		}
+	}
+	if (clipped != NULL) {
+		*clipped = n ? (double)top / n : 0;
+	}
+	return n ? (double)sum / n : 0;
+}
+
 /* ---- CoreMedia's derived objects, as iOS 16.5 lays them out ---------------------------------------- */
 
 typedef struct OpaqueCMBaseObject *CMBaseObjectRef;
@@ -1677,36 +1738,69 @@ layout_check(const char *what, CVPixelBufferRef pb)
 /*
  * redfin: /private/var/local/camera-dump-still: the photograph as it goes to the encoder (both NV12 planes, whole rows
  * of each plane's bytes per row) to /private/var/local/camera-still-<n>.nv12, at most 3 for mediaserverd's run.
+ * (2026-10-30) Every photograph is looked at while the flag is there, and a photograph not dumped says why. mediaserverd
+ * runs as mobile and /private/var/local is root's: the files are made there only if they are there already and writable
+ * (`: > camera-still-1.nv12; chmod 666 ...`, 1 to 3) or the directory is; otherwise in the process's temporary directory,
+ * and the line says where.
  */
 static void
-still_dump(CVPixelBufferRef pb)
+still_dump(CVPixelBufferRef pb, uint64_t sequence)
 {
 	static unsigned dumped;
-	char path[64];
-	int fd;
-	size_t bpr[2], rows[2];
+	char path[256], dir[200];
+	int fd, err;
+	size_t bpr[2], rows[2], planes;
 	bool written = true;
 
-	if (CVPixelBufferGetPlaneCount(pb) != 2 || access("/private/var/local/camera-dump-still", F_OK) != 0 || dumped >= 3) {
+	if (access("/private/var/local/camera-dump-still", F_OK) != 0) {
 		return;
 	}
-	snprintf(path, sizeof(path), "/private/var/local/camera-still-%u.nv12", ++dumped);
+	if (dumped >= 3) {
+		say("still dump: frame %llu not dumped: 3 dumped already this run", (unsigned long long)sequence);
+		return;
+	}
+	planes = CVPixelBufferGetPlaneCount(pb);
+	if (planes != 2) {
+		uint32_t pf = CVPixelBufferGetPixelFormatType(pb);
+
+		say("still dump: frame %llu not dumped: %zu planes (%c%c%c%c), not NV12's 2", (unsigned long long)sequence, planes, pf >> 24,
+		    pf >> 16 & 255, pf >> 8 & 255, pf & 255);
+		return;
+	}
 	for (size_t p = 0; p < 2; p++) {
 		bpr[p] = CVPixelBufferGetBytesPerRowOfPlane(pb, p);
 		rows[p] = CVPixelBufferGetHeightOfPlane(pb, p);
+		if (CVPixelBufferGetBaseAddressOfPlane(pb, p) == NULL || bpr[p] == 0 || rows[p] == 0) {
+			say("still dump: frame %llu not dumped: plane %zu has no address or size (base %p, bpr %zu, rows %zu; locked?)",
+			    (unsigned long long)sequence, p, CVPixelBufferGetBaseAddressOfPlane(pb, p), bpr[p], rows[p]);
+			return;
+		}
 	}
-	if ((fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644)) < 0) {
-		say("still dump: %s: %s", path, strerror(errno));
-		return;
+	snprintf(path, sizeof(path), "/private/var/local/camera-still-%u.nv12", dumped + 1);
+	if ((fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)) < 0) {
+		size_t got = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof(dir));
+
+		err = errno;
+		if (got == 0 || got > sizeof(dir)) {
+			snprintf(dir, sizeof(dir), "/private/var/tmp/");
+		}
+		say("still dump: %s: %s; to the temporary directory %s instead", path, strerror(err), dir);
+		snprintf(path, sizeof(path), "%s%scamera-still-%u.nv12", dir, dir[strlen(dir) - 1] == '/' ? "" : "/", dumped + 1);
+		if ((fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)) < 0) {
+			say("still dump: frame %llu not dumped: %s: %s", (unsigned long long)sequence, path, strerror(errno));
+			return;
+		}
 	}
+	dumped++;
 	for (size_t p = 0; p < 2 && written; p++) {
 		const uint8_t *plane = CVPixelBufferGetBaseAddressOfPlane(pb, p);
 
-		written = plane != NULL && write(fd, plane, bpr[p] * rows[p]) == (ssize_t)(bpr[p] * rows[p]);
+		written = write(fd, plane, bpr[p] * rows[p]) == (ssize_t)(bpr[p] * rows[p]);
 	}
 	close(fd);
-	say("still dump: %s: w %zu h %zu bpr0 %zu bpr1 %zu (plane 0 %zu rows, plane 1 %zu rows)%s", path, CVPixelBufferGetWidth(pb),
-	    CVPixelBufferGetHeight(pb), bpr[0], bpr[1], rows[0], rows[1], written ? "" : " NOT WRITTEN WHOLE");
+	say("still dump: frame %llu to %s: w %zu h %zu bpr0 %zu bpr1 %zu (plane 0 %zu rows, plane 1 %zu rows)%s", (unsigned long long)sequence,
+	    path, CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb), bpr[0], bpr[1], rows[0], rows[1],
+	    written ? "" : " NOT WRITTEN WHOLE");
 }
 
 /*
@@ -1746,9 +1840,12 @@ render_into(struct output *out, CVPixelBufferRef pb, const struct isp *isp, cons
 		if (tb.denom == 0) {
 			mach_timebase_info(&tb);
 		}
-		say("%s: %ux%u made of every pixel in %.0f ms", out->name, width, height,
-		    (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6);
-		still_dump(pb);
+		double clipped, y = picture_y(pb, &clipped);
+
+		say("%s: %ux%u made of every pixel of frame %llu in %.0f ms: luma mean %.0f, %.1f %% at 250 or above", out->name, width,
+		    height, (unsigned long long)f->sequence, (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6, y,
+		    clipped * 100);
+		still_dump(pb, f->sequence);
 	}
 	CVPixelBufferUnlockBaseAddress(pb, 0);
 	return true;
@@ -2274,13 +2371,35 @@ worker_pause(const struct stream *s, unsigned generation, unsigned ms)
 }
 
 
-/* redfin (B6): a photograph with the flash, on its way */
-enum { SHOT_IDLE, SHOT_EXPOSING, SHOT_FIRING };
+/*
+ * redfin (B6; 2026-10-30 as a phone does it): a photograph with the flash, on its way. PREFLASH: the LED at the torch's
+ * current (FLASH c=1) for ~350 ms while AE meters the lit scene; METERED: the pre-flash off, the photograph's exposure
+ * (from the ambient and the pre-flash's levels, the flash's part scaled by the main/pre current ratio) set; EXPOSING:
+ * waiting for frames of that exposure, unlit; FIRING: the main flash asked for, the frame with FLASH_LIT the photograph.
+ */
+enum { SHOT_IDLE, SHOT_PREFLASH, SHOT_METERED, SHOT_EXPOSING, SHOT_FIRING };
+#define PREFLASH_MA     100u    /* (the kernel caps a pre-flash at the torch's own most, sweettorch_ma, default 100) */
+#define MAINFLASH_MA    300u    /* (the kernel's flash cap, 0933) */
+#define PREFLASH_MS     350u
 struct shot {
 	int             state;
-	unsigned        frames, waited;
+	unsigned        frames, waited, lit;
 	uint32_t        lines, gain;    /* the exposure asked for it */
+	float           digital;        /* ... and the processor's gain with it */
+	uint64_t        t0, asked_at, fired_at;         /* ms (redwood_camera_ms) and frame numbers */
+	/* the ambient exposure before the pre-flash (put back after the photograph) and its levels */
+	uint32_t        amb_lines, amb_gain, amb_frame_lines, amb_dgain;
+	float           amb_digital, amb_sensor_digital;
+	double          amb_e, amb_mean, amb_bright;    /* exposure (lines x the sensor's gains), metered green, its brightest 1 % */
+	double          pre_e, pre_mean, pre_bright;    /* the same on the last pre-flash-lit frame */
 };
+
+/* the frame's exposure as the levels measure it: lines x the sensor's analog and digital gain (the processor's not in it) */
+static double
+sensor_exposure(const struct isp *isp, const struct redwood_camera_frame *f)
+{
+	return f->exposure_lines * (double)f->gain / (f->gain_unity ? f->gain_unity : 256) * isp->sensor_digital;
+}
 
 struct worker_start {
 	CMBaseObjectRef o;
@@ -2410,7 +2529,9 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 
 		/* redfin (B4-B7): the controls as the capture stack has set them, for this frame */
 		pthread_mutex_lock(&s->ctl_lock);
-		isp.ae_locked = s->ae_locked || shot.state != SHOT_IDLE;
+		isp.ae_locked = s->ae_locked || (shot.state != SHOT_IDLE && shot.state != SHOT_PREFLASH);
+		isp.ae_target = camera_ae_target;
+		isp.ae_unshaded = camera_ae_unshaded;
 		isp.ae_bias = s->ae_bias;
 		memcpy(isp.ae_roi, s->ae_roi, sizeof(isp.ae_roi));
 		isp.ae_max_gain = s->ae_max_gain;
@@ -2464,18 +2585,30 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 		s->frames++;
 
 		/*
-		 * redfin (B6): a photograph. Not while focus is still searching (up to 20 frames); with the flash (asked for,
-		 * or FlashMode on, or auto in the dark), the exposure is made shorter for it first (the flash's own light about
-		 * 2 EV at a photograph's distance: a quarter of the exposure, at most 1/60 s), then the kernel lights the next
-		 * full frame (FLASH) and the frame that carries FLASH_LIT is the photograph; a kernel that never says so has
-		 * the photograph without flash after 8 frames.
+		 * redfin (B6): a photograph. Not while focus is still searching (up to 20 frames). Without the flash, the next
+		 * frame. With it (asked for, or FlashMode on, or auto in the dark): (2026-10-30) a pre-flash at the torch's current
+		 * for ~350 ms while AE meters the lit frames, then the exposure for the photograph worked out from the ambient
+		 * and the pre-flash levels (the flash's part times the main/pre current ratio; at most 1/60 s, the rest gain),
+		 * the pre-flash off, and once the frames have that exposure the main flash for one frame (lit by the kernel
+		 * from the start of the frame before it, so the whole of that frame's rolling exposure has the light); the
+		 * frame that carries FLASH_LIT is the photograph. A kernel that never says so: the photograph without flash.
 		 */
 		pthread_mutex_lock(&s->lock);
 		unsigned stills_wanted = s->graph_running ? s->stills_wanted : 0;
 		int wish = s->still_flash;
 
 		pthread_mutex_unlock(&s->lock);
+		bool lit = (f->reserved[REDWOOD_CAMERA_R_FLAGS] & REDWOOD_CAMERA_FLASH_LIT) != 0;
+		uint64_t now_ms = redwood_camera_ms();
+		double frame_ms = f->frame_lines && f->line_ns ? f->frame_lines * (double)f->line_ns / 1e6 : 33.3;
+
 		if (stills_wanted == 0) {
+			if (shot.state != SHOT_IDLE) {
+				struct redwood_camera_command off = { .command = REDWOOD_CAMERA_FLASH, .a = 0 };
+
+				(void)write(device, &off, sizeof(off));
+				say("flash: the photograph no longer wanted (state %d): flash off", shot.state);
+			}
 			shot.state = SHOT_IDLE;
 			shot.waited = 0;
 		} else if (shot.state == SHOT_IDLE) {
@@ -2486,40 +2619,147 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 			} else if (!flash || !has_flash) {
 				give_still = true;
 			} else {
-				uint32_t sixtieth = f->line_ns ? (uint32_t)(1e9 / 60 / f->line_ns) : f->exposure_lines;
-				double unity = f->gain_unity ? f->gain_unity : 256, total = f->exposure_lines * (double)f->gain / unity * isp.digital;
-				struct redwood_camera_command e = { .command = REDWOOD_CAMERA_EXPOSURE };
+				unsigned frames_lit = (unsigned)(PREFLASH_MS / frame_ms + 0.5);
+				struct redwood_camera_command pre = { .command = REDWOOD_CAMERA_FLASH, .a = PREFLASH_MA, .c = 1 };
 
-				e.a = f->exposure_lines < sixtieth ? f->exposure_lines : sixtieth;
-				e.a = e.a < 4 ? 4 : e.a;
-				double g = total / 4 / e.a, most = f->gain_max > f->gain_unity ? (double)f->gain_max / unity : 1;
-
-				g = g < 1 ? 1 : g > most ? most : g;
-				e.b = (uint32_t)(g * unity + 0.5);
-				shot.lines = e.a;
-				shot.gain = e.b;
-				shot.state = SHOT_EXPOSING;
-				shot.frames = 0;
-				isp.asked = false;
-				isp.digital = 1;
-				(void)write(device, &e, sizeof(e));
-				say("a photograph with the flash: the exposure %.1f ms at %.2fx for it", e.a * (double)f->line_ns / 1e6, g);
+				frames_lit = frames_lit < 3 ? 3 : frames_lit > 8 ? 8 : frames_lit;      /* (the kernel's FLASH_FRAMES_MAX) */
+				pre.b = frames_lit;
+				shot.t0 = now_ms;
+				shot.asked_at = f->sequence;
+				shot.amb_lines = f->exposure_lines;
+				shot.amb_gain = f->gain;
+				shot.amb_frame_lines = f->frame_lines;
+				shot.amb_dgain = isp.asked_digital;
+				shot.amb_digital = isp.digital;
+				shot.amb_sensor_digital = isp.sensor_digital;
+				shot.amb_e = sensor_exposure(&isp, f);
+				shot.amb_mean = isp_metered(&isp, &st, &shot.amb_bright);
+				shot.state = SHOT_PREFLASH;
+				shot.frames = shot.lit = 0;
+				(void)write(device, &pre, sizeof(pre));
+				say("flash: +0 ms frame %llu: pre-flash %u mA for %u frames (%.0f ms); AE before: %.2f ms x %.2fx x %.2fx, "
+				    "metered %.1f (target %.1f), brightest %.0f, lux index %.0f", (unsigned long long)f->sequence, pre.a, pre.b,
+				    pre.b * frame_ms, f->exposure_lines * (double)f->line_ns / 1e6, (double)f->gain / (f->gain_unity ? f->gain_unity : 256),
+				    isp.digital, shot.amb_mean, isp.ae_target_level, shot.amb_bright, lux);
 			}
-		} else if (shot.state == SHOT_EXPOSING) {
-			if ((f->exposure_lines == shot.lines && f->gain <= shot.gain + shot.gain / 50) || ++shot.frames >= 4) {
-				struct redwood_camera_command l = { .command = REDWOOD_CAMERA_FLASH, .a = 300, .b = 1, .c = 0 };
+		} else if (shot.state == SHOT_PREFLASH) {
+			/* AE runs on the lit frames (isp_ae above); the last lit frame's levels are kept */
+			shot.frames++;
+			if (lit) {
+				shot.lit++;
+				shot.pre_e = sensor_exposure(&isp, f);
+				shot.pre_mean = isp_metered(&isp, &st, &shot.pre_bright);
+				say("flash: +%llu ms frame %llu lit (pre-flash %u): %.2f ms x %.2fx x %.2fx, metered %.1f, brightest %.0f%s",
+				    (unsigned long long)(now_ms - shot.t0), (unsigned long long)f->sequence, shot.lit,
+				    f->exposure_lines * (double)f->line_ns / 1e6, (double)f->gain / (f->gain_unity ? f->gain_unity : 256), isp.digital,
+				    shot.pre_mean, shot.pre_bright, isp.ae_stable ? ", AE settled" : "");
+			}
+			if ((shot.lit >= 3 && isp.ae_stable) || (shot.lit > 0 && !lit) || shot.lit >= 8 || (now_ms - shot.t0 > 600) ||
+			    (shot.lit == 0 && shot.frames >= 6)) {
+				struct redwood_camera_command off = { .command = REDWOOD_CAMERA_FLASH, .a = 0 };
+				double unity = f->gain_unity ? f->gain_unity : 256, analog_max = f->gain_max > f->gain_unity ? f->gain_max / unity : 1;
+				double ratio = (double)MAINFLASH_MA / PREFLASH_MA, target = isp.ae_target_level > 0 ? isp.ae_target_level : 0.15 * 959;
+				double amb_rate = shot.amb_e > 0 ? shot.amb_mean / shot.amb_e : 0, amb_brate = shot.amb_e > 0 ? shot.amb_bright / shot.amb_e : 0;
+				double fl_rate = 0, fl_brate = 0, want, bright;
+				uint32_t sixtieth = f->line_ns ? (uint32_t)(1e9 / 60 / f->line_ns) : f->exposure_lines;
+				uint32_t most_lines = f->frame_lines > f->margin + 4 ? f->frame_lines - f->margin : f->exposure_lines;
 
+				(void)write(device, &off, sizeof(off));
+				if (shot.lit > 0 && shot.pre_e > 0) {
+					fl_rate = shot.pre_mean / shot.pre_e - amb_rate;
+					fl_brate = shot.pre_bright / shot.pre_e - amb_brate;
+					fl_rate = fl_rate < 0 ? 0 : fl_rate;
+					fl_brate = fl_brate < 0 ? 0 : fl_brate;
+				}
+				/* (lines x total gain for the target with the main flash; then no more than 90 % of white in the brightest 1 %) */
+				want = amb_rate + ratio * fl_rate > 0 ? target / (amb_rate + ratio * fl_rate) : shot.amb_e * shot.amb_digital / 4;
+				bright = want * (amb_brate + ratio * fl_brate);
+				if (bright > 0.9 * 959) {
+					want *= 0.9 * 959 / bright;
+				}
+				if (fl_rate == 0) {
+					/* (the pre-flash did nothing that could be seen: as before 2026-10-30, a quarter of the ambient exposure) */
+					want = shot.amb_e * shot.amb_digital / 4;
+				}
+				uint32_t lines = sixtieth < most_lines ? sixtieth : most_lines;
+				double g;
+
+				lines = lines < 4 ? 4 : lines;
+				if (want < lines) {
+					lines = want < 4 ? 4 : (uint32_t)want;
+				}
+				g = want / lines;
+				g = g < 1 ? 1 : g;
+				double analog = g < analog_max ? g : analog_max, digital = g / analog;
+
+				digital = digital > 4 ? 4 : digital < 1 ? 1 : digital;
+				shot.lines = lines;
+				shot.gain = (uint32_t)(analog * unity + 0.5);
+				shot.digital = (float)digital;
+				shot.state = SHOT_METERED;
+				shot.frames = 0;
+				say("flash: +%llu ms frame %llu: pre-flash done (%u lit frames): ambient %.3f/unit, flash %.3f/unit at %u mA (x%.1f "
+				    "at %u mA); for target %.1f: %.0f line-gains = %.2f ms x %.2fx x %.2fx (pre-flash AE had %.2f ms x %.2fx)",
+				    (unsigned long long)(now_ms - shot.t0), (unsigned long long)f->sequence, shot.lit, amb_rate, fl_rate, PREFLASH_MA,
+				    ratio, MAINFLASH_MA, target, want, lines * (double)f->line_ns / 1e6, analog, digital,
+				    f->exposure_lines * (double)f->line_ns / 1e6, (double)f->gain / unity);
+				if (shot.lit == 0) {
+					say("flash: no frame lit by the pre-flash (FLASH c=1 refused? the torch on?): the photograph's exposure guessed");
+				}
+			}
+		}
+		if (shot.state == SHOT_METERED) {
+			/* (the photograph's exposure asked for, after the pre-flash's off: one FLASH command waits in the kernel at a time) */
+			bool has_dgain = (f->reserved[REDWOOD_CAMERA_R_DGAIN] >> 16) != 0;
+			struct redwood_camera_command e = { .command = REDWOOD_CAMERA_EXPOSURE, .a = shot.lines, .b = shot.gain, .c = 0,
+				.d = has_dgain ? 256 : 0 };
+
+			(void)write(device, &e, sizeof(e));
+			isp.sensor_digital = has_dgain ? 1 : isp.sensor_digital;
+			isp.asked = false;
+			isp.digital = shot.digital;
+			shot.state = SHOT_EXPOSING;
+			shot.frames = 0;
+		} else if (shot.state == SHOT_EXPOSING) {
+			bool there = f->exposure_lines + 1 >= shot.lines && f->exposure_lines <= shot.lines + 1 && f->gain <= shot.gain + shot.gain / 50 &&
+			    f->gain + f->gain / 50 + 1 >= shot.gain;
+
+			isp.digital = shot.digital;
+			if ((there && !lit) || ++shot.frames >= 6) {
+				struct redwood_camera_command l = { .command = REDWOOD_CAMERA_FLASH, .a = MAINFLASH_MA, .b = 1, .c = 0 };
+				/* (lit from the next start of frame to the end of the frame after it: that frame's every line's exposure) */
+				double exposure_ms = f->exposure_lines * (double)f->line_ns / 1e6;
+
+				/*
+				 * (the kernel lights from frame k+1's start of frame to frame k+2's end, k+2 being the one marked: every line
+				 * of k+2 exposes within that, its exposure being at most a frame. b = 2 only where a frame is so short that
+				 * the exposure would start before k+1's start -- it cannot -- or the kernel's 100 ms would cut a long
+				 * frame short: then the light ends early and the frame is not marked; said here)
+				 */
+				l.b = exposure_ms > frame_ms ? 2 : 1;
+				if (2 * frame_ms + 16 > 100) {
+					say("flash: frames of %.1f ms: the kernel's 100 ms flash cannot light the whole of frame k+2", frame_ms);
+				}
 				(void)write(device, &l, sizeof(l));
 				shot.state = SHOT_FIRING;
 				shot.frames = 0;
+				shot.fired_at = f->sequence;
+				say("flash: +%llu ms frame %llu: main flash %u mA for %u frame(s) (exposure %.2f ms in %.1f ms frames)%s",
+				    (unsigned long long)(now_ms - shot.t0), (unsigned long long)f->sequence, l.a, l.b, exposure_ms, frame_ms,
+				    there ? "" : " -- the exposure asked for not seen in 6 frames");
 			}
 		} else if (shot.state == SHOT_FIRING) {
-			if (f->reserved[REDWOOD_CAMERA_R_FLAGS] & REDWOOD_CAMERA_FLASH_LIT) {
+			isp.digital = shot.digital;
+			if (lit) {
 				give_still = true;
-				say("the flash lit frame %llu: the photograph", (unsigned long long)f->sequence);
+				say("flash: +%llu ms frame %llu lit by the main flash (asked at frame %llu, fired at %llu): the photograph; %.2f ms x "
+				    "%.2fx x %.2fx", (unsigned long long)(now_ms - shot.t0), (unsigned long long)f->sequence,
+				    (unsigned long long)shot.asked_at, (unsigned long long)shot.fired_at, f->exposure_lines * (double)f->line_ns / 1e6,
+				    (double)f->gain / (f->gain_unity ? f->gain_unity : 256), isp.digital);
 			} else if (++shot.frames >= 8) {
 				give_still = true;
-				say("no frame lit by the flash (the kernel's FLASH): the photograph without it");
+				say("flash: +%llu ms frame %llu: no frame lit by the main flash (the kernel's FLASH): the photograph without it",
+				    (unsigned long long)(now_ms - shot.t0), (unsigned long long)f->sequence);
 			}
 		}
 
@@ -2587,6 +2827,17 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 				continue;
 			}
 			memcpy(job->frame, buffer, need);
+			{
+				double bright, metered = isp_metered(&isp, &st, &bright);
+
+				say("still: frame %llu (one frame, copied whole: %zu bytes) for the photograph asked for %s: %.2f ms x %.2fx analog "
+				    "x %.2fx sensor x %.2fx ISP; AE metered %.1f (x ISP %.1f) target %.1f, brightest %.0f, %s; white balance R %.2f "
+				    "B %.2f%s", (unsigned long long)f->sequence, need, shot.state == SHOT_FIRING ? "with the flash" : "without flash",
+				    f->exposure_lines * (double)f->line_ns / 1e6, (double)f->gain / (f->gain_unity ? f->gain_unity : 256),
+				    isp.sensor_digital, isp.digital, metered, metered * isp.digital, isp.ae_target_level, bright,
+				    isp.ae_stable ? "settled" : "NOT settled", isp.wb[0], isp.wb[2], f->reserved[REDWOOD_CAMERA_R_FLAGS] &
+				    REDWOOD_CAMERA_FLASH_LIT ? ", FLASH_LIT" : "");
+			}
 			job->o = (CMBaseObjectRef)CFRetain(o);
 			job->output = i;
 			job->pb = pb;
@@ -2602,6 +2853,16 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 		}
 		pthread_mutex_unlock(&s->lock);
 		if (job != NULL || give_still) {
+			if (shot.state == SHOT_FIRING) {
+				/* (the ambient exposure from before the pre-flash put back: AE goes on from there, not from the flash's) */
+				struct redwood_camera_command e = { .command = REDWOOD_CAMERA_EXPOSURE, .a = shot.amb_lines, .b = shot.amb_gain,
+					.c = shot.amb_frame_lines, .d = shot.amb_dgain };
+
+				(void)write(device, &e, sizeof(e));
+				isp.digital = shot.amb_digital;
+				isp.sensor_digital = shot.amb_dgain ? shot.amb_sensor_digital : isp.sensor_digital;
+				say("flash: +%llu ms: done; the ambient exposure put back", (unsigned long long)(now_ms - shot.t0));
+			}
 			shot.state = SHOT_IDLE;
 			shot.waited = 0;
 			isp.asked = false;      /* (AE goes on from what the frames say) */
@@ -2638,9 +2899,14 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 			CFRelease(metadata);
 		}
 		if (s->frames == 1 || s->frames % 300 == 0) {
-			say("frame %llu: exposure %.1f ms, gain %.1fx, digital %.2fx, green %.0f above black; white balance R %.2f "
+			if (s->frames % 300 == 0) {
+				camera_settings_check();
+			}
+			say("frame %llu: exposure %.1f ms, gain %.1fx, sensor digital %.2fx, digital %.2fx, green %.0f above black (lens-shaded "
+			    "%.0f); AE metered %.1f target %.1f%s; white balance R %.2f "
 			    "B %.2f, lux index %.0f, about %.0f K; %.1f fps%s%s", f->sequence, f->exposure_lines * (double)f->line_ns / 1e6,
-			    (double)f->gain / f->gain_unity, isp.digital, st.mean[1], isp.wb[0], isp.wb[2], lux, cct,
+			    (double)f->gain / f->gain_unity, isp.sensor_digital, isp.digital, st.mean[1], st.shaded_mean, isp.ae_metered,
+			    isp.ae_target_level, isp.ae_stable ? " (settled)" : "", isp.wb[0], isp.wb[2], lux, cct,
 			    f->frame_lines && f->line_ns ? 1e9 / ((double)f->frame_lines * f->line_ns) : 0, isp.ae_locked ? ", AE locked" : "",
 			    isp.manual ? ", custom exposure" : "");
 		}
@@ -2883,6 +3149,7 @@ stream_start(CMBaseObjectRef o)
 	}
 	pthread_mutex_unlock(&s->lock);
 	redwood_camera_log_check("stream start");
+	camera_settings_check();
 	say("stream: the graph starts the %s's stream (format %d)", s->camera->name, s->format_index);
 	stream_want(o, "no output to give pictures to");
 	if (!s->running) {

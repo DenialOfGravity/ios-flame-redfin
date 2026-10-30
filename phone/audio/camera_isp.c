@@ -127,14 +127,17 @@ void
 isp_measure(const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw, struct isp_stats *s)
 {
 	uint32_t cells_w = f->width / 2, cells_h = f->height / 2;
-	double sum[3] = { 0, 0, 0 }, grey[2] = { 0, 0 }, neutral[2] = { 0, 0 }, roi_sum[3] = { 0, 0, 0 };
+	double sum[3] = { 0, 0, 0 }, grey[2] = { 0, 0 }, neutral[2] = { 0, 0 }, roi_sum[3] = { 0, 0, 0 }, shaded = 0, roi_shaded = 0;
 	float gains[3] = { 1, 1, 1 };
-	uint32_t roi_hist[64], rx0 = 0, rx1 = 0, ry0 = 0, ry1 = 0;
+	uint32_t roi_hist[64], rx0 = 0, rx1 = 0, ry0 = 0, ry1 = 0, shaded_hist[64], roi_shaded_hist[64];
+	bool lsc = isp != NULL && isp->lsc.on;
 	bool roi = isp != NULL && isp->ae_roi[2] > isp->ae_roi[0] && isp->ae_roi[3] > isp->ae_roi[1];
 	int r, b;
 
 	memset(s, 0, sizeof(*s));
 	memset(roi_hist, 0, sizeof(roi_hist));
+	memset(shaded_hist, 0, sizeof(shaded_hist));
+	memset(roi_shaded_hist, 0, sizeof(roi_shaded_hist));
 	if (roi) {
 		/* (redfin: AE's metering window, in cells; at least a 16th of the frame each way) */
 		rx0 = (uint32_t)(isp->ae_roi[0] * cells_w);
@@ -161,11 +164,21 @@ isp_measure(const struct isp *isp, const struct redwood_camera_frame *f, const u
 			sum[0] += v[r];
 			sum[1] += g;
 			sum[2] += v[b];
+			/* (redfin: the lens shading's gains here, once: for the shaded levels and the white balance's cells) */
+			if (lsc) {
+				lsc_at(isp, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, gains);
+			}
+			int gs = (int)(g * gains[1] + 0.5f);
+
+			shaded += gs;
+			shaded_hist[gs >> 4 > 63 ? 63 : gs >> 4]++;
 			if (roi && cx >= rx0 && cx < rx1 && cy >= ry0 && cy < ry1) {
 				roi_sum[0] += v[r];
 				roi_sum[1] += g;
 				roi_sum[2] += v[b];
 				roi_hist[g >> 4 > 63 ? 63 : g >> 4]++;
+				roi_shaded += gs;
+				roi_shaded_hist[gs >> 4 > 63 ? 63 : gs >> 4]++;
 				s->roi_cells++;
 			}
 			/*
@@ -180,8 +193,7 @@ isp_measure(const struct isp *isp, const struct redwood_camera_frame *f, const u
 				 * As the picture will have it: the lens shading raises the corners several times, and
 				 * the light there counts for that much more than in the frame as it comes.
 				 */
-				if (isp != NULL && isp->lsc.on) {
-					lsc_at(isp, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, gains);
+				if (lsc) {
 					cr *= gains[0];
 					cg *= gains[1];
 					cb *= gains[2];
@@ -237,6 +249,38 @@ isp_measure(const struct isp *isp, const struct redwood_camera_frame *f, const u
 			break;
 		}
 	}
+	s->shaded_mean = s->cells ? shaded / s->cells : 0;
+	s->roi_shaded_mean = s->roi_cells ? roi_shaded / s->roi_cells : 0;
+	for (int i = 63, above = 0; i >= 0; i--) {
+		above += shaded_hist[i];
+		if (above * 100 >= (int)s->cells) {
+			s->shaded_bright = i * 16 + 8;
+			break;
+		}
+	}
+	for (int i = 63, above = 0; s->roi_cells && i >= 0; i--) {
+		above += roi_shaded_hist[i];
+		if (above * 100 >= (int)s->roi_cells) {
+			s->roi_shaded_bright = i * 16 + 8;
+			break;
+		}
+	}
+}
+
+double
+isp_metered(const struct isp *isp, const struct isp_stats *s, double *bright)
+{
+	bool raw = isp->ae_unshaded;
+	double mean = raw ? s->mean[1] : s->shaded_mean, top = raw ? s->bright : s->shaded_bright;
+
+	if (s->roi_cells != 0) {
+		mean = 0.75 * (raw ? s->roi_mean[1] : s->roi_shaded_mean) + 0.25 * mean;
+		top = raw ? s->roi_bright : s->roi_shaded_bright;
+	}
+	if (bright != NULL) {
+		*bright = top;
+	}
+	return mean;
 }
 
 /*
@@ -288,6 +332,9 @@ isp_ae(struct isp *isp, const struct redwood_camera_frame *f, const struct isp_s
 		if (isp->asked_digital != 0) {
 			isp->sensor_digital = isp->asked_digital / 256.0f;
 		}
+		if (isp->asked_isp_digital >= 1) {
+			isp->digital = isp->asked_isp_digital;
+		}
 	}
 	if (f->frame_lines_max != 0 && ceiling > f->frame_lines_max) {
 		ceiling = f->frame_lines_max;
@@ -315,17 +362,20 @@ isp_ae(struct isp *isp, const struct redwood_camera_frame *f, const struct isp_s
 		goto split;
 	}
 	now = (double)f->exposure_lines * f->gain / unity * isp->sensor_digital * isp->digital;
-	target = 0.15 * WHITE * pow(2, isp->ae_bias < -8 ? -8 : isp->ae_bias > 8 ? 8 : isp->ae_bias);
+	target = (isp->ae_target > 0.005f && isp->ae_target < 0.8f ? isp->ae_target : ISP_AE_TARGET) * WHITE *
+	    pow(2, isp->ae_bias < -8 ? -8 : isp->ae_bias > 8 ? 8 : isp->ae_bias);
 	target = target > 0.8 * WHITE ? 0.8 * WHITE : target;
-	/* (the measured levels are the sensor's, its digital gain in them: the processor's is applied to the picture only) */
-	mean = s->mean[1];
-	bright = s->bright;
-	if (s->roi_cells != 0) {
-		mean = 0.75 * s->roi_mean[1] + 0.25 * s->mean[1];
-		bright = s->roi_bright;
-	}
+	/*
+	 * (the measured levels are the sensor's, its digital gain in them: the processor's is applied to the picture only).
+	 * redfin (2026-10-30): lens-shaded, as the picture shows them -- metered on the frame as it came, AE aimed the
+	 * middle of the frame at the target and the picture then raised it by the lens shading's gains (1x in the very
+	 * middle, several times at the corners: its mean over the frame well above 1), the photographs 1-2 EV too bright.
+	 */
+	mean = isp_metered(isp, s, &bright);
 	mean = mean * isp->digital > 0.5 ? mean * isp->digital : 0.5;
 	bright *= isp->digital;
+	isp->ae_metered = (float)mean;
+	isp->ae_target_level = (float)target;
 	ratio = target / mean;
 	if (isp->ae_bias <= 0.5f && bright * ratio > 0.9 * WHITE && bright > 0) {
 		ratio = 0.9 * WHITE / bright > target / mean * 0.5 ? 0.9 * WHITE / bright : target / mean * 0.5;
@@ -369,7 +419,12 @@ split:
 		isp->ae_stable = true;
 		return false;           /* (the custom exposure is there already) */
 	}
-	isp->digital = (float)digital;
+	/*
+	 * redfin (2026-10-30): the processor's gain with the exposure it goes with: taken (above) when the frames have that
+	 * exposure, not at once -- the frames still on their way, of the old exposure, were made with the new gain (two or
+	 * more frames too bright or too dark at each change, a photograph among them now and then)
+	 */
+	isp->asked_isp_digital = (float)digital;
 	isp->asked_lines = lines;
 	isp->asked_gain = (uint32_t)(analog * unity + 0.5);
 	isp->asked_frame_lines = frame_lines;

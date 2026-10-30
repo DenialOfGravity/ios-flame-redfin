@@ -30,6 +30,11 @@ struct isp_stats {
 	double          roi_mean[3];
 	double          roi_bright;
 	uint32_t        roi_cells;
+	/*
+	 * redfin (2026-10-30): green as the picture has it, the lens shading's gains applied (the same as mean[1] etc. when
+	 * there is no lens shading): what AE meters on unless isp->ae_unshaded
+	 */
+	double          shaded_mean, shaded_bright, roi_shaded_mean, roi_shaded_bright;
 };
 
 /*
@@ -106,7 +111,21 @@ struct isp {
 	float           wb_manual[3];
 	bool            awb_stable;             /* (AWB's answer) the white balance has stopped moving */
 	bool            reference;              /* the pictures by the float code (the integer code's reference: tests) */
+	/*
+	 * redfin (2026-10-30): AE's target, green's mean as a fraction of white (0: the default, ISP_AE_TARGET); and
+	 * metering on the frame as it comes (true: as before 2026-10-30) rather than on it lens-shaded as the picture shows it
+	 */
+	float           ae_target;
+	bool            ae_unshaded;
+	float           asked_isp_digital;      /* the processor's gain AE asked with: isp->digital once the frames have its exposure */
+	float           ae_metered;             /* (AE's answer) the level it metered last, above black, with the processor's gain */
+	float           ae_target_level;        /* (AE's answer) ... and the level it aimed at */
 };
+
+#define ISP_AE_TARGET   0.15f
+
+/* the level AE meters (green above black, mostly in its window; the sensor's, without the processor's gain) and its brightest 1 % */
+double isp_metered(const struct isp *isp, const struct isp_stats *s, double *bright);
 
 /* frames AE waits for the exposure it asked for before it takes what the frames say (a clamped or lost request) */
 #define AE_PATIENCE     6
