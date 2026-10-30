@@ -757,6 +757,7 @@ struct stream {
 	pthread_cond_t  worker_gone;
 	int             torch;
 	uint64_t        frames, stills_given;
+	uint64_t        previews;       /* (redfin) frames whose moving pictures were made: the stamp's number */
 	/*
 	 * redfin (plan B4-B7): what the capture stack asks of exposure, white balance, focus and the flash (the
 	 * properties below; the worker takes a copy each frame, under ctl_lock).
@@ -1851,6 +1852,74 @@ render_into(struct output *out, CVPixelBufferRef pb, const struct isp *isp, cons
 	return true;
 }
 
+/*
+ * redfin (2026-10-30): /private/var/local/camera-stamp (looked for at each stream start): every moving picture carries
+ * the plug-in's preview frame number in its top left corner, for telling frames' order from screenshots: a start marker
+ * (a white block, a black block), then the number's 16 bits, the most significant first, each a 32x32 block of luma 235
+ * (1) or 16 (0), chroma 128 (BGRA: 235/16 grey). Only those 32 rows' first 576 pixels are touched.
+ */
+static volatile bool camera_stamp;
+#define STAMP_BLOCK     32
+
+static void
+stamp_check(void)
+{
+	bool on = access("/private/var/local/camera-stamp", F_OK) == 0;
+
+	if (on && !camera_stamp) {
+		say("stamp on: the preview frame number in each moving picture's top left (marker 1 0, 16 bits MSB first, 32 px blocks)");
+	} else if (!on && camera_stamp) {
+		say("stamp off");
+	}
+	camera_stamp = on;
+}
+
+static void
+stamp_picture(CVPixelBufferRef pb, uint32_t number)
+{
+	size_t w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), planes = CVPixelBufferGetPlaneCount(pb);
+	int bits[18];
+
+	if (w < 18 * STAMP_BLOCK || h < STAMP_BLOCK) {
+		return;
+	}
+	bits[0] = 1;
+	bits[1] = 0;
+	for (int i = 0; i < 16; i++) {
+		bits[2 + i] = number >> (15 - i) & 1;
+	}
+	CVPixelBufferLockBaseAddress(pb, 0);
+	if (planes >= 2) {
+		uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0), *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+		size_t ys = CVPixelBufferGetBytesPerRowOfPlane(pb, 0), uvs = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+
+		for (size_t r = 0; y != NULL && r < STAMP_BLOCK; r++) {
+			for (int b = 0; b < 18; b++) {
+				memset(y + r * ys + (size_t)b * STAMP_BLOCK, bits[b] ? 235 : 16, STAMP_BLOCK);
+			}
+		}
+		for (size_t r = 0; uv != NULL && r < STAMP_BLOCK / 2; r++) {
+			memset(uv + r * uvs, 128, 18 * STAMP_BLOCK);    /* (Cb Cr pairs: 18 blocks of 16 pairs, 2 bytes each = 32 x 18) */
+		}
+	} else {
+		uint8_t *p = CVPixelBufferGetBaseAddress(pb);
+		size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+
+		for (size_t r = 0; p != NULL && r < STAMP_BLOCK; r++) {
+			for (int b = 0; b < 18; b++) {
+				uint8_t v = bits[b] ? 235 : 16;
+				uint8_t *q = p + r * bpr + (size_t)b * STAMP_BLOCK * 4;
+
+				for (int x = 0; x < STAMP_BLOCK; x++, q += 4) {
+					q[0] = q[1] = q[2] = v;
+					q[3] = 255;
+				}
+			}
+		}
+	}
+	CVPixelBufferUnlockBaseAddress(pb, 0);
+}
+
 /* redfin (B8): the picture made once for both scalers where their buffers are alike: copied, not made again */
 static bool
 copy_picture(CVPixelBufferRef from, CVPixelBufferRef to)
@@ -2870,6 +2939,8 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 		if (job != NULL) {
 			dispatch_async_f(still_queue(), job, still_made);
 		}
+		uint64_t preview_number = taken > 0 ? ++s->previews : s->previews;
+
 		for (int k = 0; k < taken; k++) {
 			struct output *out = &s->out[moving[k].output];
 			bool made = k > 0 && moving[0].pb != NULL && copy_picture(moving[0].pb, moving[k].pb);
@@ -2878,6 +2949,9 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 				CVPixelBufferRelease(moving[k].pb);
 				moving[k].pb = NULL;
 				continue;
+			}
+			if (camera_stamp) {
+				stamp_picture(moving[k].pb, (uint32_t)preview_number);
 			}
 			attach(moving[k].pb, metadata);
 		}
@@ -3150,6 +3224,7 @@ stream_start(CMBaseObjectRef o)
 	pthread_mutex_unlock(&s->lock);
 	redwood_camera_log_check("stream start");
 	camera_settings_check();
+	stamp_check();
 	say("stream: the graph starts the %s's stream (format %d)", s->camera->name, s->format_index);
 	stream_want(o, "no output to give pictures to");
 	if (!s->running) {
