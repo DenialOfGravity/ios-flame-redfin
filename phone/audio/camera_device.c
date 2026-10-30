@@ -433,6 +433,7 @@ struct output {
 	CVPixelBufferRef held[HELD];            /* the pictures given last, kept from the pool (see deliver) */
 	unsigned        held_next;
 	bool            said_pool;
+	bool            said_layout;            /* (redfin) the first moving picture's buffer layout said (layout_check) */
 };
 
 static void let_go(struct output *out);
@@ -1518,6 +1519,10 @@ render_into(struct output *out, CVPixelBufferRef pb, const struct isp *isp, cons
 		return false;
 	}
 	CVPixelBufferLockBaseAddress(pb, 0);
+	if (still || !out->said_layout) {
+		out->said_layout |= !still;
+		layout_check(out->name, pb);
+	}
 
 	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, still && pf != PF_BGRA };
 	uint64_t began = mach_absolute_time();
@@ -1532,9 +1537,84 @@ render_into(struct output *out, CVPixelBufferRef pb, const struct isp *isp, cons
 		}
 		say("%s: %ux%u made of every pixel in %.0f ms", out->name, width, height,
 		    (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6);
+		still_dump(pb);
 	}
 	CVPixelBufferUnlockBaseAddress(pb, 0);
 	return true;
+}
+
+/*
+ * redfin (corrupted photographs): a buffer's layout as CoreVideo has it beside its IOSurface's own -- the size, the
+ * format, each plane's offset from plane 0, bytes per row, width and height -- with MISMATCH where they differ, for the
+ * first moving picture of a session and for every photograph (under the buffer's base address lock).
+ */
+static void
+layout_check(const char *what, CVPixelBufferRef pb)
+{
+	IOSurfaceRef surface = CVPixelBufferGetIOSurface(pb);
+	size_t planes = CVPixelBufferGetPlaneCount(pb), splanes = surface != NULL ? IOSurfaceGetPlaneCount(surface) : 0;
+	uint32_t pf = CVPixelBufferGetPixelFormatType(pb);
+	const uint8_t *base = planes ? CVPixelBufferGetBaseAddressOfPlane(pb, 0) : CVPixelBufferGetBaseAddress(pb);
+	const uint8_t *sbase = surface != NULL ? (splanes ? IOSurfaceGetBaseAddressOfPlane(surface, 0) : IOSurfaceGetBaseAddress(surface)) : NULL;
+	bool mismatch = surface == NULL || planes != splanes || base != sbase;
+
+	say("%s: layout: %zux%zu %c%c%c%c, %zu planes; IOSurface %s %zux%zu %zu planes, base %s CoreVideo's", what,
+	    CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb), pf >> 24, pf >> 16 & 255, pf >> 8 & 255, pf & 255, planes,
+	    surface != NULL ? "" : "NONE", surface != NULL ? IOSurfaceGetWidth(surface) : 0, surface != NULL ? IOSurfaceGetHeight(surface) : 0,
+	    splanes, base == sbase ? "at" : "NOT at");
+	if (surface != NULL && (IOSurfaceGetWidth(surface) != CVPixelBufferGetWidth(pb) || IOSurfaceGetHeight(surface) != CVPixelBufferGetHeight(pb) ||
+	    IOSurfaceGetPixelFormat(surface) != pf)) {
+		mismatch = true;
+	}
+	for (size_t p = 0; p < (planes > splanes ? planes : splanes); p++) {
+		const uint8_t *a = p < planes ? CVPixelBufferGetBaseAddressOfPlane(pb, p) : NULL;
+		const uint8_t *b = surface != NULL && p < splanes ? IOSurfaceGetBaseAddressOfPlane(surface, p) : NULL;
+		long off = a != NULL && base != NULL ? (long)(a - base) : -1, soff = b != NULL && sbase != NULL ? (long)(b - sbase) : -1;
+		size_t bpr = p < planes ? CVPixelBufferGetBytesPerRowOfPlane(pb, p) : 0, sbpr = b != NULL ? IOSurfaceGetBytesPerRowOfPlane(surface, p) : 0;
+		size_t w = p < planes ? CVPixelBufferGetWidthOfPlane(pb, p) : 0, sw = b != NULL ? IOSurfaceGetWidthOfPlane(surface, p) : 0;
+		size_t h = p < planes ? CVPixelBufferGetHeightOfPlane(pb, p) : 0, sh = b != NULL ? IOSurfaceGetHeightOfPlane(surface, p) : 0;
+		bool differs = off != soff || bpr != sbpr || w != sw || h != sh;
+
+		mismatch |= differs;
+		say("%s: layout: plane %zu: CoreVideo offset %ld bpr %zu %zux%zu; IOSurface offset %ld bpr %zu %zux%zu%s", what, p, off, bpr, w, h,
+		    soff, sbpr, sw, sh, differs ? " MISMATCH" : "");
+	}
+	say("%s: layout: %s", what, mismatch ? "MISMATCH between CoreVideo and the IOSurface" : "CoreVideo and the IOSurface agree");
+}
+
+/*
+ * redfin: /private/var/local/camera-dump-still: the photograph as it goes to the encoder (both NV12 planes, whole rows
+ * of each plane's bytes per row) to /private/var/local/camera-still-<n>.nv12, at most 3 for mediaserverd's run.
+ */
+static void
+still_dump(CVPixelBufferRef pb)
+{
+	static unsigned dumped;
+	char path[64];
+	int fd;
+	size_t bpr[2], rows[2];
+	bool written = true;
+
+	if (CVPixelBufferGetPlaneCount(pb) != 2 || access("/private/var/local/camera-dump-still", F_OK) != 0 || dumped >= 3) {
+		return;
+	}
+	snprintf(path, sizeof(path), "/private/var/local/camera-still-%u.nv12", ++dumped);
+	for (size_t p = 0; p < 2; p++) {
+		bpr[p] = CVPixelBufferGetBytesPerRowOfPlane(pb, p);
+		rows[p] = CVPixelBufferGetHeightOfPlane(pb, p);
+	}
+	if ((fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644)) < 0) {
+		say("still dump: %s: %s", path, strerror(errno));
+		return;
+	}
+	for (size_t p = 0; p < 2 && written; p++) {
+		const uint8_t *plane = CVPixelBufferGetBaseAddressOfPlane(pb, p);
+
+		written = plane != NULL && write(fd, plane, bpr[p] * rows[p]) == (ssize_t)(bpr[p] * rows[p]);
+	}
+	close(fd);
+	say("still dump: %s: w %zu h %zu bpr0 %zu bpr1 %zu (plane 0 %zu rows, plane 1 %zu rows)%s", path, CVPixelBufferGetWidth(pb),
+	    CVPixelBufferGetHeight(pb), bpr[0], bpr[1], rows[0], rows[1], written ? "" : " NOT WRITTEN WHOLE");
 }
 
 /* redfin (B8): the picture made once for both scalers where their buffers are alike: copied, not made again */
@@ -2661,6 +2741,9 @@ stream_start(CMBaseObjectRef o)
 
 	pthread_mutex_lock(&s->lock);
 	s->graph_running = true;
+	for (int i = 0; i < OUTPUTS; i++) {
+		s->out[i].said_layout = false;  /* (a session's first moving picture's layout said again) */
+	}
 	pthread_mutex_unlock(&s->lock);
 	say("stream: the graph starts the %s's stream (format %d)", s->camera->name, s->format_index);
 	stream_want(o, "no output to give pictures to");
