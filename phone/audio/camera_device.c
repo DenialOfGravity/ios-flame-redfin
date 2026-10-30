@@ -1499,51 +1499,6 @@ frame_metadata(const struct isp *isp, const struct redwood_camera_frame *f, cons
 }
 
 /*
- * A picture of the frame into a buffer of the graph's (the scalers' moving picture, or the photograph: every pixel
- * of the sensor, isp_render_still_nv12), in pieces on every core. redfin (B8): without the stream's lock, so that the
- * capture stack's property calls do not wait for it (a 12 MP photograph took a second or more).
- */
-static bool
-render_into(struct output *out, CVPixelBufferRef pb, const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw,
-    bool still)
-{
-	uint32_t pf = CVPixelBufferGetPixelFormatType(pb), width = (uint32_t)CVPixelBufferGetWidth(pb),
-	    height = (uint32_t)CVPixelBufferGetHeight(pb);
-
-	if (width == 0 || height == 0 || (pf != PF_420F && pf != PF_420V && pf != PF_BGRA)) {
-		if (out->delivered == 0 && out->said_shape == false) {
-			out->said_shape = true;
-			say("%s: %ux%u %c%c%c%c buffers are not for this ISP", out->name, width, height, pf >> 24, pf >> 16 & 255,
-			    pf >> 8 & 255, pf & 255);
-		}
-		return false;
-	}
-	CVPixelBufferLockBaseAddress(pb, 0);
-	if (still || !out->said_layout) {
-		out->said_layout |= !still;
-		layout_check(out->name, pb);
-	}
-
-	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, still && pf != PF_BGRA };
-	uint64_t began = mach_absolute_time();
-
-	dispatch_apply_f(job.pieces, dispatch_get_global_queue(still ? QOS_CLASS_USER_INITIATED : QOS_CLASS_USER_INTERACTIVE, 0), &job,
-	    render_piece);
-	if (job.still) {
-		static mach_timebase_info_data_t tb;
-
-		if (tb.denom == 0) {
-			mach_timebase_info(&tb);
-		}
-		say("%s: %ux%u made of every pixel in %.0f ms", out->name, width, height,
-		    (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6);
-		still_dump(pb);
-	}
-	CVPixelBufferUnlockBaseAddress(pb, 0);
-	return true;
-}
-
-/*
  * redfin (corrupted photographs): a buffer's layout as CoreVideo has it beside its IOSurface's own -- the size, the
  * format, each plane's offset from plane 0, bytes per row, width and height -- with MISMATCH where they differ, for the
  * first moving picture of a session and for every photograph (under the buffer's base address lock).
@@ -1615,6 +1570,51 @@ still_dump(CVPixelBufferRef pb)
 	close(fd);
 	say("still dump: %s: w %zu h %zu bpr0 %zu bpr1 %zu (plane 0 %zu rows, plane 1 %zu rows)%s", path, CVPixelBufferGetWidth(pb),
 	    CVPixelBufferGetHeight(pb), bpr[0], bpr[1], rows[0], rows[1], written ? "" : " NOT WRITTEN WHOLE");
+}
+
+/*
+ * A picture of the frame into a buffer of the graph's (the scalers' moving picture, or the photograph: every pixel
+ * of the sensor, isp_render_still_nv12), in pieces on every core. redfin (B8): without the stream's lock, so that the
+ * capture stack's property calls do not wait for it (a 12 MP photograph took a second or more).
+ */
+static bool
+render_into(struct output *out, CVPixelBufferRef pb, const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw,
+    bool still)
+{
+	uint32_t pf = CVPixelBufferGetPixelFormatType(pb), width = (uint32_t)CVPixelBufferGetWidth(pb),
+	    height = (uint32_t)CVPixelBufferGetHeight(pb);
+
+	if (width == 0 || height == 0 || (pf != PF_420F && pf != PF_420V && pf != PF_BGRA)) {
+		if (out->delivered == 0 && out->said_shape == false) {
+			out->said_shape = true;
+			say("%s: %ux%u %c%c%c%c buffers are not for this ISP", out->name, width, height, pf >> 24, pf >> 16 & 255,
+			    pf >> 8 & 255, pf & 255);
+		}
+		return false;
+	}
+	CVPixelBufferLockBaseAddress(pb, 0);
+	if (still || !out->said_layout) {
+		out->said_layout |= !still;
+		layout_check(out->name, pb);
+	}
+
+	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, still && pf != PF_BGRA };
+	uint64_t began = mach_absolute_time();
+
+	dispatch_apply_f(job.pieces, dispatch_get_global_queue(still ? QOS_CLASS_USER_INITIATED : QOS_CLASS_USER_INTERACTIVE, 0), &job,
+	    render_piece);
+	if (job.still) {
+		static mach_timebase_info_data_t tb;
+
+		if (tb.denom == 0) {
+			mach_timebase_info(&tb);
+		}
+		say("%s: %ux%u made of every pixel in %.0f ms", out->name, width, height,
+		    (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6);
+		still_dump(pb);
+	}
+	CVPixelBufferUnlockBaseAddress(pb, 0);
+	return true;
 }
 
 /* redfin (B8): the picture made once for both scalers where their buffers are alike: copied, not made again */
