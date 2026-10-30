@@ -1,0 +1,187 @@
+From 82c52aed15ef7d1d6b3db9cb5dc04c136c006044 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Fri, 30 Oct 2026 00:54:00 +0000
+Subject: [PATCH] 1046 redfin: preferred live settings as boot defaults (direct
+ scanout auto-on, UI threads on big cores)
+
+sweetscanout absent = 2 (was 0). 0 off (blit, no slots); 1 slots + direct
+on at AppleCLCD::start (as before); 2 (default) slots + direct turned on by
+itself, once, at the first SwapEnd whose single layer is a 1125x2436
+scanout-slot surface with the display on: the same sweet_scan_set as
+p scanout 1, from backboardd's SwapEnd thread, so it already counts for
+that frame (0979's 3 slot frames in a row still apply before entering).
+Display off leaves the direct geometry with scanout still on (0989), the
+next slot frames enter it again, as with the live poke. 3 = slots only
+(the old 2). p scanout 0|1 still switch live and disarm a pending auto-on.
+Boot klog: "SWEET SCANOUT: sweetscanout=2 (1046: ...): auto armed", then
+"SWEET SCANOUT: auto on (1046 default sweetscanout=2): swap N from
+backboardd, surface S in slot K" and "SWEET SCANOUT: on (auto ...)".
+kern.sweet_ui_bigcore default 1 (was 0); the sysctl still changes it.
+---
+ bsd/dev/sweet_cpufreq.c               |  2 +-
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 51 +++++++++++++++++++++++++--
+ iokit/Kernel/arm/SweetSurface.cpp     |  7 +++-
+ osfmk/kern/sched_prim.c               |  4 +--
+ 4 files changed, 58 insertions(+), 6 deletions(-)
+
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 5648ef7..fb23104 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -203,7 +203,7 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_gov_framehold, CTLTYPE_INT | CTLFLAG_RW | CTL
+     0, 0, sysctl_sweet_gov_framehold, "I", "SWEET GOV: % of each domain's top held 300 ms after a SwapEnd (0 off)");
+ 
+ /*
+- * 1041: kern.sweet_ui_bigcore MASK (osfmk/kern/sched_prim.c, choose_processor; default 0 = as before): 1 threads named
++ * 1041: kern.sweet_ui_bigcore MASK (osfmk/kern/sched_prim.c, choose_processor; 1046: default 1, was 0): 1 threads named
+  * com.apple.coreanimation.display* (backboardd's CA display thread), 2 com.apple.coreanimation.render-server*: an idle
+  * big core (CPU6/7, sweetbig order), else preempt the big core running the lowest priority below theirs, else the
+  * normal choice (never waits). Line SWEET UI: bigcore 5s every 5 s while tagged threads run (also with 0: baseline).
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d2de1d2..2c96689 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -440,6 +440,8 @@ static IOReturn sweet_scan_poll(AppleCLCD *fb, uint32_t id);    /* 0996 */
+ static void sweet_scan_set(AppleCLCD *fb, bool on, const char *why);
+ 
+ static AppleCLCD *sweet_fb_instance;    /* 0943: for the poke commands (p fc, p hz) */
++static volatile bool sweet_scan_auto_armed;     /* 1046: sweetscanout=2 (default): direct on at the first slot swap */
++static void sweet_scan_auto(AppleCLCD *fb, const uint8_t *rec);
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+@@ -935,7 +937,11 @@ AppleCLCD::start(IOService *provider)
+ 	sweet_surface_scan_reserve();   /* 0979: the scanout slots' memory before userland (sweetscanout) */
+ 	if (sweet_surface_scan_mode() == 1) {
+ 		sweet_scan_set(this, true, "boot-arg sweetscanout=1");  /* 0976 */
++	} else if (sweet_surface_scan_mode() == 2) {
++		sweet_scan_auto_armed = true;   /* 1046: on at the first slot surface's swap (AppleCLCD::swap) */
+ 	}
++	IOLog("SWEET SCANOUT: sweetscanout=%u (1046: 0 off, 1 on at start, 2 = default: on at the first slot swap, "
++	    "3 slots only)%s\n", sweet_surface_scan_mode(), sweet_scan_auto_armed ? ": auto armed" : "");
+ 	IOLog("SWEET FB: sweetfbx %#x, panel %u Hz\n", sweet_fbx, fHz);
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+@@ -1421,6 +1427,9 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	uint64_t now = mach_absolute_time();
+ 	uint32_t fence = sweet_gpu_fence_submitted();   /* 0949: CA's rendering of this frame is at or before it */
+ 	SWEET_TRACE_START(SWT_SWAP, get32(rec, 0x50), fence, get32(rec, 0x104), 0);      /* 0994 */
++	if (__improbable(sweet_scan_auto_armed)) {
++		sweet_scan_auto(this, rec);     /* 1046: before this frame's sweet_scan_live() check, so it already counts */
++	}
+ 	IOLockLock(fLock);
+ 	fSwapFence[fSwapFenceNext].abs = now;
+ 	fSwapFence[fSwapFenceNext].fence = fence;
+@@ -2620,7 +2629,8 @@ AppleCLCD::mdpCmd(const char *s, const char *end)
+ 
+ /*
+  * ---- 0976: direct scanout (step e of docs/redfin/scanout-plan.md): boot-arg sweetscanout=1 (on) or 2 (slots
+- * only, off until p scanout 1); p scanout 0|1 switches live. Inert with sweetscanout=0 (the default). ----
++ * only, off until p scanout 1); p scanout 0|1 switches live. Inert with sweetscanout=0. 1046: 2 is the default and
++ * turns direct on at the first slot swap (sweet_scan_auto); 3 = slots only (the old 2). ----
+  *
+  * A SwapEnd whose single layer is a CA surface in a scanout slot (0975) is not copied: it waits for the GPU fence
+  * submitted at its SwapEnd (0949: SwapEnd comes when CA has queued the rendering, not when the GPU has drawn it),
+@@ -3500,6 +3510,39 @@ sweet_scan_gpu_kick(void)
+ 	}
+ }
+ 
++/*
++ * 1046: sweetscanout=2 (the default): direct scanout turns itself on, once, at the first SwapEnd whose single layer is
++ * a scanout-slot surface of the panel's logical size, with the display on: the same sweet_scan_set as p scanout 1,
++ * from backboardd's SwapEnd thread (AppleCLCD::start has made the slots, the MDP is ABL's set-up, CA's chain is in the
++ * slots). Afterwards nothing differs from the live poke: display off leaves the direct geometry (0989) with
++ * sweet_scan.on kept, and the next slot frames (3 in a row, 0979) enter it again. p scanout 0|1 before that disarms it.
++ */
++static void
++sweet_scan_auto(AppleCLCD *fb, const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104);
++	if (mask == 0 || (mask & (mask - 1)) || fb->fPowerOff) {
++		return;
++	}
++	uint32_t l = (uint32_t)__builtin_ctz(mask);
++	uint32_t id = l < SWEET_FB_LAYERS ? get32(rec, 0x54 + 4 * l) : 0;
++	SweetSurface *s = id != 0 ? sweet_surface_copy(id) : NULL;
++	if (s == NULL) {
++		return;
++	}
++	bool slot = s->scanSlot != 0 && s->width == SWEET_FB_LOGICAL_W && s->height == SWEET_FB_LOGICAL_H;
++	uint32_t sid = s->id, n = s->scanSlot;
++	s->release();
++	if (!slot || !OSCompareAndSwap8(1, 0, (volatile UInt8 *)&sweet_scan_auto_armed)) {
++		return;
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET SCANOUT: auto on (1046 default sweetscanout=2): swap %u from %s, surface %u in slot %u\n",
++	    get32(rec, 0x50), name, sid, n - 1);
++	sweet_scan_set(fb, true, "auto (1046: sweetscanout=2, first slot swap)");
++}
++
+ /* p scanout 0|1 and the boot-arg: frames direct or the normal way. */
+ static void
+ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+@@ -3547,7 +3590,7 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+  *                   with the tear-check configuration
+  *   p hz 60|90 [tc] the panel's rate now (DCS 0x53), ticks and SyncRate with it; tc: tear-check line clock too
+  *   p mdp ...       0948: display-engine dump and scanout tests (above)
+- *   p scanout 0|1   0976: the direct scanout off / on (needs boot-arg sweetscanout=1|2); no argument: the state
++ *   p scanout 0|1   0976: the direct scanout off / on (needs sweetscanout 1|2|3; 1046: 2 by default); no argument: the state
+  *   p scanout gate 0|1|2   0985: SwapEnd back pressure (0), the swapper's GPU submits wait (1, default), 0989: the
+  *                          CP waits for the latch (2; boot-arg sweetscangate)
+  *   p scanout corners 0|1  0986: corner mattes drawn into each direct frame (default off)
+@@ -3784,6 +3827,10 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+ 			    sweet_scan.tribuf ? "busy until latched" : "done at once for the newest",
+ 			    sweet_scan.tribuf ? "K-1 on screen at chain 3" : "K on screen");
+ 		} else if (q < end && (*q == '0' || *q == '1')) {
++			if (sweet_scan_auto_armed) {
++				sweet_scan_auto_armed = false;  /* 1046: the poke decides from now on */
++				IOLog("SWEET SCANOUT: auto disarmed (p scanout %c)\n", *q);
++			}
+ 			sweet_scan_set(this, *q == '1', "p scanout");
+ 		} else {
+ 			sweet_scan_set(this, sweet_scan.on, "p scanout (state)");
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index f1979df..8642b78 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -102,7 +102,12 @@ uint32_t
+ sweet_surface_scan_mode(void)
+ {
+ 	if (sweet_scan_boot < 0) {
+-		int m = 0;
++		/*
++		 * 1046: absent = 2 (was 0). 0 off (blit, no slots); 1 slots + direct on at AppleCLCD::start; 2 slots + direct
++		 * on by itself at the first swap of a scanout-slot surface (AppleCLCD::swap, sweet_scan_auto); 3 slots only
++		 * (direct off until p scanout 1: what 2 was before 1046).
++		 */
++		int m = 2;
+ 		PE_parse_boot_argn("sweetscanout", &m, sizeof(m));
+ 		sweet_scan_boot = m < 0 ? 0 : m;
+ 	}
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 497baf2..ca538b1 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -5023,7 +5023,7 @@ choose_next_pset(
+ uint64_t sweet_cpu_idle_abs(int cpu);
+ 
+ /*
+- * redfin 1041: kern.sweet_ui_bigcore MASK (bsd/dev/sweet_cpufreq.c; default 0 = as before). Trace of a Settings scroll
++ * redfin 1041: kern.sweet_ui_bigcore MASK (bsd/dev/sweet_cpufreq.c; 1046: default 1, was 0). Trace of a Settings scroll
+  * (2026-10-29): backboardd's com.apple.coreanimation.display.primary (CA prepare, ~10 ms of CPU per frame on an A76)
+  * ran 8 of 174 frames on an A55 at ~19.7 ms and cost 44 "display thread busy" ticks: 0962 only takes an IDLE big core.
+  * Threads are tagged when named (bsd_setthreadname): com.apple.coreanimation.display* (class 1) and
+@@ -5036,7 +5036,7 @@ uint64_t sweet_cpu_idle_abs(int cpu);
+  * Stats always (cheap): runs and on-CPU ms of tagged threads on big (CPU6/7) and little cores, counted when they go off
+  * core; line every 5 s while tagged threads run: SWEET UI: bigcore 5s: ... (sweet_thermal.c's 5 s tick).
+  */
+-int sweet_ui_bigcore;
++int sweet_ui_bigcore = 1;      /* 1046: default 1 (CA display threads; was 0); sysctl kern.sweet_ui_bigcore changes it live */
+ static uint32_t sweet_ui_tagged;
+ static uint32_t sweet_ui_st_idle, sweet_ui_st_preempt, sweet_ui_st_fallback;
+ static uint64_t sweet_ui_runs[2][2], sweet_ui_abs[2][2];     /* [class display, render-server][big, little] */
+-- 
+2.43.0
+

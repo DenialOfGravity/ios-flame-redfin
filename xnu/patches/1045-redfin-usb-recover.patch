@@ -1,0 +1,417 @@
+From 257ad6851d5066ee4be586c944ddf661ac49727a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 01:00:13 +0000
+Subject: [PATCH] redfin 1045: USB Ethernet recovery after unplug/replug; 1034
+ fast path on by default
+
+USB cable moved to a charger at t=1244 s: the bulk IN transfer in flight
+never completed (tx busy 1), no disconnect event came (VBUS override keeps
+the session valid). Back on the PC the host re-enumerated, but nothing in
+sweet_usb.c had been torn down: ud.configured stayed true, so
+SET_CONFIGURATION skipped ud_configure (no DEPSTARTCFG/SETEPCONFIG/
+XferResource, no new RX TRB) while the host had reset its data toggles,
+the old RX TRB/IN transfer stayed with the old endpoint state, and the
+interrupt endpoint's NETWORK_CONNECTION transfer was still active
+("ep5 cmd 0x6 status 1"). rx froze at 124285 frames until reboot.
+
+kern.sweet_usb_recover 1 (default; boot sweetusbrecover=0 = old
+behaviour): bus reset/disconnect/SET_CONFIGURATION end the bulk OUT/IN
+and interrupt IN transfers (End Transfer ForceRM with the recorded
+resource index), clear tx_busy, free the TX queue, LINK_OFF; SET_CONFIG
+sets the endpoints up from scratch (DEPSTARTCFG, RX TRB armed); a second
+SET_INTERFACE alt 1 does the same; stale completions are ignored.
+Watchdog: configured, alt 1, TX busy and no RX/TX completion for 5 s with
+the host present (link U0/L0 or new events) -> "SWEET USB: stuck,
+re-arming" + re-setup, at most every 10 s. Counters kern.sweet_usb_resets,
+_rearms, _stuck and in the 10 s ue0 line.
+
+Defaults: txbatch 16, poll_us 100 (1034's soaked values); sysctl or boot
+sweetusbtxb=0 / sweetusbpollus=0 restore the old path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC2ugyLE29nbFLJoQZd
+---
+ bsd/dev/sweet_usb.c | 231 ++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 224 insertions(+), 7 deletions(-)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 1dc8244..74ad9a6 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -192,8 +192,10 @@ sweet_usb_probe(void)
+ #define DEPCMD_SETTRANSFRESOURCE 2
+ #define DEPCMD_SETSTALL         4
+ #define DEPCMD_STARTTRANSFER    6
++#define DEPCMD_ENDTRANSFER      8
+ #define DEPCMD_DEPSTARTCFG      9
+ #define DEPCMD_CMDACT           (1u << 10)
++#define DEPCMD_FORCERM          (1u << 11)
+ 
+ #define TRB_HWO         (1u << 0)
+ #define TRB_LST         (1u << 1)
+@@ -247,6 +249,7 @@ static struct {
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
++	bool        data_up;        /* 1045: data interface alt 1 was activated since the last ud_configure */
+ } ud;
+ 
+ static inline void
+@@ -275,6 +278,17 @@ ud_sync(uint32_t off, uint32_t len)
+ 	flush_dcache64((addr64_t)(ud.dma_pa + off), len, TRUE);
+ }
+ 
++/* 1045: invalidate before reading a TRB the controller writes (ud.dma or the 1034 batch buffer). */
++static void
++ud_sync_any(uint64_t pa, uint32_t len)
++{
++	if (ud_dma_uncached && pa >= ud.dma_pa && pa < ud.dma_pa + UD_SIZE) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++		return;
++	}
++	flush_dcache64((addr64_t)pa, len, TRUE);
++}
++
+ static void
+ ud_sleep_ms(unsigned ms)
+ {
+@@ -352,6 +366,50 @@ SYSCTL_QUAD(_kern, OID_AUTO, sweet_usb_rx_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &
+ SYSCTL_QUAD(_kern, OID_AUTO, sweet_usb_tx_xfers, CTLFLAG_RD | CTLFLAG_LOCKED, &ud_tx_xfers, "");
+ SYSCTL_QUAD(_kern, OID_AUTO, sweet_usb_tx_drops, CTLFLAG_RD | CTLFLAG_LOCKED, &ud_tx_drops, "");
+ 
++/*
++ * redfin 1045: USB Ethernet survives unplug/replug. Before, nothing was torn down on a bus reset:
++ * ud.configured stayed true, so the next SET_CONFIGURATION skipped ud_configure (no DEPSTARTCFG /
++ * SETEPCONFIG / XferResource, no new RX TRB), the bulk endpoints kept the transfers they had when the
++ * cable went (TX in flight: tx_busy 1 forever, its XferComplete never comes; RX TRB armed with the old
++ * sequence number, while SET_CONFIGURATION / SET_INTERFACE reset the host's data toggles to DATA0) and
++ * the interrupt endpoint's NETWORK_CONNECTION TRB was still active ("ep5 cmd 0x6 status 1").
++ * kern.sweet_usb_recover 1 (default; boot sweetusbrecover=0 = 0): on USB reset/disconnect End Transfer
++ * (ForceRM) on bulk OUT/IN and interrupt IN, drop tx_busy and the queued frames, link off; endpoints are
++ * set up again on SET_CONFIGURATION, and on SET_INTERFACE(1, alt 1) once the data interface had been up;
++ * watchdog: configured, alt 1, TX busy and neither RX nor TX completing for 5 s while the host is there
++ * (link state U0/L0 or new events) -> "SWEET USB: stuck, re-arming" + the same re-setup, at most once per
++ * 10 s. Counters kern.sweet_usb_resets / _rearms / _stuck, also in the 10 s ue0 line.
++ */
++static int ud_recover = 1;
++static uint64_t ud_resets, ud_rearms, ud_stuck, ud_stale, ud_tx_done;
++static uint32_t ud_cfg_count;
++static vm_offset_t ud_tx_trb;   /* first TRB of the TX transfer in flight (single or batch) */
++static uint64_t ud_tx_trb_pa;
++static bool ud_xact[6];         /* transfer started on this physical endpoint and not yet completed/ended */
++static uint8_t ud_rsc[6];       /* its transfer resource index (DEPCMD[22:16] after StartTransfer) */
++
++static int
++sysctl_sweet_usb_recover SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, ud_recover, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value != 0 && value != 1) {
++		return EINVAL;
++	}
++	ud_recover = value;
++	printf("SWEET USB: recover %d\n", value);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_usb_recover, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_usb_recover, "I", "SWEET USB: reset endpoints on bus reset/reconfig + stuck watchdog (1045)");
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_usb_resets, CTLFLAG_RD | CTLFLAG_LOCKED, &ud_resets, "");
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_usb_rearms, CTLFLAG_RD | CTLFLAG_LOCKED, &ud_rearms, "");
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_usb_stuck, CTLFLAG_RD | CTLFLAG_LOCKED, &ud_stuck, "");
++
+ static void
+ ud_sleep_us_crit(unsigned us)
+ {
+@@ -378,6 +436,10 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ 				printf("SWEET USB: ep%u cmd 0x%x status %u\n", ep, cmd & 0xf, status);
+ 				return -1;
+ 			}
++			if ((cmd & 0xf) == DEPCMD_STARTTRANSFER && ep < 6) {      /* 1045 */
++				ud_rsc[ep] = (uint8_t)((v >> 16) & 0x7f);
++				ud_xact[ep] = true;
++			}
+ 			return 0;
+ 		}
+ 		delay(1);
+@@ -508,9 +570,81 @@ ud_configure(void)
+ 		return;
+ 	}
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
++	lck_mtx_lock(ud.lock);
+ 	ud.configured = true;
++	lck_mtx_unlock(ud.lock);
++	ud.data_up = false;
+ 	ud_rx_arm();
+-	printf("SWEET USB: ECM endpoints configured\n");
++	if (ud_cfg_count++ > 0) {
++		ud_rearms++;
++		printf("SWEET USB: ECM endpoints configured again (rearms %llu)\n", ud_rearms);
++	} else {
++		printf("SWEET USB: ECM endpoints configured\n");
++	}
++}
++
++/*
++ * 1045: End Transfer (ForceRM, no IOC: poll CMDACT, then 100 us as Linux dwc3 does) on the data endpoints
++ * that have one, TX idle, queued frames freed. ud.lock held (ud_if_output starts TX under it).
++ */
++static unsigned
++ud_eps_stop_locked(unsigned *ended)
++{
++	static const unsigned eps[3] = { EP_RX, EP_TX, EP_INT };
++	unsigned n = 0, dropped = 0;
++	for (int i = 0; i < 3; i++) {
++		unsigned ep = eps[i];
++		if (ud_xact[ep]) {
++			(void)ud_epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | ((uint32_t)ud_rsc[ep] << 16), 0, 0, 0);
++			ud_xact[ep] = false;
++			n |= 1u << i;
++		}
++	}
++	if (n) {
++		delay(100);
++	}
++	ud.tx_busy = false;
++	while (ud.txq_count > 0) {
++		mbuf_freem(ud.txq[ud.txq_head]);
++		ud.txq[ud.txq_head] = NULL;
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ_MAX;
++		ud.txq_count--;
++		dropped++;
++	}
++	ud.txq_head = 0;
++	*ended = n;
++	return dropped;
++}
++
++/* 1045: the data endpoints down (bus reset/disconnect, SET_CONFIGURATION, re-setup). */
++static void
++ud_data_down(const char *why, bool link_off)
++{
++	unsigned ended = 0;
++	lck_mtx_lock(ud.lock);
++	bool was = ud.configured;
++	ud.configured = false;
++	ud.data_up = false;
++	unsigned dropped = ud_eps_stop_locked(&ended);
++	lck_mtx_unlock(ud.lock);
++	dwc_wr(DALEPENA, dwc_rd(DALEPENA) & ~((1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT)));
++	if (was && link_off) {
++		ud_link_event(false);
++	}
++	printf("SWEET USB: data endpoints down (%s): was configured %d, ended rx %u tx %u int %u, dropped %u tx frames; resets %llu rearms %llu stuck %llu\n",
++	    why, was, ended & 1, (ended >> 1) & 1, (ended >> 2) & 1, dropped, ud_resets, ud_rearms, ud_stuck);
++}
++
++/* 1045: data interface up again (alt 1 after it had been up, or the watchdog): fresh endpoints, RX armed. */
++static void
++ud_data_rearm(const char *why)
++{
++	ud_data_down(why, false);
++	ud_configure();
++	if (ud.configured && ud.data_alt == 1) {
++		ud_notify_connected();
++		ud.data_up = true;
++	}
+ }
+ 
+ static void
+@@ -543,6 +677,12 @@ ud_setup(void)
+ 		dwc_wr(DCFG, dcfg | ((uint32_t)(value & 0x7f) << 3));
+ 		printf("SWEET USB: address %u\n", value & 0x7f);
+ 	} else if (req == 9) {          /* SET_CONFIGURATION */
++		if (ud_recover && ud.configured) {
++			ud_data_down("set configuration", true);        /* 1045: endpoints from scratch */
++		}
++		if (ud_recover) {
++			ud.data_alt = 0;
++		}
+ 		if (value == 1) {
+ 			ud_configure();
+ 		}
+@@ -554,8 +694,13 @@ ud_setup(void)
+ 	} else if (req == 11) {         /* SET_INTERFACE */
+ 		if (index == 1) {
+ 			ud.data_alt = (uint8_t)value;
+-			if (value == 1 && ud.configured) {
++			if (value == 1 && ud.configured && ud_recover && (ud.data_up || ud_xact[EP_INT])) {
++				/* 1045: the host reset its toggles (alt 1 again): endpoints from scratch */
++				ud_data_rearm("set interface alt 1 again");
++				ud_link_event(true);
++			} else if (value == 1 && ud.configured) {
+ 				ud_notify_connected();
++				ud.data_up = true;
+ 				ud_link_event(true);
+ 			}
+ 		}
+@@ -728,6 +873,8 @@ ud_tx_kick_batch_locked(unsigned max)
+ 	ud.tx_busy = true;
+ 	ud.tx_frames += k;
+ 	ud_tx_xfers++;
++	ud_tx_trb = ud_txb_va;
++	ud_tx_trb_pa = ud_txb_pa;
+ 	if (ud_epcmd(EP_TX, DEPCMD_STARTTRANSFER, (uint32_t)(ud_txb_pa >> 32), (uint32_t)ud_txb_pa, 0) != 0) {
+ 		ud.tx_busy = false;     /* no transfer started: no completion will come (ud_epcmd logged it) */
+ 		ud_tx_drops += k;
+@@ -756,6 +903,8 @@ ud_tx_kick_locked(void)
+ 		ud.tx_busy = true;
+ 		ud.tx_frames++;
+ 		ud_tx_xfers++;
++		ud_tx_trb = ud.dma + UD_TRB_TX;
++		ud_tx_trb_pa = ud.dma_pa + UD_TRB_TX;
+ 		ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, len, TRBCTL_NORMAL);
+ 	}
+ }
+@@ -918,6 +1067,11 @@ ud_event(uint32_t ev)
+ 		if (type == 1) {        /* USB reset */
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
+ 			printf("SWEET USB: bus reset\n");
++			if (ud_recover) {
++				ud_resets++;
++				ud.data_alt = 0;
++				ud_data_down("bus reset", true);        /* re-enumeration follows; LINK_ON again at alt 1 */
++			}
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t speed = dwc_rd(DSTS) & 7;
+ 			/* ep0 max packet: 64 at high/full speed (modify action) */
+@@ -928,6 +1082,11 @@ ud_event(uint32_t ev)
+ 			printf("SWEET USB: connected, speed %u\n", speed);
+ 		} else if (type == 0) {
+ 			printf("SWEET USB: disconnect\n");
++			if (ud_recover) {
++				ud_resets++;
++				ud.data_alt = 0;
++				ud_data_down("disconnect", true);
++			}
+ 		}
+ 		return;
+ 	}
+@@ -936,16 +1095,41 @@ ud_event(uint32_t ev)
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
+ 	if (ep == EP_RX && type == 1) {
++		if (ud_recover) {
++			/* 1045: a completion of a transfer that was ended (or whose TRB the controller still owns) */
++			volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
++			ud_sync(UD_TRB_RX, 16);
++			if (!ud_xact[EP_RX] || !ud.configured || (t[3] & TRB_HWO)) {
++				ud_stale++;
++				return;
++			}
++		}
++		ud_xact[EP_RX] = false;
+ 		ud_rx_done();
+ 		return;
+ 	}
+ 	if (ep == EP_TX && type == 1) {
+ 		lck_mtx_lock(ud.lock);
++		if (ud_recover && ud_tx_trb != 0) {
++			/* 1045: stale completion (transfer ended by ud_data_down, or a newer one still owned by the controller) */
++			ud_sync_any(ud_tx_trb_pa, 16);
++			if (!ud_xact[EP_TX] || (*(volatile uint32_t *)(ud_tx_trb + 12) & TRB_HWO)) {
++				ud_stale++;
++				lck_mtx_unlock(ud.lock);
++				return;
++			}
++		}
++		ud_xact[EP_TX] = false;
+ 		ud.tx_busy = false;
++		ud_tx_done++;
+ 		ud_tx_kick_locked();
+ 		lck_mtx_unlock(ud.lock);
+ 		return;
+ 	}
++	if (ep == EP_INT && type == 1) {
++		ud_xact[EP_INT] = false;
++		return;
++	}
+ 	if (ep > 1) {
+ 		return;
+ 	}
+@@ -987,6 +1171,9 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 	uint32_t ticks = 0;
+ 	/* redfin (0969): poll every 1 ms while events flow, every 10 ms after 200 quiet polls; sweetudpoll=1: always 1 ms */
+ 	uint32_t quiet = 0, fast = 0, sub_us = 0;
++	/* 1045 watchdog: ms with TX busy and no RX/TX progress, the counters/events then, last re-arm */
++	uint32_t wd_ms = 0, wd_ev = 0, wd_last = 0;
++	uint64_t wd_rx = 0, wd_txc = 0;
+ 	PE_parse_boot_argn("sweetudpoll", &fast, sizeof(fast));
+ 	for (;;) {
+ 		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
+@@ -1017,14 +1204,41 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 			}
+ 			dwc_wr(GEVNTCOUNT, count);
+ 		}
++		if (tick) {
++			if (!ud_recover || !ud.configured || ud.data_alt != 1 || !ud.tx_busy ||
++			    ud.rx_frames != wd_rx || ud_tx_done != wd_txc) {
++				wd_ms = 0;
++				wd_rx = ud.rx_frames;
++				wd_txc = ud_tx_done;
++				wd_ev = ud.events;
++			} else if (++wd_ms >= 5000 && (wd_last == 0 || ticks - wd_last >= 10000)) {
++				uint32_t lnk = (dwc_rd(DSTS) >> 18) & 0xf;
++				uint32_t dev = ud.events - wd_ev;
++				if (lnk == 0 || dev != 0) {     /* host there: link in U0/L0, or it sent something */
++					ud_stuck++;
++					wd_last = ticks ? ticks : 1;
++					printf("SWEET USB: stuck, re-arming (rx %llu tx %llu frames, no progress %u ms, tx busy, link state %u, events +%u; stuck %llu)\n",
++					    ud.rx_frames, ud.tx_frames, wd_ms, lnk, dev, ud_stuck);
++					ud_data_rearm("watchdog");
++					lck_mtx_lock(ud.lock);
++					ud_tx_kick_locked();
++					lck_mtx_unlock(ud.lock);
++				}
++				wd_ms = 0;
++				wd_rx = ud.rx_frames;
++				wd_txc = ud_tx_done;
++				wd_ev = ud.events;
++			}
++		}
+ 		if (tick && (++ticks % 10000) == 0) {
+ 			volatile uint32_t *rt = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+ 			volatile uint32_t *tt = (volatile uint32_t *)(ud.dma + UD_TRB_TX);
+ 			ud_sync(UD_TRB_RX, 16);
+ 			ud_sync(UD_TRB_TX, 16);
+-			printf("SWEET USB: ue0 rx %llu tx %llu frames, events %llu; rx trb %08x %08x tx trb %08x %08x busy %d DSTS %08x\n",
++			printf("SWEET USB: ue0 rx %llu tx %llu frames, events %llu; rx trb %08x %08x tx trb %08x %08x busy %d DSTS %08x; resets %llu rearms %llu stuck %llu (recover %d, xfer rx/tx/int %d%d%d, txq %u, stale %llu)\n",
+ 			    ud.rx_frames, ud.tx_frames, (unsigned long long)ud.events, rt[2], rt[3], tt[2], tt[3],
+-			    ud.tx_busy, dwc_rd(DSTS));
++			    ud.tx_busy, dwc_rd(DSTS), ud_resets, ud_rearms, ud_stuck, ud_recover,
++			    ud_xact[EP_RX], ud_xact[EP_TX], ud_xact[EP_INT], ud.txq_count, ud_stale);
+ 		}
+ 		if (tick && ticks <= 60000 && (ticks % 5000) == 0) {
+ 			printf("SWEET USB: t=%us DCFG %08x DCTL %08x DSTS %08x GUSB2PHYCFG %08x GUSB3PIPECTL %08x GCTL %08x GSTS %08x EVCNT %x\n",
+@@ -1579,10 +1793,13 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	 * kernel-memory DMA path and the SMMU in its default bypass mode: sweetusbdma's write-combined window
+ 	 * and sweetusbsmmu=1's single identity-mapped 2 MB block do not cover them.
+ 	 */
+-	int smmu_mode = 0, txb = 0, pollus = 0;
++	/* 1045: 1034's soaked values are the defaults (sweetusbtxb=0 / sweetusbpollus=0 = the old path) */
++	int smmu_mode = 0, txb = 16, pollus = 100;
+ 	PE_parse_boot_argn("sweetusbsmmu", &smmu_mode, sizeof(smmu_mode));
+ 	PE_parse_boot_argn("sweetusbtxb", &txb, sizeof(txb));
+ 	PE_parse_boot_argn("sweetusbpollus", &pollus, sizeof(pollus));
++	PE_parse_boot_argn("sweetusbrecover", &ud_recover, sizeof(ud_recover));
++	ud_recover = ud_recover ? 1 : 0;
+ 	if (!ud_dma_uncached && smmu_mode == 0) {
+ 		vm_offset_t va = 0;
+ 		if (kmem_alloc_contig(kernel_map, &va, UD_TXB_SIZE, PAGE_MASK, 0, 0,
+@@ -1596,8 +1813,8 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	}
+ 	ud_txbatch = (txb >= 2 && txb <= UD_TXB_MAX && ud_txb_va) ? txb : 0;
+ 	ud_poll_us = (pollus >= 50 && pollus <= 1000) ? pollus : 0;
+-	printf("SWEET USB: fast path: txbatch %d (buffer %s at 0x%llx) poll_us %d\n", ud_txbatch,
+-	    ud_txb_va ? "ok" : "none", ud_txb_pa, ud_poll_us);
++	printf("SWEET USB: fast path: txbatch %d (buffer %s at 0x%llx) poll_us %d (1045 defaults 16/100); recover %d\n", ud_txbatch,
++	    ud_txb_va ? "ok" : "none", ud_txb_pa, ud_poll_us, ud_recover);
+ 	ud_if_create();
+ 	if (ud_smmu_setup(ud.dma_pa) != 0) {
+ 		printf("SWEET USB: SMMU setup failed; not starting the device\n");
+-- 
+2.43.0
+

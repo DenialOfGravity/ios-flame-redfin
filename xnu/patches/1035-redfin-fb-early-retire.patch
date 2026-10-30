@@ -1,0 +1,273 @@
+From b7ecebb4a7da18772a8392052b955d983c5b3c9f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 17:21:42 +0000
+Subject: [PATCH] redfin 1035: early swap retire on the GPU present path,
+ kern.sweet_fb_early_retire (default 0)
+
+r64u presents through the 0944 swap queue (sweetfbx 0x107, sweetfbflip=1, scanout off): CA learns a swap is done
+from SwapWait polls, which answer 0 at once, and from type-5 ticks (sweetswapdone 1, off). CA's chain stays at 2
+surfaces and the GPU idles ~6 ms/frame. Idea from UniXNU GopFramebuffer (sheng early retire): a swap is retired as
+soon as its present blit is accepted onto the ring.
+
+kern.sweet_fb_early_retire MASK, live:
+  1  swap-complete tick at ring acceptance (swapDone where 4), no tick at the blit fence
+  2  re-kick: a put-off queued present is retried at each vsync tick and when the previous blit's fence is seen
+  4  SwapWait polls answer kIOReturnBusy while the swap is still queued / being presented, 0 once on the ring
+Hazard: the blit reads CA's surface after retirement; CA's next GPU render into it is queued after the blit on the
+same in-order ring (blit IB: CACHE_INVALIDATE + WFI first, CCU flush + CACHE_FLUSH_TS last), so it is safe for GPU
+rendering; a CPU write by CA into a retired surface could tear (CA renders with metal2vulkan here). No copy-out.
+Line: SWEET FB: early retire 5s: retired N | polls busy B done D stale S | rekick K | mode M.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC2ugyLE29nbFLJoQZd
+---
+ bsd/dev/sweet_gpu.c                   |  32 ++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 102 +++++++++++++++++++++++++-
+ 2 files changed, 130 insertions(+), 4 deletions(-)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 0521e5c..293c23f 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -30,6 +30,7 @@
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+ #include <mach/mach_time.h>
++#include <sys/sysctl.h>
+ #include "sweet_a6xx.h"
+ #include "../../iokit/Kernel/arm/SweetDisplayMask.h"
+ #include "../../iokit/Kernel/arm/SweetTrace.h"  /* 0994 */
+@@ -1296,6 +1297,37 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 	return rc;
+ }
+ 
++/*
++ * 1035: kern.sweet_fb_early_retire MASK (SweetFramebuffer.cpp, the 0944 swap queue + GPU present; default 0 = as
++ * before). A swap counts as retired once its present blit is accepted onto the ring (present() queued it), not when
++ * the blit's fence lands or the flip latches:
++ *   1  swap-complete tick (type-5 notification, as sweetswapdone 1) at acceptance, without needing sweetswapdone;
++ *      no tick at the fence; at least sweetpace_min after the last notification
++ *   2  re-kick: a queued frame that was put off (flip not latched, IB slot busy) is tried again at each vsync tick
++ *      and as soon as the previous blit's fence is seen, instead of 1 ms later
++ *   4  SwapWait polls (scalar 1 bit 31, CA's can_update_) answer kIOReturnBusy while that swap still waits in the
++ *      queue or is being presented, 0 once its blit is on the ring (100 ms cap); today they answer 0 at once
++ */
++int sweet_fb_early_retire;
++static int
++sysctl_sweet_fb_early_retire SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, sweet_fb_early_retire, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value < 0 || value > 7) {
++		return EINVAL;
++	}
++	sweet_fb_early_retire = value;
++	printf("SWEET FB: early retire %d (1 tick at ring, 2 rekick, 4 honest SwapWait poll)\n", value);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_early_retire, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_fb_early_retire, "I", "SWEET FB: early swap retire mask (1 tick, 2 rekick, 4 SwapWait poll)");
++
+ /* ---- buffers and submissions for Metal (iokit/Kernel/arm/SweetAccelerator.cpp) ---- */
+ 
+ #define USER_VA_BASE    0x200000000ULL  /* above the surface slots */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 56adb40..e0a2e68 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -63,6 +63,7 @@ void sweet_gpu_cpu_flip(void);
+ void sweet_gpu_present_tag(uint64_t swap_abs);
+ void sweet_gpu_present_visible(uint64_t *sum_abs, uint64_t *n);
+ void sweet_cpufreq_boost(int why);              /* 0970: bsd/dev/sweet_cpufreq.c */
++extern int sweet_fb_early_retire;               /* 1035: bsd/dev/sweet_gpu.c, kern.sweet_fb_early_retire */
+ void flush_dcache64(addr64_t addr, unsigned count, int phys);
+ uint32_t sweet_gpu_fence_submitted(void);       /* 0949: CPU present after the GPU has drawn the frame */
+ int sweet_gpu_fence_wait_soft(uint32_t fence, unsigned ms);
+@@ -377,6 +378,7 @@ public:
+ 	bool          vsyncOn(void);
+ 	void          sendVsync(uint64_t count, uint64_t now);
+ 	void          swapDone(uint64_t now, uint32_t where);     /* 0987 (fLock) */
++	IOReturn      erPoll(uint32_t id);                        /* 1035: SwapWait poll with early retire */
+ 	/* 0983 (fLock) */
+ 	IOTimerEventSource *fPaceTimer;       /* mode 3: the notification at last + MIN */
+ 	bool          fPaceArmed;
+@@ -925,6 +927,14 @@ AppleCLCD::start(IOService *provider)
+ }
+ 
+ static uint64_t sweet_fb_swap_count;
++/*
++ * 1035 (kern.sweet_fb_early_retire): the swap the present thread is presenting (accepted onto the ring when present()
++ * returns shown), and the 5 s counters: retired at acceptance, SwapWait polls answered busy / done / stale (pending
++ * over 100 ms: done), present-thread re-kicks from the vsync tick. All with the fLock.
++ */
++static bool sweet_er_presenting;
++static uint32_t sweet_er_presenting_id;
++static uint32_t sweet_er_acc, sweet_er_busy, sweet_er_done, sweet_er_stale, sweet_er_kick;
+ 
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -956,6 +966,16 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	sweet_gpu_flip_poll();	/* 0905: a finished frame in the back buffer goes on screen at this vsync */
+ 	sweet_gpu_present_poll();	/* 0943: blit->fence latency */
+ 	fb->statLine(now);		/* 0943: every 5 s, the frame statistics */
++	if ((sweet_fb_early_retire & 2) && fb->fSwapQ) {
++		/* 1035: the flip latched at the TE this tick follows: a put-off queued frame is tried now, not 1 ms later */
++		IOLockLock(fb->fLock);
++		if (fb->fQn != 0 && fb->fQRetry != 0) {
++			fb->fQRetry = 0;
++			sweet_er_kick++;
++			IOLockWakeup(fb->fLock, &fb->fPresentReq, true);
++		}
++		IOLockUnlock(fb->fLock);
++	}
+ 	/*
+ 	 * CA::WindowServer::IOMFBServer::vsync_callback(fb, a1, a2, a3, refcon): a1 only goes to kdebug, a2 is
+ 	 * the vsync's host time and a2 + a3 the next one (a3 = the refresh period, also CA's CVTimeStamp
+@@ -1079,14 +1099,14 @@ AppleCLCD::sendVsync(uint64_t count, uint64_t now)
+ 
+ /*
+  * 0987: with the fLock. A frame's present is done (where: 1 GPU blit fence landed, 2 CPU copy done, 3 direct scanout
+- * latched): with sweetswapdone & 1, the swap-complete tick (type 5, the only notification CA takes).
++ * latched; 1035: 4 blit accepted onto the ring): with sweetswapdone & 1, the swap-complete tick (type 5, the only notification CA takes).
+  */
+ void
+ AppleCLCD::swapDone(uint64_t now, uint32_t where)
+ {
+ 	sweet_swaptrace('D', where);
+ 	SWEET_TRACE(SWT_SWAPDONE, where, 0, 0, 0);     /* 0994 */
+-	if (!(sweet_swapdone & SWEET_SWAPDONE_TICK)) {
++	if (!(sweet_swapdone & SWEET_SWAPDONE_TICK) && !(where == 4 && (sweet_fb_early_retire & 1))) {
+ 		return;
+ 	}
+ 	sweet_swapdone_events++;
+@@ -1101,6 +1121,55 @@ AppleCLCD::swapDone(uint64_t now, uint32_t where)
+ 	sendVsync(fVsyncCount, now);
+ }
+ 
++/*
++ * 1035 (kern.sweet_fb_early_retire & 4): SwapWait poll (scalar 1 bit 31: CA's can_update_ frees the swap ring entry
++ * before swap id, and the surface it holds, only when this answers 0 for id) on the 0944 queue path. Without it the
++ * poll answers 0 at once (as before 1035): CA may draw into the surface of K-1 while K-1's present is still queued,
++ * i.e. before its blit is on the ring, and that blit then reads the next frame (out-of-order / torn content). Busy while swap id still waits in the queue or is being presented;
++ * 0 once its blit is on the ring (or it was replaced, or anything else). Source hazard: the blit reads CA's surface
++ * from the ring, after the swap is retired. CA's next rendering into that surface is queued on the same ring after
++ * the blit (one ring, in order, no preemption: sweet_a6xx.c), and the blit IB starts with CACHE_INVALIDATE + WFI and
++ * ends with CCU flushes + CACHE_FLUSH_TS, so the GPU finishes reading before it writes the surface again. A CPU
++ * write by CA into the surface (software layers) after retirement could still tear the frame: CA draws its
++ * framebuffer surfaces with the GPU here (metal2vulkan). Pending over 100 ms: 0 (never stuck). With no queue: 0.
++ */
++IOReturn
++AppleCLCD::erPoll(uint32_t id)
++{
++	if (!fSwapQ || (sweet_fbx & SWEET_FBX_CPUPRESENT)) {
++		return kIOReturnSuccess;
++	}
++	IOLockLock(fLock);
++	bool pending = false;
++	uint64_t since = 0;
++	if (sweet_er_presenting && sweet_er_presenting_id == id) {
++		pending = true;
++		since = fPresentRecAbs;
++	}
++	for (uint32_t i = 0; !pending && i < fQn; i++) {
++		uint32_t s = (fQHead + i) % 2;
++		if (get32(fQ + s * SWEET_FB_SWAP_REC_SIZE, 0x50) == id) {
++			pending = true;
++			since = fQAbs[s];
++		}
++	}
++	if (pending && since != 0) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - since, &ns);
++		if (ns > 100 * NSEC_PER_MSEC) {
++			sweet_er_stale++;
++			pending = false;
++		}
++	}
++	if (pending) {
++		sweet_er_busy++;
++	} else {
++		sweet_er_done++;
++	}
++	IOLockUnlock(fLock);
++	return pending ? kIOReturnBusy : kIOReturnSuccess;
++}
++
+ /* 0977: with the fLock. Does any client take vsync notifications now (CA turns them on while it animates)? */
+ bool
+ AppleCLCD::vsyncOn(void)
+@@ -1184,8 +1253,14 @@ AppleCLCD::presentLoop(void *arg)
+ 				break;
+ 			}
+ 			bool out = sweet_gpu_present_poll();
+-			if (blitOut && !out) {
+-				fb->swapDone(mach_absolute_time(), 1);  /* 0987: the present blit's fence landed */
++			if (blitOut && !out && !(sweet_fb_early_retire & 1)) {
++				fb->swapDone(mach_absolute_time(), 1);  /* 0987: the present blit's fence landed (1035 & 1: at acceptance) */
++			}
++			if (blitOut && !out && (sweet_fb_early_retire & 2) && queued && fb->fQRetry != 0) {
++				fb->fQRetry = 0;                        /* 1035: the IB slot / back buffer is free now: try at once */
++				sweet_er_kick++;
++				blitOut = out;
++				continue;
+ 			}
+ 			blitOut = out;
+ 			if (fb->fSwapQ && out) {
+@@ -1205,6 +1280,8 @@ AppleCLCD::presentLoop(void *arg)
+ 			uint32_t h = fb->fQHead;
+ 			memcpy(fb->fPresentRec, fb->fQ + h * SWEET_FB_SWAP_REC_SIZE, SWEET_FB_SWAP_REC_SIZE);
+ 			fb->fPresentRecAbs = fb->fQAbs[h];
++			sweet_er_presenting = true;     /* 1035: still pending for SwapWait until present() has queued it */
++			sweet_er_presenting_id = get32(fb->fPresentRec, 0x50);
+ 			IOLockUnlock(fb->fLock);
+ 			uint64_t t0 = mach_absolute_time();
+ 			fb->fPresentBusy = false;
+@@ -1228,6 +1305,12 @@ AppleCLCD::presentLoop(void *arg)
+ 				fb->fQn--;
+ 				IOLockWakeup(fb->fLock, &fb->fQn, true);   /* a held SwapEnd may go on */
+ 			}
++			sweet_er_presenting = false;
++			if (shown && (sweet_fb_early_retire & 1) && !(sweet_fbx & SWEET_FBX_CPUPRESENT)) {
++				/* 1035: the blit is on the ring, behind the frame's rendering and ahead of anything CA queues next */
++				sweet_er_acc++;
++				fb->swapDone(mach_absolute_time(), 4);
++			}
+ 			IOLockUnlock(fb->fLock);
+ 			if (shown) {
+ 				fb->fStatPresents++;
+@@ -1478,6 +1561,9 @@ AppleCLCD::statLine(uint64_t now)
+ 	absolutetime_to_nanoseconds(fPaceAheadAbs, &pAhead);
+ 	fPaceHeld = fPaceAtSwap = fPaceLapsed = 0;
+ 	fPaceAheadAbs = 0;
++	uint32_t erAcc = sweet_er_acc, erBusy = sweet_er_busy, erDone = sweet_er_done, erStale = sweet_er_stale,
++	    erKick = sweet_er_kick;       /* 1035 */
++	sweet_er_acc = sweet_er_busy = sweet_er_done = sweet_er_stale = sweet_er_kick = 0;
+ 	fStWin = now;
+ 	fStSwaps = fStShown = fStDropped = fStBlitqN = fStHistN = 0;
+ 	fStBlitqAbs = 0;
+@@ -1499,6 +1585,11 @@ AppleCLCD::statLine(uint64_t now)
+ 	IOLog("SWEET FB: 5s: swaps %u shown %u dropped %u | le11 %u le18 %u le26 %u le35 %u gt35 %u | "
+ 	    "p50 %u.%u p95 %u.%u ms | blitq %llu us fence %llu us | hz %u | vis %llu us cpu %llu us gpuwait %llu us late %llu\n", swaps, shown,
+ 	    dropped, b[0], b[1], b[2], b[3], b[4], p50 / 10, p50 % 10, p95 / 10, p95 % 10, blitq, fence, fHz, vis, cpu, gw, gwLate);
++	if (sweet_fb_early_retire || erAcc || erBusy || erKick) {
++		/* 1035: swaps retired at ring acceptance; SwapWait polls busy/done/stale; present re-kicks at the vsync tick */
++		IOLog("SWEET FB: early retire 5s: retired %u | polls busy %u done %u stale %u | rekick %u | mode %d\n",
++		    erAcc, erBusy, erDone, erStale, erKick, sweet_fb_early_retire);
++	}
+ 	if (sweet_pace) {
+ 		/* 0977: ticks held for a SwapEnd, sent at one (and how much before the next tick), lapsed to the next tick */
+ 		IOLog("SWEET FB: pace 5s: held %u at-swap %u (%llu us before the next tick) lapsed %u | early %u skipped %u "
+@@ -4386,6 +4477,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 					sweet_scan_wait(fFB, id);
+ 				}
+ 			}
++		} else if ((sweet_fb_early_retire & 4) && args->scalarInputCount >= 2 &&
++		    (args->scalarInput[1] & 0x80000000ULL)) {
++			ret = fFB->erPoll((uint32_t)args->scalarInput[0]);      /* 1035 */
+ 		}
+ 		sweet_swaptrace('w', args->scalarInputCount >= 1 ? (uint32_t)args->scalarInput[0] : 0);  /* 0987 */
+ 		break;
