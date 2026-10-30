@@ -379,6 +379,9 @@ run() {	# one request line
 	phone)
 		timeout 300 ssh -i ~/.ssh/redfin-claude -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
 			-o ConnectTimeout=10 -o LogLevel=ERROR root@192.168.7.2 "$rest";;
+	phonew)	# same as phone, over Wi-Fi (fallback when the USB link is down); host from WIFI_HOST or 192.168.0.238
+		timeout 300 ssh -i ~/.ssh/redfin-claude -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+			-o ConnectTimeout=10 -o LogLevel=ERROR root@${WIFI_HOST:-192.168.0.238} "$rest";;
 	pull)
 		local src dst gz d size t0 t1 got
 		read -r src dst gz <<<"$rest"
