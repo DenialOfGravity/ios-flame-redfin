@@ -218,9 +218,14 @@ static void lumaKnob(int64_t live) {
  static int (*get)(int)=(int (*)(int))dlsym(RTLD_DEFAULT,"CAGetDebugOption");
  char text[200];
  if(!set){snprintf(text,sizeof text,"native-metal: luma: SWEET_LUMA_BOOST=%d NOT applied (no CASetDebugOption)",want?0:1);sm2_logs(text);applied=want;return;}
- set(91,(uint8_t)want);applied=want;
- snprintf(text,sizeof text,"native-metal: luma: SWEET_LUMA_BOOST=%d applied: CASetDebugOption(91 = CA_DISABLE_LUMA_BOOST, %d), reads back %d",want?0:1,want,get?get(91):-1);
- sm2_logs(text);
+ applied=want;
+ // off the render thread (CASetDebugOption posts a notification after it sets the byte; its observers may take CA's locks)
+ dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
+  set(91,(uint8_t)want);
+  char line[200];
+  snprintf(line,sizeof line,"native-metal: luma: SWEET_LUMA_BOOST=%d applied: CASetDebugOption(91 = CA_DISABLE_LUMA_BOOST, %d), reads back %d",want?0:1,want,get?get(91):-1);
+  sm2_logs(line);
+ });
 }
 // once a second at most (one thread wins the slot): the file's mtime; on a change, parse it and publish the values
 static void liveKnobsPoll() {
